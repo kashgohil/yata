@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/icons/yata-yatagarasu-simple.svg" alt="yata" width="128" />
+</p>
+
 # yata
 
 **Yet Another Terminal browser** — a fast, keyboard-first web browser for the terminal.
