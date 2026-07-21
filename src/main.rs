@@ -1,5 +1,6 @@
 mod browser;
 mod msg;
+mod net;
 mod term;
 
 use std::io::{self, Write};
@@ -15,6 +16,9 @@ use term::Renderer;
 
 fn main() -> io::Result<()> {
     let panic_requested = env::args().any(|a| a == "--panic");
+    // `yata <url>`: the first non-flag argument (`--panic` etc. are flags,
+    // not URLs). No argument → no fetch, blank page.
+    let url = env::args().skip(1).find(|a| !a.starts_with("--"));
 
     // Installed before the Screen exists so no panic window is uncovered.
     // Restore first, then report: the default hook's output must land on the
@@ -37,6 +41,13 @@ fn main() -> io::Result<()> {
     let mut app = App::new(w, h);
 
     let (tx, rx) = mpsc::channel();
+    if let Some(url) = url {
+        // The id makes any previous generation stale; the worker owns its
+        // own Sender clone, so main keeps none and the channel still closes
+        // once every producer is gone.
+        let id = app.start_fetch(url.clone());
+        net::spawn_fetch(id, url, tx.clone());
+    }
     spawn_input_thread(tx);
 
     let mut out = io::stdout();
