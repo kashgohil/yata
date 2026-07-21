@@ -8,7 +8,11 @@ pub const CONT: char = '\0';
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Color {
     Default,
+    // The renderer emits both variants but nothing paints in color until the
+    // CSS cascade (M4); only the renderer's tests construct them until then.
+    #[allow(dead_code)]
     Ansi(u8),
+    #[allow(dead_code)]
     Rgb(u8, u8, u8),
 }
 
