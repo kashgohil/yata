@@ -210,4 +210,25 @@ mod tests {
         let mut app = App::new(80, 24);
         assert_eq!(apply_batch(&mut app, iter::empty()), Effect::default());
     }
+
+    #[test]
+    fn batch_keeps_only_the_last_fetch_commit() {
+        // Two URL-bar commits in one coalesced batch: the first is already a
+        // stale generation by the time the loop sees the effect, so only the
+        // second may be spawned (M1.5: `apply_batch` keeps the last fetch).
+        let commit = |url: &str| {
+            let mut msgs = vec![key('o')];
+            msgs.extend(url.chars().map(key));
+            msgs.push(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+            msgs
+        };
+        let mut msgs = commit("a.com");
+        msgs.extend(commit("b.com"));
+
+        let mut app = App::new(80, 24);
+        let effect = apply_batch(&mut app, msgs.into_iter());
+        let (id, url) = effect.fetch.expect("a commit must surface a fetch");
+        assert_eq!(url, "https://b.com", "an earlier commit leaked through");
+        assert_eq!(id, net::FetchId(2), "the id must be the second generation");
+    }
 }

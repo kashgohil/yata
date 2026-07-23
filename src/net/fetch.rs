@@ -100,7 +100,7 @@ mod tests {
 
     /// Serve one canned HTTP response on an ephemeral local port, from a test
     /// thread. Tests never hit the network (CLAUDE.md conventions).
-    fn serve_once(response: &'static [u8]) -> SocketAddr {
+    fn serve_once(response: Vec<u8>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -115,16 +115,15 @@ mod tests {
                     Ok(n) => req.extend_from_slice(&buf[..n]),
                 }
             }
-            let _ = stream.write_all(response);
+            let _ = stream.write_all(&response);
         });
         addr
     }
 
-    /// Serve a redirect from `/start` to `/final`, then a truncated body on
-    /// the follow-up request: headers promise 100 bytes, the connection dies
-    /// after 5. `Connection: close` on the redirect forces the client onto a
-    /// second connection, so each request is its own accept.
-    fn serve_redirect_then_truncated_body() -> SocketAddr {
+    /// Serve a redirect from `/start` to `/final`, then `final_response` on
+    /// the follow-up request. `Connection: close` on the redirect forces the
+    /// client onto a second connection, so each request is its own accept.
+    fn serve_redirect_then(final_response: &'static [u8]) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         thread::spawn(move || {
@@ -143,7 +142,7 @@ mod tests {
                 let response: &[u8] = if req.starts_with(b"GET /start") {
                     b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 } else {
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello"
+                    final_response
                 };
                 let _ = stream.write_all(response);
             }
@@ -168,7 +167,8 @@ mod tests {
     #[test]
     fn local_server_success_sends_loading_then_exactly_one_loaded() {
         let addr = serve_once(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world"
+                .to_vec(),
         );
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
@@ -231,7 +231,10 @@ mod tests {
 
     #[test]
     fn mid_body_failure_reports_the_post_redirect_url() {
-        let addr = serve_redirect_then_truncated_body();
+        // Headers promise 100 bytes; the connection dies after 5.
+        let addr = serve_redirect_then(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello",
+        );
         let (tx, rx) = mpsc::channel();
         spawn_fetch(FetchId(4), format!("http://{addr}/start"), tx);
 
@@ -257,6 +260,60 @@ mod tests {
             }
             other => panic!("expected NetError last, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn success_after_redirect_reports_the_final_url() {
+        let addr = serve_redirect_then(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(5), format!("http://{addr}/start"), tx);
+
+        let msgs = drain(rx);
+        assert_eq!(
+            *msgs.last().expect("worker sent nothing"),
+            Msg::Loaded {
+                id: FetchId(5),
+                url: format!("http://{addr}/final"),
+                status: 200,
+                body: b"hello".to_vec(),
+            },
+            "Loaded must carry the post-redirect URL and the final status"
+        );
+    }
+
+    #[test]
+    fn gzip_body_is_transparently_decompressed() {
+        // `printf 'hello world' | gzip -n -9`, embedded so the test stays
+        // offline and dependency-free.
+        const GZ: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xcb, 0x48, 0xcd, 0xc9,
+            0xc9, 0x57, 0x28, 0xcf, 0x2f, 0xca, 0x49, 0x01, 0x00, 0x85, 0x11, 0x4a, 0x0d, 0x0b,
+            0x00, 0x00, 0x00,
+        ];
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            GZ.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(GZ);
+        let addr = serve_once(response);
+        let url = format!("http://{addr}/");
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(6), url.clone(), tx);
+
+        let msgs = drain(rx);
+        assert_eq!(
+            *msgs.last().expect("worker sent nothing"),
+            Msg::Loaded {
+                id: FetchId(6),
+                url,
+                status: 200,
+                body: b"hello world".to_vec(),
+            },
+            "the body must arrive decompressed, not as gzip bytes"
+        );
     }
 
     #[test]
