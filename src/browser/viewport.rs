@@ -48,6 +48,21 @@ impl Viewport {
         &self.lines[self.offset..end]
     }
 
+    /// Scroll position as a percentage: 0 at the top, 100 with the last page
+    /// visible. Content that fits entirely reads 100 — everything is on
+    /// screen. `None` until there is content at all (the statusline omits the
+    /// segment rather than showing a made-up number).
+    pub fn scroll_percent(&self) -> Option<u8> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        let max = self.max_offset();
+        if max == 0 {
+            return Some(100);
+        }
+        Some(((self.offset * 100 + max / 2) / max) as u8)
+    }
+
     #[cfg(test)]
     pub fn offset(&self) -> usize {
         self.offset
@@ -255,6 +270,33 @@ mod tests {
         assert_eq!(vp.visible()[0], "0");
         vp.scroll_down();
         assert_eq!(vp.visible()[0], "1");
+    }
+
+    #[test]
+    fn new_content_resets_the_scroll_to_the_top() {
+        let mut vp = tall();
+        vp.scroll_to_bottom();
+        vp.set_content("fresh page", 80, 10);
+        assert_eq!(vp.offset(), 0, "a new page must start at its first line");
+    }
+
+    #[test]
+    fn scroll_percent_is_none_without_content_and_tracks_position() {
+        assert_eq!(Viewport::default().scroll_percent(), None);
+        let mut vp = tall();
+        assert_eq!(vp.scroll_percent(), Some(0));
+        vp.scroll_to_bottom();
+        assert_eq!(vp.scroll_percent(), Some(100));
+        // One line up from the bottom: 89/90 rounds to 99, not a premature 100.
+        vp.scroll_up();
+        assert_eq!(vp.scroll_percent(), Some(99));
+    }
+
+    #[test]
+    fn content_that_fits_entirely_reads_100_percent() {
+        let mut vp = Viewport::default();
+        vp.set_content("a\nb", 80, 10);
+        assert_eq!(vp.scroll_percent(), Some(100));
     }
 
     #[test]

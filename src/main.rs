@@ -5,6 +5,7 @@ mod term;
 
 use std::io::{self, Write};
 use std::sync::mpsc;
+use std::time::Instant;
 use std::{env, iter, panic, thread};
 
 use crossterm::event::{self, Event};
@@ -57,7 +58,7 @@ fn main() -> io::Result<()> {
     spawn_input_thread(tx.clone());
 
     let mut out = io::stdout();
-    render(&app, &mut renderer, &mut out)?;
+    render(&mut app, &mut renderer, &mut out)?;
 
     // Blocking recv is the only wait in the process: idle CPU must be 0%.
     while let Ok(first) = rx.recv() {
@@ -72,7 +73,7 @@ fn main() -> io::Result<()> {
             net::spawn_fetch(id, url, tx.clone());
         }
         if effect.dirty {
-            render(&app, &mut renderer, &mut out)?;
+            render(&mut app, &mut renderer, &mut out)?;
         }
     }
     Ok(())
@@ -99,14 +100,20 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
     effect
 }
 
-fn render(app: &App, renderer: &mut Renderer, out: &mut impl Write) -> io::Result<()> {
+fn render(app: &mut App, renderer: &mut Renderer, out: &mut impl Write) -> io::Result<()> {
+    let started = Instant::now();
     // A coalesced batch of resizes syncs the renderer once, at the final size.
     let (w, h) = app.size();
     if (renderer.frame().width(), renderer.frame().height()) != (w, h) {
         renderer.resize(w, h);
     }
     app.draw(renderer.frame());
-    renderer.present(out)
+    renderer.present(out)?;
+    // A plain setter, deliberately not a Msg: a message would dirty the app
+    // and every frame would schedule the next. The statusline shows this on
+    // whatever paint comes next.
+    app.record_frame(started.elapsed());
+    Ok(())
 }
 
 /// Detached producer: blocks in `event::read()`, forwards key and resize

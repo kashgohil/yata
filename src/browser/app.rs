@@ -1,6 +1,7 @@
-use unicode_width::UnicodeWidthStr;
+use std::time::Duration;
 
 use crate::browser::keys::{self, Action, Chord, Resolution};
+use crate::browser::statusline;
 use crate::browser::viewport::Viewport;
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
@@ -63,6 +64,12 @@ pub struct App {
     /// backs it (idle CPU 0%): it waits indefinitely until the next key.
     pending: Option<Chord>,
     viewport: Viewport,
+    /// Spinner frame index. Progress messages are its clock — there is no
+    /// timer in this app — so it animates exactly while bytes are flowing.
+    spinner: usize,
+    /// Duration of the last presented frame, recorded by the event loop after
+    /// the fact; shown on whatever paint comes next.
+    last_frame: Option<Duration>,
 }
 
 impl App {
@@ -75,6 +82,8 @@ impl App {
             mode: Mode::Browse,
             pending: None,
             viewport: Viewport::default(),
+            spinner: 0,
+            last_frame: None,
         }
     }
 
@@ -98,7 +107,17 @@ impl App {
             url,
             bytes_so_far: 0,
         };
+        self.spinner = 0;
         id
+    }
+
+    /// Record the duration of the frame just presented. A plain setter, not a
+    /// `Msg` and not dirty: feeding it back through the channel would make
+    /// every frame schedule the next and the loop would never idle. The
+    /// statusline therefore shows the *previous* frame's time — honest, since
+    /// the current frame's cost isn't known until after it is drawn.
+    pub fn record_frame(&mut self, dur: Duration) {
+        self.last_frame = Some(dur);
     }
 
     pub fn update(&mut self, msg: Msg) -> Effect {
@@ -128,6 +147,7 @@ impl App {
                         ..
                     } => {
                         *bytes = bytes_so_far;
+                        self.spinner = (self.spinner + 1) % SPINNER.len();
                         redraw()
                     }
                     _ => Effect::default(),
@@ -249,8 +269,7 @@ impl App {
     }
 
     /// Paint the whole frame: the visible body slice into the page area, plus
-    /// the bottom row — the URL bar in `UrlInput`, the status placeholder in
-    /// `Browse`.
+    /// the bottom row — the URL bar in `UrlInput`, the statusline in `Browse`.
     pub fn draw(&self, frame: &mut Frame) {
         frame.clear();
         for (row, line) in self.viewport.visible().iter().enumerate() {
@@ -265,23 +284,17 @@ impl App {
         }
     }
 
-    /// The reversed bottom status row — a placeholder M1.6 replaces, here so
-    /// renders and resizes are visible at all.
+    /// The statusline (PLAN.md §3): URL · fetch progress · scroll % and frame
+    /// time. Composition is pure and pre-padded to the row width, so one
+    /// `put_str` paints every cell reversed.
     fn draw_status(&self, frame: &mut Frame, y: u16) {
-        let style = reversed();
-        for x in 0..frame.width() {
-            frame.set(x, y, Cell::new(' ', style));
-        }
-        let mut left = String::from("yata");
-        if let Some(text) = self.fetch_text() {
-            left.push_str("  ");
-            left.push_str(&text);
-        }
-        frame.put_str(1, y, &left, style);
-        // Drawn after the left text so the size survives an overlap.
-        let size = format!("{}×{}", self.size.0, self.size.1);
-        let x = frame.width().saturating_sub(size.width() as u16 + 1);
-        frame.put_str(x, y, &size, style);
+        let row = statusline::compose(
+            frame.width() as usize,
+            &self.status_left(),
+            &self.status_middle(),
+            &self.status_right(),
+        );
+        frame.put_str(0, y, &row, reversed());
     }
 
     /// The URL bar: `open: <buffer>` with a cursor cell at the end (the cursor
@@ -297,21 +310,50 @@ impl App {
         frame.set(end, y, Cell::new(CURSOR, style));
     }
 
-    /// Placeholder-row summary of the fetch (M1.6 replaces this with a real
-    /// statusline): `loading… N KB`, `status · N KB`, or the error reason.
-    fn fetch_text(&self) -> Option<String> {
+    /// Left segment: what page this is — the current fetch's URL, or the app
+    /// name before anything has been opened.
+    fn status_left(&self) -> String {
         match &self.fetch {
-            Fetch::Idle => None,
-            Fetch::Loading { url, bytes_so_far } => {
-                Some(format!("{url}  loading… {} KB", kb(*bytes_so_far)))
+            Fetch::Idle => "yata".into(),
+            Fetch::Loading { url, .. } | Fetch::Loaded { url, .. } | Fetch::Failed { url, .. } => {
+                url.clone()
             }
-            Fetch::Loaded { url, status, body } => {
-                Some(format!("{url}  {status} · {} KB", kb(body.len() as u64)))
-            }
-            Fetch::Failed { url, reason } => Some(format!("{url}  {reason}")),
         }
     }
+
+    /// Middle segment: where the fetch stands — spinner + progress, the
+    /// loaded summary, or the failure reason.
+    fn status_middle(&self) -> String {
+        match &self.fetch {
+            Fetch::Idle => String::new(),
+            Fetch::Loading { bytes_so_far, .. } => format!(
+                "{} loading… {} KB",
+                SPINNER[self.spinner],
+                kb(*bytes_so_far)
+            ),
+            Fetch::Loaded { status, body, .. } => {
+                format!("{status} · {} KB", kb(body.len() as u64))
+            }
+            Fetch::Failed { reason, .. } => reason.clone(),
+        }
+    }
+
+    /// Right segment: `scroll% · frame time`. A part with no value yet is
+    /// omitted, not shown as a placeholder.
+    fn status_right(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(percent) = self.viewport.scroll_percent() {
+            parts.push(format!("{percent}%"));
+        }
+        if let Some(dur) = self.last_frame {
+            parts.push(format!("{:.1} ms", dur.as_secs_f64() * 1000.0));
+        }
+        parts.join(" · ")
+    }
 }
+
+/// Spinner frames, advanced once per accepted progress message.
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// The cursor cell drawn at the end of the URL buffer.
 const CURSOR: char = '▮';
@@ -588,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn draw_paints_reversed_status_row_with_size_at_bottom() {
+    fn statusline_is_reversed_and_idle_shows_the_app_name_only() {
         let app = App::new(20, 6);
         let mut frame = Frame::new(20, 6);
         app.draw(&mut frame);
@@ -597,12 +639,16 @@ mod tests {
         for x in 0..frame.width() {
             assert!(
                 frame.get(x, bottom).attrs.contains(Attrs::REVERSE),
-                "status row cell {x} must be reversed"
+                "statusline cell {x} must be reversed"
             );
         }
         let text = row_text(&frame, bottom);
-        assert!(text.contains("yata"), "status row was {text:?}");
-        assert!(text.contains("20×6"), "status row was {text:?}");
+        assert!(text.contains("yata"), "statusline was {text:?}");
+        // The M1.5 placeholder readouts are gone: no terminal size, and no
+        // scroll % or frame time before either has a value.
+        assert!(!text.contains('×'), "size readout survived: {text:?}");
+        assert!(!text.contains('%'), "made-up scroll %: {text:?}");
+        assert!(!text.contains("ms"), "made-up frame time: {text:?}");
     }
 
     #[test]
@@ -660,7 +706,13 @@ mod tests {
         let mut frame = Frame::new(60, 6);
 
         app.draw(&mut frame);
-        assert!(row_text(&frame, 5).contains("loading… 0 KB"));
+        let row = row_text(&frame, 5);
+        assert!(row.contains("http://x/"), "row was {row:?}");
+        assert!(row.contains("loading… 0 KB"), "row was {row:?}");
+        assert!(
+            row.chars().any(|c| SPINNER.contains(&c)),
+            "no spinner glyph in {row:?}"
+        );
 
         assert_eq!(
             app.update(Msg::Loading {
@@ -675,6 +727,7 @@ mod tests {
         assert_eq!(app.update(loaded(id, 200, 54 * 1024)), dirty());
         app.draw(&mut frame);
         let row = row_text(&frame, 5);
+        assert!(row.contains("http://final/"), "row was {row:?}");
         assert!(row.contains("200 · 54 KB"), "row was {row:?}");
         assert!(!row.contains("loading"), "row was {row:?}");
     }
@@ -694,16 +747,153 @@ mod tests {
         let mut frame = Frame::new(60, 6);
         app.draw(&mut frame);
         let row = row_text(&frame, 5);
+        assert!(row.contains("http://x/"), "row was {row:?}");
         assert!(row.contains("connection refused"), "row was {row:?}");
         assert!(!row.contains("loading"), "row was {row:?}");
     }
 
     #[test]
-    fn draw_shows_the_size_from_state_after_resize() {
+    fn statusline_spans_the_full_row_after_resize() {
         let mut app = App::new(20, 6);
         app.update(Msg::Resize(19, 5));
         let mut frame = Frame::new(19, 5);
         app.draw(&mut frame);
-        assert!(row_text(&frame, 4).contains("19×5"));
+        for x in 0..frame.width() {
+            assert!(
+                frame.get(x, 4).attrs.contains(Attrs::REVERSE),
+                "cell {x} of the resized statusline must be reversed"
+            );
+        }
+    }
+
+    // ---- M1.6 statusline ---------------------------------------------------
+
+    #[test]
+    fn spinner_advances_per_progress_message_and_resets_on_new_fetch() {
+        let mut app = App::new(60, 6);
+        let progress = |id| Msg::Loading {
+            id,
+            bytes_so_far: 1024,
+        };
+        let mut frame = Frame::new(60, 6);
+
+        let id = app.start_fetch("http://x/".into());
+        app.update(progress(id));
+        app.draw(&mut frame);
+        let one = row_text(&frame, 5);
+        app.update(progress(id));
+        app.draw(&mut frame);
+        // Identical byte counts: the glyph is the only thing that may differ.
+        assert_ne!(row_text(&frame, 5), one, "spinner did not advance");
+
+        // A new fetch restarts the cycle: one message in, the row matches the
+        // first fetch's one-message row exactly.
+        let id2 = app.start_fetch("http://x/".into());
+        app.update(progress(id2));
+        app.draw(&mut frame);
+        assert_eq!(row_text(&frame, 5), one, "spinner cycle did not reset");
+    }
+
+    #[test]
+    fn stale_progress_does_not_advance_the_spinner() {
+        let mut app = App::new(60, 6);
+        let stale = app.start_fetch("http://old/".into());
+        let current = app.start_fetch("http://new/".into());
+        app.update(Msg::Loading {
+            id: current,
+            bytes_so_far: 1024,
+        });
+        let mut frame = Frame::new(60, 6);
+        app.draw(&mut frame);
+        let before = row_text(&frame, 5);
+
+        assert_eq!(
+            app.update(Msg::Loading {
+                id: stale,
+                bytes_so_far: 1024,
+            }),
+            Effect::default()
+        );
+        app.draw(&mut frame);
+        assert_eq!(
+            row_text(&frame, 5),
+            before,
+            "a stale message moved the spinner"
+        );
+    }
+
+    #[test]
+    fn frame_time_appears_only_after_a_recording() {
+        let mut app = App::new(40, 6);
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(!row_text(&frame, 5).contains("ms"));
+
+        // `record_frame` returns nothing and carries no Effect: it must never
+        // be able to request a redraw (that would loop forever). The value
+        // simply shows on the next paint.
+        app.record_frame(Duration::from_micros(2100));
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 5).contains("2.1 ms"),
+            "row was {:?}",
+            row_text(&frame, 5)
+        );
+    }
+
+    #[test]
+    fn scroll_percent_tracks_the_viewport() {
+        let mut app = App::new(20, 6);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(50)); // page of 5: max offset 45
+        let mut frame = Frame::new(20, 6);
+
+        app.draw(&mut frame);
+        let row = row_text(&frame, 5);
+        assert!(
+            row.trim_end().ends_with("0%") && !row.contains("100%"),
+            "top must read 0%: {row:?}"
+        );
+
+        // Half a page down (2 of 45): strictly between the ends, never
+        // snapped to 0 or 100.
+        app.update(key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        app.draw(&mut frame);
+        let row = row_text(&frame, 5);
+        assert!(row.trim_end().ends_with("4%"), "row was {row:?}");
+
+        app.update(key(KeyCode::Char('G'), KeyModifiers::NONE));
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 5).contains("100%"));
+
+        // One line above the bottom: 44/45 rounds to 98 — between, never 100.
+        app.update(ch('k'));
+        app.draw(&mut frame);
+        let row = row_text(&frame, 5);
+        assert!(row.contains("98%"), "row was {row:?}");
+    }
+
+    #[test]
+    fn byte_counts_round_up_so_progress_never_reads_zero() {
+        assert_eq!(kb(0), 0);
+        assert_eq!(kb(1), 1, "any progress at all must read 1 KB, not 0 KB");
+        assert_eq!(kb(1024), 1);
+        assert_eq!(kb(1025), 2);
+    }
+
+    #[test]
+    fn content_that_fits_reads_100_percent_and_no_content_reads_nothing() {
+        let mut app = App::new(40, 6);
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(!row_text(&frame, 5).contains('%'), "no content, no percent");
+
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(3));
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 5).contains("100%"),
+            "fully visible content reads 100%"
+        );
     }
 }
