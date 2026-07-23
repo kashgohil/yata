@@ -42,13 +42,17 @@ fn main() -> io::Result<()> {
 
     let (tx, rx) = mpsc::channel();
     if let Some(url) = url {
-        // The id makes any previous generation stale; the worker owns its
-        // own Sender clone, so main keeps none and the channel still closes
-        // once every producer is gone.
+        // Scheme defaulting for the CLI argument goes through the same helper
+        // the URL bar uses. The id makes any previous generation stale; each
+        // worker owns its own Sender clone.
+        let url = net::normalize_url(&url);
         let id = app.start_fetch(url.clone());
         net::spawn_fetch(id, url, tx.clone());
     }
-    spawn_input_thread(tx);
+    // The loop keeps `tx` alive so a URL-bar commit can spawn a fetch (below);
+    // the input thread gets its own clone. Every worker holds a clone too, so
+    // the channel only closes once the loop drops `tx` at exit.
+    spawn_input_thread(tx.clone());
 
     let mut out = io::stdout();
     render(&app, &mut renderer, &mut out)?;
@@ -59,6 +63,11 @@ fn main() -> io::Result<()> {
         let effect = apply_batch(&mut app, batch);
         if effect.quit {
             break;
+        }
+        // A committed navigation: `App` already started the generation, the
+        // loop's only job is to spawn the worker with its own Sender clone.
+        if let Some((id, url)) = effect.fetch {
+            net::spawn_fetch(id, url, tx.clone());
         }
         if effect.dirty {
             render(&app, &mut renderer, &mut out)?;
@@ -75,6 +84,11 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
     for msg in msgs {
         let e = app.update(msg);
         effect.dirty |= e.dirty;
+        // Keep only the last fetch of the batch: an earlier commit is already a
+        // stale generation, so spawning its worker would be pure waste.
+        if e.fetch.is_some() {
+            effect.fetch = e.fetch;
+        }
         if e.quit {
             effect.quit = true;
             break;
@@ -103,8 +117,8 @@ fn spawn_input_thread(tx: mpsc::Sender<Msg>) {
                 Ok(Event::Key(key)) => Msg::Key(key),
                 Ok(Event::Resize(w, h)) => Msg::Resize(w, h),
                 Ok(_) => continue,
-                // Input is gone for good; dropping the sender closes the
-                // channel and the event loop exits via recv's Err.
+                // Input is gone for good; drop this Sender clone and stop. The
+                // loop keeps its own clone, so shutdown is driven by `quit`.
                 Err(_) => return,
             };
             if tx.send(msg).is_err() {
@@ -124,34 +138,45 @@ mod tests {
     }
 
     #[test]
-    fn batch_of_scrollish_keys_is_one_decision_with_no_redraw() {
+    fn batch_of_dead_keys_is_one_decision_with_no_redraw() {
         let mut app = App::new(80, 24);
-        // 'j' is unbound until M1.5 gives it scroll; a key that does nothing
-        // must not redraw, no matter how many arrive in one batch.
+        // 'z' is bound to nothing; a key that does nothing must not redraw, no
+        // matter how many arrive in one batch.
+        let effect = apply_batch(&mut app, (0..200).map(|_| key('z')));
+        assert_eq!(effect, Effect::default());
+    }
+
+    #[test]
+    fn batch_of_scroll_keys_coalesces_to_one_redraw() {
+        let mut app = App::new(80, 6); // 5-row page area
+        let id = app.start_fetch("http://x/".into());
+        let body = (0..100)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/".into(),
+            status: 200,
+            body,
+        });
+        // 200 'j' now scroll for real: still one coalesced redraw decision, not
+        // 200 renders. (Clamping to the last page is covered by viewport tests.)
         let effect = apply_batch(&mut app, (0..200).map(|_| key('j')));
-        assert_eq!(
-            effect,
-            Effect {
-                quit: false,
-                dirty: false
-            }
-        );
+        assert!(effect.dirty);
+        assert!(!effect.quit);
+        assert!(effect.fetch.is_none());
     }
 
     #[test]
     fn batch_of_dirtying_messages_coalesces_to_one_redraw() {
         let mut app = App::new(80, 24);
         // 200 resize wiggles: one redraw decision at the final state, not 200
-        // renders. This is the shape a scroll-key flood takes from M1.5 on.
+        // renders.
         let msgs = (0..200).map(|i| Msg::Resize(80, 24 + (i % 2)));
         let effect = apply_batch(&mut app, msgs);
-        assert_eq!(
-            effect,
-            Effect {
-                quit: false,
-                dirty: true
-            }
-        );
+        assert!(effect.dirty && !effect.quit);
         assert_eq!(app.size(), (80, 25), "state reflects the last message");
     }
 
