@@ -156,10 +156,13 @@ mod tests {
     }
 
     #[test]
-    fn quit_in_a_batch_reports_quit() {
+    fn quit_in_a_batch_reports_quit_and_stops_applying() {
         let mut app = App::new(80, 24);
-        let msgs = vec![key('j'), key('q'), key('j')];
+        // The resize after 'q' must never be applied: quit short-circuits the
+        // batch, so state still shows the pre-quit size.
+        let msgs = vec![key('j'), key('q'), Msg::Resize(10, 10)];
         assert!(apply_batch(&mut app, msgs.into_iter()).quit);
+        assert_eq!(app.size(), (80, 24), "message after quit was applied");
     }
 
     #[test]
