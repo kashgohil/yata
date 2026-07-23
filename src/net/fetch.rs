@@ -23,7 +23,7 @@ pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
             }
             // Channel closed mid-stream: nobody is listening anymore.
             Ok(None) => {}
-            Err(reason) => {
+            Err((url, reason)) => {
                 let _ = tx.send(Msg::NetError { id, url, reason });
             }
         }
@@ -31,16 +31,21 @@ pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
 }
 
 /// The whole request, run on the worker. `Ok(Some(Loaded))` on success,
-/// `Ok(None)` if the channel closed mid-stream, `Err(reason)` on any failure
-/// (bad URL, DNS, connect, TLS, mid-body disconnect).
-fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, String> {
+/// `Ok(None)` if the channel closed mid-stream, `Err((url, reason))` on any
+/// failure (bad URL, DNS, connect, TLS, mid-body disconnect). The error's url
+/// is the most precise one known at the point of failure: the requested URL
+/// until headers arrive, the post-redirect final URL after.
+fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (String, String)> {
     // Built here, not in `spawn_fetch`, so the UI thread never touches
     // reqwest. Defaults follow redirects and (via the gzip feature)
     // transparently decompress.
     let client = reqwest::blocking::Client::builder()
         .build()
-        .map_err(describe)?;
-    let mut resp = client.get(url).send().map_err(describe)?;
+        .map_err(|e| (url.to_string(), describe(e)))?;
+    let mut resp = client
+        .get(url)
+        .send()
+        .map_err(|e| (url.to_string(), describe(e)))?;
     let status = resp.status().as_u16();
     // The final URL, after redirects — what M1.5's URL bar should display.
     let final_url = resp.url().to_string();
@@ -48,7 +53,9 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, String
     let mut body = Vec::new();
     let mut buf = [0u8; CHUNK];
     loop {
-        let n = resp.read(&mut buf).map_err(describe)?;
+        let n = resp
+            .read(&mut buf)
+            .map_err(|e| (final_url.clone(), describe(e)))?;
         if n == 0 {
             break;
         }
@@ -109,6 +116,37 @@ mod tests {
                 }
             }
             let _ = stream.write_all(response);
+        });
+        addr
+    }
+
+    /// Serve a redirect from `/start` to `/final`, then a truncated body on
+    /// the follow-up request: headers promise 100 bytes, the connection dies
+    /// after 5. `Connection: close` on the redirect forces the client onto a
+    /// second connection, so each request is its own accept.
+    fn serve_redirect_then_truncated_body() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 512];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let response: &[u8] = if req.starts_with(b"GET /start") {
+                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                } else {
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello"
+                };
+                let _ = stream.write_all(response);
+            }
         });
         addr
     }
@@ -188,6 +226,36 @@ mod tests {
                 assert!(!reason.is_empty(), "reason must be human-readable");
             }
             other => panic!("expected NetError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mid_body_failure_reports_the_post_redirect_url() {
+        let addr = serve_redirect_then_truncated_body();
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(4), format!("http://{addr}/start"), tx);
+
+        let msgs = drain(rx);
+        let (last, progress) = msgs.split_last().expect("worker sent nothing");
+        // The bytes that did arrive before the cut may or may not have
+        // produced Loading messages; only the terminal message is pinned.
+        for msg in progress {
+            assert!(
+                matches!(msg, Msg::Loading { id: FetchId(4), .. }),
+                "expected only Loading before NetError, got {msg:?}"
+            );
+        }
+        match last {
+            Msg::NetError { id, url, reason } => {
+                assert_eq!(*id, FetchId(4));
+                assert_eq!(
+                    *url,
+                    format!("http://{addr}/final"),
+                    "a failure after redirects must report the final URL"
+                );
+                assert!(!reason.is_empty(), "reason must be human-readable");
+            }
+            other => panic!("expected NetError last, got {other:?}"),
         }
     }
 
