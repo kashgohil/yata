@@ -21,8 +21,9 @@ pub struct Effect {
     pub fetch: Option<(FetchId, String)>,
 }
 
-/// Where the current fetch stands. `Loaded` keeps the raw body so a re-wrap on
-/// resize can rebuild the viewport from it (via `String::from_utf8_lossy`).
+/// Where the current fetch stands. `Loaded` retains the raw body for the
+/// status-row byte count now, and for M2's parser to consume later; the
+/// viewport re-wraps from its own sanitized lines, not from this.
 enum Fetch {
     Idle,
     Loading {
@@ -109,6 +110,11 @@ impl App {
                 self.viewport.resize(w, self.page());
                 redraw()
             }
+            // Terminal input is gone; exit cleanly, the same as the quit key.
+            Msg::InputClosed => Effect {
+                quit: true,
+                ..Effect::default()
+            },
             // Net messages: a stale id means a fetch that was superseded — its
             // progress, body, and errors must not clobber the current one, so
             // it changes nothing and triggers no redraw.
@@ -360,6 +366,14 @@ mod tests {
 
         let effect = app.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(effect.quit);
+    }
+
+    #[test]
+    fn input_closed_reports_quit() {
+        let mut app = App::new(80, 24);
+        let effect = app.update(Msg::InputClosed);
+        assert!(effect.quit);
+        assert!(effect.fetch.is_none());
     }
 
     #[test]

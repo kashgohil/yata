@@ -50,8 +50,10 @@ fn main() -> io::Result<()> {
         net::spawn_fetch(id, url, tx.clone());
     }
     // The loop keeps `tx` alive so a URL-bar commit can spawn a fetch (below);
-    // the input thread gets its own clone. Every worker holds a clone too, so
-    // the channel only closes once the loop drops `tx` at exit.
+    // the input thread gets its own clone. Because the loop holds a sender,
+    // `recv` never ends on its own — input-thread death instead sends
+    // `Msg::InputClosed`, which resolves to quit through the normal
+    // `update` → `Effect` path (still just `effect.quit`, no extra loop branch).
     spawn_input_thread(tx.clone());
 
     let mut out = io::stdout();
@@ -117,9 +119,13 @@ fn spawn_input_thread(tx: mpsc::Sender<Msg>) {
                 Ok(Event::Key(key)) => Msg::Key(key),
                 Ok(Event::Resize(w, h)) => Msg::Resize(w, h),
                 Ok(_) => continue,
-                // Input is gone for good; drop this Sender clone and stop. The
-                // loop keeps its own clone, so shutdown is driven by `quit`.
-                Err(_) => return,
+                // Input is gone for good. Signal the loop to quit (if it is
+                // already gone the channel is closed, and the failed send is
+                // fine), then stop.
+                Err(_) => {
+                    let _ = tx.send(Msg::InputClosed);
+                    return;
+                }
             };
             if tx.send(msg).is_err() {
                 return;
@@ -188,6 +194,15 @@ mod tests {
         let msgs = vec![key('j'), key('q'), Msg::Resize(10, 10)];
         assert!(apply_batch(&mut app, msgs.into_iter()).quit);
         assert_eq!(app.size(), (80, 24), "message after quit was applied");
+    }
+
+    #[test]
+    fn batch_ending_in_input_closed_reports_quit() {
+        let mut app = App::new(80, 24);
+        // Input-thread death rides the same coalescing path as any quit: no
+        // special loop branch, just `effect.quit`.
+        let msgs = vec![key('j'), Msg::InputClosed];
+        assert!(apply_batch(&mut app, msgs.into_iter()).quit);
     }
 
     #[test]

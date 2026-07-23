@@ -9,6 +9,8 @@ use crate::net::FetchId;
 pub enum Msg {
     Key(KeyEvent),
     Resize(u16, u16),
+    /// The input thread's terminal source is gone for good; the app must exit.
+    InputClosed,
     /// Progress: the fetch worker has `bytes_so_far` of the body.
     Loading {
         id: FetchId,
