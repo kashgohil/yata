@@ -108,6 +108,12 @@ fn clip(s: &str, cap: usize) -> String {
         };
         let w = ch.width().unwrap_or(0);
         if width + w > cap {
+            // The ellipsis lives *inside* the cap: drop kept chars until it
+            // fits, so a clipped result is never wider than `cap` cells.
+            while width + 1 > cap {
+                let Some(dropped) = out.pop() else { break };
+                width -= dropped.width().unwrap_or(0);
+            }
             out.push('…');
             return out;
         }
@@ -121,6 +127,7 @@ fn clip(s: &str, cap: usize) -> String {
 mod tests {
     use super::*;
     use crate::html::parse;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn lines_are_indented_one_node_each() {
@@ -169,13 +176,24 @@ mod tests {
             tree_lines(&dom)
         );
 
-        // 40 wide chars are 80 cells: the cap must bite by cells, not chars.
+        // 40 wide chars are 80 cells: the cap must bite by cells, not chars,
+        // and the ellipsis must fit inside the cap, not ride past it.
         let dom = parse(&format!("<p>{}</p>", "世".repeat(40)));
         let lines = tree_lines(&dom);
         let text = lines.iter().find(|l| l.contains("#text")).unwrap();
         assert!(text.ends_with("…\""), "wide text must truncate: {text}");
-        let kept = text.chars().filter(|&c| c == '世').count();
-        assert_eq!(kept, TEXT_CAP / 2, "cap is in cells: {text}");
+        let snippet: String = text
+            .chars()
+            .skip_while(|&c| c != '"')
+            .filter(|&c| c != '"')
+            .collect();
+        assert!(
+            UnicodeWidthStr::width(snippet.as_str()) <= TEXT_CAP,
+            "clipped snippet is {} cells, over the {TEXT_CAP}-cell cap: {text}",
+            UnicodeWidthStr::width(snippet.as_str())
+        );
+        // 29 whole wide chars (58 cells) + the 1-cell ellipsis ≤ 60.
+        assert_eq!(snippet.chars().filter(|&c| c == '世').count(), 29);
     }
 
     #[test]

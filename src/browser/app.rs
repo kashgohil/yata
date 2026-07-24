@@ -83,10 +83,17 @@ pub struct App {
     /// stops matching the shown body the moment a new body lands. Kept whole
     /// (not just as lines) because style/selector work (M4) reads it next.
     dom: Option<Dom>,
-    /// The `F1` inspector's scrollable tree text — `dom` rendered to lines
-    /// once per `Parsed`, then scrolled exactly like the page (cached lines →
-    /// repaint; scrolling never re-parses or re-renders the tree).
+    /// The `F1` inspector's scrollable tree text — `dom` rendered to lines,
+    /// then scrolled exactly like the page (cached lines → repaint; scrolling
+    /// never re-parses or re-renders the tree).
     dom_view: Viewport,
+    /// Whether `dom_view` currently holds `dom`'s lines. Rendering a
+    /// Wikipedia-sized tree to lines costs ~15 ms, so it is deferred to the
+    /// moment the tree is about to be seen (F1 toggled on, or a parse landing
+    /// while F1 is open) instead of hitching the event loop on every
+    /// navigation — pages load far more often than F1 opens. The flag also
+    /// keeps an off/on toggle from rebuilding (and losing the scroll offset).
+    dom_view_built: bool,
     /// Whether the `F1` DOM surface replaces the page area.
     dom_visible: bool,
 }
@@ -106,6 +113,7 @@ impl App {
             timing_visible: false,
             dom: None,
             dom_view: Viewport::default(),
+            dom_view_built: false,
             dom_visible: false,
         }
     }
@@ -201,7 +209,11 @@ impl App {
                 // The old tree stops matching the body just shown; the F1
                 // surface goes back to its placeholder until this fetch's
                 // `Parsed` follows (it is coming — same worker, next message).
+                // Its parse duration goes with it: fetch is now this run's,
+                // and a table mixing stages from two runs would lie.
                 self.dom = None;
+                self.dom_view_built = false;
+                self.timings.parse = None;
                 // Only an accepted, completed fetch records its duration.
                 // `start_fetch` deliberately does not clear it and `NetError`
                 // sets nothing: the timing table shows the last *completed*
@@ -215,12 +227,15 @@ impl App {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
-                // Render the tree to lines once, here; every later scroll or
-                // repaint of the F1 surface reads these cached lines.
-                let text = inspector::tree_lines(&dom).join("\n");
-                self.dom_view.set_content(&text, self.size.0, self.page());
                 self.dom = Some(dom);
                 self.timings.parse = Some(elapsed);
+                // No line building here (see `dom_view_built`) — unless F1 is
+                // open right now, in which case the user is watching the tree
+                // and it must refresh on this repaint.
+                self.dom_view_built = false;
+                if self.dom_visible {
+                    self.build_dom_view();
+                }
                 redraw()
             }
             Msg::NetError { id, url, reason } => {
@@ -291,6 +306,9 @@ impl App {
             }
             Action::ToggleDom => {
                 self.dom_visible = !self.dom_visible;
+                if self.dom_visible {
+                    self.build_dom_view();
+                }
                 redraw()
             }
             Action::ToggleTiming => {
@@ -319,6 +337,21 @@ impl App {
     /// dead-end.
     fn dom_active(&self) -> bool {
         self.dom_visible && self.dom.is_some()
+    }
+
+    /// Render `dom` into the F1 surface's lines at the current size, if it
+    /// isn't already. Called only at the two moments the tree is about to be
+    /// shown (see `dom_view_built`); every scroll and repaint in between
+    /// reads the cached lines.
+    fn build_dom_view(&mut self) {
+        if self.dom_view_built {
+            return;
+        }
+        if let Some(dom) = &self.dom {
+            let text = inspector::tree_lines(dom).join("\n");
+            self.dom_view.set_content(&text, self.size.0, self.page());
+            self.dom_view_built = true;
+        }
     }
 
     /// The view the shared scroll keys act on: the same bindings drive the
@@ -1375,6 +1408,12 @@ mod tests {
         let html: String = (0..20).map(|i| format!("<p>p{i}</p>")).collect();
         app.update(parsed(id, &html));
         app.update(f1());
+        // The no-re-parse invariant is structural — `App` has no path to the
+        // parser; a `Dom` only ever enters via `Msg::Parsed` — and the
+        // cached-lines invariant is observable: the line store must not be
+        // rebuilt by scrolling (a rebuild would also reset the offset, which
+        // the assertions below would catch).
+        let lines_before = app.dom_view.line_count();
 
         // `j` scrolls the tree: the first visible line moves down one.
         assert_eq!(app.update(ch('j')), redraw());
@@ -1384,6 +1423,11 @@ mod tests {
             row_text(&frame, 0).starts_with("  <html>"),
             "inspector must scroll, row was {:?}",
             row_text(&frame, 0)
+        );
+        assert_eq!(
+            app.dom_view.line_count(),
+            lines_before,
+            "scrolling must only move the offset over the cached lines"
         );
 
         // The page did not move: toggling the inspector off shows line0.
@@ -1398,6 +1442,58 @@ mod tests {
         app.update(f1());
         app.draw(&mut frame);
         assert!(row_text(&frame, 0).starts_with("  <html>"));
+    }
+
+    #[test]
+    fn a_new_loaded_drops_the_stale_parse_timing_with_the_tree() {
+        let mut app = App::new(40, 10);
+        let id = app.start_fetch("http://a/".into());
+        load(&mut app, id, body(3));
+        app.update(parsed(id, "<p>a</p>"));
+        assert!(app.timings().parse.is_some());
+
+        // Page B's body lands: fetch is now B's, so A's parse must not sit
+        // next to it — a table mixing stages from two runs would lie.
+        let id2 = app.start_fetch("http://b/".into());
+        load(&mut app, id2, body(3));
+        assert_eq!(app.timings().parse, None);
+        assert!(
+            !app.timings().rows().iter().any(|r| r.starts_with("parse")),
+            "rows were {:?}",
+            app.timings().rows()
+        );
+
+        app.update(parsed(id2, "<p>b</p>"));
+        assert!(app.timings().parse.is_some());
+    }
+
+    #[test]
+    fn parsed_defers_line_building_until_f1_opens() {
+        let mut app = App::new(40, 10);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(3));
+        // F1 closed: Parsed stores the tree but builds no lines — a
+        // Wikipedia-sized build (~15 ms) must not ride the load path.
+        app.update(parsed(id, "<p>hi</p>"));
+        assert_eq!(
+            app.dom_view.line_count(),
+            0,
+            "line building must wait for the surface to open"
+        );
+
+        app.update(f1());
+        assert!(
+            app.dom_view.line_count() > 0,
+            "toggling on builds the lines"
+        );
+
+        // Off and on again: the cached lines (and the offset with them, see
+        // the scroll test) survive — no rebuild per toggle.
+        app.update(ch('j'));
+        let offset = app.dom_view.offset();
+        app.update(f1());
+        app.update(f1());
+        assert_eq!(app.dom_view.offset(), offset, "a toggle must not rebuild");
     }
 
     #[test]

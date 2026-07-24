@@ -1,5 +1,7 @@
 //! The M2 fast gate (PLAN.md §6): tokenizer + tree builder over the committed
 //! Wikipedia fixture must come in under 50 ms. Run: `cargo bench --bench parse`.
+//!
+//! Last recorded: 13.0 ms (M2.3, Apple M4 Pro, 2026-07) — gate < 50 ms.
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::hint::black_box;
