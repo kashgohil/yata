@@ -1,4 +1,5 @@
 mod browser;
+mod dom;
 mod msg;
 mod net;
 mod term;
