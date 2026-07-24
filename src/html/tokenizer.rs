@@ -24,9 +24,13 @@ pub enum Token {
     Doctype(String),
 }
 
-/// Tags whose content is raw text: only the matching end tag ends the run, and
-/// nothing inside is a tag or an entity.
+/// Tags whose content is treated as raw text: only the matching end tag ends the
+/// run, and nothing inside is parsed as a tag.
 const RAW_TEXT_TAGS: [&str; 4] = ["script", "style", "title", "textarea"];
+
+/// The subset of raw-text tags that are RCDATA rather than RAWTEXT — their text
+/// still has entities decoded (a `<title>` or `<textarea>` value is user-facing).
+const RCDATA_TAGS: [&str; 2] = ["title", "textarea"];
 
 /// Tokenize an HTML string. Chosen over an iterator type for simplicity — the
 /// whole stream is small relative to a page's layout cost, and the tree builder
@@ -135,10 +139,16 @@ impl Tokenizer {
             }
             inner.push(c);
         }
+        // `get(..7)` rather than `[..7]`: a multi-byte char right after `<!`
+        // (e.g. `<!über>`) would make a byte slice panic mid-character, and the
+        // tokenizer must never panic on malformed input.
         let trimmed = inner.trim_start();
-        if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("doctype") {
-            self.tokens
-                .push(Token::Doctype(trimmed[7..].trim().to_string()));
+        if trimmed
+            .get(..7)
+            .is_some_and(|kw| kw.eq_ignore_ascii_case("doctype"))
+        {
+            let rest = trimmed.get(7..).unwrap_or("").trim();
+            self.tokens.push(Token::Doctype(rest.to_string()));
         } else {
             self.tokens.push(Token::Comment(inner));
         }
@@ -270,10 +280,15 @@ impl Tokenizer {
         value
     }
 
-    /// Raw-text run for `<script>`/`<style>`/`<title>`/`<textarea>`: swallow
-    /// everything as one undecoded `Text` token until `</name` appears with a
-    /// valid terminator, then leave the cursor on that `<` for the normal end-tag
-    /// path. No matching end tag before EOF → all the rest is text.
+    /// Raw run for `<script>`/`<style>`/`<title>`/`<textarea>`: swallow everything
+    /// as one `Text` token until `</name` appears with a valid terminator, then
+    /// leave the cursor on that `<` for the normal end-tag path. No matching end
+    /// tag before EOF → all the rest is text.
+    ///
+    /// Two flavors, per the spec: RCDATA (`<title>`/`<textarea>`) still decodes
+    /// entities — a page title `AT&amp;T` means `AT&T` — while RAWTEXT
+    /// (`<script>`/`<style>`) keeps its source verbatim so `if (a<b)` and CSS
+    /// `content:"&amp;"` survive untouched.
     fn consume_raw_text(&mut self, name: &str) {
         let start = self.pos;
         while self.pos < self.chars.len() {
@@ -281,16 +296,17 @@ impl Tokenizer {
                 && self.peek_at(1) == Some('/')
                 && self.matches_end_tag(name)
             {
-                if self.pos > start {
-                    let text: String = self.chars[start..self.pos].iter().collect();
-                    self.tokens.push(Token::Text(text));
-                }
-                return; // cursor on '<'; consume_end_tag handles it next
+                break; // cursor on '<'; consume_end_tag handles it next
             }
             self.pos += 1;
         }
         if self.pos > start {
-            let text: String = self.chars[start..self.pos].iter().collect();
+            let raw: String = self.chars[start..self.pos].iter().collect();
+            let text = if RCDATA_TAGS.contains(&name) {
+                decode_entities(&raw)
+            } else {
+                raw
+            };
             self.tokens.push(Token::Text(text));
         }
     }
@@ -531,6 +547,26 @@ mod tests {
     }
 
     #[test]
+    fn title_is_rcdata_and_decodes_entities() {
+        // Unlike script/style, RCDATA title/textarea still decode entities, but
+        // still don't parse nested tags.
+        assert_eq!(
+            tokenize("<title>AT&amp;T &lt;3</title>"),
+            vec![
+                Token::StartTag {
+                    name: "title".into(),
+                    attrs: vec![],
+                    self_closing: false,
+                },
+                Token::Text("AT&T <3".into()),
+                Token::EndTag {
+                    name: "title".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn comment_and_doctype() {
         assert_eq!(tokenize("<!-- x -->"), vec![Token::Comment(" x ".into())]);
         assert_eq!(
@@ -541,6 +577,14 @@ mod tests {
             tokenize("<!DOCTYPE HTML>"),
             vec![Token::Doctype("HTML".into())]
         );
+    }
+
+    #[test]
+    fn bogus_bang_with_multibyte_does_not_panic() {
+        // The doctype keyword probe must be char-safe: a multi-byte char right
+        // after `<!` used to slice mid-character and panic.
+        assert_eq!(tokenize("<!über>"), vec![Token::Comment("über".into())]);
+        assert_eq!(tokenize("<!dö>"), vec![Token::Comment("dö".into())]);
     }
 
     #[test]

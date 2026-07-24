@@ -19,3 +19,16 @@ pub use tree_builder::{build, debug_tree, parse};
 pub fn decode_body(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::decode_body;
+
+    #[test]
+    fn decode_body_is_lossy_utf8() {
+        assert_eq!(decode_body("héllo".as_bytes()), "héllo");
+        // An invalid byte becomes U+FFFD rather than panicking — the seam holds
+        // until a page forces real charset detection.
+        assert_eq!(decode_body(&[0x68, 0xFF, 0x69]), "h\u{FFFD}i");
+    }
+}
