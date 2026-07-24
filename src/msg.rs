@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::KeyEvent;
 
+use crate::dom::Dom;
 use crate::net::FetchId;
 
 /// Everything the UI thread reacts to arrives as one of these over the single
@@ -27,6 +28,15 @@ pub enum Msg {
         url: String,
         status: u16,
         body: Vec<u8>,
+        elapsed: Duration,
+    },
+    /// The parsed tree for a `Loaded` body, sent by the same worker right
+    /// after it. Parsing happens off the UI thread (CLAUDE.md: the UI thread
+    /// never blocks, not even on a slow parse); the duration is measured on
+    /// the worker for the same reason `Loaded::elapsed` is.
+    Parsed {
+        id: FetchId,
+        dom: Dom,
         elapsed: Duration,
     },
     /// Terminal failure — bad URL, DNS, connect, TLS, mid-body disconnect.

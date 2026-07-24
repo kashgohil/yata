@@ -1,9 +1,11 @@
 use std::time::Duration;
 
+use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
+use crate::dom::Dom;
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -76,6 +78,17 @@ pub struct App {
     /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
     /// stays up while the URL bar is open.
     timing_visible: bool,
+    /// The current page's parsed tree, from the fetch worker's `Msg::Parsed`.
+    /// `None` between an accepted `Loaded` and its `Parsed` — the old tree
+    /// stops matching the shown body the moment a new body lands. Kept whole
+    /// (not just as lines) because style/selector work (M4) reads it next.
+    dom: Option<Dom>,
+    /// The `F1` inspector's scrollable tree text — `dom` rendered to lines
+    /// once per `Parsed`, then scrolled exactly like the page (cached lines →
+    /// repaint; scrolling never re-parses or re-renders the tree).
+    dom_view: Viewport,
+    /// Whether the `F1` DOM surface replaces the page area.
+    dom_visible: bool,
 }
 
 impl App {
@@ -91,6 +104,9 @@ impl App {
             spinner: 0,
             timings: Timings::default(),
             timing_visible: false,
+            dom: None,
+            dom_view: Viewport::default(),
+            dom_visible: false,
         }
     }
 
@@ -140,6 +156,7 @@ impl App {
                 self.size = (w, h);
                 // Resize is a wrap point: re-wrap at the new width, keep offset.
                 self.viewport.resize(w, self.page());
+                self.dom_view.resize(w, self.page());
                 redraw()
             }
             // Terminal input is gone; exit cleanly, the same as the quit key.
@@ -181,11 +198,29 @@ impl App {
                 let text = String::from_utf8_lossy(&body).into_owned();
                 self.viewport.set_content(&text, self.size.0, self.page());
                 self.fetch = Fetch::Loaded { url, status, body };
+                // The old tree stops matching the body just shown; the F1
+                // surface goes back to its placeholder until this fetch's
+                // `Parsed` follows (it is coming — same worker, next message).
+                self.dom = None;
                 // Only an accepted, completed fetch records its duration.
                 // `start_fetch` deliberately does not clear it and `NetError`
                 // sets nothing: the timing table shows the last *completed*
                 // run (PLAN.md §4) until a newer one lands.
                 self.timings.fetch = Some(elapsed);
+                redraw()
+            }
+            Msg::Parsed { id, dom, elapsed } => {
+                // Same stale-generation guard as `Loaded`: a slow parse of a
+                // superseded page must not clobber the current tree.
+                if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                // Render the tree to lines once, here; every later scroll or
+                // repaint of the F1 surface reads these cached lines.
+                let text = inspector::tree_lines(&dom).join("\n");
+                self.dom_view.set_content(&text, self.size.0, self.page());
+                self.dom = Some(dom);
+                self.timings.parse = Some(elapsed);
                 redraw()
             }
             Msg::NetError { id, url, reason } => {
@@ -242,16 +277,20 @@ impl App {
                 quit: true,
                 ..Effect::default()
             },
-            Action::ScrollDown => moved(self.viewport.scroll_down()),
-            Action::ScrollUp => moved(self.viewport.scroll_up()),
-            Action::HalfPageDown => moved(self.viewport.half_page_down()),
-            Action::HalfPageUp => moved(self.viewport.half_page_up()),
-            Action::Top => moved(self.viewport.scroll_to_top()),
-            Action::Bottom => moved(self.viewport.scroll_to_bottom()),
+            Action::ScrollDown => moved(self.scroll_target().scroll_down()),
+            Action::ScrollUp => moved(self.scroll_target().scroll_up()),
+            Action::HalfPageDown => moved(self.scroll_target().half_page_down()),
+            Action::HalfPageUp => moved(self.scroll_target().half_page_up()),
+            Action::Top => moved(self.scroll_target().scroll_to_top()),
+            Action::Bottom => moved(self.scroll_target().scroll_to_bottom()),
             Action::OpenUrl => {
                 self.mode = Mode::UrlInput {
                     buffer: String::new(),
                 };
+                redraw()
+            }
+            Action::ToggleDom => {
+                self.dom_visible = !self.dom_visible;
                 redraw()
             }
             Action::ToggleTiming => {
@@ -271,6 +310,25 @@ impl App {
                 }
                 redraw()
             }
+        }
+    }
+
+    /// Whether the F1 surface currently owns the page area (and therefore the
+    /// scroll keys and the scroll-% readout). With no parsed tree the surface
+    /// is a static placeholder — the page keeps the scroll keys so they never
+    /// dead-end.
+    fn dom_active(&self) -> bool {
+        self.dom_visible && self.dom.is_some()
+    }
+
+    /// The view the shared scroll keys act on: the same bindings drive the
+    /// page and the F1 tree, whichever is on screen (the brief's "do not
+    /// invent a second scheme").
+    fn scroll_target(&mut self) -> &mut Viewport {
+        if self.dom_active() {
+            &mut self.dom_view
+        } else {
+            &mut self.viewport
         }
     }
 
@@ -295,8 +353,12 @@ impl App {
     /// the bottom row — the URL bar in `UrlInput`, the statusline in `Browse`.
     pub fn draw(&self, frame: &mut Frame) {
         frame.clear();
-        for (row, line) in self.viewport.visible().iter().enumerate() {
-            frame.put_str(0, row as u16, line, Style::default());
+        if self.dom_visible {
+            self.draw_dom(frame);
+        } else {
+            for (row, line) in self.viewport.visible().iter().enumerate() {
+                frame.put_str(0, row as u16, line, Style::default());
+            }
         }
         // Over the page area, after the body and before the bottom row.
         if self.timing_visible {
@@ -308,6 +370,19 @@ impl App {
         match &self.mode {
             Mode::UrlInput { buffer } => self.draw_url_bar(frame, y, buffer),
             Mode::Browse => self.draw_status(frame, y),
+        }
+    }
+
+    /// The `F1` surface: the cached tree lines in the page area, or a calm
+    /// placeholder while there is nothing parsed yet (fresh start, mid-load,
+    /// or after a failure) — never a panic, never a blank that looks broken.
+    fn draw_dom(&self, frame: &mut Frame) {
+        if self.dom.is_none() {
+            frame.put_str(0, 0, "no DOM yet — open a page (o)", Style::default());
+            return;
+        }
+        for (row, line) in self.dom_view.visible().iter().enumerate() {
+            frame.put_str(0, row as u16, line, Style::default());
         }
     }
 
@@ -360,13 +435,19 @@ impl App {
     }
 
     /// Left segment: what page this is — the current fetch's URL, or the app
-    /// name before anything has been opened.
+    /// name before anything has been opened — tagged with the active surface
+    /// when it isn't the page itself.
     fn status_left(&self) -> String {
-        match &self.fetch {
-            Fetch::Idle => "yata".into(),
+        let base = match &self.fetch {
+            Fetch::Idle => "yata".to_string(),
             Fetch::Loading { url, .. } | Fetch::Loaded { url, .. } | Fetch::Failed { url, .. } => {
                 url.clone()
             }
+        };
+        if self.dom_visible {
+            format!("[dom] {base}")
+        } else {
+            base
         }
     }
 
@@ -388,10 +469,16 @@ impl App {
     }
 
     /// Right segment: `scroll% · frame time`. A part with no value yet is
-    /// omitted, not shown as a placeholder.
+    /// omitted, not shown as a placeholder. The percentage tracks whichever
+    /// surface the scroll keys currently drive.
     fn status_right(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(percent) = self.viewport.scroll_percent() {
+        let view = if self.dom_active() {
+            &self.dom_view
+        } else {
+            &self.viewport
+        };
+        if let Some(percent) = view.scroll_percent() {
             parts.push(format!("{percent}%"));
         }
         if let Some(dur) = self.timings.frame {
@@ -1176,6 +1263,163 @@ mod tests {
         app.record_frame(Duration::from_micros(2_100));
         app.draw(&mut frame);
         assert!(row_text(&frame, 0).ends_with("frame 2.1 ms"));
+    }
+
+    // ---- M2.3 parse + F1 DOM inspector ------------------------------------
+
+    fn f1() -> Msg {
+        key(KeyCode::F(1), KeyModifiers::NONE)
+    }
+
+    fn parsed(id: FetchId, html: &str) -> Msg {
+        Msg::Parsed {
+            id,
+            dom: crate::html::parse(html),
+            elapsed: Duration::from_micros(31_700),
+        }
+    }
+
+    #[test]
+    fn accepted_parsed_records_the_parse_duration_and_f4_shows_it() {
+        let mut app = timed_app(40, 10);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(3));
+        assert_eq!(app.update(parsed(id, "<p>hi</p>")), redraw());
+        assert_eq!(app.timings().parse, Some(Duration::from_micros(31_700)));
+
+        app.update(f4());
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        let overlay: String = (0..3).map(|y| row_text(&frame, y)).collect();
+        assert!(overlay.contains("parse 31.7 ms"), "overlay was {overlay:?}");
+    }
+
+    #[test]
+    fn stale_parsed_is_ignored() {
+        let mut app = App::new(40, 10);
+        let stale = app.start_fetch("http://old/".into());
+        let _current = app.start_fetch("http://new/".into());
+        assert_eq!(app.update(parsed(stale, "<p>old</p>")), Effect::default());
+        assert_eq!(
+            app.timings().parse,
+            None,
+            "a stale Parsed must not record a duration"
+        );
+        app.update(f1());
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).contains("no DOM yet"),
+            "a stale tree must not become the inspector's content"
+        );
+    }
+
+    #[test]
+    fn f1_toggles_between_placeholder_and_page() {
+        let mut app = App::new(40, 6);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(3));
+
+        assert_eq!(app.update(f1()), redraw());
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).contains("no DOM yet"),
+            "no parse yet → calm placeholder, got {:?}",
+            row_text(&frame, 0)
+        );
+        assert!(
+            row_text(&frame, 5).contains("[dom]"),
+            "statusline must reflect the active surface"
+        );
+
+        assert_eq!(app.update(f1()), redraw());
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).starts_with("line0"),
+            "toggling off must restore the page"
+        );
+        assert!(!row_text(&frame, 5).contains("[dom]"));
+    }
+
+    #[test]
+    fn f1_renders_the_parsed_tree_as_an_indented_grid() {
+        let mut app = App::new(40, 10);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(3));
+        app.update(parsed(id, "<p>hi</p>"));
+        app.update(f1());
+
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        let expected = [
+            "#document",
+            "  <html>",
+            "    <head>",
+            "    <body>",
+            "      <p>",
+            "        #text \"hi\"",
+        ];
+        for (y, want) in expected.iter().enumerate() {
+            let row = row_text(&frame, y as u16);
+            assert!(row.starts_with(want), "row {y} was {row:?}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn inspector_scrolls_with_the_page_keys_without_touching_the_page() {
+        let mut app = App::new(40, 6); // page area of 5 rows
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, body(50));
+        // A tree taller than the page: 20 paragraphs is 40+ lines.
+        let html: String = (0..20).map(|i| format!("<p>p{i}</p>")).collect();
+        app.update(parsed(id, &html));
+        app.update(f1());
+
+        // `j` scrolls the tree: the first visible line moves down one.
+        assert_eq!(app.update(ch('j')), redraw());
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).starts_with("  <html>"),
+            "inspector must scroll, row was {:?}",
+            row_text(&frame, 0)
+        );
+
+        // The page did not move: toggling the inspector off shows line0.
+        app.update(f1());
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).starts_with("line0"),
+            "the page offset must be untouched by inspector scrolling"
+        );
+
+        // And the tree kept its own offset while hidden.
+        app.update(f1());
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).starts_with("  <html>"));
+    }
+
+    #[test]
+    fn a_new_loaded_clears_the_old_tree_until_its_parse_lands() {
+        let mut app = App::new(40, 10);
+        let id = app.start_fetch("http://a/".into());
+        load(&mut app, id, body(3));
+        app.update(parsed(id, "<p>old</p>"));
+        app.update(f1());
+
+        let id2 = app.start_fetch("http://b/".into());
+        load(&mut app, id2, body(3));
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).contains("no DOM yet"),
+            "the old page's tree must not pose as the new page's"
+        );
+
+        app.update(parsed(id2, "<p>new</p>"));
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).starts_with("#document"));
     }
 
     #[test]

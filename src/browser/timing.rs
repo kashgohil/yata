@@ -9,6 +9,9 @@ pub struct Timings {
     /// The whole request — client build → last body byte — measured on the
     /// fetch worker and shipped as `Msg::Loaded::elapsed`.
     pub fetch: Option<Duration>,
+    /// The HTML parse (tokenize + tree build), measured on the fetch worker
+    /// and shipped as `Msg::Parsed::elapsed`.
+    pub parse: Option<Duration>,
     /// The last presented frame's draw + present time, recorded by the event
     /// loop after the fact.
     pub frame: Option<Duration>,
@@ -20,10 +23,14 @@ impl Timings {
     /// single source of truth for timing output: the `F4` overlay draws
     /// exactly these rows and `--timing` prints exactly these rows.
     pub fn rows(&self) -> Vec<String> {
-        [("fetch", self.fetch), ("frame", self.frame)]
-            .into_iter()
-            .filter_map(|(label, dur)| dur.map(|d| format!("{label} {}", format_ms(d))))
-            .collect()
+        [
+            ("fetch", self.fetch),
+            ("parse", self.parse),
+            ("frame", self.frame),
+        ]
+        .into_iter()
+        .filter_map(|(label, dur)| dur.map(|d| format!("{label} {}", format_ms(d))))
+        .collect()
     }
 }
 
@@ -49,24 +56,34 @@ mod tests {
     fn each_stage_appears_only_once_it_has_a_value() {
         let fetch_only = Timings {
             fetch: Some(Duration::from_micros(12_300)),
-            frame: None,
+            ..Timings::default()
         };
         assert_eq!(fetch_only.rows(), ["fetch 12.3 ms"]);
 
+        let parse_only = Timings {
+            parse: Some(Duration::from_micros(31_700)),
+            ..Timings::default()
+        };
+        assert_eq!(parse_only.rows(), ["parse 31.7 ms"]);
+
         let frame_only = Timings {
-            fetch: None,
             frame: Some(Duration::from_micros(2_100)),
+            ..Timings::default()
         };
         assert_eq!(frame_only.rows(), ["frame 2.1 ms"]);
     }
 
     #[test]
     fn rows_come_in_pipeline_order() {
-        let both = Timings {
+        let all = Timings {
             fetch: Some(Duration::from_millis(40)),
+            parse: Some(Duration::from_micros(31_700)),
             frame: Some(Duration::from_micros(2_100)),
         };
-        assert_eq!(both.rows(), ["fetch 40.0 ms", "frame 2.1 ms"]);
+        assert_eq!(
+            all.rows(),
+            ["fetch 40.0 ms", "parse 31.7 ms", "frame 2.1 ms"]
+        );
     }
 
     #[test]

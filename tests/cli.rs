@@ -104,7 +104,35 @@ fn dump_against_a_closed_port_reports_the_reason_and_exits_1() {
 }
 
 #[test]
-fn timing_prints_fetch_and_frame_rows_to_stderr_only() {
+fn dump_dom_prints_the_parsed_tree_to_stdout() {
+    let addr = serve_once(response_with_body("200 OK", b"<title>T</title><p>hi</p>"));
+    let out = yata(&["--dump-dom", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let tree = String::from_utf8(out.stdout).unwrap();
+    // The synthesized spine plus real content, indented — the same shape the
+    // in-crate `debug_tree` snapshot tests pin.
+    for line in ["#document", "  <html>", "    <head>", "    <body>"] {
+        assert!(
+            tree.lines().any(|l| l == line),
+            "missing {line:?} in:\n{tree}"
+        );
+    }
+    assert!(tree.contains("<p>"), "tree was:\n{tree}");
+    assert!(tree.contains("#text \"hi\""), "tree was:\n{tree}");
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn timing_prints_fetch_parse_and_frame_rows_to_stderr_only() {
     let addr = serve_once(response_with_body("200 OK", b"<html>hello</html>"));
     let out = yata(&["--timing", &format!("http://{addr}/")]);
     assert_eq!(
@@ -119,16 +147,13 @@ fn timing_prints_fetch_and_frame_rows_to_stderr_only() {
         String::from_utf8_lossy(&out.stdout)
     );
     let table = String::from_utf8(out.stderr).unwrap();
-    let fetch = table
-        .lines()
-        .find(|l| l.starts_with("fetch"))
-        .unwrap_or_else(|| panic!("no fetch row in {table:?}"));
-    assert!(fetch.ends_with("ms"), "fetch row was {fetch:?}");
-    let frame = table
-        .lines()
-        .find(|l| l.starts_with("frame"))
-        .unwrap_or_else(|| panic!("no frame/render row in {table:?}"));
-    assert!(frame.ends_with("ms"), "frame row was {frame:?}");
+    for stage in ["fetch", "parse", "frame"] {
+        let row = table
+            .lines()
+            .find(|l| l.starts_with(stage))
+            .unwrap_or_else(|| panic!("no {stage} row in {table:?}"));
+        assert!(row.ends_with("ms"), "{stage} row was {row:?}");
+    }
 }
 
 #[test]
@@ -145,7 +170,7 @@ fn timing_against_a_closed_port_reports_the_reason_and_exits_1() {
 
 #[test]
 fn a_headless_flag_without_a_url_is_a_usage_error() {
-    for flags in [&["--dump"][..], &["--timing"][..]] {
+    for flags in [&["--dump"][..], &["--dump-dom"][..], &["--timing"][..]] {
         let out = yata(flags);
         assert_eq!(out.status.code(), Some(2), "flags: {flags:?}");
         assert!(out.stdout.is_empty());
@@ -159,16 +184,22 @@ fn a_headless_flag_without_a_url_is_a_usage_error() {
 }
 
 #[test]
-fn dump_and_timing_together_is_a_usage_error() {
+fn two_headless_flags_together_is_a_usage_error() {
     // A URL is present; the flag combination alone must fail, before any
     // fetch is attempted.
-    let out = yata(&["--dump", "--timing", "http://127.0.0.1:9/"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
-    assert_eq!(
-        out.stderr.iter().filter(|&&b| b == b'\n').count(),
-        1,
-        "exactly one usage line, got {:?}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for flags in [
+        ["--dump", "--timing"],
+        ["--dump", "--dump-dom"],
+        ["--dump-dom", "--timing"],
+    ] {
+        let out = yata(&[flags[0], flags[1], "http://127.0.0.1:9/"]);
+        assert_eq!(out.status.code(), Some(2), "flags: {flags:?}");
+        assert!(out.stdout.is_empty());
+        assert_eq!(
+            out.stderr.iter().filter(|&&b| b == b'\n').count(),
+            1,
+            "exactly one usage line, got {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

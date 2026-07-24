@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Instant;
 
+use crate::html;
 use crate::msg::Msg;
 use crate::net::FetchId;
 
@@ -13,14 +14,33 @@ const CHUNK: usize = 16 * 1024;
 
 /// Fetch `url` on a detached worker thread; returns immediately. The worker
 /// talks to the rest of the program only by sending `Msg`s into `tx`: one
-/// `Loading` per body chunk, then exactly one `Loaded` on success or one
-/// `NetError` on any failure. It never panics and never prints; if the
-/// channel is closed (the app quit), it just stops.
+/// `Loading` per body chunk, then exactly one `Loaded` followed by one
+/// `Parsed` on success, or one `NetError` on any failure. It never panics and
+/// never prints; if the channel is closed (the app quit), it just stops.
+///
+/// Parsing lives here, not in the `Loaded` handler: the worker already owns
+/// the bytes and already runs off the UI thread, and a Wikipedia-sized parse
+/// (~tens of ms) would blow the keypress→screen budget if the UI thread did
+/// it. `Loaded` goes out first so the raw body shows without waiting on the
+/// parse.
 pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
     thread::spawn(move || {
         match fetch(id, &url, &tx) {
             Ok(Some(loaded)) => {
-                let _ = tx.send(loaded);
+                let Msg::Loaded { body, .. } = &loaded else {
+                    unreachable!("fetch's success message is always Loaded");
+                };
+                let text = html::decode_body(body);
+                if tx.send(loaded).is_err() {
+                    return;
+                }
+                let started = Instant::now();
+                let dom = html::parse(&text);
+                let _ = tx.send(Msg::Parsed {
+                    id,
+                    dom,
+                    elapsed: started.elapsed(),
+                });
             }
             // Channel closed mid-stream: nobody is listening anymore.
             Ok(None) => {}
@@ -170,8 +190,25 @@ mod tests {
         }
     }
 
+    /// Split a successful worker's message stream into (progress, loaded,
+    /// parsed), asserting the M2.3 shape: `Loading`* then `Loaded` then
+    /// exactly one `Parsed`.
+    fn split_success(msgs: &[Msg]) -> (&[Msg], &Msg, &Msg) {
+        let (parsed, rest) = msgs.split_last().expect("worker sent nothing");
+        assert!(
+            matches!(parsed, Msg::Parsed { .. }),
+            "expected Parsed last, got {parsed:?}"
+        );
+        let (loaded, progress) = rest.split_last().expect("no Loaded before Parsed");
+        assert!(
+            matches!(loaded, Msg::Loaded { .. }),
+            "expected Loaded before Parsed, got {loaded:?}"
+        );
+        (progress, loaded, parsed)
+    }
+
     #[test]
-    fn local_server_success_sends_loading_then_exactly_one_loaded() {
+    fn local_server_success_sends_loading_then_loaded_then_parsed() {
         let addr = serve_once(
             b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nhello world"
                 .to_vec(),
@@ -181,10 +218,10 @@ mod tests {
         spawn_fetch(FetchId(1), url.clone(), tx);
 
         let msgs = drain(rx);
-        let (last, progress) = msgs.split_last().expect("worker sent nothing");
+        let (progress, loaded, parsed) = split_success(&msgs);
         assert!(
             !progress.is_empty(),
-            "expected at least one Loading before Loaded, got only {last:?}"
+            "expected at least one Loading before Loaded"
         );
         let mut prev = 0;
         for msg in progress {
@@ -199,15 +236,15 @@ mod tests {
         }
         // The worker measures the whole request; even against localhost the
         // elapsed time can never be zero.
-        let Msg::Loaded { elapsed, .. } = last else {
-            panic!("expected Loaded last, got {last:?}");
+        let Msg::Loaded { elapsed, .. } = loaded else {
+            unreachable!()
         };
         assert!(
             *elapsed > Duration::ZERO,
             "the worker must measure the request"
         );
         assert_eq!(
-            *last,
+            *loaded,
             Msg::Loaded {
                 id: FetchId(1),
                 url,
@@ -215,6 +252,16 @@ mod tests {
                 body: b"hello world".to_vec(),
                 elapsed: *elapsed,
             }
+        );
+        // The Parsed message carries the body's tree, built on the worker.
+        let Msg::Parsed { id, dom, .. } = parsed else {
+            unreachable!()
+        };
+        assert_eq!(*id, FetchId(1));
+        assert!(
+            html::debug_tree(dom).contains("#text \"hello world\""),
+            "the parsed tree must contain the body text:\n{}",
+            html::debug_tree(dom)
         );
     }
 
@@ -287,12 +334,12 @@ mod tests {
         spawn_fetch(FetchId(5), format!("http://{addr}/start"), tx);
 
         let msgs = drain(rx);
-        let last = msgs.last().expect("worker sent nothing");
-        let Msg::Loaded { elapsed, .. } = last else {
-            panic!("expected Loaded last, got {last:?}");
+        let (_, loaded, _) = split_success(&msgs);
+        let Msg::Loaded { elapsed, .. } = loaded else {
+            unreachable!()
         };
         assert_eq!(
-            *last,
+            *loaded,
             Msg::Loaded {
                 id: FetchId(5),
                 url: format!("http://{addr}/final"),
@@ -325,12 +372,12 @@ mod tests {
         spawn_fetch(FetchId(6), url.clone(), tx);
 
         let msgs = drain(rx);
-        let last = msgs.last().expect("worker sent nothing");
-        let Msg::Loaded { elapsed, .. } = last else {
-            panic!("expected Loaded last, got {last:?}");
+        let (_, loaded, _) = split_success(&msgs);
+        let Msg::Loaded { elapsed, .. } = loaded else {
+            unreachable!()
         };
         assert_eq!(
-            *last,
+            *loaded,
             Msg::Loaded {
                 id: FetchId(6),
                 url,

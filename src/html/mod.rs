@@ -4,10 +4,6 @@
 //! one seam where `encoding_rs` would slot in — PLAN.md M2 says pull it only when
 //! a ladder page needs a non-UTF-8 decode, and none of them do yet.
 //!
-// Nothing wires the parser into `App` yet — the F1 inspector and bench (M2.3) are
-// the first consumers. The inner allow covers this module and its children.
-#![allow(dead_code, unused_imports)]
-
 mod tokenizer;
 mod tree_builder;
 

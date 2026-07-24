@@ -12,6 +12,7 @@ pub enum Action {
     Top,
     Bottom,
     OpenUrl,
+    ToggleDom,
     ToggleTiming,
     Commit,
     Cancel,
@@ -92,8 +93,9 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::Char('G'), NONE), Action::Bottom),
     browse(None, chord(KeyCode::End, NONE), Action::Bottom),
     browse(None, chord(KeyCode::Char('o'), NONE), Action::OpenUrl),
-    // `F4` is the timing inspector (PLAN.md §3 `F1`–`F4`); Browse only — in
-    // the URL bar it is unbound and ignored.
+    // `F1`/`F4` are the DOM and timing inspectors (PLAN.md §3 `F1`–`F4`);
+    // Browse only — in the URL bar they are unbound and ignored.
+    browse(None, chord(KeyCode::F(1), NONE), Action::ToggleDom),
     browse(None, chord(KeyCode::F(4), NONE), Action::ToggleTiming),
     browse(None, chord(KeyCode::Char('q'), NONE), Action::Quit),
     browse(None, chord(KeyCode::Char('c'), CTRL), Action::Quit),
@@ -287,6 +289,18 @@ mod tests {
         );
         assert_eq!(
             resolve(Mode::UrlInput, None, &press(KeyCode::F(4), NONE)),
+            Resolution::Unbound
+        );
+    }
+
+    #[test]
+    fn f1_toggles_the_dom_inspector_in_browse_only() {
+        assert_eq!(
+            browse_key(KeyCode::F(1), NONE),
+            Resolution::Action(Action::ToggleDom)
+        );
+        assert_eq!(
+            resolve(Mode::UrlInput, None, &press(KeyCode::F(1), NONE)),
             Resolution::Unbound
         );
     }

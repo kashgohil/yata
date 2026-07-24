@@ -1,10 +1,3 @@
-mod browser;
-mod dom;
-mod html;
-mod msg;
-mod net;
-mod term;
-
 use std::io::{self, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -13,14 +6,16 @@ use std::{env, iter, panic, process, thread};
 use crossterm::event::{self, Event};
 use crossterm::terminal;
 
-use browser::app::{App, Effect};
-use msg::Msg;
-use term::Renderer;
+use yata::browser::app::{App, Effect};
+use yata::msg::Msg;
+use yata::term::{self, Renderer};
+use yata::{html, net};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let panic_requested = args.iter().any(|a| a == "--panic");
     let dump = args.iter().any(|a| a == "--dump");
+    let dump_dom = args.iter().any(|a| a == "--dump-dom");
     let timing = args.iter().any(|a| a == "--timing");
     // `yata <url>`: the first non-flag argument (`--panic` etc. are flags,
     // not URLs). In the TUI, no argument → no fetch, blank page.
@@ -30,8 +25,8 @@ fn main() -> io::Result<()> {
     // `Screen::new`, raw mode, or the input thread exist. `--dump`'s stdout
     // carries body bytes and nothing else, so piping to a file is byte-exact.
     // Exit codes are part of the spec: 0 success · 1 fetch failure · 2 usage.
-    if dump || timing {
-        if dump && timing {
+    if dump || dump_dom || timing {
+        if [dump, dump_dom, timing].into_iter().filter(|&f| f).count() > 1 {
             process::exit(usage());
         }
         let Some(url) = url else {
@@ -39,6 +34,8 @@ fn main() -> io::Result<()> {
         };
         process::exit(if dump {
             run_dump(&url)
+        } else if dump_dom {
+            run_dump_dom(&url)
         } else {
             run_timing(&url)
         });
@@ -104,19 +101,31 @@ fn main() -> io::Result<()> {
 
 /// The one usage line. Returns the usage exit code for `main` to exit with.
 fn usage() -> i32 {
-    eprintln!("usage: yata [--dump | --timing] <url>");
+    eprintln!("usage: yata [--dump | --dump-dom | --timing] <url>");
     2
+}
+
+/// One successfully fetched-and-parsed page, as the worker reported it.
+struct Page {
+    url: String,
+    status: u16,
+    body: Vec<u8>,
+    fetch_elapsed: Duration,
+    dom: yata::dom::Dom,
+    parse_elapsed: Duration,
 }
 
 /// The headless fetch: the *production* path — `net::normalize_url`, then
 /// `net::spawn_fetch`, then a blocking drain of the same channel the event
-/// loop `recv`s on (no polling) — flattening the worker's one terminal
-/// message into a result. Redirects, decompression, and the one-terminal-
-/// message contract all get exercised for free.
-fn headless_fetch(url: &str) -> Result<(String, u16, Vec<u8>, Duration), String> {
+/// loop `recv`s on (no polling). On success the worker sends `Loaded` then
+/// `Parsed` before dropping its sender; both are collected here, so every
+/// headless mode sees exactly what the TUI would. Redirects, decompression,
+/// and the message contract all get exercised for free.
+fn headless_fetch(url: &str) -> Result<Page, String> {
     let url = net::normalize_url(url);
     let (tx, rx) = mpsc::channel();
     net::spawn_fetch(net::FetchId(1), url, tx);
+    let mut loaded = None;
     loop {
         match rx.recv() {
             Ok(Msg::Loaded {
@@ -125,13 +134,26 @@ fn headless_fetch(url: &str) -> Result<(String, u16, Vec<u8>, Duration), String>
                 body,
                 elapsed,
                 ..
-            }) => return Ok((url, status, body, elapsed)),
+            }) => loaded = Some((url, status, body, elapsed)),
+            Ok(Msg::Parsed { dom, elapsed, .. }) => {
+                let Some((url, status, body, fetch_elapsed)) = loaded else {
+                    return Err("fetch worker sent Parsed before Loaded".into());
+                };
+                return Ok(Page {
+                    url,
+                    status,
+                    body,
+                    fetch_elapsed,
+                    dom,
+                    parse_elapsed: elapsed,
+                });
+            }
             Ok(Msg::NetError { url, reason, .. }) => return Err(format!("{url}: {reason}")),
-            // Progress messages: keep draining until the terminal one.
+            // Progress messages: keep draining until the terminal ones.
             Ok(_) => {}
-            // The worker sends exactly one terminal message before dropping
-            // its sender; a closed channel without one is a worker bug, but
-            // it must surface as an error page/exit, never a hang or panic.
+            // The worker finishes its message sequence before dropping its
+            // sender; a closed channel without one is a worker bug, but it
+            // must surface as an error exit, never a hang or panic.
             Err(_) => return Err("fetch worker exited without a result".into()),
         }
     }
@@ -142,9 +164,36 @@ fn headless_fetch(url: &str) -> Result<(String, u16, Vec<u8>, Duration), String>
 /// still a page). Exit 0, or 1 with the reason on stderr.
 fn run_dump(url: &str) -> i32 {
     match headless_fetch(url) {
-        Ok((_, _, body, _)) => {
+        Ok(page) => {
             let mut out = io::stdout();
-            if out.write_all(&body).and_then(|()| out.flush()).is_err() {
+            if out
+                .write_all(&page.body)
+                .and_then(|()| out.flush())
+                .is_err()
+            {
+                return 1;
+            }
+            0
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            1
+        }
+    }
+}
+
+/// `--dump-dom`: the parsed tree as indented text on stdout — the parser's
+/// headless, greppable test hook, mirroring what `--dump` is for raw bytes.
+/// The tree printed is the worker's own parse, not a second one.
+fn run_dump_dom(url: &str) -> i32 {
+    match headless_fetch(url) {
+        Ok(page) => {
+            let mut out = io::stdout();
+            if out
+                .write_all(html::debug_tree(&page.dom).as_bytes())
+                .and_then(|()| out.flush())
+                .is_err()
+            {
                 return 1;
             }
             0
@@ -161,7 +210,7 @@ fn run_dump(url: &str) -> i32 {
 /// the `Timings` table (exactly the `F4` overlay's rows) on stderr. Stdout
 /// stays empty.
 fn run_timing(url: &str) -> i32 {
-    let (final_url, status, body, elapsed) = match headless_fetch(url) {
+    let page = match headless_fetch(url) {
         Ok(ok) => ok,
         Err(reason) => {
             eprintln!("{reason}");
@@ -174,13 +223,18 @@ fn run_timing(url: &str) -> i32 {
     let caps = term::detect_caps(env::var("COLORTERM").ok().as_deref());
     let mut renderer = Renderer::new(w, h, caps);
     let mut app = App::new(w, h);
-    let id = app.start_fetch(final_url.clone());
+    let id = app.start_fetch(page.url.clone());
     app.update(Msg::Loaded {
         id,
-        url: final_url,
-        status,
-        body,
-        elapsed,
+        url: page.url,
+        status: page.status,
+        body: page.body,
+        elapsed: page.fetch_elapsed,
+    });
+    app.update(Msg::Parsed {
+        id,
+        dom: page.dom,
+        elapsed: page.parse_elapsed,
     });
 
     let started = Instant::now();

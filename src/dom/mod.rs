@@ -28,7 +28,7 @@ pub enum NodeData {
 
 /// A node and its links. All links are `Option<NodeId>`: the root has no parent,
 /// leaves no children, ends of a sibling run no neighbour on that side.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Node {
     // `parent` and `prev_sibling` are written by `append_child` and exercised by
     // this module's tests, but no non-test caller reads them yet — style (parent,
@@ -45,6 +45,9 @@ pub struct Node {
 }
 
 /// The arena. `nodes[root.0]` is always the `Document`.
+// `PartialEq`/`Debug` exist because a `Dom` travels inside `Msg::Parsed` and
+// `Msg` is compared and printed wholesale by tests.
+#[derive(PartialEq, Eq, Debug)]
 pub struct Dom {
     nodes: Vec<Node>,
     pub root: NodeId,
