@@ -163,7 +163,11 @@ impl TreeBuilder {
         p == self.dom.root || Some(p) == self.html || Some(p) == self.head
     }
 
-    fn ensure_html(&mut self) -> NodeId {
+    // The structural constructors take the start tag's attrs so `<html lang>` /
+    // `<body class>` survive (example.com, Wikipedia). Attrs apply only on first
+    // creation; an implied open passes an empty vec, and a duplicate structural
+    // tag is a no-op (first wins — merging is out of scope).
+    fn ensure_html(&mut self, attrs: Vec<(String, String)>) -> NodeId {
         if let Some(h) = self.html {
             return h;
         }
@@ -171,7 +175,7 @@ impl TreeBuilder {
             self.dom.root,
             NodeData::Element {
                 tag: "html".into(),
-                attrs: Vec::new(),
+                attrs,
             },
         );
         self.open.push(h);
@@ -179,17 +183,16 @@ impl TreeBuilder {
         h
     }
 
-    fn ensure_head(&mut self) -> NodeId {
-        self.ensure_html();
+    fn ensure_head(&mut self, attrs: Vec<(String, String)>) -> NodeId {
+        let html = self.ensure_html(Vec::new());
         if let Some(h) = self.head {
             return h;
         }
-        let html = self.html.unwrap();
         let h = self.dom.append_child(
             html,
             NodeData::Element {
                 tag: "head".into(),
-                attrs: Vec::new(),
+                attrs,
             },
         );
         // Push the head so metadata inserts under it; it is popped when body opens.
@@ -204,12 +207,12 @@ impl TreeBuilder {
     /// is complete, pop everything back down to `<html>`, then create and enter
     /// the body. Idempotent — a later `<body>` tag or stray flow content is a
     /// no-op once the body exists.
-    fn open_body(&mut self) {
+    fn open_body(&mut self, attrs: Vec<(String, String)>) {
         if self.body.is_some() {
             return;
         }
-        self.ensure_head();
-        let html = self.html.unwrap();
+        let html = self.ensure_html(Vec::new());
+        self.ensure_head(Vec::new());
         while let Some(&top) = self.open.last() {
             if top == html {
                 break;
@@ -221,7 +224,7 @@ impl TreeBuilder {
             html,
             NodeData::Element {
                 tag: "body".into(),
-                attrs: Vec::new(),
+                attrs,
             },
         );
         self.open.push(body);
@@ -241,7 +244,7 @@ impl TreeBuilder {
             }
         } else if self.at_structural_root() {
             // Real text before/around the spine belongs in flow.
-            self.open_body();
+            self.open_body(Vec::new());
         }
         let parent = self.insertion_parent();
         self.dom.append_child(parent, NodeData::Text(s));
@@ -250,15 +253,15 @@ impl TreeBuilder {
     fn insert_start(&mut self, name: String, attrs: Vec<(String, String)>, self_closing: bool) {
         match name.as_str() {
             "html" => {
-                self.ensure_html();
+                self.ensure_html(attrs);
                 return;
             }
             "head" => {
-                self.ensure_head();
+                self.ensure_head(attrs);
                 return;
             }
             "body" => {
-                self.open_body();
+                self.open_body(attrs);
                 return;
             }
             _ => {}
@@ -269,9 +272,9 @@ impl TreeBuilder {
 
         // Placement: head metadata into <head> while it's open, otherwise flow.
         if !self.head_done && HEAD_TAGS.contains(&name.as_str()) {
-            self.ensure_head();
+            self.ensure_head(Vec::new());
         } else if self.at_structural_root() {
-            self.open_body();
+            self.open_body(Vec::new());
         }
 
         let parent = self.insertion_parent();
@@ -346,7 +349,7 @@ impl TreeBuilder {
     /// gets an empty `<body>`, so the tree a human draws always has one.
     fn finish(&mut self) {
         if self.html.is_some() && self.body.is_none() {
-            self.open_body();
+            self.open_body(Vec::new());
         }
         self.open.clear();
     }
@@ -587,6 +590,22 @@ mod tests {
           #text \"a\\n  \"
         <li>
           #text \"b\\n\"
+"
+        );
+    }
+
+    #[test]
+    fn structural_element_attrs_are_kept() {
+        // <html lang> / <body class> must survive — example.com and Wikipedia
+        // both carry them, and the cascade (M4) will need them.
+        assert_eq!(
+            tree(r#"<html lang="en"><body class="doc">hi"#),
+            "\
+#document
+  <html lang=\"en\">
+    <head>
+    <body class=\"doc\">
+      #text \"hi\"
 "
         );
     }
