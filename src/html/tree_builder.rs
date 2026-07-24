@@ -607,3 +607,110 @@ mod tests {
         );
     }
 }
+
+/// Ladder smoke test: parse each committed fixture without panicking and assert
+/// a couple of structural invariants per page. These pin the recovery that real
+/// pages depend on — notably danluu.com, which ships no `<body>` tag at all, so
+/// "exactly one body" is a test of synthesis, not of the source.
+#[cfg(test)]
+mod ladder {
+    use super::*;
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/",
+                $name
+            ))
+        };
+    }
+
+    /// Every node in the tree, in no particular order.
+    fn all_nodes(dom: &Dom) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![dom.root];
+        while let Some(id) = stack.pop() {
+            out.push(id);
+            for child in dom.children(id) {
+                stack.push(child);
+            }
+        }
+        out
+    }
+
+    fn count_tag(dom: &Dom, tag: &str) -> usize {
+        all_nodes(dom)
+            .iter()
+            .filter(
+                |&&id| matches!(&dom.node(id).data, NodeData::Element { tag: t, .. } if t == tag),
+            )
+            .count()
+    }
+
+    /// Elements of `tag` carrying `class_token` as one of their space-separated
+    /// classes (HN rows are `class="athing submission"`, so equality won't do).
+    fn count_tag_with_class(dom: &Dom, tag: &str, class_token: &str) -> usize {
+        all_nodes(dom)
+            .iter()
+            .filter(|&&id| {
+                matches!(&dom.node(id).data, NodeData::Element { tag: t, .. } if t == tag)
+                    && dom
+                        .attr(id, "class")
+                        .is_some_and(|c| c.split_whitespace().any(|w| w == class_token))
+            })
+            .count()
+    }
+
+    #[test]
+    fn example_com() {
+        let dom = parse(fixture!("example.com.html"));
+        assert_eq!(count_tag(&dom, "body"), 1);
+        assert!(count_tag(&dom, "h1") >= 1);
+    }
+
+    #[test]
+    fn motherfuckingwebsite_com() {
+        let dom = parse(fixture!("motherfuckingwebsite.com.html"));
+        assert_eq!(count_tag(&dom, "body"), 1);
+        assert!(count_tag(&dom, "p") > 1);
+    }
+
+    #[test]
+    fn danluu_com_body_is_synthesized() {
+        // danluu.com's source has no <body> tag; the builder must invent exactly
+        // one and hang the page's links off it.
+        let src = fixture!("danluu.com.html");
+        assert!(!src.to_ascii_lowercase().contains("<body"));
+        let dom = parse(src);
+        assert_eq!(count_tag(&dom, "body"), 1);
+        assert!(count_tag(&dom, "a") > 10);
+    }
+
+    #[test]
+    fn hacker_news_story_rows() {
+        let dom = parse(fixture!("news.ycombinator.com.html"));
+        assert_eq!(count_tag(&dom, "body"), 1);
+        // A full HN front page is 30 stories, each a <tr class="athing …">.
+        assert_eq!(count_tag_with_class(&dom, "tr", "athing"), 30);
+    }
+
+    #[test]
+    fn wikipedia_article() {
+        let dom = parse(fixture!("en.wikipedia.org.html"));
+        assert_eq!(count_tag(&dom, "body"), 1);
+        assert!(count_tag(&dom, "p") > 20);
+        // The <title>'s text child survives raw-text handling.
+        let title = all_nodes(&dom)
+            .into_iter()
+            .find(
+                |&id| matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "title"),
+            )
+            .expect("a <title> element");
+        let text = dom.children(title).next().expect("title text");
+        assert_eq!(
+            dom.node(text).data,
+            NodeData::Text("Cat - Wikipedia".into())
+        );
+    }
+}
