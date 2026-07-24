@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crossterm::event::KeyEvent;
 
 use crate::net::FetchId;
@@ -17,12 +19,15 @@ pub enum Msg {
         bytes_so_far: u64,
     },
     /// Terminal success: final URL after redirects, HTTP status, raw bytes
-    /// (charset handling is M2's problem).
+    /// (charset handling is M2's problem), and the whole request's duration
+    /// (client build → last body byte), measured on the worker so the app
+    /// stays pure of `Instant::now()`.
     Loaded {
         id: FetchId,
         url: String,
         status: u16,
         body: Vec<u8>,
+        elapsed: Duration,
     },
     /// Terminal failure — bad URL, DNS, connect, TLS, mid-body disconnect.
     NetError {

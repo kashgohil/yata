@@ -2,6 +2,7 @@ use std::error::Error;
 use std::io::Read;
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::Instant;
 
 use crate::msg::Msg;
 use crate::net::FetchId;
@@ -36,6 +37,10 @@ pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
 /// is the most precise one known at the point of failure: the requested URL
 /// until headers arrive, the post-redirect final URL after.
 fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (String, String)> {
+    // Timed on the worker, where the request happens: the duration reaches
+    // the app as message data, so the app never reads the clock. The span is
+    // the whole request — client build → last body byte.
+    let started = Instant::now();
     // Built here, not in `spawn_fetch`, so the UI thread never touches
     // reqwest. Defaults follow redirects and (via the gzip feature)
     // transparently decompress.
@@ -73,6 +78,7 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
         url: final_url,
         status,
         body,
+        elapsed: started.elapsed(),
     }))
 }
 
@@ -191,6 +197,15 @@ mod tests {
                 other => panic!("expected only Loading before Loaded, got {other:?}"),
             }
         }
+        // The worker measures the whole request; even against localhost the
+        // elapsed time can never be zero.
+        let Msg::Loaded { elapsed, .. } = last else {
+            panic!("expected Loaded last, got {last:?}");
+        };
+        assert!(
+            *elapsed > Duration::ZERO,
+            "the worker must measure the request"
+        );
         assert_eq!(
             *last,
             Msg::Loaded {
@@ -198,6 +213,7 @@ mod tests {
                 url,
                 status: 200,
                 body: b"hello world".to_vec(),
+                elapsed: *elapsed,
             }
         );
     }
@@ -271,13 +287,18 @@ mod tests {
         spawn_fetch(FetchId(5), format!("http://{addr}/start"), tx);
 
         let msgs = drain(rx);
+        let last = msgs.last().expect("worker sent nothing");
+        let Msg::Loaded { elapsed, .. } = last else {
+            panic!("expected Loaded last, got {last:?}");
+        };
         assert_eq!(
-            *msgs.last().expect("worker sent nothing"),
+            *last,
             Msg::Loaded {
                 id: FetchId(5),
                 url: format!("http://{addr}/final"),
                 status: 200,
                 body: b"hello".to_vec(),
+                elapsed: *elapsed,
             },
             "Loaded must carry the post-redirect URL and the final status"
         );
@@ -304,13 +325,18 @@ mod tests {
         spawn_fetch(FetchId(6), url.clone(), tx);
 
         let msgs = drain(rx);
+        let last = msgs.last().expect("worker sent nothing");
+        let Msg::Loaded { elapsed, .. } = last else {
+            panic!("expected Loaded last, got {last:?}");
+        };
         assert_eq!(
-            *msgs.last().expect("worker sent nothing"),
+            *last,
             Msg::Loaded {
                 id: FetchId(6),
                 url,
                 status: 200,
                 body: b"hello world".to_vec(),
+                elapsed: *elapsed,
             },
             "the body must arrive decompressed, not as gzip bytes"
         );

@@ -5,8 +5,8 @@ mod term;
 
 use std::io::{self, Write};
 use std::sync::mpsc;
-use std::time::Instant;
-use std::{env, iter, panic, thread};
+use std::time::{Duration, Instant};
+use std::{env, iter, panic, process, thread};
 
 use crossterm::event::{self, Event};
 use crossterm::terminal;
@@ -16,10 +16,31 @@ use msg::Msg;
 use term::Renderer;
 
 fn main() -> io::Result<()> {
-    let panic_requested = env::args().any(|a| a == "--panic");
+    let args: Vec<String> = env::args().skip(1).collect();
+    let panic_requested = args.iter().any(|a| a == "--panic");
+    let dump = args.iter().any(|a| a == "--dump");
+    let timing = args.iter().any(|a| a == "--timing");
     // `yata <url>`: the first non-flag argument (`--panic` etc. are flags,
-    // not URLs). No argument → no fetch, blank page.
-    let url = env::args().skip(1).find(|a| !a.starts_with("--"));
+    // not URLs). In the TUI, no argument → no fetch, blank page.
+    let url = args.into_iter().find(|a| !a.starts_with("--"));
+
+    // Headless modes are decided and finished here — before the panic hook,
+    // `Screen::new`, raw mode, or the input thread exist. `--dump`'s stdout
+    // carries body bytes and nothing else, so piping to a file is byte-exact.
+    // Exit codes are part of the spec: 0 success · 1 fetch failure · 2 usage.
+    if dump || timing {
+        if dump && timing {
+            process::exit(usage());
+        }
+        let Some(url) = url else {
+            process::exit(usage());
+        };
+        process::exit(if dump {
+            run_dump(&url)
+        } else {
+            run_timing(&url)
+        });
+    }
 
     // Installed before the Screen exists so no panic window is uncovered.
     // Restore first, then report: the default hook's output must land on the
@@ -77,6 +98,99 @@ fn main() -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// The one usage line. Returns the usage exit code for `main` to exit with.
+fn usage() -> i32 {
+    eprintln!("usage: yata [--dump | --timing] <url>");
+    2
+}
+
+/// The headless fetch: the *production* path — `net::normalize_url`, then
+/// `net::spawn_fetch`, then a blocking drain of the same channel the event
+/// loop `recv`s on (no polling) — flattening the worker's one terminal
+/// message into a result. Redirects, decompression, and the one-terminal-
+/// message contract all get exercised for free.
+fn headless_fetch(url: &str) -> Result<(String, u16, Vec<u8>, Duration), String> {
+    let url = net::normalize_url(url);
+    let (tx, rx) = mpsc::channel();
+    net::spawn_fetch(net::FetchId(1), url, tx);
+    loop {
+        match rx.recv() {
+            Ok(Msg::Loaded {
+                url,
+                status,
+                body,
+                elapsed,
+                ..
+            }) => return Ok((url, status, body, elapsed)),
+            Ok(Msg::NetError { url, reason, .. }) => return Err(format!("{url}: {reason}")),
+            // Progress messages: keep draining until the terminal one.
+            Ok(_) => {}
+            // The worker sends exactly one terminal message before dropping
+            // its sender; a closed channel without one is a worker bug, but
+            // it must surface as an error page/exit, never a hang or panic.
+            Err(_) => return Err("fetch worker exited without a result".into()),
+        }
+    }
+}
+
+/// `--dump`: raw body bytes to stdout, verbatim — no lossy decode, no added
+/// newline. Any HTTP status dumps its body (curl semantics: a 404 page is
+/// still a page). Exit 0, or 1 with the reason on stderr.
+fn run_dump(url: &str) -> i32 {
+    match headless_fetch(url) {
+        Ok((_, _, body, _)) => {
+            let mut out = io::stdout();
+            if out.write_all(&body).and_then(|()| out.flush()).is_err() {
+                return 1;
+            }
+            0
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            1
+        }
+    }
+}
+
+/// `--timing`: the same headless fetch, then one full first-frame render —
+/// the same `draw` + `present` pair the event loop times, into a sink — and
+/// the `Timings` table (exactly the `F4` overlay's rows) on stderr. Stdout
+/// stays empty.
+fn run_timing(url: &str) -> i32 {
+    let (final_url, status, body, elapsed) = match headless_fetch(url) {
+        Ok(ok) => ok,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return 1;
+        }
+    };
+    // The normal App + Renderer at the real terminal size when there is one
+    // (best-effort — a pipe has none), else 80×24.
+    let (w, h) = terminal::size().unwrap_or((80, 24));
+    let caps = term::detect_caps(env::var("COLORTERM").ok().as_deref());
+    let mut renderer = Renderer::new(w, h, caps);
+    let mut app = App::new(w, h);
+    let id = app.start_fetch(final_url.clone());
+    app.update(Msg::Loaded {
+        id,
+        url: final_url,
+        status,
+        body,
+        elapsed,
+    });
+
+    let started = Instant::now();
+    app.draw(renderer.frame());
+    // A sink write cannot fail; the Result exists for real terminals.
+    let _ = renderer.present(&mut io::sink());
+    app.record_frame(started.elapsed());
+
+    for row in app.timings().rows() {
+        eprintln!("{row}");
+    }
+    0
 }
 
 /// Input coalescing: apply every already-queued message, then decide **once**
@@ -173,6 +287,7 @@ mod tests {
             url: "http://x/".into(),
             status: 200,
             body,
+            elapsed: Duration::ZERO,
         });
         // 200 'j' now scroll for real: still one coalesced redraw decision, not
         // 200 renders. (Clamping to the last page is covered by viewport tests.)

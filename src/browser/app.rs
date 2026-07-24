@@ -2,10 +2,12 @@ use std::time::Duration;
 
 use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::statusline;
+use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthStr;
 
 use crate::term::{Attrs, Cell, Frame, Style};
 
@@ -67,9 +69,13 @@ pub struct App {
     /// Spinner frame index. Progress messages are its clock — there is no
     /// timer in this app — so it animates exactly while bytes are flowing.
     spinner: usize,
-    /// Duration of the last presented frame, recorded by the event loop after
-    /// the fact; shown on whatever paint comes next.
-    last_frame: Option<Duration>,
+    /// Per-stage durations of the last completed pipeline run, fed by message
+    /// data (`Loaded::elapsed`) and by the event loop (`record_frame`) — the
+    /// app itself never reads the clock.
+    timings: Timings,
+    /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
+    /// stays up while the URL bar is open.
+    timing_visible: bool,
 }
 
 impl App {
@@ -83,7 +89,8 @@ impl App {
             pending: None,
             viewport: Viewport::default(),
             spinner: 0,
-            last_frame: None,
+            timings: Timings::default(),
+            timing_visible: false,
         }
     }
 
@@ -117,7 +124,13 @@ impl App {
     /// statusline therefore shows the *previous* frame's time — honest, since
     /// the current frame's cost isn't known until after it is drawn.
     pub fn record_frame(&mut self, dur: Duration) {
-        self.last_frame = Some(dur);
+        self.timings.frame = Some(dur);
+    }
+
+    /// The last completed pipeline run's timings. `--timing` prints exactly
+    /// the rows the `F4` overlay draws, so both read from here.
+    pub fn timings(&self) -> &Timings {
+        &self.timings
     }
 
     pub fn update(&mut self, msg: Msg) -> Effect {
@@ -158,6 +171,7 @@ impl App {
                 url,
                 status,
                 body,
+                elapsed,
             } => {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
@@ -167,6 +181,11 @@ impl App {
                 let text = String::from_utf8_lossy(&body).into_owned();
                 self.viewport.set_content(&text, self.size.0, self.page());
                 self.fetch = Fetch::Loaded { url, status, body };
+                // Only an accepted, completed fetch records its duration.
+                // `start_fetch` deliberately does not clear it and `NetError`
+                // sets nothing: the timing table shows the last *completed*
+                // run (PLAN.md §4) until a newer one lands.
+                self.timings.fetch = Some(elapsed);
                 redraw()
             }
             Msg::NetError { id, url, reason } => {
@@ -235,6 +254,10 @@ impl App {
                 };
                 redraw()
             }
+            Action::ToggleTiming => {
+                self.timing_visible = !self.timing_visible;
+                redraw()
+            }
             Action::Commit => self.commit(),
             Action::Cancel => {
                 // Cancel drops the buffer with no fetch; the bar reverts to the
@@ -275,6 +298,10 @@ impl App {
         for (row, line) in self.viewport.visible().iter().enumerate() {
             frame.put_str(0, row as u16, line, Style::default());
         }
+        // Over the page area, after the body and before the bottom row.
+        if self.timing_visible {
+            self.draw_timing(frame);
+        }
         let Some(y) = frame.height().checked_sub(1) else {
             return;
         };
@@ -295,6 +322,28 @@ impl App {
             &self.status_right(),
         );
         frame.put_str(0, y, &row, reversed());
+    }
+
+    /// The `F4` timing overlay: the `Timings` rows as one reversed box in the
+    /// page area's top-right corner. It never touches the bottom row — a
+    /// 1-row frame has no page area, so nothing is drawn — and on a frame
+    /// narrower than the box it clips at the left edge. No rows (nothing
+    /// timed yet) → nothing drawn.
+    fn draw_timing(&self, frame: &mut Frame) {
+        let rows = self.timings.rows();
+        let Some(box_w) = rows.iter().map(|r| r.width()).max() else {
+            return;
+        };
+        let x = (frame.width() as usize).saturating_sub(box_w) as u16;
+        let page = frame.height().saturating_sub(1) as usize;
+        for (y, row) in rows.iter().enumerate().take(page) {
+            // Left-pad each row to the widest row's width — in cells, never
+            // chars — so the overlay is a solid rectangle with the `ms`
+            // column against the frame edge.
+            let mut padded = " ".repeat(box_w - row.width());
+            padded.push_str(row);
+            frame.put_str(x, y as u16, &padded, reversed());
+        }
     }
 
     /// The URL bar: `open: <buffer>` with a cursor cell at the end (the cursor
@@ -345,8 +394,8 @@ impl App {
         if let Some(percent) = self.viewport.scroll_percent() {
             parts.push(format!("{percent}%"));
         }
-        if let Some(dur) = self.last_frame {
-            parts.push(format!("{:.1} ms", dur.as_secs_f64() * 1000.0));
+        if let Some(dur) = self.timings.frame {
+            parts.push(timing::format_ms(dur));
         }
         parts.join(" · ")
     }
@@ -452,6 +501,7 @@ mod tests {
             url: "http://final/".into(),
             status: 200,
             body,
+            elapsed: Duration::ZERO,
         })
     }
 
@@ -626,6 +676,7 @@ mod tests {
             url: "http://final/".into(),
             status,
             body: vec![b'x'; body_len],
+            elapsed: Duration::ZERO,
         }
     }
 
@@ -685,6 +736,10 @@ mod tests {
         for msg in msgs {
             assert_eq!(app.update(msg), Effect::default());
         }
+        assert!(
+            app.timings().fetch.is_none(),
+            "a stale Loaded must not record a fetch duration"
+        );
 
         let mut frame = Frame::new(80, 24);
         app.draw(&mut frame);
@@ -697,6 +752,10 @@ mod tests {
         assert!(!row.contains("too late"), "stale error leaked into {row:?}");
 
         assert_eq!(app.update(loaded(current, 200, 4096)), dirty());
+        assert!(
+            app.timings().fetch.is_some(),
+            "the accepted Loaded must record its duration"
+        );
     }
 
     #[test]
@@ -895,5 +954,246 @@ mod tests {
             row_text(&frame, 5).contains("100%"),
             "fully visible content reads 100%"
         );
+    }
+
+    // ---- M1.7 fetch duration ----------------------------------------------
+
+    #[test]
+    fn accepted_loaded_records_the_fetch_duration() {
+        let mut app = App::new(40, 6);
+        let id = app.start_fetch("http://x/".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/".into(),
+            status: 200,
+            body: b"hi".to_vec(),
+            elapsed: Duration::from_micros(12_300),
+        });
+        assert_eq!(app.timings().fetch, Some(Duration::from_micros(12_300)));
+    }
+
+    #[test]
+    fn start_fetch_keeps_the_last_completed_fetch_duration() {
+        let mut app = App::new(40, 6);
+        let id = app.start_fetch("http://x/".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/".into(),
+            status: 200,
+            body: b"hi".to_vec(),
+            elapsed: Duration::from_micros(12_300),
+        });
+        // The overlay shows the last *completed* run (PLAN.md §4): the old
+        // number stands until the new fetch lands.
+        app.start_fetch("http://y/".into());
+        assert_eq!(app.timings().fetch, Some(Duration::from_micros(12_300)));
+    }
+
+    #[test]
+    fn net_error_records_no_fetch_duration() {
+        let mut app = App::new(40, 6);
+        let id = app.start_fetch("http://x/".into());
+        app.update(Msg::NetError {
+            id,
+            url: "http://x/".into(),
+            reason: "connection refused".into(),
+        });
+        assert_eq!(app.timings().fetch, None, "a failed fetch records nothing");
+
+        // After a completed run, a later failure leaves the old value alone.
+        let id = app.start_fetch("http://x/".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/".into(),
+            status: 200,
+            body: b"hi".to_vec(),
+            elapsed: Duration::from_micros(12_300),
+        });
+        let id = app.start_fetch("http://y/".into());
+        app.update(Msg::NetError {
+            id,
+            url: "http://y/".into(),
+            reason: "connection refused".into(),
+        });
+        assert_eq!(app.timings().fetch, Some(Duration::from_micros(12_300)));
+    }
+
+    // ---- M1.7 timing overlay ----------------------------------------------
+
+    fn f4() -> Msg {
+        key(KeyCode::F(4), KeyModifiers::NONE)
+    }
+
+    /// An app with both stages timed: rows `fetch 12.3 ms` (13 cells, the box
+    /// width) and `frame 2.1 ms` (12 cells), over a 50-line body.
+    fn timed_app(w: u16, h: u16) -> App {
+        let mut app = App::new(w, h);
+        let id = app.start_fetch("http://x/".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/".into(),
+            status: 200,
+            body: body(50),
+            elapsed: Duration::from_micros(12_300),
+        });
+        app.record_frame(Duration::from_micros(2_100));
+        app
+    }
+
+    #[test]
+    fn timing_overlay_is_hidden_by_default() {
+        let app = timed_app(40, 10);
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        assert!(
+            !row_text(&frame, 0).contains("ms"),
+            "no overlay before F4: {:?}",
+            row_text(&frame, 0)
+        );
+        assert!(!frame.get(39, 0).attrs.contains(Attrs::REVERSE));
+    }
+
+    #[test]
+    fn f4_shows_the_timing_rows_top_right_reversed() {
+        let mut app = timed_app(40, 10);
+        assert_eq!(app.update(f4()), redraw());
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+
+        let row0 = row_text(&frame, 0);
+        assert!(
+            row0.starts_with("line0"),
+            "body must stay visible: {row0:?}"
+        );
+        assert!(row0.ends_with("fetch 12.3 ms"), "row was {row0:?}");
+        let row1 = row_text(&frame, 1);
+        assert!(
+            row1.ends_with(" frame 2.1 ms"),
+            "rows must pad to the widest row: {row1:?}"
+        );
+        // The box: 13 cells wide, right-aligned to the frame edge, reversed.
+        for y in 0..2 {
+            for x in 27..40 {
+                assert!(
+                    frame.get(x, y).attrs.contains(Attrs::REVERSE),
+                    "overlay cell ({x},{y}) must be reversed"
+                );
+            }
+            assert!(!frame.get(26, y).attrs.contains(Attrs::REVERSE));
+        }
+        // The overlay draws exactly the formatter's rows — one implementation
+        // feeds it and `--timing` both.
+        let rows = app.timings().rows();
+        assert_eq!(&row0[27..], rows[0]);
+        assert_eq!(row1[27..].trim_start(), rows[1]);
+    }
+
+    #[test]
+    fn f4_again_hides_the_overlay_and_restores_the_page() {
+        let mut app = timed_app(40, 10);
+        let mut before = Frame::new(40, 10);
+        app.draw(&mut before);
+
+        assert_eq!(app.update(f4()), redraw());
+        let mut shown = Frame::new(40, 10);
+        app.draw(&mut shown);
+        assert!(row_text(&shown, 0).ends_with("ms"), "overlay must show");
+
+        assert_eq!(app.update(f4()), redraw());
+        let mut after = Frame::new(40, 10);
+        app.draw(&mut after);
+        for y in 0..10 {
+            for x in 0..40 {
+                assert_eq!(
+                    after.get(x, y),
+                    before.get(x, y),
+                    "cell ({x},{y}) not restored after toggling off"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_never_touches_the_bottom_row() {
+        for h in [1u16, 2] {
+            let mut app = timed_app(40, h);
+            let mut plain = Frame::new(40, h);
+            app.draw(&mut plain);
+
+            app.update(f4());
+            let mut overlaid = Frame::new(40, h);
+            app.draw(&mut overlaid);
+
+            let bottom = h - 1;
+            for x in 0..40 {
+                assert_eq!(
+                    overlaid.get(x, bottom),
+                    plain.get(x, bottom),
+                    "bottom-row cell {x} changed at height {h}"
+                );
+            }
+            if h == 2 {
+                // The one page row carries the first timing row; the second
+                // row is clipped rather than spilling onto the statusline.
+                assert!(row_text(&overlaid, 0).ends_with("fetch 12.3 ms"));
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_frames_draw_the_overlay_without_panicking() {
+        for w in [0u16, 1, 2, 5, 12] {
+            let mut app = timed_app(w, 6);
+            app.update(f4());
+            let mut frame = Frame::new(w, 6);
+            app.draw(&mut frame); // must not panic; clipping is acceptable
+            if w > 0 {
+                assert!(
+                    frame.get(0, 0).attrs.contains(Attrs::REVERSE),
+                    "a clipped overlay still paints from column 0 at width {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f4_with_nothing_timed_draws_nothing_but_still_toggles() {
+        let mut app = App::new(40, 6);
+        assert_eq!(app.update(f4()), redraw());
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        for y in 0..5 {
+            for x in 0..40 {
+                assert_eq!(
+                    frame.get(x, y),
+                    Cell::default(),
+                    "zero rows must draw nothing at ({x},{y})"
+                );
+            }
+        }
+        // The toggle still flipped: once something is timed the overlay is
+        // already on, with no second F4 needed.
+        app.record_frame(Duration::from_micros(2_100));
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).ends_with("frame 2.1 ms"));
+    }
+
+    #[test]
+    fn overlay_stays_visible_when_the_url_bar_opens() {
+        let mut app = timed_app(40, 6);
+        app.update(f4());
+        app.update(ch('o'));
+        // In UrlInput F4 is unbound: ignored, and it types nothing.
+        assert_eq!(app.update(f4()), Effect::default());
+
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).ends_with("fetch 12.3 ms"),
+            "overlay must stay up under the URL bar"
+        );
+        let bottom = row_text(&frame, 5);
+        assert!(bottom.contains("open:"), "row was {bottom:?}");
+        assert!(!bottom.contains("open: F"), "F4 must not type");
     }
 }

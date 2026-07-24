@@ -12,6 +12,7 @@ pub enum Action {
     Top,
     Bottom,
     OpenUrl,
+    ToggleTiming,
     Commit,
     Cancel,
     DeleteChar,
@@ -91,6 +92,9 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::Char('G'), NONE), Action::Bottom),
     browse(None, chord(KeyCode::End, NONE), Action::Bottom),
     browse(None, chord(KeyCode::Char('o'), NONE), Action::OpenUrl),
+    // `F4` is the timing inspector (PLAN.md §3 `F1`–`F4`); Browse only — in
+    // the URL bar it is unbound and ignored.
+    browse(None, chord(KeyCode::F(4), NONE), Action::ToggleTiming),
     browse(None, chord(KeyCode::Char('q'), NONE), Action::Quit),
     browse(None, chord(KeyCode::Char('c'), CTRL), Action::Quit),
     // UrlInput. `q` is absent on purpose: it is a letter here and types.
@@ -272,6 +276,18 @@ mod tests {
         assert_eq!(
             resolve(Mode::UrlInput, None, &press(KeyCode::Enter, NONE)),
             Resolution::Action(Action::Commit)
+        );
+    }
+
+    #[test]
+    fn f4_toggles_timing_in_browse_only() {
+        assert_eq!(
+            browse_key(KeyCode::F(4), NONE),
+            Resolution::Action(Action::ToggleTiming)
+        );
+        assert_eq!(
+            resolve(Mode::UrlInput, None, &press(KeyCode::F(4), NONE)),
+            Resolution::Unbound
         );
     }
 
