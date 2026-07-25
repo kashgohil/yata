@@ -1,6 +1,6 @@
-//! Integration tests for the headless CLI modes (`--dump`, `--timing`),
-//! running the real binary against a local one-shot server. Tests never hit
-//! the network (CLAUDE.md conventions).
+//! Integration tests for the headless CLI modes (`--dump`, `--dump-dom`,
+//! `--dump-text`, `--timing`), running the real binary against a local one-shot
+//! server. Tests never hit the network (CLAUDE.md conventions).
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -132,7 +132,48 @@ fn dump_dom_prints_the_parsed_tree_to_stdout() {
 }
 
 #[test]
-fn timing_prints_fetch_parse_and_frame_rows_to_stderr_only() {
+fn dump_text_prints_the_laid_out_page_to_stdout() {
+    // A heading, a wrapping paragraph and a list: enough to show that the
+    // output is laid out (blank line between blocks, bullet, wrap at the fixed
+    // 80-cell column) rather than raw text with the tags stripped.
+    let body = format!(
+        "<h1>Title</h1><p>{}</p><ul><li>one</li><li>two</li></ul>",
+        "word ".repeat(20)
+    );
+    let addr = serve_once(response_with_body("200 OK", body.as_bytes()));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines[0], "Title");
+    assert_eq!(lines[1], "", "blocks are separated by a blank line");
+    // 20 words of 4 letters wrap to two lines at 80 cells, neither over it.
+    assert!(
+        lines.iter().all(|l| l.chars().count() <= 80),
+        "a line ran past the fixed column: {lines:?}"
+    );
+    assert!(text.contains("• one\n• two\n"), "text was:\n{text}");
+    // Styles are dropped, not rendered as markers, and no escape sequence
+    // reaches a pipe — attributes belong to the renderer alone.
+    assert!(!text.contains('['), "style markers reached stdout:\n{text}");
+    assert!(
+        !text.contains('\u{1b}'),
+        "an escape reached stdout:\n{text}"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn timing_prints_fetch_parse_layout_and_frame_rows_to_stderr_only() {
     let addr = serve_once(response_with_body("200 OK", b"<html>hello</html>"));
     let out = yata(&["--timing", &format!("http://{addr}/")]);
     assert_eq!(
@@ -147,7 +188,7 @@ fn timing_prints_fetch_parse_and_frame_rows_to_stderr_only() {
         String::from_utf8_lossy(&out.stdout)
     );
     let table = String::from_utf8(out.stderr).unwrap();
-    for stage in ["fetch", "parse", "frame"] {
+    for stage in ["fetch", "parse", "layout", "frame"] {
         let row = table
             .lines()
             .find(|l| l.starts_with(stage))
@@ -170,7 +211,12 @@ fn timing_against_a_closed_port_reports_the_reason_and_exits_1() {
 
 #[test]
 fn a_headless_flag_without_a_url_is_a_usage_error() {
-    for flags in [&["--dump"][..], &["--dump-dom"][..], &["--timing"][..]] {
+    for flags in [
+        &["--dump"][..],
+        &["--dump-dom"][..],
+        &["--dump-text"][..],
+        &["--timing"][..],
+    ] {
         let out = yata(flags);
         assert_eq!(out.status.code(), Some(2), "flags: {flags:?}");
         assert!(out.stdout.is_empty());
@@ -191,6 +237,8 @@ fn two_headless_flags_together_is_a_usage_error() {
         ["--dump", "--timing"],
         ["--dump", "--dump-dom"],
         ["--dump-dom", "--timing"],
+        ["--dump", "--dump-text"],
+        ["--dump-text", "--timing"],
     ] {
         let out = yata(&[flags[0], flags[1], "http://127.0.0.1:9/"]);
         assert_eq!(out.status.code(), Some(2), "flags: {flags:?}");

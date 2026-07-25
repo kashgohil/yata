@@ -1,18 +1,29 @@
+use crate::layout::{Line, Span};
+use crate::term::Style;
 use unicode_width::UnicodeWidthChar;
 
-/// The scrollable body: logical source lines, their hard-wrapped display lines
-/// at the current width, and a scroll offset. Pure logic — no terminal types.
+/// Where the display lines came from, which is what a resize has to know.
+enum Source {
+    /// Plain text — the body before it is parsed, an error page, the `F1` tree.
+    /// The unwrapped lines are kept so a resize can re-wrap them here without
+    /// the producer running again.
+    Text(Vec<String>),
+    /// Lines from `layout`, already wrapped to a column width. Nothing to
+    /// re-wrap: a resize re-runs layout and hands over new lines instead.
+    Laid,
+}
+
+/// The scrollable body: display lines and a scroll offset. Pure logic — no
+/// terminal types beyond the `Style` its spans carry.
 ///
-/// Wrapping happens exactly twice, on new content and on resize; scrolling only
-/// moves the offset. This is the M1 form of the CLAUDE.md scroll invariant and
-/// the scroll-step-<5 ms budget: a keypress never re-wraps.
-#[derive(Default)]
+/// Lines are built exactly twice, on new content and on resize; scrolling only
+/// moves the offset. This is the CLAUDE.md scroll invariant and the
+/// scroll-step-<5 ms budget: a keypress never re-wraps and never relayouts.
 pub struct Viewport {
-    /// Logical lines, sanitized (no `\r`, no other control chars), pre-wrap.
-    /// Kept so a resize can re-wrap without re-parsing the body.
-    source: Vec<String>,
-    /// `source` hard-wrapped to `width` cells; what `draw` slices from.
-    lines: Vec<String>,
+    source: Source,
+    /// What `draw` slices from: text hard-wrapped to `width`, or laid-out lines
+    /// exactly as `layout` produced them.
+    lines: Vec<Line>,
     /// Index of the first visible line. Always in `0..=max_offset`.
     offset: usize,
     /// Wrap width and page height, both in cells / lines, from the last frame.
@@ -20,20 +31,44 @@ pub struct Viewport {
     page: usize,
 }
 
+impl Default for Viewport {
+    fn default() -> Self {
+        Viewport {
+            source: Source::Text(Vec::new()),
+            lines: Vec::new(),
+            offset: 0,
+            width: 0,
+            page: 0,
+        }
+    }
+}
+
 impl Viewport {
     /// Replace the content: sanitize, wrap to `width`, and reset to the top —
     /// new content always starts at the first line. `page` is the visible line
     /// count (frame height minus the status row).
     pub fn set_content(&mut self, content: &str, width: u16, page: u16) {
-        self.source = sanitize(content);
+        self.source = Source::Text(sanitize(content));
         self.width = width as usize;
         self.page = page as usize;
         self.rewrap();
         self.offset = 0;
     }
 
+    /// Show lines that arrive already wrapped, from `layout`. The offset is kept
+    /// and clamped rather than reset, because the two callers want that: a
+    /// resize relayout should stay roughly where the reader was, and a new page
+    /// passes no lines at all, which clamps the offset back to the top anyway.
+    pub fn set_lines(&mut self, lines: Vec<Line>, page: u16) {
+        self.source = Source::Laid;
+        self.lines = lines;
+        self.page = page as usize;
+        self.offset = self.offset.min(self.max_offset());
+    }
+
     /// Re-wrap at a new frame size (resize is one of the two wrap points), then
-    /// clamp the offset so it still points at real content.
+    /// clamp the offset so it still points at real content. Laid-out lines are
+    /// left alone: their producer re-runs layout and calls `set_lines`.
     pub fn resize(&mut self, width: u16, page: u16) {
         self.width = width as usize;
         self.page = page as usize;
@@ -41,9 +76,9 @@ impl Viewport {
         self.offset = self.offset.min(self.max_offset());
     }
 
-    /// The wrapped lines currently on screen: `page` of them from `offset`,
+    /// The display lines currently on screen: `page` of them from `offset`,
     /// fewer near the end. `draw` paints these into the page area.
-    pub fn visible(&self) -> &[String] {
+    pub fn visible(&self) -> &[Line] {
         let end = (self.offset + self.page).min(self.lines.len());
         &self.lines[self.offset..end]
     }
@@ -119,11 +154,29 @@ impl Viewport {
     }
 
     fn rewrap(&mut self) {
-        self.lines = self
-            .source
+        let Source::Text(source) = &self.source else {
+            return;
+        };
+        self.lines = source
             .iter()
             .flat_map(|line| wrap_line(line, self.width))
+            .map(plain_line)
             .collect();
+    }
+}
+
+/// A wrapped text line as a display line: one unstyled span, or no spans at all
+/// for a blank line — the same shape `layout` gives its blank rows.
+fn plain_line(text: String) -> Line {
+    Line {
+        spans: if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![Span {
+                text,
+                style: Style::default(),
+            }]
+        },
     }
 }
 
@@ -172,18 +225,31 @@ mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
 
+    /// A display line's text, spans concatenated — what the reader sees, with
+    /// the styles that these tests do not care about dropped.
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.text.as_str()).collect()
+    }
+
+    fn texts(vp: &Viewport) -> Vec<String> {
+        vp.lines.iter().map(text).collect()
+    }
+
     #[test]
     fn overlong_ascii_wraps_at_width() {
         let mut vp = Viewport::default();
         vp.set_content("abcdefghij", 4, 10);
-        assert_eq!(vp.lines, ["abcd", "efgh", "ij"]);
+        assert_eq!(texts(&vp), ["abcd", "efgh", "ij"]);
     }
 
     #[test]
     fn newlines_split_and_blank_lines_survive() {
         let mut vp = Viewport::default();
         vp.set_content("a\n\nb", 10, 10);
-        assert_eq!(vp.lines, ["a", "", "b"]);
+        assert_eq!(texts(&vp), ["a", "", "b"]);
+        // A blank line carries no span at all, the shape `layout` also uses, so
+        // the painter has nothing to write for it.
+        assert!(vp.lines[1].spans.is_empty());
     }
 
     #[test]
@@ -191,7 +257,7 @@ mod tests {
         let mut vp = Viewport::default();
         // Nine wide characters (2 cells each) at a page width of 5 cells.
         vp.set_content(&"世".repeat(9), 5, 10);
-        for line in &vp.lines {
+        for line in texts(&vp) {
             assert!(
                 line.width() <= 5,
                 "line {line:?} is {} cells, over the width",
@@ -201,21 +267,72 @@ mod tests {
             // the count is even and the char is whole.
             assert!(line.chars().all(|c| c.width() == Some(2)));
         }
-        assert_eq!(vp.lines.iter().map(|l| l.chars().count()).sum::<usize>(), 9);
+        assert_eq!(
+            texts(&vp).iter().map(|l| l.chars().count()).sum::<usize>(),
+            9
+        );
     }
 
     #[test]
     fn control_chars_become_spaces_and_never_reach_a_line() {
         let mut vp = Viewport::default();
         vp.set_content("a\tb\u{7}c", 80, 10);
-        assert_eq!(vp.lines, ["a b c"]);
+        assert_eq!(texts(&vp), ["a b c"]);
         assert!(
-            vp.lines
+            texts(&vp)
                 .iter()
                 .flat_map(|l| l.chars())
                 .all(|c| !c.is_control()),
             "a control character reached a display line"
         );
+    }
+
+    #[test]
+    fn laid_out_lines_are_shown_as_given_and_survive_a_resize() {
+        let mut vp = Viewport::default();
+        let line = |s: &str| Line {
+            spans: vec![Span {
+                text: s.into(),
+                style: Style::default(),
+            }],
+        };
+        vp.set_lines(vec![line("a wide laid-out line"), line("second")], 10);
+        assert_eq!(texts(&vp), ["a wide laid-out line", "second"]);
+
+        // A resize must not re-wrap them: layout owns their width, and the
+        // producer re-runs it and calls `set_lines` again.
+        vp.resize(4, 10);
+        assert_eq!(texts(&vp), ["a wide laid-out line", "second"]);
+    }
+
+    #[test]
+    fn relaying_out_keeps_the_reader_where_they_were() {
+        let mut vp = Viewport::default();
+        let lines = |n: usize| {
+            (0..n)
+                .map(|i| Line {
+                    spans: vec![Span {
+                        text: i.to_string(),
+                        style: Style::default(),
+                    }],
+                })
+                .collect::<Vec<_>>()
+        };
+        vp.set_lines(lines(100), 10);
+        vp.scroll_to_bottom();
+        assert_eq!(vp.offset(), 90);
+
+        // A narrower column produces more lines; the offset stays put.
+        vp.set_lines(lines(120), 10);
+        assert_eq!(vp.offset(), 90);
+
+        // A shorter page clamps it rather than leaving it past the end.
+        vp.set_lines(lines(20), 10);
+        assert_eq!(vp.offset(), 10);
+
+        // And a new page — no lines yet — puts the reader back at the top.
+        vp.set_lines(Vec::new(), 10);
+        assert_eq!(vp.offset(), 0);
     }
 
     fn tall() -> Viewport {
@@ -267,9 +384,9 @@ mod tests {
     fn visible_is_the_page_slice_at_the_offset() {
         let mut vp = tall();
         assert_eq!(vp.visible().len(), 10);
-        assert_eq!(vp.visible()[0], "0");
+        assert_eq!(text(&vp.visible()[0]), "0");
         vp.scroll_down();
-        assert_eq!(vp.visible()[0], "1");
+        assert_eq!(text(&vp.visible()[0]), "1");
     }
 
     #[test]

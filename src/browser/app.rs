@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
@@ -6,6 +6,7 @@ use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::dom::Dom;
+use crate::layout;
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -96,6 +97,11 @@ pub struct App {
     dom_view_built: bool,
     /// Whether the `F1` DOM surface replaces the page area.
     dom_visible: bool,
+    /// How many times `relayout` has run. Test-only instrumentation for the
+    /// invariant that costs the most if it ever breaks: scrolling relayouts
+    /// zero times, a resize exactly once.
+    #[cfg(test)]
+    layouts: usize,
 }
 
 impl App {
@@ -115,6 +121,8 @@ impl App {
             dom_view: Viewport::default(),
             dom_view_built: false,
             dom_visible: false,
+            #[cfg(test)]
+            layouts: 0,
         }
     }
 
@@ -165,6 +173,9 @@ impl App {
                 // Resize is a wrap point: re-wrap at the new width, keep offset.
                 self.viewport.resize(w, self.page());
                 self.dom_view.resize(w, self.page());
+                // ...and the second of exactly two places layout runs, because
+                // the column width changed with the frame.
+                self.relayout();
                 redraw()
             }
             // Terminal input is gone; exit cleanly, the same as the quit key.
@@ -214,6 +225,9 @@ impl App {
                 self.dom = None;
                 self.dom_view_built = false;
                 self.timings.parse = None;
+                // Layout goes with it, for the same reason: this run has a
+                // fetch time and nothing else yet.
+                self.timings.layout = None;
                 // Only an accepted, completed fetch records its duration.
                 // `start_fetch` deliberately does not clear it and `NetError`
                 // sets nothing: the timing table shows the last *completed*
@@ -229,6 +243,11 @@ impl App {
                 }
                 self.dom = Some(dom);
                 self.timings.parse = Some(elapsed);
+                // One of exactly two places layout runs. The page surface
+                // switches from the raw body to laid-out lines here, which is
+                // also what makes `dom.is_some()` mean "the viewport holds
+                // laid-out lines" everywhere below.
+                self.relayout();
                 // No line building here (see `dom_view_built`) — unless F1 is
                 // open right now, in which case the user is watching the tree
                 // and it must refresh on this repaint.
@@ -339,6 +358,31 @@ impl App {
         self.dom_visible && self.dom.is_some()
     }
 
+    /// Lay the cached tree out at the current column width and hand the lines
+    /// to the page surface. Called from exactly two places — a parse landing
+    /// and a resize — and never from the scroll path, which only moves an
+    /// offset over these lines (CLAUDE.md: scrolling never relayouts).
+    ///
+    /// Layout stays on the UI thread while fetch and parse do not: it is a
+    /// pure transform costing single-digit milliseconds even on Wikipedia, and
+    /// its input (the cached tree, the current width) is already here. Moving
+    /// it to a worker would buy a frame of latency and cost a round trip.
+    fn relayout(&mut self) {
+        let Some(dom) = &self.dom else {
+            return;
+        };
+        let started = Instant::now();
+        let lines = layout::layout(dom, column(self.size.0).width);
+        // The one place `App` reads the clock: fetch and parse are timed by the
+        // worker that runs them, but this stage runs here, so it times itself.
+        self.timings.layout = Some(started.elapsed());
+        #[cfg(test)]
+        {
+            self.layouts += 1;
+        }
+        self.viewport.set_lines(lines, self.page());
+    }
+
     /// Render `dom` into the F1 surface's lines at the current size, if it
     /// isn't already. Called only at the two moments the tree is about to be
     /// shown (see `dom_view_built`); every scroll and repaint in between
@@ -389,9 +433,7 @@ impl App {
         if self.dom_visible {
             self.draw_dom(frame);
         } else {
-            for (row, line) in self.viewport.visible().iter().enumerate() {
-                frame.put_str(0, row as u16, line, Style::default());
-            }
+            self.draw_page(frame);
         }
         // Over the page area, after the body and before the bottom row.
         if self.timing_visible {
@@ -406,6 +448,22 @@ impl App {
         }
     }
 
+    /// The page: the visible display lines, span by span. A laid-out page sits
+    /// in its centered column; raw body text — still loading, unparsed, or an
+    /// error page — starts at the left edge exactly as it did before M3.2.
+    /// Lines wider than the frame (`<pre>`) clip at the right edge inside
+    /// `put_str`: no wrap here, and no horizontal scroll until M7.
+    fn draw_page(&self, frame: &mut Frame) {
+        let left = if self.dom.is_some() {
+            column(self.size.0).left
+        } else {
+            0
+        };
+        for (row, line) in self.viewport.visible().iter().enumerate() {
+            paint_line(frame, left, row as u16, line);
+        }
+    }
+
     /// The `F1` surface: the cached tree lines in the page area, or a calm
     /// placeholder while there is nothing parsed yet (fresh start, mid-load,
     /// or after a failure) — never a panic, never a blank that looks broken.
@@ -415,7 +473,7 @@ impl App {
             return;
         }
         for (row, line) in self.dom_view.visible().iter().enumerate() {
-            frame.put_str(0, row as u16, line, Style::default());
+            paint_line(frame, 0, row as u16, line);
         }
     }
 
@@ -521,6 +579,45 @@ impl App {
     }
 }
 
+/// Widest the text column ever gets (UX §3.5). Past roughly this many cells the
+/// eye loses the start of the next line, which is why every book and every
+/// readable site stops around here — a maximized terminal must not turn a page
+/// into edge-to-edge soup.
+const MAX_MEASURE: u16 = 90;
+
+/// A cell of gutter on each side, so text never touches the frame edge. In a
+/// terminal too narrow for the cap this is all the margin there is.
+const PAGE_MARGIN: u16 = 1;
+
+/// Where the page's text column sits in a frame `width` cells wide.
+struct Column {
+    left: u16,
+    width: u16,
+}
+
+/// The column for a terminal width: capped at `MAX_MEASURE`, gutters either
+/// side, and centered in whatever is left over — so a wide terminal shows a
+/// readable column in the middle rather than a full-width wall. At least one
+/// cell survives, because `layout` must always have somewhere to put a
+/// character.
+fn column(width: u16) -> Column {
+    let w = width.saturating_sub(2 * PAGE_MARGIN).clamp(1, MAX_MEASURE);
+    Column {
+        left: width.saturating_sub(w) / 2,
+        width: w,
+    }
+}
+
+/// Paint one display line from `left`, span by span, each with its own style.
+/// The returned end column of each `put_str` is the next span's start, so a
+/// wide character's second cell is never written over.
+fn paint_line(frame: &mut Frame, left: u16, y: u16, line: &crate::layout::Line) {
+    let mut x = left;
+    for span in &line.spans {
+        x = frame.put_str(x, y, &span.text, span.style);
+    }
+}
+
 /// Spinner frames, advanced once per accepted progress message.
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -560,6 +657,7 @@ fn kb(bytes: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term::Color;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Msg {
@@ -1430,11 +1528,14 @@ mod tests {
             "scrolling must only move the offset over the cached lines"
         );
 
-        // The page did not move: toggling the inspector off shows line0.
+        // The page did not move: toggling the inspector off still shows the
+        // first laid-out line (the raw body was replaced by the laid-out page
+        // when the parse landed).
         app.update(f1());
         app.draw(&mut frame);
-        assert!(
-            row_text(&frame, 0).starts_with("line0"),
+        assert_eq!(
+            row_text(&frame, 0).trim_end(),
+            " p0",
             "the page offset must be untouched by inspector scrolling"
         );
 
@@ -1516,6 +1617,147 @@ mod tests {
         app.update(parsed(id2, "<p>new</p>"));
         app.draw(&mut frame);
         assert!(row_text(&frame, 0).starts_with("#document"));
+    }
+
+    // ---- M3.2 laid-out page: column, styles, relayout points --------------
+
+    /// A page that has been fetched and parsed — the state where the viewport
+    /// holds laid-out lines rather than raw body text.
+    fn page(w: u16, h: u16, html: &str) -> App {
+        let mut app = App::new(w, h);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, html.as_bytes().to_vec());
+        app.update(parsed(id, html));
+        app
+    }
+
+    #[test]
+    fn the_column_caps_at_ninety_cells_and_centers_what_is_left() {
+        // UX §3.5: past ~90 cells prose stops being readable, so a wide
+        // terminal gets a centered column, not edge-to-edge text.
+        let c = |w| (column(w).left, column(w).width);
+        assert_eq!(c(200), (55, 90));
+        assert_eq!(c(100), (5, 90));
+        // 92 is the widest frame the cap doesn't bite on: gutters only.
+        assert_eq!(c(92), (1, 90));
+        assert_eq!(c(40), (1, 38));
+        // Degenerate frames still leave layout a cell to write in.
+        assert_eq!(c(1), (0, 1));
+        assert_eq!(c(0), (0, 1));
+    }
+
+    #[test]
+    fn a_wide_frame_paints_the_column_centered_with_its_styles() {
+        let app = page(100, 10, "<h1>Title</h1><p>see <a href=x>docs</a></p>");
+        let mut frame = Frame::new(100, 10);
+        app.draw(&mut frame);
+
+        // 90-cell column in a 100-cell frame: 5 cells of gutter each side.
+        assert_eq!(row_text(&frame, 0).trim_end(), "     Title");
+        assert_eq!(row_text(&frame, 1).trim_end(), "", "blank between blocks");
+        assert_eq!(row_text(&frame, 2).trim_end(), "     see docs");
+        // The gutter is untouched, not painted with spaces in some style.
+        assert_eq!(frame.get(4, 0), Cell::default());
+
+        // Attributes, not just characters: the heading is bold…
+        assert!(frame.get(5, 0).attrs.contains(Attrs::BOLD), "heading bold");
+        assert!(
+            !frame.get(5, 2).attrs.contains(Attrs::BOLD),
+            "body not bold"
+        );
+        // …and the link is underlined and colored, starting after "see ".
+        let link = frame.get(9, 2);
+        assert_eq!(link.ch, 'd');
+        assert!(link.attrs.contains(Attrs::UNDERLINE), "link underlined");
+        assert_eq!(link.fg, Color::Ansi(12), "link colored");
+        // The space before it belongs to no link: no stray underlined cell.
+        assert!(!frame.get(8, 2).attrs.contains(Attrs::UNDERLINE));
+    }
+
+    #[test]
+    fn a_narrow_frame_uses_the_full_width_without_centering() {
+        // Under the cap there is nothing to center: one gutter cell each side
+        // and the rest is text.
+        let app = page(40, 10, &format!("<p>{}</p>", "wordy ".repeat(20)));
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        let row = row_text(&frame, 0);
+        assert!(row.starts_with(' '), "row was {row:?}");
+        assert!(row.starts_with(" wordy"), "row was {row:?}");
+        // Text ends inside the right gutter: the column is 38 wide at x=1.
+        assert_eq!(frame.get(39, 0), Cell::default(), "right gutter painted");
+    }
+
+    #[test]
+    fn pre_clips_at_the_right_edge_instead_of_wrapping() {
+        // <pre> does not wrap (PLAN.md M3), so the overflow is the painter's to
+        // drop — no second row, no horizontal scroll until M7.
+        let app = page(20, 6, &format!("<pre>{}</pre>", "x".repeat(60)));
+        let mut frame = Frame::new(20, 6);
+        app.draw(&mut frame);
+        assert_eq!(row_text(&frame, 0), format!(" {}", "x".repeat(19)));
+        assert_eq!(row_text(&frame, 1).trim_end(), "", "clipped, not wrapped");
+    }
+
+    #[test]
+    fn resize_relayouts_once_and_scrolling_never_does() {
+        let html: String = (0..50).map(|i| format!("<p>p{i}</p>")).collect();
+        let mut app = page(80, 10, &html);
+        assert_eq!(app.layouts, 1, "the parse lays the page out once");
+
+        // A burst of scroll keys moves the offset over the cached lines.
+        for _ in 0..50 {
+            app.update(ch('j'));
+        }
+        assert!(app.viewport.offset() > 0, "the burst must actually scroll");
+        assert_eq!(app.layouts, 1, "scrolling must never relayout");
+
+        app.update(Msg::Resize(60, 10));
+        assert_eq!(app.layouts, 2, "a resize relayouts exactly once");
+        // …and the reader keeps their place instead of being thrown to the top.
+        assert!(app.viewport.offset() > 0, "resize reset the scroll");
+    }
+
+    #[test]
+    fn an_unparsed_body_still_renders_as_raw_text_at_the_left_edge() {
+        // Between `Loaded` and `Parsed` there is no tree to lay out, so the
+        // page is exactly what M1.5 drew: raw text, no column, no styles.
+        let mut app = App::new(100, 10);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, b"<p>raw</p>".to_vec());
+        let mut frame = Frame::new(100, 10);
+        app.draw(&mut frame);
+        assert_eq!(row_text(&frame, 0).trim_end(), "<p>raw</p>");
+        assert_eq!(app.layouts, 0, "nothing to lay out without a tree");
+    }
+
+    #[test]
+    fn an_empty_document_draws_a_blank_page_and_a_calm_statusline() {
+        let app = page(40, 6, "<html><body></body></html>");
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        for y in 0..5 {
+            assert_eq!(row_text(&frame, y).trim_end(), "", "row {y} not blank");
+        }
+        // No content means no scroll position to report — not "0%".
+        assert!(!row_text(&frame, 5).contains('%'));
+    }
+
+    #[test]
+    fn the_layout_row_joins_the_timing_table_and_leaves_with_a_new_body() {
+        let mut app = page(40, 10, "<p>hi</p>");
+        assert!(app.timings().layout.is_some());
+        let rows = app.timings().rows();
+        assert!(
+            rows.iter().any(|r| r.starts_with("layout")),
+            "rows were {rows:?}"
+        );
+
+        // A new body arrives: its fetch time must not sit beside the previous
+        // page's layout time (the M2.3 no-stage-mixing rule).
+        let id2 = app.start_fetch("http://b/".into());
+        load(&mut app, id2, b"<p>b</p>".to_vec());
+        assert_eq!(app.timings().layout, None);
     }
 
     #[test]

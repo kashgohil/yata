@@ -9,13 +9,14 @@ use crossterm::terminal;
 use yata::browser::app::{App, Effect};
 use yata::msg::Msg;
 use yata::term::{self, Renderer};
-use yata::{html, net};
+use yata::{html, layout, net};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let panic_requested = args.iter().any(|a| a == "--panic");
     let dump = args.iter().any(|a| a == "--dump");
     let dump_dom = args.iter().any(|a| a == "--dump-dom");
+    let dump_text = args.iter().any(|a| a == "--dump-text");
     let timing = args.iter().any(|a| a == "--timing");
     // `yata <url>`: the first non-flag argument (`--panic` etc. are flags,
     // not URLs). In the TUI, no argument → no fetch, blank page.
@@ -25,8 +26,13 @@ fn main() -> io::Result<()> {
     // `Screen::new`, raw mode, or the input thread exist. `--dump`'s stdout
     // carries body bytes and nothing else, so piping to a file is byte-exact.
     // Exit codes are part of the spec: 0 success · 1 fetch failure · 2 usage.
-    if dump || dump_dom || timing {
-        if [dump, dump_dom, timing].into_iter().filter(|&f| f).count() > 1 {
+    if dump || dump_dom || dump_text || timing {
+        if [dump, dump_dom, dump_text, timing]
+            .into_iter()
+            .filter(|&f| f)
+            .count()
+            > 1
+        {
             process::exit(usage());
         }
         let Some(url) = url else {
@@ -36,6 +42,8 @@ fn main() -> io::Result<()> {
             run_dump(&url)
         } else if dump_dom {
             run_dump_dom(&url)
+        } else if dump_text {
+            run_dump_text(&url)
         } else {
             run_timing(&url)
         });
@@ -101,9 +109,13 @@ fn main() -> io::Result<()> {
 
 /// The one usage line. Returns the usage exit code for `main` to exit with.
 fn usage() -> i32 {
-    eprintln!("usage: yata [--dump | --dump-dom | --timing] <url>");
+    eprintln!("usage: yata [--dump | --dump-dom | --dump-text | --timing] <url>");
     2
 }
+
+/// Column width for `--dump-text`. Fixed, not the terminal's: a greppable hook
+/// whose output moved with the window would be useless in a test.
+const DUMP_TEXT_WIDTH: u16 = 80;
 
 /// The headless fetch: the *production* path — `net::normalize_url`, then
 /// `net::spawn_fetch` — returning the channel the worker sends into, the
@@ -177,6 +189,38 @@ fn run_dump_dom(url: &str) -> i32 {
             let mut out = io::stdout();
             if out
                 .write_all(html::debug_tree(&dom).as_bytes())
+                .and_then(|()| out.flush())
+                .is_err()
+            {
+                return 1;
+            }
+            0
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            1
+        }
+    }
+}
+
+/// `--dump-text`: the laid-out page as plain text on stdout — M3's headless
+/// hook, mirroring `--dump-dom` for M2. Styles are dropped (a pipe has no
+/// attributes) and the column is fixed at `DUMP_TEXT_WIDTH`, so the output is
+/// the same everywhere. Parse and layout, but no TUI.
+fn run_dump_text(url: &str) -> i32 {
+    let rx = headless_fetch(url);
+    match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
+        Ok((dom, _)) => {
+            let mut text = String::new();
+            for line in layout::layout(&dom, DUMP_TEXT_WIDTH) {
+                for span in &line.spans {
+                    text.push_str(&span.text);
+                }
+                text.push('\n');
+            }
+            let mut out = io::stdout();
+            if out
+                .write_all(text.as_bytes())
                 .and_then(|()| out.flush())
                 .is_err()
             {

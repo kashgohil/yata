@@ -1,9 +1,8 @@
 use std::time::Duration;
 
-/// Per-stage durations of the last completed pipeline run (PLAN.md §4). At M1
-/// the pipeline has exactly two timed stages; later milestones add a field per
-/// stage here (parse at M2, style at M4, layout at M5, …) rather than
-/// reshaping the struct.
+/// Per-stage durations of the last completed pipeline run (PLAN.md §4). Each
+/// milestone adds a field per stage here (parse at M2, layout at M3, style at
+/// M4, …) rather than reshaping the struct.
 #[derive(Default, Debug)]
 pub struct Timings {
     /// The whole request — client build → last body byte — measured on the
@@ -12,6 +11,9 @@ pub struct Timings {
     /// The HTML parse (tokenize + tree build), measured on the fetch worker
     /// and shipped as `Msg::Parsed::elapsed`.
     pub parse: Option<Duration>,
+    /// DOM → display lines at the current column width. Unlike the two above it
+    /// runs on the UI thread, so `App` times it where it calls it.
+    pub layout: Option<Duration>,
     /// The last presented frame's draw + present time, recorded by the event
     /// loop after the fact.
     pub frame: Option<Duration>,
@@ -26,6 +28,7 @@ impl Timings {
         [
             ("fetch", self.fetch),
             ("parse", self.parse),
+            ("layout", self.layout),
             ("frame", self.frame),
         ]
         .into_iter()
@@ -66,6 +69,12 @@ mod tests {
         };
         assert_eq!(parse_only.rows(), ["parse 31.7 ms"]);
 
+        let layout_only = Timings {
+            layout: Some(Duration::from_micros(1_800)),
+            ..Timings::default()
+        };
+        assert_eq!(layout_only.rows(), ["layout 1.8 ms"]);
+
         let frame_only = Timings {
             frame: Some(Duration::from_micros(2_100)),
             ..Timings::default()
@@ -78,11 +87,17 @@ mod tests {
         let all = Timings {
             fetch: Some(Duration::from_millis(40)),
             parse: Some(Duration::from_micros(31_700)),
+            layout: Some(Duration::from_micros(1_800)),
             frame: Some(Duration::from_micros(2_100)),
         };
         assert_eq!(
             all.rows(),
-            ["fetch 40.0 ms", "parse 31.7 ms", "frame 2.1 ms"]
+            [
+                "fetch 40.0 ms",
+                "parse 31.7 ms",
+                "layout 1.8 ms",
+                "frame 2.1 ms"
+            ]
         );
     }
 
