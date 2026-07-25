@@ -90,10 +90,11 @@ const BLOCK: &[&str] = &[
 /// same reason browsers zero the margin on a nested list.
 const TIGHT: &[&str] = &["li", "tr", "td", "th"];
 
-/// Lay the document out at `width` cells. Lines never exceed `width` except
-/// inside `<pre>`, which does not wrap — clipping overflow is the painter's job
-/// (M3.2). At a width too small to hold even the indent, forward progress wins
-/// over the width bound: one cell per line beats an infinite loop.
+/// Lay the document out at `width` cells. Lines never exceed `width` — a
+/// guarantee that holds while the content width left after the indent is above
+/// zero — except inside `<pre>`, which does not wrap: clipping overflow is the
+/// painter's job (M3.2). Where an indent has eaten the whole width, forward
+/// progress wins over the bound, because one cell per line beats a hang.
 pub fn layout(dom: &Dom, width: u16) -> Vec<Line> {
     let mut l = Layouter {
         dom,
@@ -262,19 +263,28 @@ impl Layouter<'_> {
     /// End the current line and owe a blank one before the next content.
     fn block_gap(&mut self) {
         self.flush(false);
-        // Only between siblings: nothing precedes the first line, and the gap
-        // owed after the last block is never claimed.
-        if !self.out.is_empty() {
+        // Only between siblings: nothing precedes the first line, the gap owed
+        // after the last block is never claimed, and a line that is already
+        // blank — a `<br>` just above, say — is the separation, so `<br><p>` is
+        // one break rather than two.
+        if self.out.last().is_some_and(|l| !l.spans.is_empty()) {
             self.pending_blank = true;
         }
     }
 
     /// `<br>`: ends the line even when the line is empty, so `a<br><br>b` keeps
-    /// the blank between the two breaks. This is why the blank-line collapsing
-    /// in `block_gap` is a property of block gaps and not a rule against two
-    /// empty lines in a row.
+    /// the blank between the two breaks — the blank-line collapsing in
+    /// `block_gap` is a property of block gaps, not a rule against two empty
+    /// lines in a row.
+    ///
+    /// An owed block gap already stands for an empty line, so a `<br>` on top of
+    /// one adds nothing: `</p><br>` is a gap, not a gap plus a blank. Consecutive
+    /// `<br>`s are unaffected because the first leaves no gap pending. The trade
+    /// is that `</p><br><br>` yields one blank line where a browser shows two;
+    /// matching that would mean claiming the gap here and trimming trailing
+    /// blanks at the end, which is more rule than that markup is worth.
     fn hard_line_break(&mut self) {
-        self.flush(true);
+        self.flush(!self.pending_blank);
     }
 
     /// `<hr>`: a rule across the content width, so one inside a `<blockquote>`
@@ -532,6 +542,18 @@ mod tests {
         // Each <br> breaks, so the line between them survives — the block-gap
         // collapsing must not be implemented as "never two blank lines".
         assert_eq!(lines("a<br><br>b", 20), "a\n\nb\n");
+    }
+
+    #[test]
+    fn br_does_not_stack_with_a_block_gap() {
+        // The gap a block already owes is an empty line; the <br> must not add
+        // a second one on top of it.
+        assert_eq!(lines("<p>a</p><br>b", 20), "a\n\nb\n");
+        assert_eq!(lines("<p>a</p><br><p>b</p>", 20), "a\n\nb\n");
+        // A leading <br> is one break, and the block after it adds none.
+        assert_eq!(lines("<br><p>b</p>", 20), "\nb\n");
+        // Nor does a trailing <br> leave the page ending in a blank line.
+        assert_eq!(lines("<p>a</p><br>", 20), "a\n");
     }
 
     #[test]
