@@ -6,6 +6,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Command, Output};
 use std::thread;
+use unicode_width::UnicodeWidthStr;
 
 /// Serve one canned HTTP response on an ephemeral local port, from a test
 /// thread. Duplicated from `src/net/fetch.rs`'s tests: integration tests
@@ -136,9 +137,13 @@ fn dump_text_prints_the_laid_out_page_to_stdout() {
     // A heading, a wrapping paragraph and a list: enough to show that the
     // output is laid out (blank line between blocks, bullet, wrap at the fixed
     // 80-cell column) rather than raw text with the tags stripped.
+    // The CJK paragraph is what makes the width guard below mean anything: at
+    // two cells per character it breaks any check counting chars instead of
+    // cells, which is the bug CLAUDE.md's layout invariant exists to prevent.
     let body = format!(
-        "<h1>Title</h1><p>{}</p><ul><li>one</li><li>two</li></ul>",
-        "word ".repeat(20)
+        "<h1>Title</h1><p>{}</p><p>{}</p><ul><li>one</li><li>two</li></ul>",
+        "word ".repeat(20),
+        "文字".repeat(30)
     );
     let addr = serve_once(response_with_body("200 OK", body.as_bytes()));
     let out = yata(&["--dump-text", &format!("http://{addr}/")]);
@@ -152,10 +157,15 @@ fn dump_text_prints_the_laid_out_page_to_stdout() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines[0], "Title");
     assert_eq!(lines[1], "", "blocks are separated by a blank line");
-    // 20 words of 4 letters wrap to two lines at 80 cells, neither over it.
+    // Every line fits the fixed column — measured in cells, so the 2-cell CJK
+    // above is held to 40 characters a line, not 80.
     assert!(
-        lines.iter().all(|l| l.chars().count() <= 80),
+        lines.iter().all(|l| l.width() <= 80),
         "a line ran past the fixed column: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains('文')),
+        "the wide-character paragraph never made it into the output"
     );
     assert!(text.contains("• one\n• two\n"), "text was:\n{text}");
     // Styles are dropped, not rendered as markers, and no escape sequence
@@ -238,6 +248,7 @@ fn two_headless_flags_together_is_a_usage_error() {
         ["--dump", "--dump-dom"],
         ["--dump-dom", "--timing"],
         ["--dump", "--dump-text"],
+        ["--dump-dom", "--dump-text"],
         ["--dump-text", "--timing"],
     ] {
         let out = yata(&[flags[0], flags[1], "http://127.0.0.1:9/"]);

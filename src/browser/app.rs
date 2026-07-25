@@ -72,9 +72,11 @@ pub struct App {
     /// Spinner frame index. Progress messages are its clock — there is no
     /// timer in this app — so it animates exactly while bytes are flowing.
     spinner: usize,
-    /// Per-stage durations of the last completed pipeline run, fed by message
-    /// data (`Loaded::elapsed`) and by the event loop (`record_frame`) — the
-    /// app itself never reads the clock.
+    /// Per-stage durations of the last completed pipeline run. Fetch and parse
+    /// arrive as message data (`Loaded::elapsed`, `Parsed::elapsed`) because
+    /// they run on a worker, and the frame time is set by the event loop after
+    /// it presents; only layout is timed here, by `relayout`, because that is
+    /// the one stage `App` runs itself.
     timings: Timings,
     /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
     /// stays up while the URL bar is open.
@@ -1684,8 +1686,12 @@ mod tests {
         let row = row_text(&frame, 0);
         assert!(row.starts_with(' '), "row was {row:?}");
         assert!(row.starts_with(" wordy"), "row was {row:?}");
-        // Text ends inside the right gutter: the column is 38 wide at x=1.
-        assert_eq!(frame.get(39, 0), Cell::default(), "right gutter painted");
+        // The column is 38 cells wide at x=1, so the last frame cell is gutter.
+        assert_eq!(
+            frame.get(39, 0),
+            Cell::default(),
+            "text ran into the right gutter"
+        );
     }
 
     #[test]
@@ -1716,6 +1722,26 @@ mod tests {
         assert_eq!(app.layouts, 2, "a resize relayouts exactly once");
         // …and the reader keeps their place instead of being thrown to the top.
         assert!(app.viewport.offset() > 0, "resize reset the scroll");
+    }
+
+    #[test]
+    fn a_new_page_starts_at_the_top_even_after_scrolling_the_last_one() {
+        // `set_lines` keeps the offset by design, so nothing in layout resets
+        // it — the reset rides on the `set_content` that shows the incoming raw
+        // body. This pins that load path end to end: drop it and every
+        // navigation would open partway down the new page.
+        let html: String = (0..50).map(|i| format!("<p>p{i}</p>")).collect();
+        let mut app = page(80, 10, &html);
+        for _ in 0..30 {
+            app.update(ch('j'));
+        }
+        assert!(app.viewport.offset() > 0, "the burst must actually scroll");
+
+        let id2 = app.start_fetch("http://b/".into());
+        load(&mut app, id2, html.as_bytes().to_vec());
+        assert_eq!(app.viewport.offset(), 0, "the raw body starts at the top");
+        app.update(parsed(id2, &html));
+        assert_eq!(app.viewport.offset(), 0, "and so does the laid-out page");
     }
 
     #[test]

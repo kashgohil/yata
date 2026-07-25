@@ -56,9 +56,16 @@ impl Viewport {
     }
 
     /// Show lines that arrive already wrapped, from `layout`. The offset is kept
-    /// and clamped rather than reset, because the two callers want that: a
-    /// resize relayout should stay roughly where the reader was, and a new page
-    /// passes no lines at all, which clamps the offset back to the top anyway.
+    /// and clamped, never reset: both callers are relayouts of a page the reader
+    /// is already looking at, and throwing them to the top on a resize would be
+    /// worse than landing a few lines off.
+    ///
+    /// A *new* page is put back at the top upstream, by the `set_content` that
+    /// shows its raw body while the parse is still running — by the time lines
+    /// reach here the offset is already 0. That is a load-path invariant rather
+    /// than something this method enforces, so
+    /// `a_new_page_starts_at_the_top_even_after_scrolling_the_last_one` pins it
+    /// from the outside.
     pub fn set_lines(&mut self, lines: Vec<Line>, page: u16) {
         self.source = Source::Laid;
         self.lines = lines;
