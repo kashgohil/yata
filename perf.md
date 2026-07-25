@@ -24,10 +24,13 @@ touch them, and the bench would be measuring the wrong thing if it did.
 
 | Frame | Scroll step | Budget | Headroom |
 |---|---|---|---|
-| 120×40 | **28.1 µs** (27.6–28.6) | < 5 ms | 178× |
-| 200×50 | **44.8 µs** (43.5–46.1) | < 5 ms | 112× |
+| 120×40 | **28.5 µs** (27.9–29.2) | < 5 ms | 175× |
+| 200×50 | **44.4 µs** (43.0–45.8) | < 5 ms | 113× |
 
 Run-to-run spread on this machine is about ±5%; treat the third digit as noise.
+At either end of the page the walk turns around rather than jumping to the top,
+so every measured iteration is one line step and no whole-page jump is averaged
+in with them.
 
 The write goes to `io::sink()`: `Renderer::present` diffs and writes in one
 call, so what is measured is draw + diff + serialize, everything short of
@@ -42,24 +45,30 @@ as it should.
 
 `yata --timing <url>` against the committed fixtures served from
 `127.0.0.1` (`python3 -m http.server`), so `fetch` is loopback overhead and the
-engine stages stand on their own. Median of three runs.
+engine stages stand on their own. Median run; `--timing` prints to one decimal,
+so treat ±0.1 ms as the floor.
 
 | Page | fetch | parse | layout | parse + layout | Budget |
 |---|---|---|---|---|---|
 | example.com | 2.5 ms | 0.0 ms | 0.0 ms | ~0.0 ms | — |
 | motherfuckingwebsite.com | 2.1 ms | 0.1 ms | 0.1 ms | 0.2 ms | — |
-| **danluu.com** | 1.6 ms | 0.3 ms | 0.2 ms | **0.5 ms** | < 50 ms full pipeline |
+| **danluu.com** | 2.6 ms | 0.4 ms | 0.2 ms | **0.6 ms** | < 50 ms full pipeline |
 | news.ycombinator.com | 1.8 ms | 0.4 ms | 0.1 ms | 0.5 ms | — |
-| **en.wikipedia.org** | 2.2 ms | 12.3 ms | 2.4 ms | **14.7 ms** | < 250 ms full pipeline |
+| **en.wikipedia.org** | 2.2 ms | 12.7 ms | 1.9 ms | **14.6 ms** | < 250 ms full pipeline |
 
 Both gated pages sit two orders of magnitude inside their budget — danluu at 1%
 of 50 ms, Wikipedia at 6% of 250 ms. Layout is the cheaper of the two stages
 everywhere; parse dominates, which is why parse is the one that runs on the
 worker thread.
 
-Layout also runs on every resize (M3.2), so Wikipedia's 2.4 ms is the cost of a
+Layout also runs on every resize (M3.2), so Wikipedia's 1.9 ms is the cost of a
 terminal drag frame. That is inside the 10 ms keypress budget with room to
 spare, and no async layout is needed.
+
+Wikipedia layout was 2.4 ms when M3.3 first landed. The M3.3 review pointed out
+that the new run buffer copied every word into a fresh `String`; the buffer now
+borrows `&str` straight from the arena's text nodes, which took it to 1.9 ms
+(7 runs, median) — about 20% of the stage, for one lifetime parameter.
 
 ### M2 fast gate, re-measured on the same machine
 

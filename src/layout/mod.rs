@@ -176,9 +176,11 @@ fn is_html_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
 }
 
-/// One styled chunk of a buffered run, measured once as it is buffered.
-struct Piece {
-    text: String,
+/// One styled chunk of a buffered run, measured once as it is buffered. The text
+/// is borrowed straight from the arena's text nodes — buffering a run must not
+/// cost an allocation per word, and the tree outlives the layout that reads it.
+struct Piece<'a> {
+    text: &'a str,
     cells: usize,
     style: Style,
 }
@@ -209,7 +211,7 @@ struct Layouter<'a> {
     /// no whitespace between them, and breaking between them stranded the `)`
     /// alone on a line; Wikipedia's `<a>wildcat</a>.<sup>[54]</sup>` did the same
     /// to its citation marks.
-    run: Vec<Piece>,
+    run: Vec<Piece<'a>>,
     /// Cells the buffered run occupies. Summed as pieces arrive so each is
     /// measured exactly once (PLAN.md §4: no re-measuring per wrap attempt).
     run_cells: usize,
@@ -221,11 +223,12 @@ struct Layouter<'a> {
     marker: Option<&'static str>,
 }
 
-impl Layouter<'_> {
+impl<'a> Layouter<'a> {
     fn walk(&mut self, id: NodeId, style: Style, pre: bool) {
         // Copied out so the borrow lives as long as the arena, not as long as
-        // `&self` — the walk mutates `self` while reading node data.
-        let dom = self.dom;
+        // `&self` — the walk mutates `self` while reading node data, and the
+        // run buffer holds `&'a str` into these text nodes across the walk.
+        let dom: &'a Dom = self.dom;
         match &dom.node(id).data {
             NodeData::Text(text) => {
                 if pre {
@@ -343,7 +346,7 @@ impl Layouter<'_> {
     /// spaces at a line box's edges are dropped rather than painted. Whitespace
     /// is also the only place a line may break, so each run of it commits the
     /// buffered run and owes a space before the next one.
-    fn flow_text(&mut self, text: &str, style: Style) {
+    fn flow_text(&mut self, text: &'a str, style: Style) {
         if text.starts_with(is_html_space) {
             self.space(style);
         }
@@ -369,14 +372,10 @@ impl Layouter<'_> {
     }
 
     /// Add a piece to the run being built, measuring it once.
-    fn buffer(&mut self, text: &str, style: Style) {
+    fn buffer(&mut self, text: &'a str, style: Style) {
         let cells = text.width();
         self.run_cells += cells;
-        self.run.push(Piece {
-            text: text.to_string(),
-            cells,
-            style,
-        });
+        self.run.push(Piece { text, cells, style });
     }
 
     /// Place the buffered run, wrapping to the next line if it no longer fits.
@@ -406,7 +405,7 @@ impl Layouter<'_> {
         }
         if self.cur_cells + self.run_cells <= self.width {
             for piece in std::mem::take(&mut self.run) {
-                self.push_text(&piece.text, piece.cells, piece.style);
+                self.push_text(piece.text, piece.cells, piece.style);
             }
             self.run_cells = 0;
             self.line_has_text = true;
@@ -422,7 +421,7 @@ impl Layouter<'_> {
     /// terminal is reachable, and a hang is a bug, not an error path).
     fn break_run(&mut self) {
         for piece in std::mem::take(&mut self.run) {
-            let mut rest = piece.text.as_str();
+            let mut rest = piece.text;
             while !rest.is_empty() {
                 // Pieces continue on the line the one before them ended on, so
                 // a full line has to be closed here rather than overrun.
@@ -908,13 +907,30 @@ mod ladder {
         span.style.fg == LINK && span.style.attrs.contains(Attrs::UNDERLINE)
     }
 
+    /// Whether the tree holds a `<pre>` anywhere. Asked of the parsed tree, not
+    /// of the source text: `contains("<pre")` also fires on `<presentation>` and
+    /// on any attribute value that happens to spell it.
+    fn has_pre(dom: &Dom) -> bool {
+        let mut stack = vec![dom.root];
+        while let Some(id) = stack.pop() {
+            if let NodeData::Element { tag, .. } = &dom.node(id).data
+                && tag == "pre"
+            {
+                return true;
+            }
+            stack.extend(dom.children(id));
+        }
+        false
+    }
+
     /// Every page's invariants, then the lines for the per-page assertions.
     fn check(html: &str, min_lines: usize) -> Vec<Line> {
+        let dom = parse(html);
         // The width bound below applies to every line only because no ladder
         // page has a `<pre>`, the one box that may overflow the column. If a
         // refreshed fixture ever brings one in, this says why the bound broke.
-        assert!(!html.contains("<pre"), "fixture gained a <pre>");
-        let lines = layout(&parse(html), COLUMN);
+        assert!(!has_pre(&dom), "fixture gained a <pre>");
+        let lines = layout(&dom, COLUMN);
         assert!(lines.len() >= min_lines, "only {} lines", lines.len());
         for (i, line) in lines.iter().enumerate() {
             let cells = cells(line);
@@ -956,31 +972,35 @@ mod ladder {
     #[test]
     fn motherfuckingwebsite_com() {
         let lines = check(fixture!("motherfuckingwebsite.com.html"), 20);
-        // The heading is bold, and the paragraphs under it are separated by
-        // exactly one blank line each — no gap, and no double gap.
+        let bold = |l: &Line| l.spans.iter().all(|s| s.style.attrs.contains(Attrs::BOLD));
+
+        // The page opens `<h1>`, `<aside>`, `<h2>` — one line each, one blank
+        // between, and the two headings bold while the aside is not.
         assert_eq!(text(&lines[0]), "This is a motherfucking website.");
-        assert!(
-            lines[0]
-                .spans
-                .iter()
-                .all(|s| s.style.attrs.contains(Attrs::BOLD)),
-            "heading not bold: {:?}",
-            lines[0]
-        );
+        assert!(bold(&lines[0]), "h1 not bold: {:?}", lines[0]);
         assert_eq!(text(&lines[1]), "");
         assert_eq!(text(&lines[2]), "And it's fucking perfect.");
+        assert!(!bold(&lines[2]), "the aside must not be bold");
         assert_eq!(text(&lines[3]), "");
         assert_eq!(
             text(&lines[4]),
             "Seriously, what the fuck else do you want?"
         );
+        assert!(bold(&lines[4]), "h2 not bold: {:?}", lines[4]);
 
-        // The `<h2>`s further down are bold too, not just the `<h1>`.
-        let h2 = lines
+        // And two adjacent `<p>`s — the deliverable's "paragraphs separated by
+        // exactly one blank line", which the opening three blocks do not
+        // actually contain. The first wraps, so this also pins that the blank
+        // falls after its *last* line, not after its first.
+        let end = lines
             .iter()
-            .find(|l| text(l) == "It's fucking lightweight")
-            .expect("the first h2 must survive layout");
-        assert!(h2.spans.iter().all(|s| s.style.attrs.contains(Attrs::BOLD)));
+            .position(|l| text(l) == "see that shit, but they don't see any of your shitty shit.")
+            .expect("the first paragraph's last line must be present");
+        assert_eq!(text(&lines[end + 1]), "");
+        assert_eq!(
+            text(&lines[end + 2]),
+            "You never knew it, but this is your perfect website. Here's why."
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@
 //! terminal, which is a syscall no benchmark can honestly attribute.
 //!
 //! Last recorded (M3.3, Apple M4 Pro, 2026-07) — gate < 5 ms:
-//!   120×40  28.1 µs · 200×50  44.8 µs
+//!   120×40  28.5 µs · 200×50  44.4 µs
 //!
 //! Two sizes because the diff is per-cell: the column caps at 90 cells either
 //! way, so a wider frame buys no text, only more blank gutter to compare.
@@ -43,19 +43,23 @@ fn page(w: u16, h: u16) -> (App, Renderer) {
     ))
     .expect("committed fixture must exist");
 
+    // Parsed before the body is handed over, so the fixture is read once and
+    // moved rather than copied.
+    let dom = yata::html::parse(&html);
+
     let mut app = App::new(w, h);
     let id = app.start_fetch("http://fixture/".into());
     app.update(Msg::Loaded {
         id,
         url: "http://fixture/".into(),
         status: 200,
-        body: html.clone().into_bytes(),
+        body: html.into_bytes(),
         elapsed: Duration::ZERO,
     });
-    // Parse and layout both happen here, before the timer starts.
+    // Layout happens here, before the timer starts.
     app.update(Msg::Parsed {
         id,
-        dom: yata::html::parse(&html),
+        dom,
         elapsed: Duration::ZERO,
     });
 
@@ -66,13 +70,18 @@ fn page(w: u16, h: u16) -> (App, Renderer) {
     (app, renderer)
 }
 
-/// One step down. At the last page `j` stops moving and would measure an empty
-/// diff, so the offset wraps to the top instead — `gg` is one more scroll step,
-/// not a reload, and on this fixture it happens about once every 3600 steps.
-fn step(app: &mut App, renderer: &mut Renderer) {
-    if !app.update(key('j')).dirty {
-        app.update(key('g'));
-        app.update(key('g'));
+/// Whether a scroll step goes down or up. At either end of the page the key
+/// stops moving and would measure an empty diff, so the walk turns around
+/// instead of jumping: every measured iteration is then exactly one line step,
+/// with no whole-page jump averaged in among them.
+struct Walk {
+    down: bool,
+}
+
+fn step(app: &mut App, renderer: &mut Renderer, walk: &mut Walk) {
+    if !app.update(key(if walk.down { 'j' } else { 'k' })).dirty {
+        walk.down = !walk.down;
+        app.update(key(if walk.down { 'j' } else { 'k' }));
     }
     app.draw(renderer.frame());
     renderer.present(&mut io::sink()).expect("sink cannot fail");
@@ -81,8 +90,15 @@ fn step(app: &mut App, renderer: &mut Renderer) {
 fn scroll_wikipedia(c: &mut Criterion) {
     for (w, h) in [(120, 40), (200, 50)] {
         let (mut app, mut renderer) = page(w, h);
+        let mut walk = Walk { down: true };
         c.bench_function(&format!("scroll step en.wikipedia.org {w}x{h}"), |b| {
-            b.iter(|| step(black_box(&mut app), black_box(&mut renderer)))
+            b.iter(|| {
+                step(
+                    black_box(&mut app),
+                    black_box(&mut renderer),
+                    black_box(&mut walk),
+                )
+            })
         });
     }
 }
