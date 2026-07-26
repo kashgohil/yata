@@ -259,6 +259,10 @@ impl App {
                 }
                 redraw()
             }
+            // Nothing collects stylesheets yet — the App side of M4.3 is the
+            // next commit. Until then a sheet that somehow arrives changes
+            // nothing rather than being a compile error.
+            Msg::Stylesheet { .. } => Effect::default(),
             Msg::NetError { id, url, reason } => {
                 if Some(id) != self.current_fetch {
                     return Effect::default();

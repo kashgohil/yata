@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Instant;
 
+use crate::css;
 use crate::html;
 use crate::msg::Msg;
 use crate::net::FetchId;
@@ -51,6 +52,50 @@ pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
     });
 }
 
+/// Fetch one linked stylesheet on its own detached worker (M4.3). One
+/// `Msg::Stylesheet` goes out and nothing else — a stylesheet has no visible
+/// byte counter, so there is no `Loading` progress to report.
+///
+/// The CSS is parsed here for the same reason the HTML is: the worker owns the
+/// bytes and is already off the UI thread. Anything short of a successful
+/// response yields `None`; the page is then styled by whatever else it has,
+/// which is what "render unstyled, then restyle" means when a sheet is missing
+/// rather than slow.
+pub fn spawn_stylesheet(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let sheet = match get(&url) {
+            // A 404's body is an error page, not CSS; parsing it would put
+            // whatever HTML-shaped garbage recovers into the cascade.
+            Ok((status, body)) if (200..300).contains(&status) => {
+                // Charset: lossy UTF-8, the same seam `html::decode_body`
+                // documents. `@charset` and the HTTP header wait for a page
+                // that needs them.
+                Some(css::parse(&String::from_utf8_lossy(&body)))
+            }
+            _ => None,
+        };
+        let _ = tx.send(Msg::Stylesheet { id, slot, sheet });
+    });
+}
+
+/// A whole response in one go, no progress reporting. Used for subresources,
+/// where there is no byte counter to feed.
+fn get(url: &str) -> Result<(u16, Vec<u8>), String> {
+    let mut resp = client()?.get(url).send().map_err(describe)?;
+    let status = resp.status().as_u16();
+    let mut body = Vec::new();
+    resp.read_to_end(&mut body).map_err(describe)?;
+    Ok((status, body))
+}
+
+/// One blocking client. Built on the worker, never on the UI thread; defaults
+/// follow redirects and (via the gzip feature) transparently decompress.
+fn client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .build()
+        .map_err(describe)
+}
+
 /// The whole request, run on the worker. `Ok(Some(Loaded))` on success,
 /// `Ok(None)` if the channel closed mid-stream, `Err((url, reason))` on any
 /// failure (bad URL, DNS, connect, TLS, mid-body disconnect). The error's url
@@ -61,12 +106,9 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
     // the app as message data, so the app never reads the clock. The span is
     // the whole request — client build → last body byte.
     let started = Instant::now();
-    // Built here, not in `spawn_fetch`, so the UI thread never touches
-    // reqwest. Defaults follow redirects and (via the gzip feature)
-    // transparently decompress.
-    let client = reqwest::blocking::Client::builder()
-        .build()
-        .map_err(|e| (url.to_string(), describe(e)))?;
+    // Built on the worker (see `client`), so the UI thread never touches
+    // reqwest.
+    let client = client().map_err(|reason| (url.to_string(), reason))?;
     let mut resp = client
         .get(url)
         .send()
@@ -205,6 +247,132 @@ mod tests {
             "expected Loaded before Parsed, got {loaded:?}"
         );
         (progress, loaded, parsed)
+    }
+
+    /// Serve `body` as CSS on an ephemeral port, once.
+    fn serve_css(status_line: &str, body: &'static str) -> SocketAddr {
+        serve_once(
+            format!(
+                "{status_line}\r\nContent-Type: text/css\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// Accept **two** connections before answering either. A sequential
+    /// fetcher never opens the second one, so it waits forever on a response
+    /// that will not come and the test times out. This is the structural test
+    /// for "stylesheets are fetched in parallel" (CLAUDE.md: the UI thread
+    /// never blocks) — a wall-clock assertion would only be a guess.
+    fn serve_two_but_only_after_both_connect(body: &'static str) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let mut waiting = Vec::new();
+            for _ in 0..2 {
+                let Ok((stream, _)) = listener.accept() else {
+                    return;
+                };
+                waiting.push(stream);
+            }
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            for mut stream in waiting {
+                let mut req = Vec::new();
+                let mut buf = [0u8; 512];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn a_stylesheet_worker_sends_one_parsed_sheet() {
+        let addr = serve_css("HTTP/1.1 200 OK", "a:link { color: #000 } p { color: red }");
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(FetchId(7), 3, format!("http://{addr}/news.css"), tx);
+
+        let msgs = drain(rx);
+        assert_eq!(msgs.len(), 1, "one message and nothing else: {msgs:?}");
+        match &msgs[0] {
+            Msg::Stylesheet { id, slot, sheet } => {
+                assert_eq!(*id, FetchId(7));
+                // The slot travels with the sheet: it is the document position
+                // the cascade needs, not the arrival order.
+                assert_eq!(*slot, 3);
+                let sheet = sheet.as_ref().expect("a 200 text/css body must parse");
+                assert_eq!(sheet.rules.len(), 2);
+            }
+            other => panic!("expected Stylesheet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_or_unsuccessful_sheet_resolves_to_none() {
+        // A 404's body is an error page, not CSS: parsing it would feed
+        // whatever the recovery path salvages into the cascade.
+        let addr = serve_css("HTTP/1.1 404 Not Found", "<html>nope</html>");
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(FetchId(8), 0, format!("http://{addr}/missing.css"), tx);
+        assert!(matches!(
+            drain(rx).as_slice(),
+            [Msg::Stylesheet {
+                id: FetchId(8),
+                slot: 0,
+                sheet: None
+            }]
+        ));
+
+        // A closed port is the same story: a degraded page, not an error page.
+        let dead = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(FetchId(9), 1, format!("http://{dead}/x.css"), tx);
+        assert!(matches!(
+            drain(rx).as_slice(),
+            [Msg::Stylesheet {
+                id: FetchId(9),
+                slot: 1,
+                sheet: None
+            }]
+        ));
+    }
+
+    #[test]
+    fn stylesheets_are_fetched_in_parallel() {
+        // The server answers nobody until both workers have connected, so this
+        // test cannot pass if the fetches happen one after the other — it
+        // deadlocks and `drain`'s timeout fails it.
+        let addr = serve_two_but_only_after_both_connect("p { color: red }");
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(FetchId(10), 0, format!("http://{addr}/a.css"), tx.clone());
+        spawn_stylesheet(FetchId(10), 1, format!("http://{addr}/b.css"), tx);
+
+        let msgs = drain(rx);
+        assert_eq!(msgs.len(), 2, "one message per sheet: {msgs:?}");
+        let mut slots: Vec<usize> = msgs
+            .iter()
+            .map(|m| match m {
+                Msg::Stylesheet { slot, sheet, .. } => {
+                    assert!(sheet.is_some(), "both sheets must parse");
+                    *slot
+                }
+                other => panic!("expected Stylesheet, got {other:?}"),
+            })
+            .collect();
+        slots.sort_unstable();
+        assert_eq!(slots, vec![0, 1]);
     }
 
     #[test]

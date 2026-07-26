@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use crossterm::event::KeyEvent;
 
+use crate::css::Stylesheet;
 use crate::dom::Dom;
 use crate::net::FetchId;
 
@@ -38,6 +39,20 @@ pub enum Msg {
         id: FetchId,
         dom: Dom,
         elapsed: Duration,
+    },
+    /// One linked stylesheet, from its own worker (M4.3). `slot` is the
+    /// sheet's position in the document's source list, so a sheet that arrives
+    /// second but is written first still cascades first — arrival order must
+    /// never decide a winner.
+    ///
+    /// `sheet: None` means the fetch failed or the response was not a success:
+    /// a missing stylesheet is a *degraded page*, not an error page, so the
+    /// slot resolves to nothing and the rest of the cascade proceeds. Parsing
+    /// happens on the worker for the same reason the HTML parse does.
+    Stylesheet {
+        id: FetchId,
+        slot: usize,
+        sheet: Option<Stylesheet>,
     },
     /// Terminal failure — bad URL, DNS, connect, TLS, mid-body disconnect.
     NetError {
