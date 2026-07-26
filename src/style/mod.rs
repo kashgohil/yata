@@ -10,6 +10,7 @@
 //! styling until M4.4 rewires them onto these values.
 
 pub mod matching;
+pub mod sources;
 pub mod values;
 
 use std::sync::OnceLock;
