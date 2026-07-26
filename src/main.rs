@@ -9,7 +9,7 @@ use crossterm::terminal;
 use yata::browser::app::{App, Effect};
 use yata::msg::Msg;
 use yata::term::{self, Renderer};
-use yata::{html, layout, net};
+use yata::{html, layout, net, style};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -217,8 +217,12 @@ fn run_dump_text(url: &str) -> i32 {
     let rx = headless_fetch(url);
     match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
         Ok((dom, _)) => {
+            // No worker to fetch <link> sheets in a headless run, so the page
+            // is styled by the UA sheet plus its own inline blocks.
+            let sheets = style::sources::inline_sheets(&dom);
+            let styles = style::style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
             let mut text = String::new();
-            for line in layout::layout(&dom, DUMP_TEXT_WIDTH) {
+            for line in layout::layout(&dom, &styles, DUMP_TEXT_WIDTH) {
                 for span in &line.spans {
                     text.push_str(&span.text);
                 }

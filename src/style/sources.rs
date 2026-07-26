@@ -20,6 +20,20 @@ pub enum Source {
     Link(String),
 }
 
+/// The page's inline `<style>` blocks, parsed, in document order. The headless
+/// paths (`--dump-text`, `--timing`) and the ladder tests use this: with no
+/// event loop there is no worker to fetch a `<link>`, so a page is styled by
+/// what it carries with it.
+pub fn inline_sheets(dom: &Dom) -> Vec<crate::css::Stylesheet> {
+    sources(dom)
+        .iter()
+        .filter_map(|source| match source {
+            Source::Inline(css) => Some(crate::css::parse(css)),
+            Source::Link(_) => None,
+        })
+        .collect()
+}
+
 /// Every stylesheet the document asks for, in the order it asks.
 pub fn sources(dom: &Dom) -> Vec<Source> {
     let mut out = Vec::new();

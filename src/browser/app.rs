@@ -308,6 +308,11 @@ impl App {
                 // broken, and the cascade proceeds with what it has.
                 *entry = Some(sheet.unwrap_or_default());
                 self.restyle();
+                // The page is already on screen; this is the "then restyles"
+                // half of UX §3.2, and it is only visible if the new computed
+                // values reach the lines. Relayout is not on the scroll path —
+                // it runs here, on a parse, and on a resize, and nowhere else.
+                self.relayout();
                 redraw()
             }
             Msg::NetError { id, url, reason } => {
@@ -421,11 +426,13 @@ impl App {
     /// its input (the cached tree, the current width) is already here. Moving
     /// it to a worker would buy a frame of latency and cost a round trip.
     fn relayout(&mut self) {
-        let Some(dom) = &self.dom else {
+        // Both or neither: `restyle` runs with every tree that lands, so a
+        // parsed page always has computed values to lay out with.
+        let (Some(dom), Some(styles)) = (&self.dom, &self.styles) else {
             return;
         };
         let started = Instant::now();
-        let lines = layout::layout(dom, column(self.size.0).width);
+        let lines = layout::layout(dom, styles, column(self.size.0).width);
         // The one place `App` reads the clock: fetch and parse are timed by the
         // worker that runs them, but this stage runs here, so it times itself.
         self.timings.layout = Some(started.elapsed());
@@ -1963,7 +1970,9 @@ mod tests {
         let link = frame.get(9, 2);
         assert_eq!(link.ch, 'd');
         assert!(link.attrs.contains(Attrs::UNDERLINE), "link underlined");
-        assert_eq!(link.fg, Color::Ansi(12), "link colored");
+        // The UA sheet's link colour, #5c5cff — the RGB of the ANSI 12 M3
+        // hardcoded, so the pixels are the same and the source is the cascade.
+        assert_eq!(link.fg, Color::Rgb(0x5c, 0x5c, 0xff), "link colored");
         // The space before it belongs to no link: no stray underlined cell.
         assert!(!frame.get(8, 2).attrs.contains(Attrs::UNDERLINE));
     }

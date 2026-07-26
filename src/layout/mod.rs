@@ -11,10 +11,15 @@
 //! not a cell (CJK is two, combining marks are zero) and a byte is not a cell,
 //! so `str::len()` and `chars().count()` appear nowhere in this file.
 //!
-//! This is M3's whole style system: a hardcoded table of what `<h1>` and `<a>`
-//! look like. M4 replaces it with a user-agent stylesheet and a real cascade.
+//! Styling comes from the cascade (M4.4): every node arrives with a
+//! `ComputedStyle`, so this stage no longer knows that `<h1>` is bold or that
+//! `<script>` is invisible — `style/ua.css` says both, and a page can say
+//! otherwise. What stays tag-driven is what M4 has no property for: `<pre>`
+//! whitespace, list bullets and indents, `<br>`, `<hr>`.
 
 use crate::dom::{Dom, NodeData, NodeId};
+use crate::style::Styles;
+use crate::style::values::{ColorValue, Display, FontStyle, FontWeight};
 use crate::term::{Attrs, Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -32,30 +37,24 @@ pub struct Line {
     pub spans: Vec<Span>,
 }
 
-/// Link color. `layout` is pure and cannot see `detect_caps`, so it emits an
-/// ANSI index and leaves truecolor mapping to M4. 12 is bright blue: legible on
-/// both light and dark terminals, and distinct from the `Default` foreground.
-const LINK: Color = Color::Ansi(12);
-
 /// The bullet and the indent it reserves — 2 cells, matching one nesting level.
 const BULLET: &str = "• ";
 
 /// Indent step for a nesting level of list or quote, in cells.
 const INDENT: usize = 2;
 
-/// Subtrees that contribute nothing. `script`/`style` hold code, not prose, and
-/// every ladder page has both; `template` is inert by definition; `head` is
-/// skipped by starting at `<body>`, and listed so a stray in-body `<head>` from
-/// the builder's recovery stays silent too.
-const SKIP: &[&str] = &["head", "script", "style", "template"];
-
-/// Blocks that stand alone: a line break either side and one blank line between
-/// siblings. Exactly the block-level tags the HTML user-agent stylesheet gives a
-/// default vertical margin — the blank line is that margin, drawn in the only
-/// unit a cell grid has. Tags not on the ladder are left unclassified and flow
-/// inline — danluu.com's homemade `<d>` date tag has to sit on the same line as
-/// the link beside it.
-const BLOCK: &[&str] = &[
+/// Blocks that stand alone with a blank line between siblings. This is a
+/// *margin* table, and it stays a table: `display:block` (from the cascade)
+/// decides that a box breaks the line, but the gap between two paragraphs is
+/// `margin`, which M4 has no property for — M5's box model takes this over
+/// along with the rest of the box model. Membership is exactly M3's, so
+/// paragraph spacing does not shift under the cascade landing.
+///
+/// Everything else that is `display:block` — `div`, `li`, `tr`, `td`, the
+/// table wrappers — breaks the line and takes no gap, which is what browsers
+/// give them: zero margin. A blank line there is what once blanked out every
+/// other row of Wikipedia's table of contents and every Hacker News story row.
+const GAP: &[&str] = &[
     "p",
     "h1",
     "h2",
@@ -71,43 +70,15 @@ const BLOCK: &[&str] = &[
     "form",
 ];
 
-/// Blocks that break the line but take no blank-line gap — the zero-margin half
-/// of the same table. Two kinds live here. Items come in runs: a blank between
-/// every one would double the length of danluu.com's 196-item link list, and
-/// danluu is the page the M3 demo gate calls "comfortably readable"; nested
-/// `<ul>`/`<ol>` join them (see `Layouter::element`) for the same reason browsers
-/// zero the margin on a nested list. The rest are pure containers —
-/// `div`/`section`/`header`/`footer`/`nav`/`main`/`aside`/`figcaption`/`center`
-/// and the table wrappers — which no browser gives a margin to. Giving them one
-/// is what put a blank line between every entry of Wikipedia's table of contents
-/// (each is a `<div>` inside its `<li>`) and inside every Hacker News story row
-/// (an empty vote-arrow `<div>` between the rank and the title).
-const TIGHT: &[&str] = &[
-    "li",
-    "tr",
-    "td",
-    "th",
-    "div",
-    "section",
-    "figcaption",
-    "header",
-    "footer",
-    "nav",
-    "main",
-    "aside",
-    "center",
-    "table",
-    "tbody",
-];
-
 /// Lay the document out at `width` cells. Lines never exceed `width` — a
 /// guarantee that holds while the content width left after the indent is above
 /// zero — except inside `<pre>`, which does not wrap: clipping overflow is the
 /// painter's job (M3.2). Where an indent has eaten the whole width, forward
 /// progress wins over the bound, because one cell per line beats a hang.
-pub fn layout(dom: &Dom, width: u16) -> Vec<Line> {
+pub fn layout(dom: &Dom, styles: &Styles, width: u16) -> Vec<Line> {
     let mut l = Layouter {
         dom,
+        styles,
         width: width as usize,
         out: Vec::new(),
         cur: Vec::new(),
@@ -126,7 +97,7 @@ pub fn layout(dom: &Dom, width: u16) -> Vec<Line> {
     // hand-built arena rather than pretending a missing body is an error.
     let start = body(dom).unwrap_or(dom.root);
     for child in dom.children(start) {
-        l.walk(child, Style::default(), false);
+        l.walk(child, false);
     }
     l.flush(false);
     l.out
@@ -148,25 +119,66 @@ fn body(dom: &Dom) -> Option<NodeId> {
     None
 }
 
-/// Default styling — M3's entire style system, folded into the user-agent
-/// stylesheet in M4. `i`/`em`/`code` deliberately pass through unstyled: the
-/// terminal's italic is widely unsupported and a cell grid has no second
-/// typeface to switch to.
-fn tag_style(tag: &str, inherited: Style) -> Style {
-    match tag {
-        // Headings and bold are the only emphasis M3 has; styles nest, so a
-        // bold link ends up BOLD | UNDERLINE with the link color.
-        "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "b" | "strong" => Style {
-            attrs: inherited.attrs | Attrs::BOLD,
-            ..inherited
-        },
-        // Underline carries the affordance where color is unavailable.
-        "a" => Style {
-            fg: LINK,
-            attrs: inherited.attrs | Attrs::UNDERLINE,
-            ..inherited
-        },
-        _ => inherited,
+/// A node's computed values as terminal style. No nesting or inheritance here:
+/// the cascade already did both, so a node's own values are final.
+///
+/// `background-color` is computed but not painted. Filling a text run's cells
+/// while the gutter beside it stays bare looks worse than not filling at all;
+/// real background fills need boxes, which is M5.
+fn term_style(computed: &crate::style::ComputedStyle) -> Style {
+    let mut attrs = Attrs::NONE;
+    if computed.font_weight == FontWeight::Bold {
+        attrs = attrs | Attrs::BOLD;
+    }
+    // M3 dropped italics on the grounds that terminals rendered them badly.
+    // The UA sheet asks for them on `<i>`/`<em>`, and modern terminals oblige.
+    if computed.font_style == FontStyle::Italic {
+        attrs = attrs | Attrs::ITALIC;
+    }
+    if computed.underline {
+        attrs = attrs | Attrs::UNDERLINE;
+    }
+    Style {
+        fg: term_color(computed.color),
+        bg: Color::Default,
+        attrs,
+    }
+}
+
+/// A computed colour as a terminal colour — with the one rule a terminal
+/// browser needs and a real browser does not.
+///
+/// A page declares colours against a background it also controls. This browser
+/// controls neither: the terminal's background could be anything, and there is
+/// no portable way to ask. Honouring `color:#000000` faithfully paints black
+/// text into a black terminal and the page disappears — and `#000` is what
+/// Hacker News sets on every link, and near enough what most of the web sets
+/// on its body copy.
+///
+/// So the two ends of the luminance range — where a colour risks matching the
+/// background — fall back to the terminal's own foreground, which is legible
+/// by definition. Everything between renders exactly as written:
+/// HN `#000000` (0.00) and white `#ffffff` (1.00) become `Default`, while
+/// Wikipedia's `#202122` (0.13) does too, and danluu's `#5c5cff` (0.41) and
+/// example.com's `#334488` (0.27) keep their colour.
+///
+/// This is a readability choice over fidelity, and it is two constants wide if
+/// the trade ever wants reversing.
+fn term_color(color: ColorValue) -> Color {
+    const TOO_DARK: f32 = 0.20;
+    const TOO_LIGHT: f32 = 0.85;
+    match color {
+        ColorValue::Default => Color::Default,
+        ColorValue::Rgb(r, g, b) => {
+            // Relative luminance, ITU-R BT.709 coefficients.
+            let luma =
+                (0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)) / 255.0;
+            if !(TOO_DARK..=TOO_LIGHT).contains(&luma) {
+                Color::Default
+            } else {
+                Color::Rgb(r, g, b)
+            }
+        }
     }
 }
 
@@ -187,6 +199,9 @@ struct Piece<'a> {
 
 struct Layouter<'a> {
     dom: &'a Dom,
+    /// The cascade's output for this tree: what every node looks like, and
+    /// whether it renders at all.
+    styles: &'a Styles,
     width: usize,
     out: Vec<Line>,
     /// Spans of the line being built.
@@ -224,27 +239,33 @@ struct Layouter<'a> {
 }
 
 impl<'a> Layouter<'a> {
-    fn walk(&mut self, id: NodeId, style: Style, pre: bool) {
+    fn walk(&mut self, id: NodeId, pre: bool) {
         // Copied out so the borrow lives as long as the arena, not as long as
         // `&self` — the walk mutates `self` while reading node data, and the
         // run buffer holds `&'a str` into these text nodes across the walk.
         let dom: &'a Dom = self.dom;
         match &dom.node(id).data {
             NodeData::Text(text) => {
+                // A text node carries its parent's inherited values (M4.2), so
+                // its own computed style is the run's style.
+                let style = term_style(self.styles.get(id));
                 if pre {
                     self.pre_text(text, style)
                 } else {
                     self.flow_text(text, style)
                 }
             }
-            NodeData::Element { tag, .. } => self.element(id, tag, style, pre),
+            NodeData::Element { tag, .. } => self.element(id, tag, pre),
             // Comments, doctypes and the document node never render.
             NodeData::Comment(_) | NodeData::Doctype(_) | NodeData::Document => {}
         }
     }
 
-    fn element(&mut self, id: NodeId, tag: &str, style: Style, pre: bool) {
-        if SKIP.contains(&tag) {
+    fn element(&mut self, id: NodeId, tag: &str, pre: bool) {
+        // The whole subtree goes. `<head>`, `<script>` and `<style>` land here
+        // because ua.css says `display:none`, and so does anything a page
+        // hides — layout no longer keeps a list of names it distrusts.
+        if self.styles.get(id).display == Display::None {
             return;
         }
         match tag {
@@ -253,13 +274,14 @@ impl<'a> Layouter<'a> {
             _ => {}
         }
 
-        let style = tag_style(tag, style);
         let pre = pre || tag == "pre";
         let list = tag == "ul" || tag == "ol";
-        // A nested list takes no gap of its own — it is part of the item above
+        // `display:block` decides that a box breaks the line either side of
+        // itself; the GAP table decides whether it also owes a blank line. A
+        // nested list takes no gap of its own — it is part of the item above
         // it, the way a browser zeroes the margin on a nested list.
-        let block = BLOCK.contains(&tag) && !(list && self.list_depth > 0);
-        let boxed = block || TIGHT.contains(&tag) || list;
+        let boxed = self.styles.get(id).display == Display::Block;
+        let block = boxed && GAP.contains(&tag) && !(list && self.list_depth > 0);
 
         if block {
             self.block_gap();
@@ -276,7 +298,7 @@ impl<'a> Layouter<'a> {
 
         let dom = self.dom;
         for child in dom.children(id) {
-            self.walk(child, style, pre);
+            self.walk(child, pre);
         }
 
         // Closing the box comes before its indent and bullet are torn down: the
@@ -536,7 +558,7 @@ impl<'a> Layouter<'a> {
     }
 }
 
-/// Lines as text, with styles as markers: `[b]bold[/]`, `[u c12]link[/]`,
+/// Lines as text, with styles as markers: `[b]bold[/]`, `[u #5c5cff]link[/]`,
 /// unstyled runs verbatim. Tests pin rendering as a string this way, and M3.2's
 /// painter tests reuse it. No escaping — fixtures must not contain `[`.
 pub fn debug_lines(lines: &[Line]) -> String {
@@ -555,8 +577,8 @@ pub fn debug_lines(lines: &[Line]) -> String {
             }
             let color = match span.style.fg {
                 Color::Ansi(n) => format!("c{n}"),
-                // Default, and Rgb, which nothing emits in M3.
-                _ => String::new(),
+                Color::Rgb(r, g, b) => format!("#{r:02x}{g:02x}{b:02x}"),
+                Color::Default => String::new(),
             };
             if markers.is_empty() && color.is_empty() {
                 out.push_str(&span.text);
@@ -579,9 +601,28 @@ mod tests {
     use super::*;
     use crate::html::parse;
 
+    /// Lay a tree out with **user-agent styling only**, shadowing the real
+    /// `layout` for the tests below. Most of them are about boxes and
+    /// wrapping, and threading an empty stylesheet through every call site
+    /// would say nothing; the tests that are about the cascade build their
+    /// styles explicitly (see `lines_styled`).
+    fn layout(dom: &Dom, width: u16) -> Vec<Line> {
+        let styles = crate::style::style_tree(dom, &[]);
+        super::layout(dom, &styles, width)
+    }
+
     /// Lay `html` out at `width` and render it with style markers.
     fn lines(html: &str, width: u16) -> String {
         debug_lines(&layout(&parse(html), width))
+    }
+
+    /// The same, but with `css` as the page's stylesheet — the cascade
+    /// reaching layout, which is what M4.4 added.
+    fn lines_styled(html: &str, css: &str, width: u16) -> String {
+        let dom = parse(html);
+        let sheet = crate::css::parse(css);
+        let styles = crate::style::style_tree(&dom, &[&sheet]);
+        debug_lines(&super::layout(&dom, &styles, width))
     }
 
     /// Cell width of a laid-out line, spans included.
@@ -611,7 +652,7 @@ mod tests {
         assert_eq!(lines("<div>a</div><div>b</div>", 20), "a\nb\n");
         assert_eq!(
             lines("<nav><a href=x>a</a></nav><p>b</p>", 20),
-            "[u c12]a[/]\n\nb\n"
+            "[u #5c5cff]a[/]\n\nb\n"
         );
         assert_eq!(
             lines(
@@ -619,7 +660,7 @@ mod tests {
                  <li><a href=y><div>2 Taxonomy</div></a></li></ul>",
                 20
             ),
-            "• [u c12]1 Etymology[/]\n• [u c12]2 Taxonomy[/]\n"
+            "• [u #5c5cff]1 Etymology[/]\n• [u #5c5cff]2 Taxonomy[/]\n"
         );
     }
 
@@ -636,7 +677,7 @@ mod tests {
                  <td><a href=x>Title</a></td></tr></table>",
                 20
             ),
-            "1.\n[u c12]Title[/]\n"
+            "1.\n[u #5c5cff]Title[/]\n"
         );
     }
 
@@ -696,13 +737,13 @@ mod tests {
         // stranding the `)` on a line of its own.
         assert_eq!(
             lines("<p>aaa (<a href=x>bbbbb</a>)</p>", 10),
-            "aaa\n([u c12]bbbbb[/])\n"
+            "aaa\n([u #5c5cff]bbbbb[/])\n"
         );
         // Same rule around Wikipedia's citation marks: the full stop and the
         // superscript stay welded to the word they follow.
         assert_eq!(
             lines("<p>aaaa <a href=x>bbb</a>.<sup>[54]</sup></p>", 10),
-            "aaaa\n[u c12]bbb[/].[54]\n"
+            "aaaa\n[u #5c5cff]bbb[/].[54]\n"
         );
     }
 
@@ -713,7 +754,7 @@ mod tests {
         // the style it came in with.
         assert_eq!(
             lines("<p><a href=x>aaaa</a>bbbb</p>", 3),
-            "[u c12]aaa[/]\n[u c12]a[/]bb\nbb\n"
+            "[u #5c5cff]aaa[/]\n[u #5c5cff]a[/]bb\nbb\n"
         );
     }
 
@@ -799,7 +840,7 @@ mod tests {
         assert_eq!(lines("<h1>Hi</h1>", 20), "[b]Hi[/]\n");
         assert_eq!(
             lines("<p>see <a href=x>docs</a></p>", 20),
-            "see [u c12]docs[/]\n"
+            "see [u #5c5cff]docs[/]\n"
         );
     }
 
@@ -809,13 +850,13 @@ mod tests {
         // painter writes the whole link in one call — while the space after it
         // is neutral and merges with the text that follows.
         let out = layout(&parse("<p><a href=x>two words</a> after</p>"), 40);
-        assert_eq!(debug_lines(&out), "[u c12]two words[/] after\n");
+        assert_eq!(debug_lines(&out), "[u #5c5cff]two words[/] after\n");
         assert_eq!(out[0].spans.len(), 2);
     }
 
     #[test]
     fn styles_nest() {
-        assert_eq!(lines("<b><a href=x>x</a></b>", 20), "[bu c12]x[/]\n");
+        assert_eq!(lines("<b><a href=x>x</a></b>", 20), "[bu #5c5cff]x[/]\n");
     }
 
     #[test]
@@ -837,7 +878,104 @@ mod tests {
         // breaks it rather than welding them into one run.
         assert_eq!(
             lines("<p><a href=u>kensai</a> <a href=i>3 hours ago</a></p>", 40),
-            "[u c12]kensai[/] [u c12]3 hours ago[/]\n"
+            "[u #5c5cff]kensai[/] [u #5c5cff]3 hours ago[/]\n"
+        );
+    }
+
+    // ---- the cascade reaching layout (M4.4) -------------------------------
+
+    #[test]
+    fn a_page_can_hide_its_own_content() {
+        // Half the M4 demo gate. `display:none` is no longer a list of tag
+        // names layout distrusts — it is whatever the cascade computed, so a
+        // page hiding its own nav works the same way <script> does.
+        assert_eq!(
+            lines_styled(
+                "<p>seen</p><div class=ad><p>gone</p></div><p>also seen</p>",
+                ".ad { display: none }",
+                20
+            ),
+            "seen\n\nalso seen\n"
+        );
+    }
+
+    #[test]
+    fn display_decides_what_breaks_the_line_not_the_tag_name() {
+        // A span made block breaks either side of itself...
+        assert_eq!(
+            lines_styled("a<span>b</span>c", "span { display: block }", 20),
+            "a\nb\nc\n"
+        );
+        // ...and a paragraph made inline stops breaking, gap and all. The two
+        // words glue together because the source has no whitespace between
+        // `</p>` and `<p>` — which is what a browser does with inline boxes
+        // too, and the reason the spaced variant below is the interesting one.
+        assert_eq!(
+            lines_styled("<p>a</p><p>b</p>", "p { display: inline }", 20),
+            "ab\n"
+        );
+        // The contrast is the point: same markup, one stylesheet apart. (The
+        // words glue because the tree builder drops whitespace between two
+        // blocks — there is no space node in the DOM to collapse.)
+        assert_eq!(lines("<p>a</p><p>b</p>", 20), "a\n\nb\n");
+    }
+
+    #[test]
+    fn a_pages_colour_reaches_the_span_and_inherits_into_it() {
+        assert_eq!(
+            lines_styled("<p>text</p>", "p { color: #348 }", 20),
+            "[#334488]text[/]\n"
+        );
+        // Bold from the UA sheet, colour inherited from the block: the cascade
+        // composed them, and layout no longer nests styles itself.
+        assert_eq!(
+            lines_styled("<p>a <b>b</b></p>", "p { color: #348 }", 20),
+            "[#334488]a [/][b #334488]b[/]\n"
+        );
+    }
+
+    #[test]
+    fn em_is_italic_now_that_the_ua_sheet_says_so() {
+        // A deliberate change from M3, which dropped italics on the grounds
+        // that terminals rendered them badly. ua.css asks for them; modern
+        // terminals oblige.
+        assert_eq!(lines("<em>x</em>", 20), "[i]x[/]\n");
+        assert_eq!(lines("<i>x</i>", 20), "[i]x[/]\n");
+    }
+
+    #[test]
+    fn colours_that_could_vanish_fall_back_to_the_terminals_own() {
+        // Black text into a black terminal is the failure this prevents, and
+        // `#000` is exactly what Hacker News sets on every link. White is the
+        // same problem on a light terminal. Both render as the terminal's
+        // foreground — no marker at all.
+        assert_eq!(
+            lines_styled("<p>hn</p>", "p { color: #000000 }", 20),
+            "hn\n"
+        );
+        assert_eq!(lines_styled("<p>w</p>", "p { color: #ffffff }", 20), "w\n");
+        // Wikipedia's body colour is near-black too, and would be unreadable.
+        assert_eq!(lines_styled("<p>w</p>", "p { color: #202122 }", 20), "w\n");
+        // Anything with room on both sides keeps its colour, including the UA
+        // sheet's own link blue.
+        assert_eq!(
+            lines_styled("<p>d</p>", "p { color: #5c5cff }", 20),
+            "[#5c5cff]d[/]\n"
+        );
+        assert_eq!(
+            lines_styled("<p>e</p>", "p { color: #348 }", 20),
+            "[#334488]e[/]\n"
+        );
+    }
+
+    #[test]
+    fn background_colour_is_computed_but_not_painted_yet() {
+        // M5 owns background fills. Filling a text run's cells while the
+        // gutter beside it stays bare looks worse than not filling at all, so
+        // the value is carried and ignored — deliberately, not by omission.
+        assert_eq!(
+            lines_styled("<p>x</p>", "p { background-color: #eee }", 20),
+            "x\n"
         );
     }
 
@@ -860,7 +998,7 @@ mod tests {
         // them and M3 has no CSS to add one; M4's cascade is what fixes that.
         assert_eq!(
             lines("<ul><li><d>07/26</d><a href=x>Post</a></li></ul>", 20),
-            "• 07/26[u c12]Post[/]\n"
+            "• 07/26[u #5c5cff]Post[/]\n"
         );
     }
 
@@ -903,8 +1041,10 @@ mod ladder {
         line.spans.iter().map(|s| s.text.width()).sum()
     }
 
+    /// The user-agent sheet's link styling as it reaches a cell: `#5c5cff`
+    /// (the RGB of ANSI 12, which M3 hardcoded) and underlined.
     fn is_link(span: &Span) -> bool {
-        span.style.fg == LINK && span.style.attrs.contains(Attrs::UNDERLINE)
+        span.style.fg == Color::Rgb(0x5c, 0x5c, 0xff) && span.style.attrs.contains(Attrs::UNDERLINE)
     }
 
     /// Whether the tree holds a `<pre>` anywhere. Asked of the parsed tree, not
@@ -930,7 +1070,11 @@ mod ladder {
         // page has a `<pre>`, the one box that may overflow the column. If a
         // refreshed fixture ever brings one in, this says why the bound broke.
         assert!(!has_pre(&dom), "fixture gained a <pre>");
-        let lines = layout(&dom, COLUMN);
+        // Ladder pages lay out with their own inline CSS, exactly as
+        // `--dump-text` renders them.
+        let sheets = crate::style::sources::inline_sheets(&dom);
+        let styles = crate::style::style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
+        let lines = super::layout(&dom, &styles, COLUMN);
         assert!(lines.len() >= min_lines, "only {} lines", lines.len());
         for (i, line) in lines.iter().enumerate() {
             let cells = cells(line);
