@@ -1013,6 +1013,40 @@ mod tests {
     }
 
     #[test]
+    fn a_late_sheet_repaints_the_page_it_arrives_for() {
+        // "Render unstyled, then restyle" (UX §3.2) is only real if the new
+        // values reach the pixels. The page is on screen with UA styling; the
+        // sheet lands; the next frame is different.
+        let mut app = App::new(40, 10);
+        let (id, _) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='x.css'></head><body><p>plain</p></body>",
+        );
+        // x=1: the readable column is centred, so column zero is gutter.
+        let mut before = Frame::new(40, 10);
+        app.draw(&mut before);
+        assert_eq!(before.get(1, 0).attrs, Attrs::NONE, "unstyled to start");
+        let laid_out = app.layouts;
+
+        assert_eq!(
+            app.update(Msg::Stylesheet {
+                id,
+                slot: 0,
+                sheet: sheet("p { font-weight: bold; color: #348 }"),
+            }),
+            redraw()
+        );
+
+        let mut after = Frame::new(40, 10);
+        app.draw(&mut after);
+        assert!(after.get(1, 0).attrs.contains(Attrs::BOLD));
+        assert_eq!(after.get(1, 0).fg, Color::Rgb(0x33, 0x44, 0x88));
+        // Exactly one relayout for the sheet — not none (the lines are cached,
+        // so nothing would change on screen) and not several.
+        assert_eq!(app.layouts, laid_out + 1);
+    }
+
+    #[test]
     fn inline_style_blocks_need_no_round_trip() {
         let mut app = App::new(40, 10);
         let (_, effect) = open_page(
