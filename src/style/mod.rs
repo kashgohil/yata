@@ -454,3 +454,166 @@ mod tests {
         assert_eq!(p.color, RED);
     }
 }
+
+/// Ladder proof: run the real stage over the committed fixtures. Two things
+/// are checked here that no hand-built document can check — that the rule
+/// index agrees with the naive matcher on pages with thousands of rules, and
+/// that the cascade produces the values these pages are supposed to show.
+#[cfg(test)]
+mod ladder {
+    use super::*;
+    use crate::html;
+    use crate::style::matching::RuleIndex;
+    use crate::style::values::{ColorValue, Display, FontWeight};
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/",
+                $name
+            ))
+        };
+    }
+
+    /// Every `<style>` block in the page. Reaching them through the DOM is a
+    /// stand-in until M4.3 gives stylesheet collection a real home.
+    fn author_sheets(dom: &Dom) -> Vec<Stylesheet> {
+        fn collect(dom: &Dom, id: NodeId, out: &mut Vec<Stylesheet>) {
+            if matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "style") {
+                let mut text = String::new();
+                for child in dom.children(id) {
+                    if let NodeData::Text(t) = &dom.node(child).data {
+                        text.push_str(t);
+                    }
+                }
+                out.push(css::parse(&text));
+                return;
+            }
+            for child in dom.children(id) {
+                collect(dom, child, out);
+            }
+        }
+        let mut out = Vec::new();
+        collect(dom, dom.root, &mut out);
+        out
+    }
+
+    fn elements(dom: &Dom) -> Vec<NodeId> {
+        let mut out = Vec::new();
+        let mut stack = vec![dom.root];
+        while let Some(id) = stack.pop() {
+            if matches!(dom.node(id).data, NodeData::Element { .. }) {
+                out.push(id);
+            }
+            stack.extend(dom.children(id));
+        }
+        out
+    }
+
+    fn find(dom: &Dom, tag: &str) -> NodeId {
+        elements(dom)
+            .into_iter()
+            .filter(
+                |&id| matches!(&dom.node(id).data, NodeData::Element { tag: t, .. } if t == tag),
+            )
+            .min_by_key(|id| id.0)
+            .expect("fixture is missing that tag")
+    }
+
+    /// The index and the naive matcher must agree on every element of the page,
+    /// against the UA sheet plus the page's own. A rule index that is fast
+    /// because it quietly misses rules is not an optimization, and M4.5's
+    /// bench of the two is only meaningful if they compute the same answer.
+    fn index_agrees_with_oracle(source: &str) -> Dom {
+        let dom = html::parse(source);
+        let mut sheets = vec![ua_stylesheet().clone()];
+        sheets.extend(author_sheets(&dom));
+        let index = RuleIndex::build(&sheets);
+        let mut matched = 0;
+        for node in elements(&dom) {
+            let fast: Vec<usize> = index.matches(&dom, node).iter().map(|c| c.order).collect();
+            let naive: Vec<usize> = index
+                .matches_naive(&dom, node)
+                .iter()
+                .map(|c| c.order)
+                .collect();
+            assert_eq!(fast, naive, "node {node:?}");
+            matched += fast.len();
+        }
+        // A page where nothing matched would pass the comparison above while
+        // proving nothing about the buckets.
+        assert!(matched > 0, "no rule matched anything");
+        dom
+    }
+
+    fn styled(source: &str) -> (Dom, Styles) {
+        let dom = html::parse(source);
+        let sheets = author_sheets(&dom);
+        let styles = style_tree(&dom, &sheets);
+        (dom, styles)
+    }
+
+    #[test]
+    fn example_com_shows_its_own_colours() {
+        let dom = index_agrees_with_oracle(fixture!("example.com.html"));
+        let sheets = author_sheets(&dom);
+        let styles = style_tree(&dom, &sheets);
+        // `body{background:#eee}` — the shorthand, honoured because the whole
+        // value is a colour.
+        assert_eq!(
+            styles.get(find(&dom, "body")).background_color,
+            ColorValue::Rgb(0xee, 0xee, 0xee)
+        );
+        // `a:link{color:#348}` beats the UA sheet's link colour, and the UA
+        // sheet's underline survives because the page never mentions it.
+        let a = styles.get(find(&dom, "a"));
+        assert_eq!(a.color, ColorValue::Rgb(0x33, 0x44, 0x88));
+        assert!(a.underline);
+    }
+
+    #[test]
+    fn motherfuckingwebsite_com_is_pure_user_agent_styling() {
+        let (dom, styles) = styled(fixture!("motherfuckingwebsite.com.html"));
+        // The page ships no CSS at all: everything it looks like comes from
+        // ua.css, which is the point of having one.
+        let h1 = styles.get(find(&dom, "h1"));
+        assert_eq!(h1.font_weight, FontWeight::Bold);
+        assert_eq!(h1.display, Display::Block);
+        assert_eq!(styles.get(find(&dom, "p")).display, Display::Block);
+    }
+
+    #[test]
+    fn danluu_com_keeps_its_links_and_its_flex_list() {
+        let dom = index_agrees_with_oracle(fixture!("danluu.com.html"));
+        let styles = style_tree(&dom, &author_sheets(&dom));
+        let a = styles.get(find(&dom, "a"));
+        assert!(a.underline);
+        assert_eq!(a.color, ColorValue::Rgb(0x5c, 0x5c, 0xff));
+        // `li{display:flex}` from the page's own sheet: flex is not a mode M4
+        // implements, and mapping it to Block is what keeps the list stacked
+        // instead of collapsing onto one line.
+        assert_eq!(styles.get(find(&dom, "li")).display, Display::Block);
+    }
+
+    #[test]
+    fn news_ycombinator_com_resolves_without_its_external_sheet() {
+        // HN's styling lives in news.css, which M4.3 will fetch; today the page
+        // is UA-styled only, and must still come out sane rather than empty.
+        let dom = index_agrees_with_oracle(fixture!("news.ycombinator.com.html"));
+        let styles = style_tree(&dom, &author_sheets(&dom));
+        assert_eq!(styles.get(find(&dom, "table")).display, Display::Block);
+        assert!(styles.get(find(&dom, "a")).underline);
+    }
+
+    #[test]
+    fn en_wikipedia_org_styles_every_node() {
+        let dom = index_agrees_with_oracle(fixture!("en.wikipedia.org.html"));
+        let styles = style_tree(&dom, &author_sheets(&dom));
+        // 1.5 MB of real markup, 21 inline sheets and 222 style attributes:
+        // every node gets a slot, and the ones the page styles get its values.
+        assert_eq!(styles.computed.len(), dom.node_count());
+        assert_eq!(styles.get(find(&dom, "h1")).font_weight, FontWeight::Bold);
+        assert_eq!(styles.get(find(&dom, "head")).display, Display::None);
+    }
+}
