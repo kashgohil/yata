@@ -90,6 +90,13 @@ impl Dom {
         id
     }
 
+    /// How many nodes the arena holds. Every `NodeId` is below this, which is
+    /// what lets the styled tree (M4.2) be a dense `Vec` indexed by id rather
+    /// than a map.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
     /// Borrow a node by id.
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id.0 as usize]
@@ -179,6 +186,16 @@ mod tests {
         };
         let kids: Vec<NodeId> = dom.children(dom.root).collect();
         assert_eq!(kids, vec![div, comment]);
+    }
+
+    #[test]
+    fn node_count_covers_every_id() {
+        let (dom, div, text, comment) = sample();
+        // Document + div + text + comment, and every id is a valid index.
+        assert_eq!(dom.node_count(), 4);
+        for id in [dom.root, div, text, comment] {
+            assert!((id.0 as usize) < dom.node_count());
+        }
     }
 
     #[test]

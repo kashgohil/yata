@@ -1,0 +1,37 @@
+/* User-agent stylesheet — how bare HTML looks before any page says otherwise.
+   Every browser has one of these; this is yata's, and it is real CSS parsed by
+   the engine's own parser (M4.1) rather than a table in Rust. That is
+   deliberate: it keeps "what <h1> looks like" editable without a rebuild of
+   the cascade, and it is a second proof that the parser handles the CSS this
+   project writes.
+
+   Folded in here are M3's hardcoded styles. What could NOT come along is the
+   blank line between paragraphs: that is a margin, and M4 has no margins.
+   layout/mod.rs keeps its BLOCK/TIGHT split until M5 lands the box model. */
+
+/* Not rendered. <head> content, and the two elements whose text is code. */
+head, meta, link, base, title, style, script, template, noscript { display: none }
+
+/* Everything that breaks the line. M3's BLOCK and TIGHT tables both land here
+   — display:block is only the line-breaking half of what they encoded. */
+html, body, article, section, nav, aside, header, footer, main, div, p,
+h1, h2, h3, h4, h5, h6, ul, ol, li, dl, dt, dd, blockquote, pre, figure,
+figcaption, form, fieldset, hr, address, center,
+table, thead, tbody, tfoot, tr, td, th, caption { display: block }
+
+h1, h2, h3, h4, h5, h6, b, strong, th { font-weight: bold }
+
+i, em, cite, var, dfn, address { font-style: italic }
+
+th, caption { text-align: center }
+
+/* Links: bright blue and underlined, which is what M3 hardcoded. #5c5cff is
+   the RGB of ANSI colour 12, so M4.4's nearest-256 mapping lands back on the
+   exact colour the terminal draws today and the rendering does not shift.
+   :link is every <a href> until history exists (M6). */
+a:link { color: #5c5cff; text-decoration: underline }
+
+/* Deliberately absent: `center { text-align: center }`, which is what the
+   element means. M4 has no box widths to centre within, so paint would centre
+   every line inside the column — and news.ycombinator.com wraps its whole
+   page in <center>. M5's real alignment can have it. */
