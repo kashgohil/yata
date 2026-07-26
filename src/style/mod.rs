@@ -618,4 +618,66 @@ mod ladder {
         assert_eq!(styles.get(find(&dom, "h1")).font_weight, FontWeight::Bold);
         assert_eq!(styles.get(find(&dom, "head")).display, Display::None);
     }
+
+    /// The first `<a href>` inside an element carrying `class`, in document
+    /// order. HN styles links differently depending on where they sit, which
+    /// is the point of the test below.
+    fn first_link_under_class(dom: &Dom, class: &str) -> NodeId {
+        fn walk(dom: &Dom, id: NodeId, class: &str, inside: bool) -> Option<NodeId> {
+            let inside = inside
+                || dom
+                    .attr(id, "class")
+                    .is_some_and(|c| c.split_whitespace().any(|t| t == class));
+            if inside
+                && matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "a")
+                && dom.attr(id, "href").is_some()
+            {
+                return Some(id);
+            }
+            dom.children(id)
+                .find_map(|child| walk(dom, child, class, inside))
+        }
+        walk(dom, dom.root, class, false).expect("no link under that class")
+    }
+
+    /// The whole chain, offline: HN's markup plus HN's real stylesheet, the
+    /// one the page links and M4.3 fetches. Everything before this test styled
+    /// pages from inline blocks only.
+    #[test]
+    fn news_ycombinator_com_styled_by_its_own_linked_sheet() {
+        let dom = html::parse(fixture!("news.ycombinator.com.html"));
+        // Exactly what a worker would deliver for the page's one <link>.
+        let sheet = css::parse(fixture!("news.ycombinator.com.news.css"));
+        let styles = style_tree(&dom, &[&sheet]);
+
+        // `a:link { color:#000000; text-decoration:none }` — the page beating
+        // the UA sheet on both properties. HN's links really are black and
+        // undecorated, and this is the first fixture where an author sheet
+        // *removes* UA styling rather than adding to it.
+        let story = styles.get(first_link_under_class(&dom, "titleline"));
+        assert_eq!(story.color, ColorValue::Rgb(0, 0, 0));
+        assert!(!story.underline, "news.css turns the UA underline off");
+
+        // `.subtext a:link { color:#828282 }` beats the bare `a:link` above on
+        // specificity — (0,2,1) against (0,1,1) — so two links on the same page
+        // come out different colours. Real-page proof that the cascade orders
+        // by specificity and not by source position.
+        let subtext = styles.get(first_link_under_class(&dom, "subtext"));
+        assert_eq!(subtext.color, ColorValue::Rgb(0x82, 0x82, 0x82));
+
+        // `body { color:#828282 }` inherits down to a cell with no rule of its
+        // own, through markup the page never styles directly.
+        assert_eq!(
+            styles.get(find(&dom, "body")).color,
+            ColorValue::Rgb(0x82, 0x82, 0x82)
+        );
+
+        // The sheet is real-world CSS: 12 @media blocks and attribute
+        // selectors that M4 drops on purpose. It must still deliver rules.
+        assert!(
+            sheet.rules.len() > 20,
+            "recovery dropped too much: {} rules",
+            sheet.rules.len()
+        );
+    }
 }
