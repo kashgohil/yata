@@ -82,8 +82,8 @@ pub fn ua_stylesheet() -> &'static Stylesheet {
 
 /// Resolve every node's computed values against the UA sheet, the page's
 /// sheets in order, and each element's `style=""` attribute.
-pub fn style_tree(dom: &Dom, sheets: &[Stylesheet]) -> Styles {
-    let ua = RuleIndex::build(std::slice::from_ref(ua_stylesheet()));
+pub fn style_tree(dom: &Dom, sheets: &[&Stylesheet]) -> Styles {
+    let ua = RuleIndex::build(&[ua_stylesheet()]);
     let author = RuleIndex::build(sheets);
     let mut styles = Styles {
         computed: vec![ComputedStyle::default(); dom.node_count()],
@@ -250,8 +250,8 @@ mod tests {
     /// Style `html_src` with `css_src` as its only author sheet.
     fn styled(html_src: &str, css_src: &str) -> (Dom, Styles) {
         let dom = html::parse(html_src);
-        let sheets = vec![css::parse(css_src)];
-        let styles = style_tree(&dom, &sheets);
+        let sheets = [css::parse(css_src)];
+        let styles = style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
         (dom, styles)
     }
 
@@ -528,8 +528,9 @@ mod ladder {
     /// bench of the two is only meaningful if they compute the same answer.
     fn index_agrees_with_oracle(source: &str) -> Dom {
         let dom = html::parse(source);
-        let mut sheets = vec![ua_stylesheet().clone()];
-        sheets.extend(author_sheets(&dom));
+        let mut sheets = vec![ua_stylesheet()];
+        let author = author_sheets(&dom);
+        sheets.extend(author.iter());
         let index = RuleIndex::build(&sheets);
         let mut matched = 0;
         for node in elements(&dom) {
@@ -551,7 +552,7 @@ mod ladder {
     fn styled(source: &str) -> (Dom, Styles) {
         let dom = html::parse(source);
         let sheets = author_sheets(&dom);
-        let styles = style_tree(&dom, &sheets);
+        let styles = style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
         (dom, styles)
     }
 
@@ -559,7 +560,7 @@ mod ladder {
     fn example_com_shows_its_own_colours() {
         let dom = index_agrees_with_oracle(fixture!("example.com.html"));
         let sheets = author_sheets(&dom);
-        let styles = style_tree(&dom, &sheets);
+        let styles = style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
         // `body{background:#eee}` — the shorthand, honoured because the whole
         // value is a colour.
         assert_eq!(
@@ -587,7 +588,7 @@ mod ladder {
     #[test]
     fn danluu_com_keeps_its_links_and_its_flex_list() {
         let dom = index_agrees_with_oracle(fixture!("danluu.com.html"));
-        let styles = style_tree(&dom, &author_sheets(&dom));
+        let styles = style_tree(&dom, &author_sheets(&dom).iter().collect::<Vec<_>>());
         let a = styles.get(find(&dom, "a"));
         assert!(a.underline);
         assert_eq!(a.color, ColorValue::Rgb(0x5c, 0x5c, 0xff));
@@ -602,7 +603,7 @@ mod ladder {
         // HN's styling lives in news.css, which M4.3 will fetch; today the page
         // is UA-styled only, and must still come out sane rather than empty.
         let dom = index_agrees_with_oracle(fixture!("news.ycombinator.com.html"));
-        let styles = style_tree(&dom, &author_sheets(&dom));
+        let styles = style_tree(&dom, &author_sheets(&dom).iter().collect::<Vec<_>>());
         assert_eq!(styles.get(find(&dom, "table")).display, Display::Block);
         assert!(styles.get(find(&dom, "a")).underline);
     }
@@ -610,7 +611,7 @@ mod ladder {
     #[test]
     fn en_wikipedia_org_styles_every_node() {
         let dom = index_agrees_with_oracle(fixture!("en.wikipedia.org.html"));
-        let styles = style_tree(&dom, &author_sheets(&dom));
+        let styles = style_tree(&dom, &author_sheets(&dom).iter().collect::<Vec<_>>());
         // 1.5 MB of real markup, 21 inline sheets and 222 style attributes:
         // every node gets a slot, and the ones the page styles get its values.
         assert_eq!(styles.computed.len(), dom.node_count());

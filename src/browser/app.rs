@@ -5,10 +5,13 @@ use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
+use crate::css::Stylesheet;
 use crate::dom::Dom;
 use crate::layout;
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
+use crate::style::sources::{self, Source};
+use crate::style::{self, Styles};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
@@ -25,6 +28,12 @@ pub struct Effect {
     /// to hand to `net::spawn_fetch`. `App` starts the fetch generation; the
     /// loop owns the worker thread. Keeps `App` pure of the network.
     pub fetch: Option<(FetchId, String)>,
+    /// Linked stylesheets to fetch, as (fetch id, document slot, absolute URL).
+    /// The loop spawns one worker each, in the same turn — they must not queue
+    /// behind one another (PLAN.md M4: fetched in parallel), and the page is
+    /// already on screen while they run. Same discipline as `fetch`: `App`
+    /// decides, the loop spawns.
+    pub sheets: Vec<(FetchId, usize, String)>,
 }
 
 /// Where the current fetch stands. `Loaded` retains the raw body for the
@@ -99,6 +108,16 @@ pub struct App {
     dom_view_built: bool,
     /// Whether the `F1` DOM surface replaces the page area.
     dom_visible: bool,
+    /// The page's author stylesheets, one slot per source in **document
+    /// order**: `<style>` blocks filled the moment the tree lands, linked ones
+    /// `None` until their worker reports. Indexing by document position is
+    /// what stops a sheet that arrives first from cascading first.
+    sheets: Vec<Option<Stylesheet>>,
+    /// The styled tree for `dom` and the sheets that have arrived so far.
+    /// Recomputed as each one lands — the page renders with what it has and
+    /// restyles, rather than blocking on a round trip (UX §3.2). Nothing draws
+    /// from it until M4.4 moves layout onto computed values.
+    styles: Option<Styles>,
     /// How many times `relayout` has run. Test-only instrumentation for the
     /// invariant that costs the most if it ever breaks: scrolling relayouts
     /// zero times, a resize exactly once.
@@ -123,6 +142,8 @@ impl App {
             dom_view: Viewport::default(),
             dom_view_built: false,
             dom_visible: false,
+            sheets: Vec::new(),
+            styles: None,
             #[cfg(test)]
             layouts: 0,
         }
@@ -226,6 +247,11 @@ impl App {
                 // and a table mixing stages from two runs would lie.
                 self.dom = None;
                 self.dom_view_built = false;
+                // The old page's stylesheets go with its tree: a sheet from
+                // the page being replaced must not style the new one. Workers
+                // already in flight for it are stale by `FetchId` anyway.
+                self.sheets.clear();
+                self.styles = None;
                 self.timings.parse = None;
                 // Layout goes with it, for the same reason: this run has a
                 // fetch time and nothing else yet.
@@ -245,6 +271,10 @@ impl App {
                 }
                 self.dom = Some(dom);
                 self.timings.parse = Some(elapsed);
+                // The page's own CSS: inline blocks are in hand and resolve
+                // now, linked ones go out to the loop and land later.
+                let sheets = self.adopt_sources(id);
+                self.restyle();
                 // One of exactly two places layout runs. The page surface
                 // switches from the raw body to laid-out lines here, which is
                 // also what makes `dom.is_some()` mean "the viewport holds
@@ -257,12 +287,29 @@ impl App {
                 if self.dom_visible {
                     self.build_dom_view();
                 }
+                Effect {
+                    dirty: true,
+                    sheets,
+                    ..Effect::default()
+                }
+            }
+            Msg::Stylesheet { id, slot, sheet } => {
+                // Same stale-generation guard as every other net message: a
+                // sheet requested by a page the user has already navigated
+                // away from must not touch the current one.
+                if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                let Some(entry) = self.sheets.get_mut(slot) else {
+                    return Effect::default();
+                };
+                // A failed fetch resolves the slot to an empty sheet rather
+                // than leaving it pending forever: the page is degraded, not
+                // broken, and the cascade proceeds with what it has.
+                *entry = Some(sheet.unwrap_or_default());
+                self.restyle();
                 redraw()
             }
-            // Nothing collects stylesheets yet — the App side of M4.3 is the
-            // next commit. Until then a sheet that somehow arrives changes
-            // nothing rather than being a compile error.
-            Msg::Stylesheet { .. } => Effect::default(),
             Msg::NetError { id, url, reason } => {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
@@ -389,6 +436,65 @@ impl App {
         self.viewport.set_lines(lines, self.page());
     }
 
+    /// Take the freshly parsed tree's stylesheet sources: parse the inline
+    /// blocks now, and return the linked ones for the loop to fetch. Slots are
+    /// allocated for every source up front, so document order survives however
+    /// the network reorders the arrivals.
+    ///
+    /// Inline blocks parse on the UI thread because their bytes are already
+    /// here — the round trip to a worker would cost more than the parse. The
+    /// measured worst case in the fixtures is Wikipedia's 21 blocks; the
+    /// number is in perf.md.
+    fn adopt_sources(&mut self, id: FetchId) -> Vec<(FetchId, usize, String)> {
+        let Some(dom) = &self.dom else {
+            return Vec::new();
+        };
+        // Relative hrefs resolve against the page's post-redirect URL, which is
+        // exactly what `Fetch::Loaded` holds; the `Loaded` for this generation
+        // always precedes its `Parsed` (same worker, in order).
+        let base = match &self.fetch {
+            Fetch::Loaded { url, .. } => Some(url.clone()),
+            _ => None,
+        };
+        let mut pending = Vec::new();
+        self.sheets = sources::sources(dom)
+            .into_iter()
+            .enumerate()
+            .map(|(slot, source)| match source {
+                Source::Inline(css) => Some(crate::css::parse(&css)),
+                Source::Link(href) => {
+                    match base
+                        .as_deref()
+                        .and_then(|base| net::resolve_url(base, &href))
+                    {
+                        Some(url) => {
+                            pending.push((id, slot, url));
+                            None
+                        }
+                        // Unresolvable href: settle the slot empty instead of
+                        // leaving a hole nothing will ever fill.
+                        None => Some(Stylesheet::default()),
+                    }
+                }
+            })
+            .collect();
+        pending
+    }
+
+    /// Recompute the styled tree from the tree and whatever sheets have
+    /// arrived. Called when a page parses and when each sheet lands — never on
+    /// the scroll path (CLAUDE.md: scrolling never restyles).
+    fn restyle(&mut self) {
+        let Some(dom) = &self.dom else {
+            self.styles = None;
+            return;
+        };
+        // Sheets that have not arrived are simply absent from this pass; the
+        // next arrival runs it again.
+        let sheets: Vec<&Stylesheet> = self.sheets.iter().flatten().collect();
+        self.styles = Some(style::style_tree(dom, &sheets));
+    }
+
     /// Render `dom` into the F1 surface's lines at the current size, if it
     /// isn't already. Called only at the two moments the tree is about to be
     /// shown (see `dom_view_built`); every scroll and repaint in between
@@ -426,9 +532,9 @@ impl App {
         self.mode = Mode::Browse;
         let id = self.start_fetch(url.clone());
         Effect {
-            quit: false,
             dirty: true,
             fetch: Some((id, url)),
+            ..Effect::default()
         }
     }
 
@@ -727,6 +833,188 @@ mod tests {
             body,
             elapsed: Duration::ZERO,
         })
+    }
+
+    // ---- stylesheet sources (M4.3) ----------------------------------------
+
+    /// Load and parse `html` as one page, returning the `Parsed` effect (which
+    /// carries the linked sheets the loop would spawn workers for).
+    fn open_page(app: &mut App, html_src: &str) -> (FetchId, Effect) {
+        let id = app.start_fetch("http://site.test/dir/page".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://site.test/dir/page".into(),
+            status: 200,
+            body: html_src.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+        });
+        let effect = app.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(html_src),
+            elapsed: Duration::ZERO,
+        });
+        (id, effect)
+    }
+
+    /// The computed colour of the first element with `tag`, from the styled
+    /// tree `App` holds. Nothing paints from it until M4.4; this is how the
+    /// cascade is observed until then.
+    fn computed_color(app: &App, tag: &str) -> crate::style::values::ColorValue {
+        let dom = app.dom.as_ref().expect("page must be parsed");
+        let styles = app.styles.as_ref().expect("page must be styled");
+        let mut stack = vec![dom.root];
+        let mut best: Option<crate::dom::NodeId> = None;
+        while let Some(id) = stack.pop() {
+            if matches!(&dom.node(id).data, crate::dom::NodeData::Element { tag: t, .. } if t == tag)
+            {
+                best = Some(best.map_or(id, |b| if id.0 < b.0 { id } else { b }));
+            }
+            stack.extend(dom.children(id));
+        }
+        styles.get(best.expect("tag not in the page")).color
+    }
+
+    fn sheet(css: &str) -> Option<crate::css::Stylesheet> {
+        Some(crate::css::parse(css))
+    }
+
+    const RED: crate::style::values::ColorValue = crate::style::values::ColorValue::Rgb(255, 0, 0);
+    const BLUE: crate::style::values::ColorValue = crate::style::values::ColorValue::Rgb(0, 0, 255);
+
+    #[test]
+    fn a_parse_asks_the_loop_for_every_linked_sheet_and_shows_the_page_anyway() {
+        let mut app = App::new(40, 10);
+        let (id, effect) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='a.css'><link rel=stylesheet href='/b.css'></head>\
+             <body><p>hello</p></body>",
+        );
+        // Both links go out in one turn, resolved against the page URL — the
+        // loop spawns a worker each, so they run in parallel.
+        assert_eq!(
+            effect.sheets,
+            vec![
+                (id, 0, "http://site.test/dir/a.css".to_string()),
+                (id, 1, "http://site.test/b.css".to_string()),
+            ]
+        );
+        // And the page is on screen already: nothing waited for a round trip.
+        assert!(effect.dirty);
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        assert!(
+            (0..9).any(|y| row_text(&frame, y).contains("hello")),
+            "the page must render before its stylesheets arrive"
+        );
+        // Two pending slots, styled with what exists so far (the UA sheet).
+        assert_eq!(app.sheets.len(), 2);
+        assert!(app.sheets.iter().all(|s| s.is_none()));
+        assert!(app.styles.is_some());
+    }
+
+    #[test]
+    fn sheets_cascade_in_document_order_however_they_arrive() {
+        let mut app = App::new(40, 10);
+        let (id, _) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='first.css'><link rel=stylesheet href='second.css'>\
+             </head><body><p>hello</p></body>",
+        );
+        // The *second* sheet in the document arrives first. Equal specificity,
+        // so the document's later sheet must win — arrival order deciding this
+        // would make the page's appearance depend on the network.
+        app.update(Msg::Stylesheet {
+            id,
+            slot: 1,
+            sheet: sheet("p { color: blue }"),
+        });
+        assert_eq!(computed_color(&app, "p"), BLUE);
+        app.update(Msg::Stylesheet {
+            id,
+            slot: 0,
+            sheet: sheet("p { color: red }"),
+        });
+        assert_eq!(computed_color(&app, "p"), BLUE);
+    }
+
+    #[test]
+    fn an_arriving_sheet_restyles_and_redraws() {
+        let mut app = App::new(40, 10);
+        let (id, _) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='x.css'></head><body><a href='/y'>link</a></body>",
+        );
+        // Before: the UA sheet's link colour.
+        assert_eq!(
+            computed_color(&app, "a"),
+            crate::style::values::ColorValue::Rgb(0x5c, 0x5c, 0xff)
+        );
+        assert_eq!(
+            app.update(Msg::Stylesheet {
+                id,
+                slot: 0,
+                sheet: sheet("a:link { color: red }"),
+            }),
+            redraw()
+        );
+        assert_eq!(computed_color(&app, "a"), RED);
+    }
+
+    #[test]
+    fn a_failed_sheet_settles_its_slot_instead_of_hanging_it() {
+        let mut app = App::new(40, 10);
+        let (id, _) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='gone.css'></head><body><p>hi</p></body>",
+        );
+        app.update(Msg::Stylesheet {
+            id,
+            slot: 0,
+            sheet: None,
+        });
+        // Resolved (not pending), empty, and the page still styles.
+        assert_eq!(app.sheets, vec![Some(crate::css::Stylesheet::default())]);
+        assert!(app.styles.is_some());
+    }
+
+    #[test]
+    fn a_sheet_from_a_superseded_page_is_ignored() {
+        let mut app = App::new(40, 10);
+        let (stale, _) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='x.css'></head><body><p>one</p></body>",
+        );
+        // Navigate: a new generation, and the old page's sheets go with it.
+        let (_, effect) = open_page(&mut app, "<body><p>two</p></body>");
+        assert!(effect.sheets.is_empty());
+        assert!(app.sheets.is_empty(), "the old page's slots must be gone");
+
+        // The stale worker reports late. It must change nothing — and must not
+        // panic on a slot the new page does not have.
+        assert_eq!(
+            app.update(Msg::Stylesheet {
+                id: stale,
+                slot: 0,
+                sheet: sheet("p { color: red }"),
+            }),
+            Effect::default()
+        );
+        assert_eq!(
+            computed_color(&app, "p"),
+            crate::style::values::ColorValue::Default
+        );
+    }
+
+    #[test]
+    fn inline_style_blocks_need_no_round_trip() {
+        let mut app = App::new(40, 10);
+        let (_, effect) = open_page(
+            &mut app,
+            "<head><style>p { color: red }</style></head><body><p>hi</p></body>",
+        );
+        // Nothing to fetch, and the colour is already applied on this turn.
+        assert!(effect.sheets.is_empty());
+        assert_eq!(computed_color(&app, "p"), RED);
     }
 
     #[test]

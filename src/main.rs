@@ -100,6 +100,12 @@ fn main() -> io::Result<()> {
         if let Some((id, url)) = effect.fetch {
             net::spawn_fetch(id, url, tx.clone());
         }
+        // One worker per linked stylesheet, all spawned before this turn's
+        // render: they run in parallel with each other and with the page the
+        // user is already reading (PLAN.md M4, UX §3.2).
+        for (id, slot, url) in effect.sheets {
+            net::spawn_stylesheet(id, slot, url, tx.clone());
+        }
         if effect.dirty {
             render(&mut app, &mut renderer, &mut out)?;
         }
@@ -294,6 +300,10 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         if e.fetch.is_some() {
             effect.fetch = e.fetch;
         }
+        // Sheets accumulate rather than replace: two parses in one batch each
+        // want their own sheets fetched, and a stale generation's are dropped
+        // by the id guard in `App::update`, not here.
+        effect.sheets.extend(e.sheets);
         if e.quit {
             effect.quit = true;
             break;

@@ -40,7 +40,10 @@ pub struct RuleIndex<'a> {
 }
 
 impl<'a> RuleIndex<'a> {
-    pub fn build(sheets: &'a [Stylesheet]) -> RuleIndex<'a> {
+    /// Borrowed sheets, not owned: `App` keeps each page's stylesheets in
+    /// document-order slots and restyles every time one arrives, so an index
+    /// that took ownership would clone every rule on every arrival.
+    pub fn build(sheets: &[&'a Stylesheet]) -> RuleIndex<'a> {
         let mut index = RuleIndex {
             candidates: Vec::new(),
             by_id: HashMap::new(),
@@ -48,7 +51,7 @@ impl<'a> RuleIndex<'a> {
             by_tag: HashMap::new(),
             universal: Vec::new(),
         };
-        for sheet in sheets {
+        for sheet in sheets.iter().copied() {
             for rule in &sheet.rules {
                 for selector in &rule.selectors {
                     let Some((_, rightmost)) = selector.parts.last() else {
@@ -313,12 +316,12 @@ mod tests {
     #[test]
     fn the_index_proposes_what_the_naive_matcher_finds() {
         let dom = html::parse("<div id='main'><p class='a b'>x</p><span>y</span></div>");
-        let sheets = vec![parse(
+        let sheets = [parse(
             "p { color: 1 } .a { color: 2 } .b { color: 3 } #main p { color: 4 } \
              * { color: 5 } span { color: 6 } #main { color: 7 } div > p { color: 8 } \
              .missing { color: 9 } h1 { color: 10 }",
         )];
-        let index = RuleIndex::build(&sheets);
+        let index = RuleIndex::build(&sheets.iter().collect::<Vec<_>>());
         assert_eq!(index.candidate_count(), 10);
 
         for tag in ["div", "p", "span"] {
@@ -340,8 +343,8 @@ mod tests {
     #[test]
     fn a_duplicated_class_proposes_a_candidate_once() {
         let dom = html::parse("<p class='a a'>x</p>");
-        let sheets = vec![parse(".a { color: red }")];
-        let index = RuleIndex::build(&sheets);
+        let sheets = [parse(".a { color: red }")];
+        let index = RuleIndex::build(&sheets.iter().collect::<Vec<_>>());
         assert_eq!(index.matches(&dom, find(&dom, "p")).len(), 1);
     }
 }
