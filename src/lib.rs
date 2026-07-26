@@ -5,6 +5,7 @@
 //! those stay public for it as much as for the binary.
 
 pub mod browser;
+pub mod css;
 pub mod dom;
 pub mod html;
 pub mod layout;
