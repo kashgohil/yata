@@ -611,3 +611,137 @@ mod tests {
         assert_eq!(parse_declarations("color").len(), 0);
     }
 }
+
+/// Ladder proof: parse the CSS the committed fixtures actually ship, reached
+/// through the HTML parser rather than a regex — `<style>` content is raw text
+/// to the tokenizer, and going through the DOM is what proves the two front
+/// ends agree about where a stylesheet begins and ends.
+///
+/// These pin the sheets the M4 demo gate will be judged on: example.com's four
+/// rules are the page's entire appearance.
+#[cfg(test)]
+mod ladder {
+    use super::*;
+    use crate::dom::{Dom, NodeData, NodeId};
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/",
+                $name
+            ))
+        };
+    }
+
+    /// Every `<style>` element's text, in document order.
+    fn style_blocks(html: &str) -> Vec<String> {
+        let dom = crate::html::parse(html);
+        let mut out = Vec::new();
+        collect(&dom, dom.root, &mut out);
+        out
+    }
+
+    fn collect(dom: &Dom, id: NodeId, out: &mut Vec<String>) {
+        if matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "style") {
+            let mut text = String::new();
+            for child in dom.children(id) {
+                if let NodeData::Text(t) = &dom.node(child).data {
+                    text.push_str(t);
+                }
+            }
+            out.push(text);
+            return;
+        }
+        for child in dom.children(id) {
+            collect(dom, child, out);
+        }
+    }
+
+    fn tag_of(rule: &Rule) -> Option<&str> {
+        rule.selectors[0].parts[0].1.tag.as_deref()
+    }
+
+    #[test]
+    fn example_com_is_four_rules_and_a_link_colour() {
+        let blocks = style_blocks(fixture!("example.com.html"));
+        assert_eq!(blocks.len(), 1);
+        let sheet = parse(&blocks[0]);
+
+        assert_eq!(
+            sheet.rules.iter().map(tag_of).collect::<Vec<_>>(),
+            vec![Some("body"), Some("h1"), Some("div"), Some("a")]
+        );
+        // Declarations M4 will not implement (`width`, `font-family`) are still
+        // parsed and carried: dropping unknown properties is the cascade's
+        // decision, not the parser's.
+        assert_eq!(
+            sheet.rules[0]
+                .declarations
+                .iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["background", "width", "margin", "font-family"]
+        );
+
+        // `a:link,a:visited{color:#348}` — one rule, two selectors, and the
+        // reason PseudoClass::Link exists at all.
+        let link = sheet.rules.last().unwrap();
+        assert_eq!(link.selectors.len(), 2);
+        assert_eq!(link.selectors[0].parts[0].1.pseudo, vec![PseudoClass::Link]);
+        assert_eq!(
+            link.selectors[1].parts[0].1.pseudo,
+            vec![PseudoClass::Visited]
+        );
+        assert_eq!(
+            link.declarations,
+            vec![Declaration {
+                name: "color".into(),
+                value: "#348".into(),
+                important: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn danluu_com_keeps_its_homemade_tag_and_class_rules() {
+        let blocks = style_blocks(fixture!("danluu.com.html"));
+        assert_eq!(blocks.len(), 1);
+        let sheet = parse(&blocks[0]);
+        assert_eq!(
+            sheet.rules.iter().map(tag_of).collect::<Vec<_>>(),
+            vec![Some("d"), Some("li"), Some("ul"), None]
+        );
+
+        // `d{width:4em}` — danluu's invented <d> tag, which the layout tests
+        // already care about.
+        assert_eq!(sheet.rules[0].declarations[0].value, "4em");
+        // `.np{...}` — a class-only selector with five declarations, one of
+        // which (`display:flex`) M4 parses and M9 finally honours.
+        let np = sheet.rules.last().unwrap();
+        assert_eq!(np.selectors[0].parts[0].1.classes, vec!["np".to_string()]);
+        assert_eq!(np.declarations.len(), 5);
+        assert_eq!(np.declarations[0].name, "display");
+        assert_eq!(np.declarations[0].value, "flex");
+    }
+
+    /// The 1.5 MB article: 21 inline sheets of real-world MediaWiki CSS, full
+    /// of syntax M4 does not implement. The per-block rule counts are pinned so
+    /// a future recovery change shows up as a diff rather than as rules quietly
+    /// appearing or vanishing.
+    #[test]
+    fn wikipedia_parses_every_style_block() {
+        let blocks = style_blocks(fixture!("en.wikipedia.org.html"));
+        let counts: Vec<usize> = blocks.iter().map(|b| parse(b).rules.len()).collect();
+        assert_eq!(
+            counts,
+            vec![
+                3, 8, 3, 16, 24, 4, 5, 8, 2, 2, 5, 5, 9, 15, 7, 0, 13, 17, 1, 12, 1
+            ]
+        );
+        // Block 15 is two `@media` blocks and nothing else: zero rules is the
+        // spec'd outcome, not a parse failure. Flattening it would invert a
+        // dark-mode image filter on every terminal.
+        assert!(blocks[15].starts_with("@media screen{"));
+    }
+}
