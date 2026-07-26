@@ -30,14 +30,13 @@ pub enum NodeData {
 /// leaves no children, ends of a sibling run no neighbour on that side.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Node {
-    // `parent` and `prev_sibling` are written by `append_child` and exercised by
-    // this module's tests, but no non-test caller reads them yet — style (parent,
-    // for inheritance) and sibling selectors are the first. Kept because the arena
-    // is only correct with both link directions.
-    #[allow(dead_code)]
     pub parent: Option<NodeId>,
     pub first_child: Option<NodeId>,
     pub last_child: Option<NodeId>,
+    // `prev_sibling` is written by `append_child` and exercised by this module's
+    // tests, but no non-test caller reads it yet — sibling selectors (`+`, `~`)
+    // are the first, and M4 does not implement them. Kept because the arena is
+    // only correct with both link directions.
     #[allow(dead_code)]
     pub prev_sibling: Option<NodeId>,
     pub next_sibling: Option<NodeId>,
@@ -106,9 +105,6 @@ impl Dom {
 
     /// Look up an attribute on an element by name, ASCII-case-insensitively (HTML
     /// attribute names are case-insensitive). `None` on non-elements or a miss.
-    // Exercised by tests today; the F1 inspector and selector matching (M2.3/M4)
-    // are the first non-test readers.
-    #[allow(dead_code)]
     pub fn attr(&self, id: NodeId, name: &str) -> Option<&str> {
         match &self.nodes[id.0 as usize].data {
             NodeData::Element { attrs, .. } => attrs

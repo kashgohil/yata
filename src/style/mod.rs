@@ -9,6 +9,7 @@
 //! Nothing renders differently yet: layout and paint keep M3's hardcoded
 //! styling until M4.4 rewires them onto these values.
 
+pub mod matching;
 pub mod values;
 
 use values::{ColorValue, Display, FontStyle, FontWeight, TextAlign};
