@@ -9,8 +9,19 @@
    blank line between paragraphs: that is a margin, and M4 has no margins.
    layout/mod.rs keeps its BLOCK/TIGHT split until M5 lands the box model. */
 
-/* Not rendered. <head> content, and the two elements whose text is code. */
-head, meta, link, base, title, style, script, template, noscript { display: none }
+/* Not rendered, and not negotiable: `!important` in a user-agent sheet is the
+   one thing a page cannot override (M4.2's cascade ranks). These elements hold
+   code, metadata or inert markup, never prose — a page that says
+   `script { display: block }`, or a selector this engine mis-parses into one,
+   must not be able to dump JavaScript source into what someone is reading.
+   This is a reader-first departure from what a browser does, and the reason
+   the top cascade rank exists. */
+head, meta, link, base, title, style, script, template { display: none !important }
+
+/* `<noscript>` is deliberately NOT in that list. A browser hides it because it
+   runs scripts; yata does not (JS is M10), so its content — the "enable
+   JavaScript" notice, the static fallback, the plain <img> or link a page
+   offers scripting-less clients — is exactly what this reader should see. */
 
 /* Everything that breaks the line. M3's BLOCK and TIGHT tables both land here
    — display:block is only the line-breaking half of what they encoded. */

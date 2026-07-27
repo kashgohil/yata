@@ -182,8 +182,14 @@ fn compound_matches(dom: &Dom, node: NodeId, compound: &Compound) -> bool {
     let NodeData::Element { tag, .. } = &dom.node(node).data else {
         return false;
     };
+    // Exact comparison, and it must stay exact: `RuleIndex` buckets selectors
+    // by tag under a plain `HashMap` lookup, so a case-insensitive compare here
+    // would make the index and the naive matcher disagree on an uppercase tag —
+    // silently, since the fast path would simply never propose the rule.
+    // Both sides are lowercase by construction: the HTML tokenizer lowercases
+    // tag names (M2.1) and the CSS parser lowercases type selectors (M4.1).
     if let Some(want) = &compound.tag
-        && !tag.eq_ignore_ascii_case(want)
+        && tag != want
     {
         return false;
     }
@@ -266,8 +272,12 @@ mod tests {
     }
 
     #[test]
-    fn tag_matching_ignores_source_case() {
+    fn tag_case_is_normalized_before_matching_ever_sees_it() {
+        // The parsers lowercase both sides — the tokenizer the tags, the CSS
+        // parser the type selectors — which is what lets the index bucket by
+        // tag with an exact hash lookup. This pins the invariant end to end.
         assert!(hit("<DIV><P>x</P></DIV>", "p", "div p"));
+        assert!(hit("<div><p>x</p></div>", "p", "DIV P"));
     }
 
     #[test]

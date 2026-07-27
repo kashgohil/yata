@@ -218,9 +218,14 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) {
         "display" => set(&mut computed.display, values::parse_display(value)),
         "color" => set(&mut computed.color, values::parse_color(value)),
         "background-color" => set(&mut computed.background_color, values::parse_color(value)),
-        // The `background` shorthand, honoured only when the whole value is a
-        // colour (`background:#eee`, which is example.com's). Anything with an
-        // image or a position in it is left alone rather than half-applied.
+        // The `background` shorthand, honoured for the two spellings that
+        // resolve to a colour: a bare colour (`background:#eee`, which is
+        // example.com's) and `none`, which resets to the initial value the way
+        // the shorthand is defined to. Anything with an image or a position in
+        // it is left alone rather than half-applied.
+        "background" if value.trim().eq_ignore_ascii_case("none") => {
+            computed.background_color = ColorValue::default();
+        }
         "background" => set(&mut computed.background_color, values::parse_color(value)),
         "font-weight" => set(&mut computed.font_weight, values::parse_font_weight(value)),
         "font-style" => set(&mut computed.font_style, values::parse_font_style(value)),
@@ -436,6 +441,48 @@ mod tests {
 
         assert_eq!(styles.get(find(&dom, "script")).display, Display::None);
         assert_eq!(styles.get(find(&dom, "head")).display, Display::None);
+    }
+
+    #[test]
+    fn a_page_cannot_unhide_the_elements_that_hold_code() {
+        // The UA sheet's `!important` — the top cascade rank, and the reason it
+        // exists. A browser lets `script { display: block }` print the source;
+        // a reader-first browser must not, whether the page means it or the
+        // engine mis-parsed a selector into it.
+        let (dom, styles) = styled(
+            "<body><script>var x = 1</script><p>text</p></body>",
+            "script, head, style { display: block !important }",
+        );
+        assert_eq!(styles.get(find(&dom, "script")).display, Display::None);
+        assert_eq!(styles.get(find(&dom, "head")).display, Display::None);
+        // Everything else the UA sheet says stays overridable, as it should be.
+        let (dom, styles) = styled("<p>t</p>", "p { display: inline }");
+        assert_eq!(styles.get(find(&dom, "p")).display, Display::Inline);
+    }
+
+    #[test]
+    fn noscript_content_is_for_us() {
+        // A browser hides <noscript> because it runs scripts. yata does not
+        // until M10, so the fallback a page offers scripting-less clients is
+        // exactly what its reader should get.
+        let (dom, styles) = styled("<noscript><p>No JS? Fine.</p></noscript>", "");
+        assert_ne!(styles.get(find(&dom, "noscript")).display, Display::None);
+        assert_eq!(styles.get(find(&dom, "p")).display, Display::Block);
+    }
+
+    #[test]
+    fn the_background_shorthand_can_reset_as_well_as_set() {
+        // `background: none` is the shorthand resetting to its initial value.
+        // Dropping it as "not a colour" left the old colour standing, which is
+        // the one thing a reset must not do.
+        let (dom, styles) = styled(
+            "<p>x</p>",
+            "p { background-color: red } p { background: none }",
+        );
+        assert_eq!(
+            styles.get(find(&dom, "p")).background_color,
+            ColorValue::Default
+        );
     }
 
     #[test]
