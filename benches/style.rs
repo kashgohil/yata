@@ -118,7 +118,9 @@ fn matching_at_scale(c: &mut Criterion) {
     );
 
     let mut group = c.benchmark_group("2000 unmatched rules");
-    group.sample_size(10).measurement_time(Duration::from_secs(15));
+    group
+        .sample_size(10)
+        .measurement_time(Duration::from_secs(15));
     group.bench_function("rule index", |b| {
         b.iter(|| {
             let mut hits = 0;
