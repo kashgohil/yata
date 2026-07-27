@@ -70,15 +70,56 @@ const GAP: &[&str] = &[
     "form",
 ];
 
+/// Whether `display:none` is honoured (M4 review).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Hidden {
+    /// What the cascade said. The normal path.
+    Respect,
+    /// Render hidden boxes anyway — except the ones the user-agent sheet
+    /// locked (`hidden_by_ua`: script, style, metadata). Only
+    /// `layout_readable` asks for this, and only when respecting the cascade
+    /// would leave the reader with a blank screen.
+    Reveal,
+}
+
+/// Lay the document out, and if honouring `display:none` leaves nothing to
+/// read, lay it out again revealing what the page hid. Returns the lines and
+/// whether that fallback fired.
+///
+/// The pattern this exists for is everywhere: a page sets `html{display:none}`
+/// or hides its content behind a `.js-loading` wrapper, and a script reveals
+/// it on load. A browser runs the script; yata will not until M10. Honouring
+/// the rule faithfully means a reader with a perfectly good document in memory
+/// gets a blank screen — the worst outcome a browser has, and worse than
+/// showing something the page meant to hide for a few hundred milliseconds.
+///
+/// The second pass costs a layout, and only on pages that came out empty.
+pub fn layout_readable(dom: &Dom, styles: &Styles, width: u16) -> (Vec<Line>, bool) {
+    let lines = layout(dom, styles, width, Hidden::Respect);
+    if lines.iter().any(|line| !line.spans.is_empty()) {
+        return (lines, false);
+    }
+    // Nothing came out. If the page has readable content behind its own
+    // `display:none`, show that rather than a blank page; if it does not, the
+    // page really is empty and the first answer stands.
+    let revealed = layout(dom, styles, width, Hidden::Reveal);
+    if revealed.iter().any(|line| !line.spans.is_empty()) {
+        (revealed, true)
+    } else {
+        (lines, false)
+    }
+}
+
 /// Lay the document out at `width` cells. Lines never exceed `width` — a
 /// guarantee that holds while the content width left after the indent is above
 /// zero — except inside `<pre>`, which does not wrap: clipping overflow is the
 /// painter's job (M3.2). Where an indent has eaten the whole width, forward
 /// progress wins over the bound, because one cell per line beats a hang.
-pub fn layout(dom: &Dom, styles: &Styles, width: u16) -> Vec<Line> {
+pub fn layout(dom: &Dom, styles: &Styles, width: u16, hidden: Hidden) -> Vec<Line> {
     let mut l = Layouter {
         dom,
         styles,
+        hidden,
         width: width as usize,
         out: Vec::new(),
         cur: Vec::new(),
@@ -92,31 +133,18 @@ pub fn layout(dom: &Dom, styles: &Styles, width: u16) -> Vec<Line> {
         list_depth: 0,
         marker: None,
     };
-    // The builder synthesizes a `<body>` for every page, including danluu.com,
-    // which ships without the tag. The fallback keeps `layout` total for a
-    // hand-built arena rather than pretending a missing body is an error.
-    let start = body(dom).unwrap_or(dom.root);
-    for child in dom.children(start) {
+    // The walk starts at the document, not at `<body>`: `<head>` disappears
+    // because ua.css says `display:none`, exactly as everything else does.
+    // Starting lower would mean `<html>` and `<body>` never had their own
+    // computed `display` consulted, so a page that hides itself with
+    // `body { display: none }` would render as though it had not — a decision
+    // `layout_readable` should make deliberately, not this function by
+    // accident.
+    for child in dom.children(dom.root) {
         l.walk(child, false);
     }
     l.flush(false);
     l.out
-}
-
-/// The first `<body>` element in document order.
-fn body(dom: &Dom) -> Option<NodeId> {
-    let mut stack = vec![dom.root];
-    while let Some(id) = stack.pop() {
-        if let NodeData::Element { tag, .. } = &dom.node(id).data
-            && tag == "body"
-        {
-            return Some(id);
-        }
-        // Reversed so the walk leaves the arena in document order.
-        let kids: Vec<NodeId> = dom.children(id).collect();
-        stack.extend(kids.into_iter().rev());
-    }
-    None
 }
 
 /// A node's computed values as terminal style. No nesting or inheritance here:
@@ -202,6 +230,8 @@ struct Layouter<'a> {
     /// The cascade's output for this tree: what every node looks like, and
     /// whether it renders at all.
     styles: &'a Styles,
+    /// Whether `display:none` is honoured on this pass.
+    hidden: Hidden,
     width: usize,
     out: Vec<Line>,
     /// Spans of the line being built.
@@ -265,7 +295,14 @@ impl<'a> Layouter<'a> {
         // The whole subtree goes. `<head>`, `<script>` and `<style>` land here
         // because ua.css says `display:none`, and so does anything a page
         // hides — layout no longer keeps a list of names it distrusts.
-        if self.styles.get(id).display == Display::None {
+        //
+        // On a `Reveal` pass the page's own hiding is ignored, but the
+        // user-agent sheet's `!important` hiding is not: rescuing a page from
+        // its own loading spinner must never mean printing its JavaScript.
+        let computed = self.styles.get(id);
+        if computed.display == Display::None
+            && (self.hidden == Hidden::Respect || computed.hidden_by_ua)
+        {
             return;
         }
         match tag {
@@ -608,7 +645,7 @@ mod tests {
     /// styles explicitly (see `lines_styled`).
     fn layout(dom: &Dom, width: u16) -> Vec<Line> {
         let styles = crate::style::style_tree(dom, &[]);
-        super::layout(dom, &styles, width)
+        super::layout(dom, &styles, width, Hidden::Respect)
     }
 
     /// Lay `html` out at `width` and render it with style markers.
@@ -622,7 +659,7 @@ mod tests {
         let dom = parse(html);
         let sheet = crate::css::parse(css);
         let styles = crate::style::style_tree(&dom, &[&sheet]);
-        debug_lines(&super::layout(&dom, &styles, width))
+        debug_lines(&super::layout(&dom, &styles, width, Hidden::Respect))
     }
 
     /// Cell width of a laid-out line, spans included.
@@ -907,6 +944,75 @@ mod tests {
         assert_eq!(lines("<ul><li>a</li>\n<li>b</li></ul>", 20), "• a\n• b\n");
     }
 
+    // ---- never a blank page (M4 review) -----------------------------------
+
+    fn readable(html: &str, css: &str, width: u16) -> (String, bool) {
+        let dom = parse(html);
+        let sheet = crate::css::parse(css);
+        let styles = crate::style::style_tree(&dom, &[&sheet]);
+        let (lines, revealed) = layout_readable(&dom, &styles, width);
+        (debug_lines(&lines), revealed)
+    }
+
+    #[test]
+    fn a_page_that_hides_itself_is_shown_anyway() {
+        // The anti-FOUC pattern: hide everything, reveal it from a script. A
+        // browser runs the script; yata will not until M10, so honouring the
+        // rule faithfully hands the reader a blank screen with the article
+        // sitting in memory.
+        for hider in [
+            "html { display: none }",
+            "body { display: none }",
+            // The wrapper form, which a rule about <html>/<body> would miss.
+            ".js-loading { display: none }",
+        ] {
+            let (text, revealed) = readable(
+                "<body><div class='js-loading'><p>the article</p></div></body>",
+                hider,
+                30,
+            );
+            assert_eq!(text, "the article\n", "{hider}");
+            assert!(revealed, "{hider} must report that it fell back");
+        }
+    }
+
+    #[test]
+    fn rescuing_a_page_never_prints_its_code() {
+        // The fallback ignores the page's hiding, not the user-agent sheet's:
+        // ua.css marks script/style `display:none !important`, and revealing
+        // those would dump JavaScript into what someone is reading.
+        let (text, revealed) = readable(
+            "<body style='display:none'><script>var secret = 1</script><p>text</p></body>",
+            "",
+            30,
+        );
+        assert_eq!(text, "text\n");
+        assert!(revealed);
+        assert!(!text.contains("secret"));
+    }
+
+    #[test]
+    fn a_page_with_nothing_to_show_stays_empty() {
+        // No text anywhere: the fallback finds nothing either, so the honest
+        // answer is the empty one — no flag, no second-guessing.
+        let (text, revealed) = readable("<body><script>var x = 1</script></body>", "", 30);
+        assert_eq!(text, "");
+        assert!(!revealed, "an empty page is not a hidden page");
+    }
+
+    #[test]
+    fn a_normal_page_never_takes_the_fallback() {
+        // The common case must not pay for the rescue, and hidden sections of
+        // a page that renders fine stay hidden.
+        let (text, revealed) = readable(
+            "<p>visible</p><p class=ad>hidden</p>",
+            ".ad { display: none }",
+            30,
+        );
+        assert_eq!(text, "visible\n");
+        assert!(!revealed);
+    }
+
     #[test]
     fn a_page_can_hide_its_own_content() {
         // Half the M4 demo gate. `display:none` is no longer a list of tag
@@ -1097,7 +1203,7 @@ mod ladder {
         // `--dump-text` renders them.
         let sheets = crate::style::sources::inline_sheets(&dom);
         let styles = crate::style::style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
-        let lines = super::layout(&dom, &styles, COLUMN);
+        let lines = super::layout(&dom, &styles, COLUMN, Hidden::Respect);
         assert!(lines.len() >= min_lines, "only {} lines", lines.len());
         for (i, line) in lines.iter().enumerate() {
             let cells = cells(line);

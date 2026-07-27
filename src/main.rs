@@ -221,8 +221,12 @@ fn run_dump_text(url: &str) -> i32 {
             // is styled by the UA sheet plus its own inline blocks.
             let sheets = style::sources::inline_sheets(&dom);
             let styles = style::style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
+            // Same never-blank rule as the TUI: a dump of a page that hides
+            // itself pending JavaScript is useless, and this is the harness
+            // the ladder tests read.
+            let (lines, _revealed) = layout::layout_readable(&dom, &styles, DUMP_TEXT_WIDTH);
             let mut text = String::new();
-            for line in layout::layout(&dom, &styles, DUMP_TEXT_WIDTH) {
+            for line in lines {
                 for span in &line.spans {
                     text.push_str(&span.text);
                 }

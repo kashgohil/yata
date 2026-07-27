@@ -128,6 +128,11 @@ pub struct App {
     /// `None` until their worker reports. Indexing by document position is
     /// what stops a sheet that arrives first from cascading first.
     sheets: Vec<Option<Stylesheet>>,
+    /// The last layout had to ignore the page's own `display:none` to show
+    /// anything at all (see `layout::layout_readable`). Surfaced in the
+    /// statusline, because a reader is entitled to know they are being shown
+    /// something the page tried to hide.
+    revealed: bool,
     /// The styled tree for `dom` and the sheets that have arrived so far.
     /// Recomputed as each one lands — the page renders with what it has and
     /// restyles, rather than blocking on a round trip (UX §3.2). Nothing draws
@@ -161,6 +166,7 @@ impl App {
             surface: Surface::Page,
             sheets: Vec::new(),
             styles: None,
+            revealed: false,
             #[cfg(test)]
             layouts: 0,
         }
@@ -465,7 +471,8 @@ impl App {
             return;
         };
         let started = Instant::now();
-        let lines = layout::layout(dom, styles, column(self.size.0).width);
+        let (lines, revealed) = layout::layout_readable(dom, styles, column(self.size.0).width);
+        self.revealed = revealed;
         // The one place `App` reads the clock: fetch and parse are timed by the
         // worker that runs them, but this stage runs here, so it times itself.
         self.timings.layout = Some(started.elapsed());
@@ -731,6 +738,13 @@ impl App {
             Fetch::Loading { url, .. } | Fetch::Loaded { url, .. } | Fetch::Failed { url, .. } => {
                 url.clone()
             }
+        };
+        let base = if self.revealed {
+            // Short, and only present when it happened: the page rendered
+            // blank until its own `display:none` was ignored.
+            format!("[unhidden] {base}")
+        } else {
+            base
         };
         match self.surface {
             Surface::Page => base,
@@ -1865,6 +1879,41 @@ mod tests {
     }
 
     // ---- F2: the computed-styles surface (M4.5) ---------------------------
+
+    #[test]
+    fn a_page_that_hides_itself_still_reaches_the_reader() {
+        // End to end: the page says `body { display: none }` and expects a
+        // script to undo it. There is no script engine until M10, so the
+        // choice is the article or a blank screen (layout::layout_readable).
+        // The statusline says so, because showing content a page hid is not
+        // something to do silently.
+        let mut app = App::new(40, 6);
+        open_page(
+            &mut app,
+            "<head><style>body { display: none }</style></head><body><p>rescued</p></body>",
+        );
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(
+            (0..5).any(|y| row_text(&frame, y).contains("rescued")),
+            "a hidden page must still render: {:?}",
+            row_text(&frame, 0)
+        );
+        assert!(
+            row_text(&frame, 5).contains("[unhidden]"),
+            "the statusline must say the page was unhidden: {:?}",
+            row_text(&frame, 5)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_page_is_never_tagged_as_unhidden() {
+        let mut app = App::new(40, 6);
+        open_page(&mut app, "<body><p>plain</p></body>");
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(!row_text(&frame, 5).contains("[unhidden]"));
+    }
 
     #[test]
     fn f2_shows_computed_values_and_toggles_back_to_the_page() {

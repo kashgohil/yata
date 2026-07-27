@@ -33,6 +33,12 @@ pub struct ComputedStyle {
     /// `text-decoration`, as much of it as a cell grid has: underlined or not.
     pub underline: bool,
     pub text_align: TextAlign,
+    /// The winning `display` came from the user-agent sheet's `!important` —
+    /// this element holds code, metadata or inert markup and is never prose
+    /// (see `ua.css`). Layout's never-blank fallback honours this even when it
+    /// is ignoring every other `display:none`: a page hidden behind a script
+    /// should be revealed, the script itself never.
+    pub hidden_by_ua: bool,
 }
 
 impl ComputedStyle {
@@ -55,6 +61,10 @@ impl ComputedStyle {
             font_style: self.font_style,
             underline: self.underline,
             text_align: self.text_align,
+            // Not inherited: a child of a hidden `<script>` is hidden because
+            // its ancestor's subtree is skipped, not because it inherited a
+            // verdict about itself.
+            hidden_by_ua: false,
         }
     }
 }
@@ -203,16 +213,21 @@ fn cascade(
 
     let mut computed = parent.inherit();
     for entry in &entries {
-        apply(&mut computed, entry.declaration);
+        let applied = apply(&mut computed, entry.declaration);
+        // Entries are in ascending cascade order, so the last `display` to
+        // apply is the winner and its rank is the one that matters.
+        if applied && entry.declaration.name == "display" {
+            computed.hidden_by_ua = entry.rank == Rank::UaImportant;
+        }
     }
     computed
 }
 
 /// Apply one declaration, if it is a property M4 implements and its value
-/// parses. An unparseable value leaves the previous winner standing — that is
-/// CSS's rule for invalid values, and it is why `color: bananas` must not
-/// resolve to anything.
-fn apply(computed: &mut ComputedStyle, declaration: &Declaration) {
+/// parses; `true` when it actually changed something. An unparseable value
+/// leaves the previous winner standing — that is CSS's rule for invalid values,
+/// and it is why `color: bananas` must not resolve to anything.
+fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
     let value = declaration.value.as_str();
     match declaration.name.as_str() {
         "display" => set(&mut computed.display, values::parse_display(value)),
@@ -225,24 +240,28 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) {
         // it is left alone rather than half-applied.
         "background" if value.trim().eq_ignore_ascii_case("none") => {
             computed.background_color = ColorValue::default();
+            true
         }
         "background" => set(&mut computed.background_color, values::parse_color(value)),
         "font-weight" => set(&mut computed.font_weight, values::parse_font_weight(value)),
         "font-style" => set(&mut computed.font_style, values::parse_font_style(value)),
         "text-align" => set(&mut computed.text_align, values::parse_text_align(value)),
-        "text-decoration" | "text-decoration-line" => {
-            set(
-                &mut computed.underline,
-                values::parse_text_decoration(value),
-            );
-        }
-        _ => {}
+        "text-decoration" | "text-decoration-line" => set(
+            &mut computed.underline,
+            values::parse_text_decoration(value),
+        ),
+        _ => false,
     }
 }
 
-fn set<T>(slot: &mut T, parsed: Option<T>) {
-    if let Some(value) = parsed {
-        *slot = value;
+/// `true` when the value parsed and was applied.
+fn set<T>(slot: &mut T, parsed: Option<T>) -> bool {
+    match parsed {
+        Some(value) => {
+            *slot = value;
+            true
+        }
+        None => false,
     }
 }
 
