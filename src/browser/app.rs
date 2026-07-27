@@ -56,6 +56,17 @@ enum Fetch {
     },
 }
 
+/// Which surface owns the page area. The inspectors replace the page rather
+/// than overlaying it, and only one at a time: `F1` and `F2` are one selector,
+/// not two flags that can both be true. (`F4`'s timing overlay is different —
+/// it draws *over* whatever is up, so it stays a separate flag.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Surface {
+    Page,
+    Dom,
+    Styles,
+}
+
 /// Input mode. `Browse` reads the body and scrolls; `UrlInput` is the one-line
 /// URL bar with its edit buffer (cursor always at the end, no readline moves).
 enum Mode {
@@ -106,8 +117,12 @@ pub struct App {
     /// navigation — pages load far more often than F1 opens. The flag also
     /// keeps an off/on toggle from rebuilding (and losing the scroll offset).
     dom_view_built: bool,
-    /// Whether the `F1` DOM surface replaces the page area.
-    dom_visible: bool,
+    /// The `F2` surface's lines: every element with its computed values, built
+    /// and scrolled exactly like `dom_view`.
+    styles_view: Viewport,
+    styles_view_built: bool,
+    /// Which of the page, the DOM tree or the computed styles is on screen.
+    surface: Surface,
     /// The page's author stylesheets, one slot per source in **document
     /// order**: `<style>` blocks filled the moment the tree lands, linked ones
     /// `None` until their worker reports. Indexing by document position is
@@ -141,7 +156,9 @@ impl App {
             dom: None,
             dom_view: Viewport::default(),
             dom_view_built: false,
-            dom_visible: false,
+            styles_view: Viewport::default(),
+            styles_view_built: false,
+            surface: Surface::Page,
             sheets: Vec::new(),
             styles: None,
             #[cfg(test)]
@@ -196,6 +213,7 @@ impl App {
                 // Resize is a wrap point: re-wrap at the new width, keep offset.
                 self.viewport.resize(w, self.page());
                 self.dom_view.resize(w, self.page());
+                self.styles_view.resize(w, self.page());
                 // ...and the second of exactly two places layout runs, because
                 // the column width changed with the frame.
                 self.relayout();
@@ -247,6 +265,7 @@ impl App {
                 // and a table mixing stages from two runs would lie.
                 self.dom = None;
                 self.dom_view_built = false;
+                self.styles_view_built = false;
                 // The old page's stylesheets go with its tree: a sheet from
                 // the page being replaced must not style the new one. Workers
                 // already in flight for it are stale by `FetchId` anyway.
@@ -284,9 +303,8 @@ impl App {
                 // open right now, in which case the user is watching the tree
                 // and it must refresh on this repaint.
                 self.dom_view_built = false;
-                if self.dom_visible {
-                    self.build_dom_view();
-                }
+                self.styles_view_built = false;
+                self.build_visible_inspector();
                 Effect {
                     dirty: true,
                     sheets,
@@ -308,6 +326,8 @@ impl App {
                 // broken, and the cascade proceeds with what it has.
                 *entry = Some(sheet.unwrap_or_default());
                 self.restyle();
+                self.styles_view_built = false;
+                self.build_visible_inspector();
                 // The page is already on screen; this is the "then restyles"
                 // half of UX §3.2, and it is only visible if the new computed
                 // values reach the lines. Relayout is not on the scroll path —
@@ -381,13 +401,8 @@ impl App {
                 };
                 redraw()
             }
-            Action::ToggleDom => {
-                self.dom_visible = !self.dom_visible;
-                if self.dom_visible {
-                    self.build_dom_view();
-                }
-                redraw()
-            }
+            Action::ToggleDom => self.toggle_surface(Surface::Dom),
+            Action::ToggleStyles => self.toggle_surface(Surface::Styles),
             Action::ToggleTiming => {
                 self.timing_visible = !self.timing_visible;
                 redraw()
@@ -408,12 +423,29 @@ impl App {
         }
     }
 
+    /// Show `surface`, or go back to the page if it is already showing.
+    fn toggle_surface(&mut self, surface: Surface) -> Effect {
+        self.surface = if self.surface == surface {
+            Surface::Page
+        } else {
+            surface
+        };
+        self.build_visible_inspector();
+        redraw()
+    }
+
     /// Whether the F1 surface currently owns the page area (and therefore the
     /// scroll keys and the scroll-% readout). With no parsed tree the surface
     /// is a static placeholder — the page keeps the scroll keys so they never
     /// dead-end.
     fn dom_active(&self) -> bool {
-        self.dom_visible && self.dom.is_some()
+        self.surface == Surface::Dom && self.dom.is_some()
+    }
+
+    /// The same for `F2`, which needs a styled tree rather than just a parsed
+    /// one — though in practice they arrive together.
+    fn styles_active(&self) -> bool {
+        self.surface == Surface::Styles && self.styles.is_some()
     }
 
     /// Lay the cached tree out at the current column width and hand the lines
@@ -517,12 +549,40 @@ impl App {
         }
     }
 
+    /// The `F2` equivalent, deferred the same way and for the same reason: a
+    /// Wikipedia-sized render costs milliseconds nobody should pay for a
+    /// surface they are not looking at.
+    fn build_styles_view(&mut self) {
+        if self.styles_view_built {
+            return;
+        }
+        if let (Some(dom), Some(styles)) = (&self.dom, &self.styles) {
+            let text = inspector::style_lines(dom, styles).join("\n");
+            self.styles_view
+                .set_content(&text, self.size.0, self.page());
+            self.styles_view_built = true;
+        }
+    }
+
+    /// Refresh whichever inspector is on screen, and only that one. Called when
+    /// a surface opens and when its input changes underneath it (a parse, an
+    /// arriving stylesheet).
+    fn build_visible_inspector(&mut self) {
+        match self.surface {
+            Surface::Page => {}
+            Surface::Dom => self.build_dom_view(),
+            Surface::Styles => self.build_styles_view(),
+        }
+    }
+
     /// The view the shared scroll keys act on: the same bindings drive the
     /// page and the F1 tree, whichever is on screen (the brief's "do not
     /// invent a second scheme").
     fn scroll_target(&mut self) -> &mut Viewport {
         if self.dom_active() {
             &mut self.dom_view
+        } else if self.styles_active() {
+            &mut self.styles_view
         } else {
             &mut self.viewport
         }
@@ -549,10 +609,10 @@ impl App {
     /// the bottom row — the URL bar in `UrlInput`, the statusline in `Browse`.
     pub fn draw(&self, frame: &mut Frame) {
         frame.clear();
-        if self.dom_visible {
-            self.draw_dom(frame);
-        } else {
-            self.draw_page(frame);
+        match self.surface {
+            Surface::Page => self.draw_page(frame),
+            Surface::Dom => self.draw_dom(frame),
+            Surface::Styles => self.draw_styles(frame),
         }
         // Over the page area, after the body and before the bottom row.
         if self.timing_visible {
@@ -592,6 +652,18 @@ impl App {
             return;
         }
         for (row, line) in self.dom_view.visible().iter().enumerate() {
+            paint_line(frame, 0, row as u16, line);
+        }
+    }
+
+    /// The `F2` surface: one line per element with its computed values, or the
+    /// same calm placeholder `F1` shows when there is nothing to inspect.
+    fn draw_styles(&self, frame: &mut Frame) {
+        if self.styles.is_none() {
+            frame.put_str(0, 0, "no styles yet — open a page (o)", Style::default());
+            return;
+        }
+        for (row, line) in self.styles_view.visible().iter().enumerate() {
             paint_line(frame, 0, row as u16, line);
         }
     }
@@ -654,10 +726,10 @@ impl App {
                 url.clone()
             }
         };
-        if self.dom_visible {
-            format!("[dom] {base}")
-        } else {
-            base
+        match self.surface {
+            Surface::Page => base,
+            Surface::Dom => format!("[dom] {base}"),
+            Surface::Styles => format!("[styles] {base}"),
         }
     }
 
@@ -685,6 +757,8 @@ impl App {
         let mut parts = Vec::new();
         let view = if self.dom_active() {
             &self.dom_view
+        } else if self.styles_active() {
+            &self.styles_view
         } else {
             &self.viewport
         };
@@ -1737,6 +1811,10 @@ mod tests {
         key(KeyCode::F(1), KeyModifiers::NONE)
     }
 
+    fn f2() -> Msg {
+        key(KeyCode::F(2), KeyModifiers::NONE)
+    }
+
     fn parsed(id: FetchId, html: &str) -> Msg {
         Msg::Parsed {
             id,
@@ -1777,6 +1855,112 @@ mod tests {
         assert!(
             row_text(&frame, 0).contains("no DOM yet"),
             "a stale tree must not become the inspector's content"
+        );
+    }
+
+    // ---- F2: the computed-styles surface (M4.5) ---------------------------
+
+    #[test]
+    fn f2_shows_computed_values_and_toggles_back_to_the_page() {
+        let mut app = App::new(60, 6);
+        let (_, _) = open_page(&mut app, "<body><p>hello</p></body>");
+
+        assert_eq!(app.update(f2()), redraw());
+        let mut frame = Frame::new(60, 6);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 0).starts_with("<html> block"),
+            "got {:?}",
+            row_text(&frame, 0)
+        );
+        assert!(
+            row_text(&frame, 5).contains("[styles]"),
+            "statusline must name the active surface"
+        );
+
+        assert_eq!(app.update(f2()), redraw());
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).contains("hello"), "page must come back");
+        assert!(!row_text(&frame, 5).contains("[styles]"));
+    }
+
+    #[test]
+    fn f2_without_a_page_is_a_placeholder_not_a_panic() {
+        let mut app = App::new(40, 6);
+        assert_eq!(app.update(f2()), redraw());
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).contains("no styles yet"));
+    }
+
+    #[test]
+    fn the_inspectors_are_one_surface_not_two_flags() {
+        // F1 and F2 replace the page, so they cannot both own it. Opening one
+        // from the other switches rather than stacking.
+        let mut app = App::new(60, 6);
+        open_page(&mut app, "<body><p>hello</p></body>");
+        let mut frame = Frame::new(60, 6);
+
+        app.update(f1());
+        app.update(f2());
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 5).contains("[styles]"));
+        assert!(!row_text(&frame, 5).contains("[dom]"));
+
+        app.update(f1());
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 5).contains("[dom]"));
+        assert!(!row_text(&frame, 5).contains("[styles]"));
+    }
+
+    #[test]
+    fn the_scroll_keys_drive_whichever_surface_is_up() {
+        // One binding table, one set of scroll keys (the UX charter's "do not
+        // invent a second scheme"), acting on the surface in front of you.
+        let mut app = App::new(60, 6);
+        open_page(
+            &mut app,
+            "<body><div><div><div><div><p>a</p><p>b</p><p>c</p></div></div></div></div></body>",
+        );
+        app.update(f2());
+        let mut frame = Frame::new(60, 6);
+        app.draw(&mut frame);
+        let top = row_text(&frame, 0);
+
+        assert_eq!(app.update(ch('j')), redraw());
+        app.draw(&mut frame);
+        assert_ne!(row_text(&frame, 0), top, "F2 must scroll");
+        // ...and the page underneath did not move.
+        app.update(f2());
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).contains('a'));
+    }
+
+    #[test]
+    fn an_arriving_stylesheet_refreshes_the_open_f2_surface() {
+        // The inspector is a product surface (CLAUDE.md rule 4): if it is open
+        // when the cascade changes underneath it, it must show the new values,
+        // not a cached view of the old ones.
+        let mut app = App::new(60, 6);
+        let (id, _) = open_page(
+            &mut app,
+            "<head><link rel=stylesheet href='x.css'></head><body><p>hi</p></body>",
+        );
+        app.update(f2());
+        let mut frame = Frame::new(60, 6);
+        app.draw(&mut frame);
+        assert!(!row_text(&frame, 3).contains("bold"), "plain to start");
+
+        app.update(Msg::Stylesheet {
+            id,
+            slot: 0,
+            sheet: sheet("p { font-weight: bold }"),
+        });
+        app.draw(&mut frame);
+        let rows: Vec<String> = (0..5).map(|y| row_text(&frame, y)).collect();
+        assert!(
+            rows.iter().any(|r| r.contains("<p> block · bold")),
+            "F2 must show the new computed values, got {rows:?}"
         );
     }
 

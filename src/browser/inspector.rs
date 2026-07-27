@@ -1,6 +1,8 @@
-//! The `F1` DOM inspector's tree-to-lines transform: a parsed `Dom` becomes
-//! one compact, indented line per node. Pure text — scrolling and drawing are
-//! the `App`'s job, through the same `Viewport` machinery the page uses.
+//! The inspector surfaces' tree-to-lines transforms: `F1` turns a parsed `Dom`
+//! into one compact, indented line per node, and `F2` turns the styled tree
+//! into one line per element with its computed values. Pure text — scrolling
+//! and drawing are the `App`'s job, through the same `Viewport` machinery the
+//! page uses.
 //!
 //! This is deliberately terser than `html::debug_tree` (which `--dump-dom`
 //! prints): the inspector is read on a live terminal, so ids/classes are
@@ -10,6 +12,8 @@
 use unicode_width::UnicodeWidthChar;
 
 use crate::dom::{Dom, NodeData, NodeId};
+use crate::style::Styles;
+use crate::style::values::{ColorValue, Display, FontStyle, FontWeight, TextAlign};
 
 /// Cell caps for the variable-length parts of a line. Text gets the most room
 /// (it is the content); URLs and comments are context, not content.
@@ -49,6 +53,80 @@ fn push_node(dom: &Dom, id: NodeId, depth: usize, out: &mut Vec<String>) {
     for child in dom.children(id) {
         push_node(dom, child, depth + 1, out);
     }
+}
+
+/// The `F2` view: every element with what the cascade computed for it, indented
+/// like the `F1` tree so the two read alike.
+///
+/// PLAN.md §3 describes `F2` as "computed styles for the node under the
+/// cursor". There is no cursor until M6 lands hit-testing, so this is the whole
+/// document for now and M6 narrows it — the surface, its plumbing and its
+/// vocabulary are what this milestone owes.
+///
+/// Only `display` is always printed. Everything else appears when it differs
+/// from the CSS initial value, because Wikipedia has 13 399 elements and a
+/// column of identical `color:default · normal` would hide the handful of lines
+/// worth reading.
+pub fn style_lines(dom: &Dom, styles: &Styles) -> Vec<String> {
+    let mut out = Vec::new();
+    push_styled(dom, dom.root, 0, styles, &mut out);
+    out
+}
+
+fn push_styled(dom: &Dom, id: NodeId, depth: usize, styles: &Styles, out: &mut Vec<String>) {
+    let mut depth = depth;
+    if let NodeData::Element { tag, attrs } = &dom.node(id).data {
+        // Text nodes are skipped: they carry their parent's inherited values
+        // (M4.2), so a line each would repeat the line above it.
+        out.push(format!(
+            "{}{} {}",
+            "  ".repeat(depth),
+            element_summary(tag, attrs),
+            summarize(styles.get(id))
+        ));
+        depth += 1;
+    }
+    for child in dom.children(id) {
+        push_styled(dom, child, depth, styles, out);
+    }
+}
+
+/// Computed values as one compact clause list: `block · #5c5cff · bold
+/// underline`. Initial values are left out (see `style_lines`).
+fn summarize(computed: &crate::style::ComputedStyle) -> String {
+    let mut parts = vec![
+        match computed.display {
+            Display::Block => "block",
+            Display::Inline => "inline",
+            Display::None => "none",
+        }
+        .to_string(),
+    ];
+    if let ColorValue::Rgb(r, g, b) = computed.color {
+        parts.push(format!("#{r:02x}{g:02x}{b:02x}"));
+    }
+    if let ColorValue::Rgb(r, g, b) = computed.background_color {
+        parts.push(format!("bg #{r:02x}{g:02x}{b:02x}"));
+    }
+    let mut flags = Vec::new();
+    if computed.font_weight == FontWeight::Bold {
+        flags.push("bold");
+    }
+    if computed.font_style == FontStyle::Italic {
+        flags.push("italic");
+    }
+    if computed.underline {
+        flags.push("underline");
+    }
+    if !flags.is_empty() {
+        parts.push(flags.join(" "));
+    }
+    match computed.text_align {
+        TextAlign::Left => {}
+        TextAlign::Center => parts.push("center".into()),
+        TextAlign::Right => parts.push("right".into()),
+    }
+    parts.join(" · ")
 }
 
 /// CSS-flavored element summary: `<a#nav.cls href="…">`. `id` and `class`
@@ -194,6 +272,71 @@ mod tests {
         );
         // 29 whole wide chars (58 cells) + the 1-cell ellipsis ≤ 60.
         assert_eq!(snippet.chars().filter(|&c| c == '世').count(), 29);
+    }
+
+    // ---- F2: computed styles (M4.5) ---------------------------------------
+
+    fn styled(html: &str, css: &str) -> Vec<String> {
+        let dom = parse(html);
+        let sheet = crate::css::parse(css);
+        let styles = crate::style::style_tree(&dom, &[&sheet]);
+        style_lines(&dom, &styles)
+    }
+
+    #[test]
+    fn one_line_per_element_indented_like_the_tree() {
+        // Text nodes get no line: they carry their parent's inherited values,
+        // so a line each would just repeat the line above.
+        assert_eq!(
+            styled("<p>hi</p>", ""),
+            [
+                "<html> block",
+                "  <head> none",
+                "  <body> block",
+                "    <p> block",
+            ]
+        );
+    }
+
+    #[test]
+    fn display_always_shows_and_initial_values_stay_quiet() {
+        // A plain inline element says `inline` and nothing else — 13 399
+        // elements of `color:default · normal` would bury the lines worth
+        // reading.
+        let lines = styled("<span>x</span>", "");
+        let span = lines.iter().find(|l| l.contains("<span>")).unwrap();
+        assert_eq!(span.trim(), "<span> inline");
+    }
+
+    #[test]
+    fn computed_values_appear_as_they_differ_from_the_initial() {
+        let lines = styled(
+            "<a href='/x'>link</a>",
+            "a { background-color: #eee; text-align: center }",
+        );
+        let a = lines.iter().find(|l| l.contains("<a ")).unwrap();
+        // UA link colour and underline, plus what the page added.
+        assert!(a.contains("inline"), "{a}");
+        assert!(a.contains("#5c5cff"), "{a}");
+        assert!(a.contains("bg #eeeeee"), "{a}");
+        assert!(a.contains("underline"), "{a}");
+        assert!(a.contains("center"), "{a}");
+
+        let lines = styled("<h1>t</h1>", "h1 { font-style: italic }");
+        let h1 = lines.iter().find(|l| l.contains("<h1>")).unwrap();
+        assert!(h1.contains("block"), "{h1}");
+        assert!(h1.contains("bold italic"), "{h1}");
+    }
+
+    #[test]
+    fn hidden_elements_are_listed_as_hidden_not_omitted() {
+        // The inspector's job is to explain the page, and "why is this not on
+        // screen" is the question it most needs to answer.
+        let lines = styled("<p class=ad>gone</p>", ".ad { display: none }");
+        let p = lines.iter().find(|l| l.contains("<p.ad>")).unwrap();
+        assert_eq!(p.trim(), "<p.ad> none");
+        // <script> and <head> too, from the UA sheet.
+        assert!(lines.iter().any(|l| l.trim() == "<head> none"));
     }
 
     #[test]
