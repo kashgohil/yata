@@ -75,3 +75,85 @@ borrows `&str` straight from the arena's text nodes, which took it to 1.9 ms
 `cargo bench --bench parse` — **13.0 ms** (13.0–13.1) on the Wikipedia fixture,
 gate < 50 ms. Criterion reports no change against the M2.3 baseline (p = 0.78),
 as expected: nothing in this milestone touches the parser.
+
+---
+
+## M4 — CSS: parser, cascade, inheritance (2026-07-27)
+
+Machine A. All numbers from `cargo bench` unless marked otherwise. The
+Wikipedia fixture carries its 21 inline `<style>` blocks — 291 selectors once
+the user-agent sheet is added — and 13 399 elements.
+
+### Fast gate: full restyle < 100 ms
+
+`cargo bench --bench style`, `restyle en.wikipedia.org`: DOM + stylesheets →
+one `ComputedStyle` per node, everything parsed outside the loop. This is
+exactly what `App::restyle` runs when a sheet lands.
+
+| Stage | Wikipedia fixture | Budget |
+|---|---|---|
+| **Full restyle** | **41.4 ms** (41.4–41.9) | < 100 ms |
+| Source walk + parse of all 21 inline sheets | 0.5 ms (`--timing`-style, release) | — |
+| Layout after the restyle | 1.9 ms (M3 number, unchanged) | — |
+
+Inside the gate at 41% of it. The honest caveat: those 291 selectors are the
+page's *inline* blocks only. Its `load.php` sheets are not committed, and they
+are far larger — see the scaling numbers below for what that does (nothing, to
+the indexed path).
+
+### Rule index vs the naive matcher
+
+Every element matched both ways, same rules, same page (PLAN.md §4 asks to
+"feel the difference"). The naive side runs 10 samples rather than 100 because
+it is slow by construction.
+
+| Selectors in play | Rule index | Every rule | Ratio |
+|---|---|---|---|
+| 291 (the page's own) | **39.9 ms** | 63.5 ms | 1.6× |
+| 2 291 (+2 000 rules that match nothing here) | **40.0 ms** | 375.0 ms | **9.4×** |
+
+The first row is the surprise, and it is worth understanding before trusting
+the second. The index proposes **6.1 candidates per element** out of 291 — a
+48× cut in candidates — yet only buys 1.6× in time. The reason: the candidates
+it discards are exactly the ones the naive matcher also discards cheaply, on a
+one-comparison tag or class test. What survives in both paths is the expensive
+part — walking ancestors for a descendant combinator, over an average element
+depth of 20.6.
+
+The second row is the one that matters for real pages. Rules that cannot match
+this document cost the index *nothing* (they sit in buckets nobody looks up)
+and cost the naive matcher a comparison per element: 2 000 extra rules leave
+the index at 40.0 ms and take the naive matcher from 63.5 ms to 375 ms. Real
+stylesheets are mostly rules that do not apply to the page in front of you,
+which is the case the index is for.
+
+(Duplicating the page's own sheets 10× is the wrong way to test this and was
+tried first: it multiplies the rules that *do* match, so both curves grow
+together — index 391 ms, naive 601 ms, both ~10× their baseline. The bench
+comment records this so nobody repeats it.)
+
+### An optimization that did not pay
+
+`cascade` allocated a `Vec` per element for candidate slots and another for
+matched candidates — the same allocation-per-item shape that cost 20% of M3's
+layout (M3.3's run buffer). Replacing both with buffers reused across the walk
+measured **+0.9% (p = 0.15)**: nothing, inside noise. Reverted rather than
+kept, because the profile above says why it could not help — the time is in the
+ancestor walk, not in the allocator.
+
+What would actually move this number is an ancestor filter (bloom filter over
+each element's ancestor tags/classes/ids, rejecting descendant selectors
+without walking). PLAN.md §4 files that under "later, only if measured".
+It is now measured; it is still not needed, because 41.4 ms is inside the gate
+and no user-facing path runs a full restyle today. It becomes urgent when M6
+puts `:hover` on the restyle path against a 10 ms keypress budget — at which
+point the right fix may be invalidation (restyle the hovered subtree) rather
+than a faster full restyle.
+
+### Scroll gate, re-run after the cascade landed
+
+`cargo bench --bench scroll`, after M4.4 moved layout onto computed values:
+**29.2 µs** at 120×40 and **45.9 µs** at 200×50, against M3's 28.5 µs and
+44.4 µs. Criterion reports no change (p = 0.46, p = 0.28). Scrolling still
+touches neither style nor layout — it repaints cached lines, and the cascade
+landing did not sneak into that path.

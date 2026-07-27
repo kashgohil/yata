@@ -18,3 +18,7 @@ harness = false
 [[bench]]
 name = "scroll"
 harness = false
+
+[[bench]]
+name = "style"
+harness = false
