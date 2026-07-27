@@ -183,7 +183,7 @@ fn dump_text_prints_the_laid_out_page_to_stdout() {
 }
 
 #[test]
-fn timing_prints_fetch_parse_layout_and_frame_rows_to_stderr_only() {
+fn timing_prints_every_pipeline_stage_to_stderr_only() {
     let addr = serve_once(response_with_body("200 OK", b"<html>hello</html>"));
     let out = yata(&["--timing", &format!("http://{addr}/")]);
     assert_eq!(
@@ -198,13 +198,23 @@ fn timing_prints_fetch_parse_layout_and_frame_rows_to_stderr_only() {
         String::from_utf8_lossy(&out.stdout)
     );
     let table = String::from_utf8(out.stderr).unwrap();
-    for stage in ["fetch", "parse", "layout", "frame"] {
+    // Every stage a page passes through, in pipeline order — `style` included
+    // since M4, because a restyle is 41 ms on a large page and an instrument
+    // that cannot show it is not an instrument.
+    let stages = ["fetch", "parse", "style", "layout", "frame"];
+    let mut seen = Vec::new();
+    for stage in stages {
         let row = table
             .lines()
             .find(|l| l.starts_with(stage))
             .unwrap_or_else(|| panic!("no {stage} row in {table:?}"));
         assert!(row.ends_with("ms"), "{stage} row was {row:?}");
+        seen.push(table.lines().position(|l| l.starts_with(stage)).unwrap());
     }
+    assert!(
+        seen.windows(2).all(|w| w[0] < w[1]),
+        "rows must come in pipeline order: {table:?}"
+    );
 }
 
 #[test]

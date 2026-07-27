@@ -11,8 +11,13 @@ pub struct Timings {
     /// The HTML parse (tokenize + tree build), measured on the fetch worker
     /// and shipped as `Msg::Parsed::elapsed`.
     pub parse: Option<Duration>,
-    /// DOM → display lines at the current column width. Unlike the two above it
-    /// runs on the UI thread, so `App` times it where it calls it.
+    /// DOM + stylesheets → computed values for every node. Runs on the UI
+    /// thread like layout, and is the most expensive stage after parse on a
+    /// large page (41 ms on the Wikipedia fixture, `perf.md`), so it needs to
+    /// be visible in the instrument rather than only in a bench.
+    pub style: Option<Duration>,
+    /// Styled tree → display lines at the current column width. Unlike fetch
+    /// and parse it runs on the UI thread, so `App` times it where it calls it.
     pub layout: Option<Duration>,
     /// The last presented frame's draw + present time, recorded by the event
     /// loop after the fact.
@@ -28,6 +33,7 @@ impl Timings {
         [
             ("fetch", self.fetch),
             ("parse", self.parse),
+            ("style", self.style),
             ("layout", self.layout),
             ("frame", self.frame),
         ]
@@ -69,6 +75,12 @@ mod tests {
         };
         assert_eq!(parse_only.rows(), ["parse 31.7 ms"]);
 
+        let style_only = Timings {
+            style: Some(Duration::from_micros(41_100)),
+            ..Timings::default()
+        };
+        assert_eq!(style_only.rows(), ["style 41.1 ms"]);
+
         let layout_only = Timings {
             layout: Some(Duration::from_micros(1_800)),
             ..Timings::default()
@@ -84,9 +96,12 @@ mod tests {
 
     #[test]
     fn rows_come_in_pipeline_order() {
+        // Pipeline order, not struct order or alphabetical: fetch → parse →
+        // style → layout → frame is the path a page actually takes.
         let all = Timings {
             fetch: Some(Duration::from_millis(40)),
             parse: Some(Duration::from_micros(31_700)),
+            style: Some(Duration::from_micros(41_100)),
             layout: Some(Duration::from_micros(1_800)),
             frame: Some(Duration::from_micros(2_100)),
         };
@@ -95,6 +110,7 @@ mod tests {
             [
                 "fetch 40.0 ms",
                 "parse 31.7 ms",
+                "style 41.1 ms",
                 "layout 1.8 ms",
                 "frame 2.1 ms"
             ]

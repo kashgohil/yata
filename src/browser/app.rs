@@ -272,8 +272,9 @@ impl App {
                 self.sheets.clear();
                 self.styles = None;
                 self.timings.parse = None;
-                // Layout goes with it, for the same reason: this run has a
-                // fetch time and nothing else yet.
+                // Style and layout go with it, for the same reason: this run
+                // has a fetch time and nothing else yet.
+                self.timings.style = None;
                 self.timings.layout = None;
                 // Only an accepted, completed fetch records its duration.
                 // `start_fetch` deliberately does not clear it and `NetError`
@@ -526,12 +527,17 @@ impl App {
     fn restyle(&mut self) {
         let Some(dom) = &self.dom else {
             self.styles = None;
+            self.timings.style = None;
             return;
         };
+        let started = Instant::now();
         // Sheets that have not arrived are simply absent from this pass; the
         // next arrival runs it again.
         let sheets: Vec<&Stylesheet> = self.sheets.iter().flatten().collect();
         self.styles = Some(style::style_tree(dom, &sheets));
+        // Timed here for the same reason layout is: this stage runs on the UI
+        // thread, so it measures itself rather than arriving as message data.
+        self.timings.style = Some(started.elapsed());
     }
 
     /// Render `dom` into the F1 surface's lines at the current size, if it

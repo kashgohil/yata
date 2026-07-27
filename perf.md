@@ -198,3 +198,20 @@ Hacker News's header is still glued (`Hacker Newsnew | past`) and this was not
 the cause: its source has no whitespace between those elements at all. The
 separation comes from `.hnname { margin-right: 5px }` in news.css, and margins
 arrive with M5's box model.
+
+### M4 review addendum: the pipeline with `style` in it (2026-07-27)
+
+The `F4`/`--timing` table was still M3's — fetch, parse, layout, frame — so the
+most expensive UI-thread stage on a large page was invisible in the product's
+own instrument while being the one thing M4 added. With the `style` row in:
+
+`yata --timing en.wikipedia.org` (fixture over loopback):
+
+| fetch | parse | **style** | layout | frame | total |
+|---|---|---|---|---|---|
+| 11.8 ms | 23.9 ms | **42.9 ms** | 1.8 ms | 0.0 ms | **80.4 ms** |
+
+Against PLAN.md §4's < 250 ms full-pipeline budget for a large Wikipedia
+article, with style now counted: 32% of it. Style is the largest engine stage
+on this page — larger than parse — which is the number that would have gone
+unnoticed for another milestone without the row.
