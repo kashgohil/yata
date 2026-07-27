@@ -157,3 +157,44 @@ than a faster full restyle.
 44.4 µs. Criterion reports no change (p = 0.46, p = 0.28). Scrolling still
 touches neither style nor layout — it repaints cached lines, and the cascade
 landing did not sneak into that path.
+
+---
+
+## M5.0 — whitespace text nodes kept in the DOM (2026-07-27)
+
+Machine A. The tree builder no longer drops whitespace-only text between block
+tags (browsers keep it; layout collapses it), so every tree grows. Everything
+this could plausibly cost, measured.
+
+| Measure | Before (M4 tip) | After | Budget |
+|---|---|---|---|
+| Wikipedia arena | 24 484 nodes | **25 596** (+4.5%) | — |
+| `bench parse` | 13.0 ms | **12.8 ms** (−2.0%) | < 50 ms |
+| `bench style` restyle | 41.4 ms | **41.1 ms** (−1.4%) | < 100 ms |
+| `bench scroll` 120×40 | 29.2 µs | **31.0 µs** (+5.7%) | < 5 ms |
+| `bench scroll` 200×50 | 45.9 µs | **48.2 µs** (+4.4%) | < 5 ms |
+| Peak RSS, Wikipedia render | — | **35.7 MB** | < 100 MB |
+
+Parse and restyle did not get slower despite 1 112 more nodes, which says the
+per-node cost of a text node is nearly nothing: the parser stopped doing a
+`trim()`-and-lookup per whitespace run, and a text node's cascade is a copy of
+its parent's inherited values.
+
+The scroll step really did get ~5% slower, and the cause is not the node count.
+Same page, same 3 073 laid-out lines, but **9 381 → 10 199 spans** (+8.7%): a
+space between two inline elements is now its own span, so the painter makes
+more `put_str` calls and the renderer's diff walks more style runs. Correct
+output, slightly more of it. At 31 µs against a 5 ms gate this is 160× inside
+budget and not worth chasing — but it is worth knowing that layout does not
+merge adjacent spans that share a style, and M5 rewrites that code anyway.
+
+Ladder `--dump-text` diff: example.com, motherfuckingwebsite.com, danluu.com
+and news.ycombinator.com are byte-identical. Wikipedia goes 3 271 → 3 267 lines
+and its navbox hlists become readable — `Anatomy Genetics Dwarf cat Kitten` in
+place of `AnatomyGeneticsDwarf catKitten`, which is the whole reason for the
+task.
+
+Hacker News's header is still glued (`Hacker Newsnew | past`) and this was not
+the cause: its source has no whitespace between those elements at all. The
+separation comes from `.hnname { margin-right: 5px }` in news.css, and margins
+arrive with M5's box model.

@@ -29,6 +29,15 @@ pub fn tree_lines(dom: &Dom) -> Vec<String> {
 }
 
 fn push_node(dom: &Dom, id: NodeId, depth: usize, out: &mut Vec<String>) {
+    // Whitespace-only text is real DOM (M5.0 keeps it, because layout needs it
+    // to put a space between inline items) and pure noise in a tree view: on
+    // Wikipedia it is thousands of `#text " "` lines between the nodes anyone
+    // opened F1 to find. Browsers' element inspectors hide them too.
+    // `--dump-dom` still shows them — that one is the parser's own output, and
+    // a debugging dump that hides nodes lies.
+    if matches!(&dom.node(id).data, NodeData::Text(s) if s.trim().is_empty()) {
+        return;
+    }
     let mut line = "  ".repeat(depth);
     match &dom.node(id).data {
         NodeData::Document => line.push_str("#document"),
@@ -220,6 +229,25 @@ mod tests {
                 "      <p>",
                 "        #text \"hi\"",
             ]
+        );
+    }
+
+    #[test]
+    fn whitespace_only_text_is_hidden_from_the_tree_view() {
+        // The nodes exist (M5.0) — layout needs them — but a tree view full of
+        // `#text " "` hides the structure it is there to show.
+        let dom = parse("<ul>\n  <li>a\n  <li>b\n</ul>");
+        let lines = tree_lines(&dom);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.trim() == r#"#text """# || l.contains("#text \"\\n")),
+            "whitespace nodes must not be listed: {lines:?}"
+        );
+        // ...and text with content still is, whitespace and all.
+        assert!(
+            lines.iter().any(|l| l.contains(r#"#text "a""#)),
+            "{lines:?}"
         );
     }
 

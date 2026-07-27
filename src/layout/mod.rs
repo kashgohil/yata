@@ -885,6 +885,29 @@ mod tests {
     // ---- the cascade reaching layout (M4.4) -------------------------------
 
     #[test]
+    fn inline_list_items_keep_the_space_the_source_put_between_them() {
+        // The case M5.0 exists for: Wikipedia's navbox hlists are `<li>`s made
+        // inline by the page's own CSS, one per source line. The newline
+        // between them is the space between the words — drop it in the parser
+        // and the items render as `AnatomyGenetics`.
+        assert_eq!(
+            lines_styled(
+                "<ul><li>a</li>\n<li>b</li>\n<li>c</li></ul>",
+                "li { display: inline }",
+                20
+            ),
+            // The two leading cells are the list indent, which is still
+            // tag-driven — M4 has no `padding`, so M5's box model is what will
+            // let a page zero it. The point here is the spaces *between* the
+            // items, which only exist because the parser kept the newlines.
+            "  a b c\n"
+        );
+        // Blocks are unaffected: the break already separated them, and the
+        // whitespace node must not add a stray space or a blank line.
+        assert_eq!(lines("<ul><li>a</li>\n<li>b</li></ul>", 20), "• a\n• b\n");
+    }
+
+    #[test]
     fn a_page_can_hide_its_own_content() {
         // Half the M4 demo gate. `display:none` is no longer a list of tag
         // names layout distrusts — it is whatever the cascade computed, so a

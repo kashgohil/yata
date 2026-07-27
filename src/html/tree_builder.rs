@@ -87,16 +87,6 @@ const INLINE: [&str; 20] = [
     "span", "strong", "sub", "sup", "u", "var",
 ];
 
-/// Block-only containers whose all-whitespace text children are dropped, so the
-/// tree a human reads isn't littered with the newlines between `<li>`s or table
-/// rows. Whitespace anywhere else (inside `<p>`, `<pre>`, a cell) is kept as-is —
-/// collapsing is layout's job (M3), not the parser's. Pinned by
-/// `whitespace_between_block_tags_is_dropped`.
-const WS_DROP_PARENTS: [&str; 13] = [
-    "html", "head", "body", "ul", "ol", "dl", "table", "thead", "tbody", "tfoot", "tr", "colgroup",
-    "select",
-];
-
 struct TreeBuilder {
     dom: Dom,
     /// Open elements, bottom-to-top. `<html>` sits at the bottom once created;
@@ -233,13 +223,19 @@ impl TreeBuilder {
 
     fn insert_text(&mut self, s: String) {
         if s.trim().is_empty() {
-            // All-whitespace: drop it in the structural spine and in block-only
-            // containers (see WS_DROP_PARENTS); keep it everywhere else.
+            // Whitespace before the document has a spine is ignored, as the
+            // spec's early insertion modes do. Everywhere else it is kept —
+            // including between `<li>`s and table rows, which this builder used
+            // to drop.
+            //
+            // Dropping was invisible while every `<li>` was a block (a block
+            // break swallows the space anyway) and became wrong the moment the
+            // cascade could say `display:inline`: Wikipedia's navbox hlists
+            // rendered as `AnatomyGeneticsDwarf cat`, with no space node left
+            // to collapse. Browsers keep the node and let layout decide; so do
+            // we now. The `F1` inspector hides them, which is what the old rule
+            // was really for.
             if self.at_structural_root() {
-                return;
-            }
-            let parent = self.insertion_parent();
-            if WS_DROP_PARENTS.contains(&self.tag_of(parent)) {
                 return;
             }
         } else if self.at_structural_root() {
@@ -576,8 +572,11 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_between_block_tags_is_dropped() {
-        // Newlines between <li>s don't survive as text children of <ul>.
+    fn whitespace_between_block_tags_is_kept() {
+        // The newline between `<ul>` and its first `<li>` survives as a text
+        // child, the way a browser keeps it. Collapsing it is layout's job —
+        // and if the page makes those items inline, that node is the space
+        // between them (M5.0).
         assert_eq!(
             tree("<ul>\n  <li>a\n  <li>b\n</ul>"),
             "\
@@ -586,6 +585,7 @@ mod tests {
     <head>
     <body>
       <ul>
+        #text \"\\n  \"
         <li>
           #text \"a\\n  \"
         <li>
