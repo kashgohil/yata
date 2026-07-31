@@ -1,6 +1,9 @@
 pub mod app;
+pub mod hints;
+pub mod history;
 pub mod inspector;
 pub mod keys;
 pub mod statusline;
 pub mod timing;
 pub mod viewport;
+pub mod yank;
