@@ -262,3 +262,32 @@ no restyle, no relayout.
 Demo path: open HN, `f` + label to follow a thread, `H` back with scroll
 restored; move the pointer over a link and watch `a:hover` recolour without
 a layout row blip on `F4`.
+
+---
+
+## M7 — scrolling & polish (2026-07-31)
+
+Resize anchoring, synthetic error pages (DNS/TLS/HTTP/content-type), in-page
+search (`/` `n`/`N`), and `?` help generated from the keybinding table.
+Machine A, criterion `--sample-size 20–30`.
+
+| Measure | Result | Budget |
+|---|---|---|
+| scroll step Wikipedia 120×40 | **47.4 µs** (45.2–49.5) | &lt; 5 ms |
+| scroll step Wikipedia 200×50 | **67.7 µs** (63.1–71.9) | &lt; 5 ms |
+| layout Wikipedia 80-col | **3.87 ms** | &lt; 100 ms |
+| full pipeline danluu.com | **0.57 ms** | &lt; 50 ms |
+
+All gates hold with large headroom (scroll ~100× inside budget). Absolute
+scroll cost has drifted up from M3's ~28 µs as paint and App draw gained
+overlays (focus, hints, search highlight check); the path still never
+restyles or relayouts, and unit tests pin `layouts` flat across search/`n`.
+
+Search highlight is paint-time reverse-video over match rectangles from a
+layout-tree walk — no restyle. Resize records the top visible node before
+relayout and restores its `y` afterward (UX §3.6). Error pages replace the
+viewport body; `--dump` still prints any HTTP body (curl semantics).
+
+Demo path: open a page, `?` to learn bindings, `/alpha` + Enter, `n`/`N` to
+walk hits; kill the network and confirm `r` retries from the error page;
+resize mid-article and stay on the same paragraph.
