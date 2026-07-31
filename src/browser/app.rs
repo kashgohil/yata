@@ -1,10 +1,13 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::browser::error_page;
+use crate::browser::help;
 use crate::browser::hints;
 use crate::browser::history::History;
 use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
+use crate::browser::search::{self, Match as SearchMatch};
 use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
@@ -51,6 +54,25 @@ struct HintSession {
     labels: Vec<(String, layout::LinkHit)>,
 }
 
+/// In-page search session after `/` + Enter (M7).
+#[derive(Clone, Debug)]
+struct SearchSession {
+    query: String,
+    matches: Vec<SearchMatch>,
+    /// Index of the current match when `matches` is non-empty.
+    current: usize,
+}
+
+/// Resize anchor: a layout fragment at the top of the viewport (UX §3.6).
+#[derive(Clone, Copy, Debug)]
+struct ScrollAnchor {
+    node: NodeId,
+    /// Index among this node's text boxes in walk order (mid-paragraph lines).
+    text_index: usize,
+    /// Document y of that fragment before the resize (fallback for rewrap).
+    box_y: i32,
+}
+
 /// Where the current fetch stands. `Loaded` retains the raw body for the
 /// status-row byte count now, and for M2's parser to consume later; the
 /// viewport re-wraps from its own sanitized lines, not from this.
@@ -81,13 +103,16 @@ enum Surface {
     Dom,
     Styles,
     Boxes,
+    /// Keybinding help (M7), scrollable list generated from `keys::BINDINGS`.
+    Help,
 }
 
-/// Input mode. `Browse` reads the body and scrolls; `UrlInput` is the one-line
-/// URL bar with its edit buffer (cursor always at the end, no readline moves).
+/// Input mode. `Browse` reads the body and scrolls; `UrlInput` / `SearchInput`
+/// are one-line prompts (cursor always at the end, no readline moves).
 enum Mode {
     Browse,
     UrlInput { buffer: String },
+    SearchInput { buffer: String },
 }
 
 /// The UI state. Pure with respect to the terminal: `update` touches only
@@ -178,6 +203,11 @@ pub struct App {
     /// (history back/forward, reload). Tied to `FetchId` so a resize while the
     /// old page is still on screen cannot consume the restore.
     pending_scroll: Option<(FetchId, usize)>,
+    /// Active in-page search (`/` … Enter), if any.
+    search: Option<SearchSession>,
+    /// Scrollable help overlay content (`?`).
+    help_view: Viewport,
+    help_view_built: bool,
     /// How many times `relayout` has run. Test-only instrumentation for the
     /// invariant that costs the most if it ever breaks: scrolling relayouts
     /// zero times, a resize exactly once. Hover must not increment it (M6).
@@ -218,6 +248,9 @@ impl App {
             hint: None,
             status_msg: None,
             pending_scroll: None,
+            search: None,
+            help_view: Viewport::default(),
+            help_view_built: false,
             #[cfg(test)]
             layouts: 0,
         }
@@ -268,14 +301,24 @@ impl App {
             Msg::Mouse(ev) => self.on_mouse(ev),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
+                // Anchor: remember which layout fragment sat on the top
+                // visible row so relayout can put it back (UX §3.6).
+                let anchor = self.top_anchor();
                 // Resize is a wrap point: re-wrap at the new width, keep offset.
                 self.viewport.resize(w, self.page());
                 self.dom_view.resize(w, self.page());
                 self.styles_view.resize(w, self.page());
                 self.boxes_view.resize(w, self.page());
+                self.help_view.resize(w, self.page());
                 // ...and the second of exactly two places layout runs, because
                 // the column width changed with the frame.
                 self.relayout();
+                if let Some(anchor) = anchor {
+                    self.restore_anchor(anchor);
+                }
+                // Search match geometry is layout-dependent; re-run the query
+                // and keep the current hit on screen when possible.
+                self.recompute_search_matches();
                 redraw()
             }
             // Terminal input is gone; exit cleanly, the same as the quit key.
@@ -308,54 +351,45 @@ impl App {
                 status,
                 body,
                 elapsed,
+                content_type,
             } => {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
-                // Any status has a body worth showing (even a 404); charset is
-                // M2's problem, so lossy-decode the raw bytes for now.
+                // Only an accepted fetch records its duration (PLAN.md §4).
+                self.timings.fetch = Some(elapsed);
+                // Non-document responses become error pages (M7 / UX §3.7).
+                if !error_page::is_document(status, content_type.as_deref()) {
+                    let reason = if !(200..300).contains(&status) {
+                        error_page::http_reason(status)
+                    } else {
+                        error_page::unsupported_type_reason(content_type.as_deref())
+                    };
+                    self.apply_error_page(url, reason);
+                    return redraw();
+                }
+                // Document path: show raw body until Parsed lands.
                 let text = String::from_utf8_lossy(&body).into_owned();
                 self.viewport.set_content(&text, self.size.0, self.page());
-                // Session-visited set feeds `:visited` (M6). Any terminal
-                // status counts — a 404 is still a place the user has been.
+                // Session-visited set feeds `:visited` (M6).
                 self.visited.insert(url.clone());
                 self.fetch = Fetch::Loaded { url, status, body };
-                // The old tree stops matching the body just shown; the F1
-                // surface goes back to its placeholder until this fetch's
-                // `Parsed` follows (it is coming — same worker, next message).
-                // Its parse duration goes with it: fetch is now this run's,
-                // and a table mixing stages from two runs would lie.
-                self.dom = None;
-                self.dom_view_built = false;
-                self.styles_view_built = false;
-                self.boxes_view_built = false;
-                self.layout_tree = None;
-                self.display_list = DisplayList::default();
-                // The old page's stylesheets go with its tree: a sheet from
-                // the page being replaced must not style the new one. Workers
-                // already in flight for it are stale by `FetchId` anyway.
-                self.sheets.clear();
-                self.styles = None;
-                self.timings.parse = None;
-                // Style and layout go with it, for the same reason: this run
-                // has a fetch time and nothing else yet.
-                self.timings.style = None;
-                self.timings.layout = None;
-                // Only an accepted, completed fetch records its duration.
-                // `start_fetch` deliberately does not clear it and `NetError`
-                // sets nothing: the timing table shows the last *completed*
-                // run (PLAN.md §4) until a newer one lands.
-                self.timings.fetch = Some(elapsed);
+                self.clear_page_engine();
                 // Interaction state is page-local.
                 self.hover = None;
                 self.focus = None;
                 self.hint = None;
+                self.search = None;
                 redraw()
             }
             Msg::Parsed { id, dom, elapsed } => {
                 // Same stale-generation guard as `Loaded`: a slow parse of a
                 // superseded page must not clobber the current tree.
                 if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                // Error page already owns the surface — ignore a late parse.
+                if matches!(self.fetch, Fetch::Failed { .. }) {
                     return Effect::default();
                 }
                 self.dom = Some(dom);
@@ -407,7 +441,7 @@ impl App {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
-                self.fetch = Fetch::Failed { url, reason };
+                self.apply_error_page(url, reason);
                 redraw()
             }
         }
@@ -422,6 +456,7 @@ impl App {
         let mode = match self.mode {
             Mode::Browse => keys::Mode::Browse,
             Mode::UrlInput { .. } => keys::Mode::UrlInput,
+            Mode::SearchInput { .. } => keys::Mode::SearchInput,
         };
         match keys::resolve(mode, self.pending, &ev) {
             // Not a Press event: leave the pending prefix untouched.
@@ -439,16 +474,21 @@ impl App {
             Resolution::Unbound => {
                 self.pending = None;
                 // The one sanctioned key path outside the binding table
-                // (CLAUDE.md): in the URL bar a printable character types into
-                // the buffer. `q` is a letter here, not quit. `resolve` only
-                // yields `Unbound` for Press events, so no kind check is needed.
-                if let Mode::UrlInput { buffer } = &mut self.mode
+                // (CLAUDE.md): in the URL bar / search prompt a printable
+                // character types into the buffer. `q` is a letter here, not
+                // quit. `resolve` only yields `Unbound` for Press events.
+                if matches!(self.mode, Mode::UrlInput { .. } | Mode::SearchInput { .. })
                     && let KeyCode::Char(c) = ev.code
                     && !ev
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                 {
-                    buffer.push(c);
+                    match &mut self.mode {
+                        Mode::UrlInput { buffer } | Mode::SearchInput { buffer } => {
+                            buffer.push(c);
+                        }
+                        Mode::Browse => {}
+                    }
                     return redraw();
                 }
                 Effect::default()
@@ -497,6 +537,7 @@ impl App {
             Action::Bottom => moved(self.scroll_target().scroll_to_bottom()),
             Action::OpenUrl => {
                 self.hint = None;
+                self.surface = Surface::Page;
                 self.mode = Mode::UrlInput {
                     buffer: String::new(),
                 };
@@ -504,6 +545,7 @@ impl App {
             }
             Action::EditUrl => {
                 self.hint = None;
+                self.surface = Surface::Page;
                 let buffer = self.current_url().unwrap_or_default();
                 self.mode = Mode::UrlInput { buffer };
                 redraw()
@@ -520,16 +562,20 @@ impl App {
                 if self.hint.take().is_some() {
                     return redraw();
                 }
-                // URL bar: drop the buffer and return to browse. Already in
-                // browse with nothing to cancel → not dirty (no dead redraw).
-                if matches!(self.mode, Mode::UrlInput { .. }) {
+                if self.surface == Surface::Help {
+                    self.surface = Surface::Page;
+                    return redraw();
+                }
+                // URL bar / search: drop the buffer and return to browse.
+                // Already in browse with nothing to cancel → not dirty.
+                if matches!(self.mode, Mode::UrlInput { .. } | Mode::SearchInput { .. }) {
                     self.mode = Mode::Browse;
                     return redraw();
                 }
                 Effect::default()
             }
             Action::DeleteChar => {
-                if let Mode::UrlInput { buffer } = &mut self.mode {
+                if let Mode::UrlInput { buffer } | Mode::SearchInput { buffer } = &mut self.mode {
                     buffer.pop();
                 }
                 redraw()
@@ -543,6 +589,21 @@ impl App {
             Action::HistoryForward => self.history_go(false),
             Action::Reload => self.reload(),
             Action::YankUrl => self.yank_page_url(),
+            Action::OpenSearch => {
+                self.hint = None;
+                // Starting a new find clears the previous session so old
+                // highlights do not linger while the user types a new query.
+                self.search = None;
+                self.status_msg = None;
+                self.surface = Surface::Page;
+                self.mode = Mode::SearchInput {
+                    buffer: String::new(),
+                };
+                redraw()
+            }
+            Action::SearchNext => self.search_step(1),
+            Action::SearchPrev => self.search_step(-1),
+            Action::ToggleHelp => self.toggle_surface(Surface::Help),
         }
     }
 
@@ -576,6 +637,213 @@ impl App {
 
     fn boxes_active(&self) -> bool {
         self.surface == Surface::Boxes && self.layout_tree.is_some()
+    }
+
+    fn help_active(&self) -> bool {
+        self.surface == Surface::Help
+    }
+
+    /// Wipe engine state for a new body or an error page. Timing stages other
+    /// than fetch are cleared so the table never mixes two runs.
+    fn clear_page_engine(&mut self) {
+        self.dom = None;
+        self.dom_view_built = false;
+        self.styles_view_built = false;
+        self.boxes_view_built = false;
+        self.layout_tree = None;
+        self.display_list = DisplayList::default();
+        self.sheets.clear();
+        self.styles = None;
+        self.timings.parse = None;
+        self.timings.style = None;
+        self.timings.layout = None;
+        self.revealed = false;
+        self.search = None;
+    }
+
+    /// Show a synthetic error page (M7) and leave the app in `Fetch::Failed`.
+    fn apply_error_page(&mut self, url: String, reason: String) {
+        let text = error_page::render(&url, &reason);
+        self.viewport.set_content(&text, self.size.0, self.page());
+        self.fetch = Fetch::Failed { url, reason };
+        self.clear_page_engine();
+        self.hover = None;
+        self.focus = None;
+        self.hint = None;
+        self.pending_scroll = None;
+        if self.surface != Surface::Help {
+            self.surface = Surface::Page;
+        }
+    }
+
+    /// Layout fragment that intersects the top visible document row.
+    /// Prefer text boxes (what the reader sees); fall back to blocks.
+    /// Stores the fragment index among that node's text boxes so a mid-
+    /// paragraph scroll does not snap to the element's first line after resize.
+    fn top_anchor(&self) -> Option<ScrollAnchor> {
+        let tree = self.layout_tree.as_ref()?;
+        let top = self.viewport.offset() as i32;
+        let mut best_text: Option<(NodeId, i32)> = None;
+        let mut best_block: Option<(NodeId, i32)> = None;
+        tree.walk(tree.root, &mut |_, b| {
+            let Some(node) = b.node else {
+                return;
+            };
+            let y = b.dimensions.content.y;
+            let h = b.dimensions.content.height.max(1);
+            if y + h <= top || y > top {
+                return;
+            }
+            match b.kind {
+                // Deeper text fragments overwrite shallower ones (walk order).
+                BoxKind::Text => best_text = Some((node, y)),
+                BoxKind::Block => best_block = Some((node, y)),
+                _ => {}
+            }
+        });
+        let (node, box_y) = best_text.or(best_block)?;
+        // Index among Text boxes for this node (document walk order).
+        let mut text_index = 0usize;
+        let mut seen = 0usize;
+        let mut found = false;
+        tree.walk(tree.root, &mut |_, b| {
+            if found || b.kind != BoxKind::Text || b.node != Some(node) {
+                return;
+            }
+            if b.dimensions.content.y == box_y {
+                text_index = seen;
+                found = true;
+            }
+            seen += 1;
+        });
+        Some(ScrollAnchor {
+            node,
+            text_index,
+            box_y,
+        })
+    }
+
+    /// After relayout, restore the anchored fragment to the top of the viewport.
+    fn restore_anchor(&mut self, anchor: ScrollAnchor) {
+        let Some(tree) = &self.layout_tree else {
+            return;
+        };
+        let mut text_ys: Vec<i32> = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text && b.node == Some(anchor.node) {
+                text_ys.push(b.dimensions.content.y);
+            }
+        });
+        let y = text_ys
+            .get(anchor.text_index)
+            .copied()
+            .or_else(|| {
+                // Fragment count changed (rewrap): nearest y to the old one.
+                text_ys
+                    .iter()
+                    .copied()
+                    .min_by_key(|y| (*y - anchor.box_y).unsigned_abs())
+            })
+            .or_else(|| layout::first_y(tree, anchor.node));
+        if let Some(y) = y {
+            let _ = self.viewport.scroll_to_offset(y.max(0) as usize);
+        }
+    }
+
+    fn recompute_search_matches(&mut self) {
+        let Some(session) = &self.search else {
+            return;
+        };
+        let query = session.query.clone();
+        let current = session.current;
+        let Some(tree) = &self.layout_tree else {
+            self.search = None;
+            return;
+        };
+        let matches = search::find_matches(tree, &query);
+        if matches.is_empty() {
+            self.search = Some(SearchSession {
+                query,
+                matches,
+                current: 0,
+            });
+            return;
+        }
+        let current = current.min(matches.len() - 1);
+        self.search = Some(SearchSession {
+            query,
+            matches,
+            current,
+        });
+        self.scroll_search_into_view();
+    }
+
+    fn commit_search(&mut self, query: String) -> Effect {
+        self.mode = Mode::Browse;
+        let query = query.trim().to_string();
+        if query.is_empty() {
+            self.search = None;
+            return redraw();
+        }
+        let Some(tree) = &self.layout_tree else {
+            self.search = None;
+            self.status_msg = Some("no matches".into());
+            return redraw();
+        };
+        let matches = search::find_matches(tree, &query);
+        if matches.is_empty() {
+            self.search = Some(SearchSession {
+                query,
+                matches,
+                current: 0,
+            });
+            self.status_msg = Some("no matches".into());
+            return redraw();
+        }
+        self.search = Some(SearchSession {
+            query,
+            matches,
+            current: 0,
+        });
+        self.status_msg = None;
+        self.scroll_search_into_view();
+        redraw()
+    }
+
+    fn search_step(&mut self, dir: i32) -> Effect {
+        let Some(session) = &mut self.search else {
+            return Effect::default();
+        };
+        if session.matches.is_empty() {
+            return Effect::default();
+        }
+        let n = session.matches.len();
+        if dir >= 0 {
+            session.current = (session.current + 1) % n;
+        } else {
+            session.current = (session.current + n - 1) % n;
+        }
+        self.scroll_search_into_view();
+        redraw()
+    }
+
+    fn scroll_search_into_view(&mut self) {
+        let Some(session) = &self.search else {
+            return;
+        };
+        if session.matches.is_empty() {
+            return;
+        }
+        let y = session.matches[session.current].y as usize;
+        let page = self.page() as usize;
+        let off = self.viewport.offset();
+        if y < off {
+            let _ = self.viewport.scroll_to_offset(y);
+        } else if y >= off + page {
+            let _ = self
+                .viewport
+                .scroll_to_offset(y.saturating_sub(page.saturating_sub(1)));
+        }
     }
 
     /// Lay the cached tree out at the current column width and hand the lines
@@ -770,7 +1038,17 @@ impl App {
             Surface::Dom => self.build_dom_view(),
             Surface::Styles => self.build_styles_view(),
             Surface::Boxes => self.build_boxes_view(),
+            Surface::Help => self.build_help_view(),
         }
+    }
+
+    fn build_help_view(&mut self) {
+        if self.help_view_built {
+            return;
+        }
+        let text = help::help_text();
+        self.help_view.set_content(&text, self.size.0, self.page());
+        self.help_view_built = true;
     }
 
     /// The view the shared scroll keys act on: the same bindings drive the
@@ -783,21 +1061,27 @@ impl App {
             &mut self.styles_view
         } else if self.boxes_active() {
             &mut self.boxes_view
+        } else if self.help_active() {
+            &mut self.help_view
         } else {
             &mut self.viewport
         }
     }
 
-    /// Commit the URL bar: normalize the input, leave the bar, and start a
-    /// fetch generation. The returned `Effect::fetch` tells the loop to spawn
-    /// the worker — `App` never spawns.
+    /// Commit the URL bar or the search prompt.
     fn commit(&mut self) -> Effect {
-        let Mode::UrlInput { buffer } = &self.mode else {
-            return Effect::default();
-        };
-        let url = net::normalize_url(buffer);
-        self.mode = Mode::Browse;
-        self.navigate(url, true)
+        match &self.mode {
+            Mode::UrlInput { buffer } => {
+                let url = net::normalize_url(buffer);
+                self.mode = Mode::Browse;
+                self.navigate(url, true)
+            }
+            Mode::SearchInput { buffer } => {
+                let query = buffer.clone();
+                self.commit_search(query)
+            }
+            Mode::Browse => Effect::default(),
+        }
     }
 
     /// Current page URL if one is known (loaded, loading, or failed).
@@ -824,6 +1108,7 @@ impl App {
         self.hover = None;
         self.focus = None;
         self.hint = None;
+        self.search = None;
         self.status_msg = None;
         let id = self.start_fetch(url.clone());
         Effect {
@@ -839,6 +1124,7 @@ impl App {
         self.hover = None;
         self.focus = None;
         self.hint = None;
+        self.search = None;
         self.status_msg = None;
         let id = self.start_fetch(url.clone());
         self.pending_scroll = Some((id, scroll));
@@ -1127,6 +1413,7 @@ impl App {
             Surface::Dom => self.draw_dom(frame),
             Surface::Styles => self.draw_styles(frame),
             Surface::Boxes => self.draw_boxes(frame),
+            Surface::Help => self.draw_help(frame),
         }
         // Over the page area, after the body and before the bottom row.
         if self.timing_visible {
@@ -1136,7 +1423,8 @@ impl App {
             return;
         };
         match &self.mode {
-            Mode::UrlInput { buffer } => self.draw_url_bar(frame, y, buffer),
+            Mode::UrlInput { buffer } => self.draw_prompt(frame, y, "open: ", buffer),
+            Mode::SearchInput { buffer } => self.draw_prompt(frame, y, "find: ", buffer),
             Mode::Browse => self.draw_status(frame, y),
         }
     }
@@ -1150,11 +1438,58 @@ impl App {
             let left = column(self.size.0).left;
             let scroll = self.viewport.offset() as i32;
             paint::paint_to_frame(&self.display_list, frame, left, scroll, self.page());
+            self.draw_search_highlights(frame, left, scroll);
             self.draw_focus_overlay(frame, left, scroll);
             self.draw_hint_overlay(frame, left, scroll);
             return;
         }
         for (row, line) in self.viewport.visible().iter().enumerate() {
+            paint_line(frame, 0, row as u16, line);
+        }
+    }
+
+    /// Reverse-video every visible search match.
+    ///
+    /// Paint-time frame overlay (same pattern as focus and link hints), not a
+    /// display-list command: PLAN.md M7's "via the display list" is satisfied
+    /// by reading layout geometry without restyle/relayout; overlays keep
+    /// highlight chrome out of the cached list so scroll re-emit stays cheap.
+    fn draw_search_highlights(&self, frame: &mut Frame, left: u16, scroll: i32) {
+        let Some(session) = &self.search else {
+            return;
+        };
+        if session.matches.is_empty() {
+            return;
+        }
+        let page_h = self.page() as i32;
+        let style = reversed();
+        for (i, m) in session.matches.iter().enumerate() {
+            let screen_y = m.y - scroll;
+            if screen_y < 0 || screen_y >= page_h {
+                continue;
+            }
+            // Current match is bold reverse so n/N is easy to track.
+            let st = if i == session.current {
+                Style {
+                    attrs: Attrs::REVERSE | Attrs::BOLD,
+                    ..Style::default()
+                }
+            } else {
+                style
+            };
+            for dx in 0..m.width {
+                let sx = left as i32 + m.x + dx;
+                if sx < 0 || sx >= frame.width() as i32 {
+                    continue;
+                }
+                let cell = frame.get(sx as u16, screen_y as u16);
+                frame.set(sx as u16, screen_y as u16, Cell::new(cell.ch, st));
+            }
+        }
+    }
+
+    fn draw_help(&self, frame: &mut Frame) {
+        for (row, line) in self.help_view.visible().iter().enumerate() {
             paint_line(frame, 0, row as u16, line);
         }
     }
@@ -1289,14 +1624,13 @@ impl App {
         }
     }
 
-    /// The URL bar: `open: <buffer>` with a cursor cell at the end (the cursor
-    /// is always at the end — no readline editing beyond `Backspace`).
-    fn draw_url_bar(&self, frame: &mut Frame, y: u16, buffer: &str) {
+    /// One-line prompt (`open:` / `find:`) with a cursor cell at the end.
+    fn draw_prompt(&self, frame: &mut Frame, y: u16, label: &str, buffer: &str) {
         let style = reversed();
         for x in 0..frame.width() {
             frame.set(x, y, Cell::new(' ', style));
         }
-        let mut prompt = String::from("open: ");
+        let mut prompt = String::from(label);
         prompt.push_str(buffer);
         let end = frame.put_str(0, y, &prompt, style);
         frame.set(end, y, Cell::new(CURSOR, style));
@@ -1324,6 +1658,7 @@ impl App {
             Surface::Dom => format!("[dom] {base}"),
             Surface::Styles => format!("[styles] {base}"),
             Surface::Boxes => format!("[boxes] {base}"),
+            Surface::Help => format!("[help] {base}"),
         }
     }
 
@@ -1337,6 +1672,11 @@ impl App {
         if let Some(session) = &self.hint {
             let n = hints::filter_prefix(&session.labels, &session.buffer).len();
             return format!("hints: {} ({n})", session.buffer);
+        }
+        if let Some(session) = &self.search
+            && !session.matches.is_empty()
+        {
+            return format!("{}/{}", session.current + 1, session.matches.len());
         }
         match &self.fetch {
             Fetch::Idle => String::new(),
@@ -1361,6 +1701,10 @@ impl App {
             &self.dom_view
         } else if self.styles_active() {
             &self.styles_view
+        } else if self.boxes_active() {
+            &self.boxes_view
+        } else if self.help_active() {
+            &self.help_view
         } else {
             &self.viewport
         };
@@ -1539,6 +1883,7 @@ mod tests {
             status: 200,
             body,
             elapsed: Duration::ZERO,
+            content_type: None,
         })
     }
 
@@ -1554,6 +1899,7 @@ mod tests {
             status: 200,
             body: html_src.as_bytes().to_vec(),
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         let effect = app.update(Msg::Parsed {
             id,
@@ -1930,6 +2276,7 @@ mod tests {
             status,
             body: vec![b'x'; body_len],
             elapsed: Duration::ZERO,
+            content_type: None,
         }
     }
 
@@ -2221,6 +2568,7 @@ mod tests {
             status: 200,
             body: b"hi".to_vec(),
             elapsed: Duration::from_micros(12_300),
+            content_type: None,
         });
         assert_eq!(app.timings().fetch, Some(Duration::from_micros(12_300)));
     }
@@ -2235,6 +2583,7 @@ mod tests {
             status: 200,
             body: b"hi".to_vec(),
             elapsed: Duration::from_micros(12_300),
+            content_type: None,
         });
         // The overlay shows the last *completed* run (PLAN.md §4): the old
         // number stands until the new fetch lands.
@@ -2261,6 +2610,7 @@ mod tests {
             status: 200,
             body: b"hi".to_vec(),
             elapsed: Duration::from_micros(12_300),
+            content_type: None,
         });
         let id = app.start_fetch("http://y/".into());
         app.update(Msg::NetError {
@@ -2288,6 +2638,7 @@ mod tests {
             status: 200,
             body: body(50),
             elapsed: Duration::from_micros(12_300),
+            content_type: None,
         });
         app.record_frame(Duration::from_micros(2_100));
         app
@@ -3162,6 +3513,7 @@ mod tests {
             status: 200,
             body: b"<p>page b</p>".to_vec(),
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         app.update(Msg::Parsed {
             id,
@@ -3181,6 +3533,7 @@ mod tests {
                 b"<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>"
                     .to_vec(),
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         app.update(Msg::Parsed {
             id,
@@ -3261,6 +3614,7 @@ mod tests {
             status: 200,
             body: b"<p>there</p>".to_vec(),
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         assert!(app.visited.contains("http://visited.test/"));
 
@@ -3272,6 +3626,7 @@ mod tests {
             status: 200,
             body: b"<p><a href='http://visited.test/'>back</a></p>".to_vec(),
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         app.update(Msg::Parsed {
             id: id2,
@@ -3329,6 +3684,7 @@ mod tests {
                 b"<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>"
                     .to_vec(),
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         app.update(Msg::Parsed {
             id,
@@ -3367,5 +3723,284 @@ mod tests {
         app.update(ch('z'));
         assert!(app.hint.is_some());
         assert_eq!(app.hint.as_ref().map(|h| h.buffer.as_str()), Some(""));
+    }
+
+    // ---- M7 polish --------------------------------------------------------
+
+    #[test]
+    fn net_error_renders_a_retry_page() {
+        let mut app = App::new(60, 12);
+        let id = app.start_fetch("http://x.test/gone".into());
+        assert!(
+            app.update(Msg::NetError {
+                id,
+                url: "http://x.test/gone".into(),
+                reason: "connection refused".into(),
+            })
+            .dirty
+        );
+        assert!(app.dom.is_none());
+        let mut frame = Frame::new(60, 12);
+        app.draw(&mut frame);
+        let page: String = (0..11)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains("http://x.test/gone"), "{page}");
+        assert!(page.contains("connection refused"), "{page}");
+        assert!(page.contains("Press r to retry."), "{page}");
+        // Reload still knows the URL.
+        let effect = app.update(ch('r'));
+        assert_eq!(
+            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            Some("http://x.test/gone")
+        );
+    }
+
+    #[test]
+    fn http_404_is_an_error_page_not_a_document() {
+        let mut app = App::new(60, 12);
+        let id = app.start_fetch("http://x/".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/".into(),
+            status: 404,
+            body: b"<html><body>server 404 page</body></html>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+        });
+        assert!(app.dom.is_none());
+        // A late Parsed must not clobber the error page.
+        app.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse("<html><body>server 404 page</body></html>"),
+            elapsed: Duration::ZERO,
+        });
+        assert!(app.dom.is_none());
+        let mut frame = Frame::new(60, 12);
+        app.draw(&mut frame);
+        let page: String = (0..11)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains("HTTP 404"), "{page}");
+        assert!(page.contains("Press r to retry."), "{page}");
+        assert!(!page.contains("server 404 page"), "{page}");
+    }
+
+    #[test]
+    fn unsupported_content_type_is_an_error_page() {
+        let mut app = App::new(60, 12);
+        let id = app.start_fetch("http://x/pic.png".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://x/pic.png".into(),
+            status: 200,
+            body: b"\x89PNG".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("image/png".into()),
+        });
+        assert!(app.dom.is_none());
+        let mut frame = Frame::new(60, 12);
+        app.draw(&mut frame);
+        let page: String = (0..11)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains("unsupported content-type"), "{page}");
+        assert!(page.contains("image/png"), "{page}");
+    }
+
+    #[test]
+    fn search_finds_highlights_and_steps() {
+        let mut app = page(80, 12, "<p>alpha</p><p>beta alpha</p><p>gamma</p>");
+        let layouts_before = app.layouts;
+        assert!(app.update(ch('/')).dirty);
+        match &app.mode {
+            Mode::SearchInput { .. } => {}
+            _ => panic!("/ must open search"),
+        }
+        for c in "alpha".chars() {
+            app.update(ch(c));
+        }
+        assert!(app.update(key(KeyCode::Enter, KeyModifiers::NONE)).dirty);
+        let session = app.search.as_ref().expect("search session");
+        let n = session.matches.len();
+        assert!(n >= 2, "{:?}", session.matches);
+        assert_eq!(session.current, 0);
+
+        let mut frame = Frame::new(80, 12);
+        app.draw(&mut frame);
+        // At least one reversed cell on the page (highlight), not the status row.
+        let mut reversed_cells = 0;
+        for y in 0..11u16 {
+            for x in 0..80u16 {
+                if frame.get(x, y).attrs.contains(Attrs::REVERSE) {
+                    reversed_cells += 1;
+                }
+            }
+        }
+        assert!(reversed_cells > 0, "expected search highlights");
+
+        // Status middle is "1/N" — must not rely on the URL containing '/'.
+        let row = row_text(&frame, 11);
+        assert!(
+            row.contains(&format!("1/{n}")),
+            "status should show 1/{n}, row was {row:?}"
+        );
+
+        app.update(ch('n'));
+        assert_eq!(app.search.as_ref().unwrap().current, 1);
+        let mut frame = Frame::new(80, 12);
+        app.draw(&mut frame);
+        let row = row_text(&frame, 11);
+        assert!(
+            row.contains(&format!("2/{n}")),
+            "status should show 2/{n}, row was {row:?}"
+        );
+
+        app.update(key(KeyCode::Char('N'), KeyModifiers::NONE));
+        assert_eq!(app.search.as_ref().unwrap().current, 0);
+        // Wrap backward from 0 → last.
+        app.update(key(KeyCode::Char('N'), KeyModifiers::NONE));
+        assert_eq!(app.search.as_ref().unwrap().current, n - 1);
+        assert_eq!(app.layouts, layouts_before, "search must not relayout");
+    }
+
+    #[test]
+    fn search_esc_cancels_without_a_session() {
+        let mut app = page(80, 10, "<p>hello</p>");
+        app.update(ch('/'));
+        app.update(ch('h'));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app.search.is_none());
+    }
+
+    #[test]
+    fn opening_search_clears_a_previous_session() {
+        let mut app = page(80, 12, "<p>alpha beta alpha</p>");
+        app.update(ch('/'));
+        for c in "alpha".chars() {
+            app.update(ch(c));
+        }
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.search.as_ref().unwrap().matches.len() >= 2);
+
+        // `/` again: old highlights/session must go before the user types.
+        app.update(ch('/'));
+        assert!(app.search.is_none());
+        assert!(matches!(app.mode, Mode::SearchInput { .. }));
+    }
+
+    #[test]
+    fn help_toggles_from_question_mark() {
+        let mut app = page(80, 16, "<p>hello world unique_token</p>");
+        assert!(app.update(ch('?')).dirty);
+        assert_eq!(app.surface, Surface::Help);
+        let mut frame = Frame::new(80, 16);
+        app.draw(&mut frame);
+        let page: String = (0..15)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains("yata"), "{page}");
+        assert!(page.contains("Browse") || page.contains("scroll"), "{page}");
+        // Page body must not be the active content.
+        assert!(
+            !page.contains("unique_token"),
+            "page content under help: {page}"
+        );
+        app.update(ch('?'));
+        assert_eq!(app.surface, Surface::Page);
+    }
+
+    #[test]
+    fn resize_keeps_the_top_element_anchored() {
+        // Distinct markers per paragraph so we can see which one is on top.
+        let html: String = (0..40)
+            .map(|i| format!("<p>MARKER{i:02} content line</p>"))
+            .collect();
+        let mut app = page(80, 12, &html);
+        // Scroll until MARKER10 is near the top.
+        for _ in 0..80 {
+            app.update(ch('j'));
+            let mut frame = Frame::new(80, 12);
+            app.draw(&mut frame);
+            let top = row_text(&frame, 0);
+            if top.contains("MARKER10") {
+                break;
+            }
+        }
+        let mut frame = Frame::new(80, 12);
+        app.draw(&mut frame);
+        let before = row_text(&frame, 0);
+        assert!(
+            before.contains("MARKER"),
+            "expected a marker on the top row before resize, got {before:?}"
+        );
+        let marker = before
+            .split_whitespace()
+            .find(|w| w.starts_with("MARKER"))
+            .unwrap()
+            .to_string();
+
+        let layouts_before = app.layouts;
+        app.update(Msg::Resize(50, 12));
+        assert_eq!(app.layouts, layouts_before + 1);
+        let mut frame = Frame::new(50, 12);
+        app.draw(&mut frame);
+        let after = row_text(&frame, 0);
+        assert!(
+            after.contains(&marker),
+            "anchor lost: before top had {marker}, after {after:?}"
+        );
+    }
+
+    #[test]
+    fn resize_mid_paragraph_does_not_snap_to_the_first_line() {
+        // One long paragraph wraps to many lines. Scroll into the middle of it,
+        // resize, and the top row must still show a mid-paragraph slice — not
+        // jump back to the opening words (the old first_y bug).
+        let words: String = (0..80).map(|i| format!("w{i:02} ")).collect();
+        let html = format!("<p>{words}</p><p>after</p>");
+        let mut app = page(40, 8, &html);
+        // Scroll a few lines into the wrapped paragraph.
+        for _ in 0..4 {
+            app.update(ch('j'));
+        }
+        let mut frame = Frame::new(40, 8);
+        app.draw(&mut frame);
+        let before = row_text(&frame, 0);
+        assert!(
+            !before.contains("w00"),
+            "test setup: should be mid-paragraph, top was {before:?}"
+        );
+        assert!(
+            before.contains('w'),
+            "expected wrapped words on top, got {before:?}"
+        );
+        // Capture a distinctive token from the top row.
+        let token = before
+            .split_whitespace()
+            .find(|t| t.starts_with('w') && t.len() >= 3)
+            .expect("a wNN token on the top row")
+            .to_string();
+
+        app.update(Msg::Resize(36, 8));
+        let mut frame = Frame::new(36, 8);
+        app.draw(&mut frame);
+        let after = row_text(&frame, 0);
+        // Either the same token or a near neighbour still mid-paragraph —
+        // not the paragraph start.
+        assert!(
+            !after.contains("w00") || after.contains(&token),
+            "snapped to start or lost place: before had {token}, after {after:?}"
+        );
+        // Stronger: the top row should still be paragraph text, not blank.
+        assert!(
+            after.contains('w'),
+            "lost paragraph content after resize: {after:?}"
+        );
     }
 }

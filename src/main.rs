@@ -282,6 +282,7 @@ fn run_timing(url: &str) -> i32 {
         status,
         body,
         elapsed: fetch_elapsed,
+        content_type: None,
     });
     app.update(Msg::Parsed {
         id,
@@ -404,6 +405,7 @@ mod tests {
             status: 200,
             body,
             elapsed: Duration::ZERO,
+            content_type: None,
         });
         // 200 'j' now scroll for real: still one coalesced redraw decision, not
         // 200 renders. (Clamping to the last page is covered by viewport tests.)

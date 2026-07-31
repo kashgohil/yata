@@ -33,6 +33,14 @@ pub enum Action {
     Reload,
     /// Yank the current page URL (`yy`).
     YankUrl,
+    /// Open in-page search (`/`).
+    OpenSearch,
+    /// Jump to the next search match (`n`).
+    SearchNext,
+    /// Jump to the previous search match (`N`).
+    SearchPrev,
+    /// Toggle the help overlay (`?`).
+    ToggleHelp,
 }
 
 /// Which key map is live. `App`'s own mode carries the URL buffer; this is the
@@ -41,6 +49,8 @@ pub enum Action {
 pub enum Mode {
     Browse,
     UrlInput,
+    /// Same chord set as `UrlInput` (Enter/Esc/Backspace); printable chars type.
+    SearchInput,
 }
 
 /// One key plus its modifiers. A binding is one chord, or a two-chord sequence
@@ -76,9 +86,9 @@ const fn browse(prefix: Option<Chord>, trigger: Chord, action: Action) -> Bindin
     }
 }
 
-const fn input(trigger: Chord, action: Action) -> Binding {
+const fn input(mode: Mode, trigger: Chord, action: Action) -> Binding {
     Binding {
-        mode: Mode::UrlInput,
+        mode,
         prefix: None,
         trigger,
         action,
@@ -142,14 +152,43 @@ pub const BINDINGS: &[Binding] = &[
         chord(KeyCode::Char('y'), NONE),
         Action::YankUrl,
     ),
+    // M7 polish.
+    browse(None, chord(KeyCode::Char('/'), NONE), Action::OpenSearch),
+    browse(None, chord(KeyCode::Char('n'), NONE), Action::SearchNext),
+    browse(None, chord(KeyCode::Char('N'), NONE), Action::SearchPrev),
+    browse(None, chord(KeyCode::Char('?'), NONE), Action::ToggleHelp),
     browse(None, chord(KeyCode::Esc, NONE), Action::Cancel),
     browse(None, chord(KeyCode::Char('q'), NONE), Action::Quit),
     browse(None, chord(KeyCode::Char('c'), CTRL), Action::Quit),
-    // UrlInput. `q` is absent on purpose: it is a letter here and types.
-    input(chord(KeyCode::Enter, NONE), Action::Commit),
-    input(chord(KeyCode::Esc, NONE), Action::Cancel),
-    input(chord(KeyCode::Backspace, NONE), Action::DeleteChar),
-    input(chord(KeyCode::Char('c'), CTRL), Action::Quit),
+    // UrlInput / SearchInput. `q` is absent on purpose: it is a letter here.
+    input(Mode::UrlInput, chord(KeyCode::Enter, NONE), Action::Commit),
+    input(Mode::UrlInput, chord(KeyCode::Esc, NONE), Action::Cancel),
+    input(
+        Mode::UrlInput,
+        chord(KeyCode::Backspace, NONE),
+        Action::DeleteChar,
+    ),
+    input(
+        Mode::UrlInput,
+        chord(KeyCode::Char('c'), CTRL),
+        Action::Quit,
+    ),
+    input(
+        Mode::SearchInput,
+        chord(KeyCode::Enter, NONE),
+        Action::Commit,
+    ),
+    input(Mode::SearchInput, chord(KeyCode::Esc, NONE), Action::Cancel),
+    input(
+        Mode::SearchInput,
+        chord(KeyCode::Backspace, NONE),
+        Action::DeleteChar,
+    ),
+    input(
+        Mode::SearchInput,
+        chord(KeyCode::Char('c'), CTRL),
+        Action::Quit,
+    ),
 ];
 
 /// The outcome of resolving one key press against the table, given the current
@@ -433,5 +472,33 @@ mod tests {
         // A release must not cancel a pending prefix.
         let g = chord(KeyCode::Char('g'), NONE);
         assert_eq!(resolve(Mode::Browse, Some(g), &ev), Resolution::Ignore);
+    }
+
+    #[test]
+    fn m7_search_and_help_bindings() {
+        assert_eq!(
+            browse_key(KeyCode::Char('/'), NONE),
+            Resolution::Action(Action::OpenSearch)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('n'), NONE),
+            Resolution::Action(Action::SearchNext)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('N'), NONE),
+            Resolution::Action(Action::SearchPrev)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('?'), NONE),
+            Resolution::Action(Action::ToggleHelp)
+        );
+        assert_eq!(
+            resolve(Mode::SearchInput, None, &press(KeyCode::Enter, NONE)),
+            Resolution::Action(Action::Commit)
+        );
+        assert_eq!(
+            resolve(Mode::SearchInput, None, &press(KeyCode::Esc, NONE)),
+            Resolution::Action(Action::Cancel)
+        );
     }
 }

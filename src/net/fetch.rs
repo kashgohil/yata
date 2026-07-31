@@ -14,34 +14,49 @@ use crate::net::FetchId;
 const CHUNK: usize = 16 * 1024;
 
 /// Fetch `url` on a detached worker thread; returns immediately. The worker
-/// talks to the rest of the program only by sending `Msg`s into `tx`: one
-/// `Loading` per body chunk, then exactly one `Loaded` followed by one
-/// `Parsed` on success, or one `NetError` on any failure. It never panics and
-/// never prints; if the channel is closed (the app quit), it just stops.
+/// talks to the rest of the program only by sending `Msg`s into `tx`:
+/// - progress: zero or more `Loading`
+/// - terminal success: always one `Loaded` (so `--dump` can print any body)
+/// - parse: one `Parsed` only when [`is_document`] is true (2xx + document
+///   content-type). Non-documents and HTTP errors skip `Parsed` so the TUI
+///   error page is not clobbered (M7).
+/// - failure: one `NetError` (DNS, TLS, connect, mid-body disconnect)
+///
+/// It never panics and never prints; if the channel is closed (the app quit),
+/// it just stops.
 ///
 /// Parsing lives here, not in the `Loaded` handler: the worker already owns
 /// the bytes and already runs off the UI thread, and a Wikipedia-sized parse
 /// (~tens of ms) would blow the keypress→screen budget if the UI thread did
-/// it. `Loaded` goes out first so the raw body shows without waiting on the
-/// parse.
+/// it. `Loaded` goes out first so a document body shows without waiting on
+/// the parse.
 pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
     thread::spawn(move || {
         match fetch(id, &url, &tx) {
             Ok(Some(loaded)) => {
-                let Msg::Loaded { body, .. } = &loaded else {
+                let Msg::Loaded {
+                    body,
+                    status,
+                    content_type,
+                    ..
+                } = &loaded
+                else {
                     unreachable!("fetch's success message is always Loaded");
                 };
-                let text = html::decode_body(body);
+                let should_parse = is_document(*status, content_type.as_deref());
+                let text = should_parse.then(|| html::decode_body(body));
                 if tx.send(loaded).is_err() {
                     return;
                 }
-                let started = Instant::now();
-                let dom = html::parse(&text);
-                let _ = tx.send(Msg::Parsed {
-                    id,
-                    dom,
-                    elapsed: started.elapsed(),
-                });
+                if let Some(text) = text {
+                    let started = Instant::now();
+                    let dom = html::parse(&text);
+                    let _ = tx.send(Msg::Parsed {
+                        id,
+                        dom,
+                        elapsed: started.elapsed(),
+                    });
+                }
             }
             // Channel closed mid-stream: nobody is listening anymore.
             Ok(None) => {}
@@ -50,6 +65,33 @@ pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
             }
         }
     });
+}
+
+/// Whether a response should be parsed and styled as a document (vs an error
+/// page). Charset parameters are ignored. Missing/empty content-type is
+/// treated as a document — many servers omit it for HTML.
+///
+/// Single source of truth for the worker (`Parsed` gate) and the TUI
+/// (`error_page` / `App` error-page path). Do not reimplement elsewhere.
+pub fn is_document(status: u16, content_type: Option<&str>) -> bool {
+    if !(200..300).contains(&status) {
+        return false;
+    }
+    let Some(ct) = content_type else {
+        return true;
+    };
+    let mime = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    mime.is_empty()
+        || mime == "text/html"
+        || mime == "application/xhtml+xml"
+        || mime == "text/plain"
+        || mime == "text/xml"
+        || mime == "application/xml"
 }
 
 /// Fetch one linked stylesheet on its own detached worker (M4.3). One
@@ -116,6 +158,11 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
     let status = resp.status().as_u16();
     // The final URL, after redirects — what M1.5's URL bar should display.
     let final_url = resp.url().to_string();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned());
 
     let mut body = Vec::new();
     let mut buf = [0u8; CHUNK];
@@ -141,6 +188,7 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
         status,
         body,
         elapsed: started.elapsed(),
+        content_type,
     }))
 }
 
@@ -419,6 +467,7 @@ mod tests {
                 status: 200,
                 body: b"hello world".to_vec(),
                 elapsed: *elapsed,
+                content_type: None,
             }
         );
         // The Parsed message carries the body's tree, built on the worker.
@@ -514,6 +563,7 @@ mod tests {
                 status: 200,
                 body: b"hello".to_vec(),
                 elapsed: *elapsed,
+                content_type: None,
             },
             "Loaded must carry the post-redirect URL and the final status"
         );
@@ -552,6 +602,7 @@ mod tests {
                 status: 200,
                 body: b"hello world".to_vec(),
                 elapsed: *elapsed,
+                content_type: None,
             },
             "the body must arrive decompressed, not as gzip bytes"
         );
@@ -568,5 +619,59 @@ mod tests {
             Msg::NetError { id: FetchId(3), url, reason }
                 if url == "not a url" && !reason.is_empty()
         ));
+    }
+
+    #[test]
+    fn non_document_responses_send_loaded_without_parsed() {
+        // HTTP error: body is still delivered (dump/curl semantics) but never
+        // parsed into a DOM the TUI would style.
+        let addr = serve_once(
+            b"HTTP/1.1 404 Not Found\r\nContent-Type: text/html\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found"
+                .to_vec(),
+        );
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(20), format!("http://{addr}/"), tx);
+        let msgs = drain(rx);
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(m, Msg::Loaded { status: 404, .. })),
+            "expected Loaded for 404: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Parsed { .. })),
+            "404 must not produce Parsed: {msgs:?}"
+        );
+
+        // 200 with a non-document content-type: same shape.
+        let addr = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: 4\r\nConnection: close\r\n\r\n\x89PNG"
+                .to_vec(),
+        );
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(21), format!("http://{addr}/"), tx);
+        let msgs = drain(rx);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                Msg::Loaded {
+                    status: 200,
+                    content_type: Some(ct),
+                    ..
+                } if ct.starts_with("image/png")
+            )),
+            "expected Loaded image/png: {msgs:?}"
+        );
+        assert!(
+            !msgs.iter().any(|m| matches!(m, Msg::Parsed { .. })),
+            "image/png must not produce Parsed: {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn is_document_matrix() {
+        assert!(is_document(200, None));
+        assert!(is_document(200, Some("text/html; charset=utf-8")));
+        assert!(!is_document(404, Some("text/html")));
+        assert!(!is_document(200, Some("image/png")));
     }
 }

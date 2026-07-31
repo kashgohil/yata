@@ -32,6 +32,9 @@ pub enum Msg {
         status: u16,
         body: Vec<u8>,
         elapsed: Duration,
+        /// Raw `Content-Type` header value, if any. The TUI uses this to refuse
+        /// non-document responses (M7); `--dump` ignores it.
+        content_type: Option<String>,
     },
     /// The parsed tree for a `Loaded` body, sent by the same worker right
     /// after it. Parsing happens off the UI thread (CLAUDE.md: the UI thread

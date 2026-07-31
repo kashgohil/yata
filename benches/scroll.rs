@@ -55,6 +55,7 @@ fn page(w: u16, h: u16) -> (App, Renderer) {
         status: 200,
         body: html.into_bytes(),
         elapsed: Duration::ZERO,
+        content_type: None,
     });
     // Layout happens here, before the timer starts.
     app.update(Msg::Parsed {
