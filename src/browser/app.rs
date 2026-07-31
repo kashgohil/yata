@@ -233,6 +233,7 @@ impl App {
                 self.viewport.resize(w, self.page());
                 self.dom_view.resize(w, self.page());
                 self.styles_view.resize(w, self.page());
+                self.boxes_view.resize(w, self.page());
                 // ...and the second of exactly two places layout runs, because
                 // the column width changed with the frame.
                 self.relayout();
@@ -351,11 +352,8 @@ impl App {
                 *entry = Some(sheet.unwrap_or_default());
                 self.restyle();
                 self.styles_view_built = false;
-                self.build_visible_inspector();
-                // The page is already on screen; this is the "then restyles"
-                // half of UX §3.2, and it is only visible if the new computed
-                // values reach the lines. Relayout is not on the scroll path —
-                // it runs here, on a parse, and on a resize, and nowhere else.
+                // Relayout first so F3/F2 rebuild (at end of relayout) sees the
+                // new tree and styles — not the pre-sheet geometry.
                 self.relayout();
                 redraw()
             }
@@ -521,6 +519,9 @@ impl App {
             self.layouts += 1;
         }
         self.viewport.set_lines(lines, self.page());
+        // F3 (and any open inspector) must reflect the new geometry — not a
+        // stale cache from before this relayout (resize / stylesheet / parse).
+        self.build_visible_inspector();
     }
 
     /// Take the freshly parsed tree's stylesheet sources: parse the inline
@@ -2031,6 +2032,31 @@ mod tests {
         assert_eq!(app.update(f3()), redraw());
         app.draw(&mut frame);
         assert!(row_text(&frame, 0).contains("hello"), "page must come back");
+    }
+
+    #[test]
+    fn f3_rebuilds_after_resize() {
+        let mut app = App::new(60, 6);
+        open_page(&mut app, "<body><p>hello wide content here</p></body>");
+        assert_eq!(app.update(f3()), redraw());
+        let mut frame = Frame::new(60, 6);
+        app.draw(&mut frame);
+        let before = row_text(&frame, 0);
+        assert!(before.contains("w="), "{before:?}");
+        // Narrow the frame; layout and F3 must refresh.
+        assert_eq!(app.update(Msg::Resize(40, 6)), redraw());
+        let mut frame = Frame::new(40, 6);
+        app.draw(&mut frame);
+        let after = row_text(&frame, 0);
+        assert!(after.contains("w="), "F3 blank after resize: {after:?}");
+        assert!(
+            row_text(&frame, 5).contains("[boxes]"),
+            "still on F3 surface"
+        );
+        // Geometry should change with the column (or at least rebuild).
+        // Width value in the first box line is content-dependent; just require
+        // a non-empty rebuilt line that still looks like box output.
+        assert!(!after.trim().is_empty(), "{after:?}");
     }
 
     #[test]

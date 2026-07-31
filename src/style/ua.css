@@ -55,7 +55,7 @@ blockquote { padding-left: 2em }
    :link is every <a href> until history exists (M6). */
 a:link { color: #5c5cff; text-decoration: underline }
 
-/* Deliberately absent: `center { text-align: center }`, which is what the
-   element means. M4 has no box widths to centre within, so paint would centre
-   every line inside the column — and news.ycombinator.com wraps its whole
-   page in <center>. M5's real alignment can have it. */
+/* What the element means. HN wraps its page in <center>; that centres the
+   content column's lines inside their boxes, which is correct CSS and what
+   M5's text-align implements. */
+center { text-align: center }

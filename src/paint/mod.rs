@@ -141,7 +141,8 @@ pub fn paint_to_frame(
                     continue;
                 }
                 let screen_x = origin_x as i32 + *x;
-                if screen_x >= frame.width() as i32 || screen_x + text.len() as i32 <= 0 {
+                let text_cells = unicode_width::UnicodeWidthStr::width(text.as_str()) as i32;
+                if screen_x >= frame.width() as i32 || screen_x + text_cells <= 0 {
                     continue;
                 }
                 // Draw char by char so a background fill already under this
