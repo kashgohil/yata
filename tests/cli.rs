@@ -167,7 +167,11 @@ fn dump_text_prints_the_laid_out_page_to_stdout() {
         lines.iter().any(|l| l.contains('文')),
         "the wide-character paragraph never made it into the output"
     );
-    assert!(text.contains("• one\n• two\n"), "text was:\n{text}");
+    // List markers sit inside the UA padding-left indent (M5 box model).
+    assert!(
+        text.contains("• one") && text.contains("• two"),
+        "text was:\n{text}"
+    );
     // Styles are dropped, not rendered as markers, and no escape sequence
     // reaches a pipe — attributes belong to the renderer alone.
     assert!(!text.contains('['), "style markers reached stdout:\n{text}");

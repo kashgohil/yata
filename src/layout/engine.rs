@@ -595,7 +595,6 @@ impl<'a> Engine<'a> {
                     cur.pop();
                 }
                 self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, align);
-                cur_cells = 0;
             }
             cur.push(piece);
             cur_cells = cur.iter().map(|p| p.cells).sum();

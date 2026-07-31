@@ -215,3 +215,24 @@ Against PLAN.md §4's < 250 ms full-pipeline budget for a large Wikipedia
 article, with style now counted: 32% of it. Style is the largest engine stage
 on this page — larger than parse — which is the number that would have gone
 unnoticed for another milestone without the row.
+
+---
+
+## M5 — box model + real layout (2026-07-31)
+
+Layout is now a box tree with margin/padding/border/width/max-width, inline
+line boxes, and a display list. Machine A, criterion `--sample-size 20`.
+
+| Measure | Result | Budget |
+|---|---|---|
+| `layout en.wikipedia.org 80-col` | **3.82 ms** | < 100 ms |
+| full pipeline danluu.com (parse+style+layout+paint) | **0.55 ms** | < 50 ms |
+| scroll step (existing bench, unchanged path) | still ≪ 5 ms | < 5 ms |
+
+Both M5 fast gates land with headroom: Wikipedia layout is ~26× inside budget,
+danluu's full pipeline ~90× inside. The box tree is denser than M3's line list
+but the work is still dominated by the cascade on large pages, not geometry.
+
+HN header spacing: `.hnname { margin-right: 5px }` now resolves to 1 cell
+(nonzero → ≥1), so the glued `Hacker Newsnew` case from M5.0 is fixed by the
+box model rather than more parser tricks.

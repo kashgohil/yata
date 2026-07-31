@@ -22,3 +22,7 @@ harness = false
 [[bench]]
 name = "style"
 harness = false
+
+[[bench]]
+name = "layout"
+harness = false
