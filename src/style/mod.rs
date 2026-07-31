@@ -13,12 +13,37 @@ pub mod matching;
 pub mod sources;
 pub mod values;
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use crate::css::{self, Declaration, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
 use matching::RuleIndex;
 use values::{ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
+
+/// Dynamic matching inputs for the cascade (M6): which node is hovered, which
+/// absolute URLs the user has visited, and the base URL for resolving `href`s
+/// in `:link` / `:visited`. Empty/default is what headless dumps and pure
+/// cascade unit tests use — every link is unvisited, nothing hovers.
+///
+/// `visited` is borrowed so a hover restyle does not clone the set every move.
+#[derive(Clone, Copy, Debug)]
+pub struct StyleContext<'a> {
+    pub hover: Option<NodeId>,
+    pub visited: &'a HashSet<String>,
+    pub base_url: Option<&'a str>,
+}
+
+impl Default for StyleContext<'static> {
+    fn default() -> Self {
+        static EMPTY: OnceLock<HashSet<String>> = OnceLock::new();
+        StyleContext {
+            hover: None,
+            visited: EMPTY.get_or_init(HashSet::new),
+            base_url: None,
+        }
+    }
+}
 
 /// What a node looks like once the cascade and inheritance have run. `Default`
 /// is the CSS initial value of every property, which is also what a node with
@@ -105,8 +130,14 @@ pub fn ua_stylesheet() -> &'static Stylesheet {
 }
 
 /// Resolve every node's computed values against the UA sheet, the page's
-/// sheets in order, and each element's `style=""` attribute.
+/// sheets in order, and each element's `style=""` attribute. Uses an empty
+/// [`StyleContext`] — no hover, no visited set.
 pub fn style_tree(dom: &Dom, sheets: &[&Stylesheet]) -> Styles {
+    style_tree_with(dom, sheets, &StyleContext::default())
+}
+
+/// Like [`style_tree`], but with hover / visited matching (M6).
+pub fn style_tree_with(dom: &Dom, sheets: &[&Stylesheet], ctx: &StyleContext<'_>) -> Styles {
     let ua = RuleIndex::build(&[ua_stylesheet()]);
     let author = RuleIndex::build(sheets);
     let mut styles = Styles {
@@ -120,6 +151,7 @@ pub fn style_tree(dom: &Dom, sheets: &[&Stylesheet]) -> Styles {
         &ComputedStyle::default(),
         &ua,
         &author,
+        ctx,
         &mut styles,
     );
     styles
@@ -131,10 +163,11 @@ fn resolve(
     parent: &ComputedStyle,
     ua: &RuleIndex,
     author: &RuleIndex,
+    ctx: &StyleContext<'_>,
     out: &mut Styles,
 ) {
     let computed = match &dom.node(node).data {
-        NodeData::Element { .. } => cascade(dom, node, parent, ua, author),
+        NodeData::Element { .. } => cascade(dom, node, parent, ua, author, ctx),
         // Text, comments and the document root match no selector; they carry
         // their parent's inherited values so paint can style a text run by
         // asking the text node itself.
@@ -142,7 +175,7 @@ fn resolve(
     };
     out.computed[node.0 as usize] = computed;
     for child in dom.children(node) {
-        resolve(dom, child, &computed, ua, author, out);
+        resolve(dom, child, &computed, ua, author, ctx, out);
     }
 }
 
@@ -180,13 +213,14 @@ fn cascade(
     parent: &ComputedStyle,
     ua: &RuleIndex,
     author: &RuleIndex,
+    ctx: &StyleContext<'_>,
 ) -> ComputedStyle {
     let mut entries: Vec<Entry> = Vec::new();
     for (index, normal, important) in [
         (ua, Rank::UaNormal, Rank::UaImportant),
         (author, Rank::AuthorNormal, Rank::AuthorImportant),
     ] {
-        for candidate in index.matches(dom, node) {
+        for candidate in index.matches(dom, node, ctx) {
             let specificity = candidate.selector.specificity();
             for declaration in candidate.declarations {
                 entries.push(Entry {
@@ -698,11 +732,16 @@ mod ladder {
         let author = author_sheets(&dom);
         sheets.extend(author.iter());
         let index = RuleIndex::build(&sheets);
+        let ctx = StyleContext::default();
         let mut matched = 0;
         for node in elements(&dom) {
-            let fast: Vec<usize> = index.matches(&dom, node).iter().map(|c| c.order).collect();
+            let fast: Vec<usize> = index
+                .matches(&dom, node, &ctx)
+                .iter()
+                .map(|c| c.order)
+                .collect();
             let naive: Vec<usize> = index
-                .matches_naive(&dom, node)
+                .matches_naive(&dom, node, &ctx)
                 .iter()
                 .map(|c| c.order)
                 .collect();

@@ -68,7 +68,9 @@ fn matching(c: &mut Criterion) {
         b.iter(|| {
             let mut hits = 0;
             for &node in &elements {
-                hits += index.matches(&dom, node).len();
+                hits += index
+                    .matches(&dom, node, &yata::style::StyleContext::default())
+                    .len();
             }
             black_box(hits)
         })
@@ -81,7 +83,9 @@ fn matching(c: &mut Criterion) {
         b.iter(|| {
             let mut hits = 0;
             for &node in &elements {
-                hits += index.matches_naive(&dom, node).len();
+                hits += index
+                    .matches_naive(&dom, node, &yata::style::StyleContext::default())
+                    .len();
             }
             black_box(hits)
         })
@@ -125,7 +129,9 @@ fn matching_at_scale(c: &mut Criterion) {
         b.iter(|| {
             let mut hits = 0;
             for &node in &elements {
-                hits += index.matches(&dom, node).len();
+                hits += index
+                    .matches(&dom, node, &yata::style::StyleContext::default())
+                    .len();
             }
             black_box(hits)
         })
@@ -134,7 +140,9 @@ fn matching_at_scale(c: &mut Criterion) {
         b.iter(|| {
             let mut hits = 0;
             for &node in &elements {
-                hits += index.matches_naive(&dom, node).len();
+                hits += index
+                    .matches_naive(&dom, node, &yata::style::StyleContext::default())
+                    .len();
             }
             black_box(hits)
         })

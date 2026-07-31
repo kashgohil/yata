@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use crate::css::{Combinator, Compound, Declaration, PseudoClass, Selector, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
+use crate::net;
+use crate::style::StyleContext;
 
 /// One selector and the declarations it carries. A rule with a selector list
 /// becomes one candidate per selector: they match different elements and carry
@@ -84,7 +86,7 @@ impl<'a> RuleIndex<'a> {
 
     /// Candidates that match `node`, in sheet order. Only the buckets this
     /// element can fall into are tested.
-    pub fn matches(&self, dom: &Dom, node: NodeId) -> Vec<&Candidate<'a>> {
+    pub fn matches(&self, dom: &Dom, node: NodeId, ctx: &StyleContext<'_>) -> Vec<&Candidate<'a>> {
         let mut slots = self.universal.clone();
         if let NodeData::Element { tag, .. } = &dom.node(node).data {
             if let Some(bucket) = self.by_tag.get(tag.as_str()) {
@@ -111,19 +113,24 @@ impl<'a> RuleIndex<'a> {
         slots
             .into_iter()
             .map(|slot| &self.candidates[slot])
-            .filter(|c| matches(dom, node, c.selector))
+            .filter(|c| matches(dom, node, c.selector, ctx))
             .collect()
     }
 
     /// The same answer, computed by testing every rule: the oracle for the
     /// equivalence test and the baseline for the M4.5 bench.
-    pub fn matches_naive(&self, dom: &Dom, node: NodeId) -> Vec<&Candidate<'a>> {
+    pub fn matches_naive(
+        &self,
+        dom: &Dom,
+        node: NodeId,
+        ctx: &StyleContext<'_>,
+    ) -> Vec<&Candidate<'a>> {
         if !matches!(dom.node(node).data, NodeData::Element { .. }) {
             return Vec::new();
         }
         self.candidates
             .iter()
-            .filter(|c| matches(dom, node, c.selector))
+            .filter(|c| matches(dom, node, c.selector, ctx))
             .collect()
     }
 
@@ -138,8 +145,8 @@ impl<'a> RuleIndex<'a> {
 /// Does `selector` match `node`? Evaluated right to left — the rightmost
 /// compound is the cheapest thing to reject on, which is the whole reason
 /// selectors are indexed by it.
-pub fn matches(dom: &Dom, node: NodeId, selector: &Selector) -> bool {
-    matches_parts(dom, node, &selector.parts)
+pub fn matches(dom: &Dom, node: NodeId, selector: &Selector, ctx: &StyleContext<'_>) -> bool {
+    matches_parts(dom, node, &selector.parts, ctx)
 }
 
 /// `parts`' last compound must match `node`, and the rest must match some chain
@@ -150,11 +157,16 @@ pub fn matches(dom: &Dom, node: NodeId, selector: &Selector) -> bool {
 /// choosing the *outer* `b` — the nearest `b` fails the child combinator, and a
 /// matcher that stops there reports no match. Depth is selector length, not
 /// document depth, so the recursion is a handful of frames.
-fn matches_parts(dom: &Dom, node: NodeId, parts: &[(Combinator, Compound)]) -> bool {
+fn matches_parts(
+    dom: &Dom,
+    node: NodeId,
+    parts: &[(Combinator, Compound)],
+    ctx: &StyleContext<'_>,
+) -> bool {
     let Some((combinator, rightmost)) = parts.last() else {
         return false;
     };
-    if !compound_matches(dom, node, rightmost) {
+    if !compound_matches(dom, node, rightmost, ctx) {
         return false;
     }
     let rest = &parts[..parts.len() - 1];
@@ -163,12 +175,12 @@ fn matches_parts(dom: &Dom, node: NodeId, parts: &[(Combinator, Compound)]) -> b
     }
     match combinator {
         Combinator::Child => {
-            parent_element(dom, node).is_some_and(|parent| matches_parts(dom, parent, rest))
+            parent_element(dom, node).is_some_and(|parent| matches_parts(dom, parent, rest, ctx))
         }
         Combinator::Descendant => {
             let mut ancestor = parent_element(dom, node);
             while let Some(id) = ancestor {
-                if matches_parts(dom, id, rest) {
+                if matches_parts(dom, id, rest, ctx) {
                     return true;
                 }
                 ancestor = parent_element(dom, id);
@@ -178,7 +190,7 @@ fn matches_parts(dom: &Dom, node: NodeId, parts: &[(Combinator, Compound)]) -> b
     }
 }
 
-fn compound_matches(dom: &Dom, node: NodeId, compound: &Compound) -> bool {
+fn compound_matches(dom: &Dom, node: NodeId, compound: &Compound, ctx: &StyleContext<'_>) -> bool {
     let NodeData::Element { tag, .. } = &dom.node(node).data else {
         return false;
     };
@@ -208,14 +220,40 @@ fn compound_matches(dom: &Dom, node: NodeId, compound: &Compound) -> bool {
         }
     }
     compound.pseudo.iter().all(|pseudo| match pseudo {
-        // An unvisited link, which is every link: history arrives in M6, and
-        // until then `:visited` matching nothing is the honest answer.
-        PseudoClass::Link => tag.eq_ignore_ascii_case("a") && dom.attr(node, "href").is_some(),
-        // Nothing hovers until M6 wires the mouse; `Unsupported` is inert by
-        // definition (M4.1). All three must match nothing rather than
-        // everything — a pseudo we cannot evaluate is not a pseudo we ignore.
-        PseudoClass::Visited | PseudoClass::Hover | PseudoClass::Unsupported(_) => false,
+        PseudoClass::Link => is_link(dom, tag, node) && !is_visited(dom, node, ctx),
+        PseudoClass::Visited => is_link(dom, tag, node) && is_visited(dom, node, ctx),
+        // CSS: the hovered element *and its ancestors* match `:hover`.
+        PseudoClass::Hover => ctx.hover.is_some_and(|h| is_self_or_ancestor(dom, h, node)),
+        // Unsupported is inert by definition (M4.1): never match.
+        PseudoClass::Unsupported(_) => false,
     })
+}
+
+fn is_link(dom: &Dom, tag: &str, node: NodeId) -> bool {
+    tag.eq_ignore_ascii_case("a") && dom.attr(node, "href").is_some()
+}
+
+fn is_visited(dom: &Dom, node: NodeId, ctx: &StyleContext<'_>) -> bool {
+    let Some(href) = dom.attr(node, "href") else {
+        return false;
+    };
+    let absolute = match ctx.base_url {
+        Some(base) => net::resolve_url(base, href).unwrap_or_else(|| href.to_string()),
+        None => href.to_string(),
+    };
+    ctx.visited.contains(&absolute)
+}
+
+/// Whether `descendant` is `ancestor` or nested under it (for `:hover`).
+fn is_self_or_ancestor(dom: &Dom, descendant: NodeId, ancestor: NodeId) -> bool {
+    let mut current = Some(descendant);
+    while let Some(id) = current {
+        if id == ancestor {
+            return true;
+        }
+        current = dom.node(id).parent;
+    }
+    false
 }
 
 /// Nearest ancestor that is an element. Text and comment nodes are skipped, and
@@ -253,7 +291,16 @@ mod tests {
         let dom = html::parse(html_src);
         let sheet = parse(&format!("{selector} {{ color: red }}"));
         let node = find(&dom, tag);
-        matches(&dom, node, &sheet.rules[0].selectors[0])
+        matches(
+            &dom,
+            node,
+            &sheet.rules[0].selectors[0],
+            &StyleContext::default(),
+        )
+    }
+
+    fn empty_ctx() -> StyleContext<'static> {
+        StyleContext::default()
     }
 
     #[test]
@@ -334,11 +381,16 @@ mod tests {
         let index = RuleIndex::build(&sheets.iter().collect::<Vec<_>>());
         assert_eq!(index.candidate_count(), 10);
 
+        let ctx = empty_ctx();
         for tag in ["div", "p", "span"] {
             let node = find(&dom, tag);
-            let fast: Vec<usize> = index.matches(&dom, node).iter().map(|c| c.order).collect();
+            let fast: Vec<usize> = index
+                .matches(&dom, node, &ctx)
+                .iter()
+                .map(|c| c.order)
+                .collect();
             let naive: Vec<usize> = index
-                .matches_naive(&dom, node)
+                .matches_naive(&dom, node, &ctx)
                 .iter()
                 .map(|c| c.order)
                 .collect();
@@ -347,7 +399,7 @@ mod tests {
         // And the buckets really are doing work: the <span> never tests the
         // eight rules that cannot match it.
         let span = find(&dom, "span");
-        assert_eq!(index.matches(&dom, span).len(), 2);
+        assert_eq!(index.matches(&dom, span, &ctx).len(), 2);
     }
 
     #[test]
@@ -355,6 +407,30 @@ mod tests {
         let dom = html::parse("<p class='a a'>x</p>");
         let sheets = [parse(".a { color: red }")];
         let index = RuleIndex::build(&sheets.iter().collect::<Vec<_>>());
-        assert_eq!(index.matches(&dom, find(&dom, "p")).len(), 1);
+        assert_eq!(index.matches(&dom, find(&dom, "p"), &empty_ctx()).len(), 1);
+    }
+
+    #[test]
+    fn hover_and_visited_match_through_context() {
+        let dom = html::parse("<div><a href='https://x/'>t</a></div>");
+        let a = find(&dom, "a");
+        let div = find(&dom, "div");
+        let mut visited = std::collections::HashSet::new();
+        visited.insert("https://x/".into());
+        let ctx = StyleContext {
+            hover: Some(a),
+            visited: &visited,
+            base_url: Some("https://example.com/"),
+        };
+        let hover_sheet = parse("a:hover { color: red }");
+        let div_hover = parse("div:hover { color: red }");
+        let visited_sheet = parse("a:visited { color: red }");
+        let link_sheet = parse("a:link { color: red }");
+        assert!(matches(&dom, a, &hover_sheet.rules[0].selectors[0], &ctx));
+        // Ancestors of the hover target also match `:hover`.
+        assert!(matches(&dom, div, &div_hover.rules[0].selectors[0], &ctx));
+        assert!(matches(&dom, a, &visited_sheet.rules[0].selectors[0], &ctx));
+        // Visited is not :link.
+        assert!(!matches(&dom, a, &link_sheet.rules[0].selectors[0], &ctx));
     }
 }

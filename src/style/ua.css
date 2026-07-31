@@ -52,8 +52,10 @@ blockquote { padding-left: 2em }
 /* Links: bright blue and underlined, which is what M3 hardcoded. #5c5cff is
    the RGB of ANSI colour 12, so M4.4's nearest-256 mapping lands back on the
    exact colour the terminal draws today and the rendering does not shift.
-   :link is every <a href> until history exists (M6). */
+   :link is unvisited; :visited is a muted purple; :hover brightens (M6). */
 a:link { color: #5c5cff; text-decoration: underline }
+a:visited { color: #af5fff; text-decoration: underline }
+a:hover { color: #87afff; text-decoration: underline }
 
 /* What the element means. HN wraps its page in <center>; that centres the
    content column's lines inside their boxes, which is correct CSS and what
