@@ -233,6 +233,7 @@ Both M5 fast gates land with headroom: Wikipedia layout is ~26× inside budget,
 danluu's full pipeline ~90× inside. The box tree is denser than M3's line list
 but the work is still dominated by the cascade on large pages, not geometry.
 
-HN header spacing: `.hnname { margin-right: 5px }` now resolves to 1 cell
-(nonzero → ≥1), so the glued `Hacker Newsnew` case from M5.0 is fixed by the
-box model rather than more parser tricks.
+HN header spacing: `.hnname { margin-right: 5px }` resolves to 1 cell
+(nonzero → ≥1). M5.2 initially only resolved the length on the cascade; the
+review-fix pass applies inline horizontal margins in the IFC, so
+`Hacker Newsnew` becomes `Hacker News new`.
