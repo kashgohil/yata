@@ -1,4 +1,4 @@
-//! Property vocabulary: CSS value text → typed values (M4.2).
+//! Property vocabulary: CSS value text → typed values (M4.2, M5.1 lengths).
 //!
 //! Every parser here is `&str -> Option<T>`, and `None` means *invalid*, which
 //! in CSS means the declaration is dropped and whatever won before it keeps
@@ -16,6 +16,107 @@ pub enum Display {
     #[default]
     Inline,
     None,
+}
+
+/// A CSS length as written, before layout resolves it into cells.
+///
+/// Resolution (PLAN.md §1.4) is axis-aware:
+/// - horizontal: `8px ≈ 1 cell`, `1em = 2 cells`
+/// - vertical: `16px ≈ 1 line`, `1em = 1 line`
+/// - `%` is always of the containing block's **width** (CSS 2.1)
+/// - nonzero values round to at least 1 cell so a thin border still draws
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum Length {
+    /// `width` / `max-width` / `margin` initial for some sides.
+    #[default]
+    Auto,
+    /// Explicit zero — distinct from Auto so `margin: 0` wins over Auto.
+    Zero,
+    Px(f32),
+    Em(f32),
+    /// Percentage 0–100 (e.g. `50%` stores `50.0`).
+    Percent(f32),
+}
+
+impl Length {
+    /// Resolve to horizontal cells inside a containing block of `cw` cells.
+    pub fn to_cells_h(self, containing_width: i32) -> i32 {
+        resolve(self, containing_width, Axis::Horizontal)
+    }
+
+    /// Resolve to vertical cells (lines). Percentage still uses width.
+    pub fn to_cells_v(self, containing_width: i32) -> i32 {
+        resolve(self, containing_width, Axis::Vertical)
+    }
+
+    pub fn is_auto(self) -> bool {
+        matches!(self, Length::Auto)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Axis {
+    Horizontal,
+    Vertical,
+}
+
+fn resolve(len: Length, containing_width: i32, axis: Axis) -> i32 {
+    let raw = match len {
+        Length::Auto | Length::Zero => 0.0,
+        Length::Px(px) => match axis {
+            // PLAN.md: 8px ≈ 1 cell width, 16px ≈ 1 line height.
+            Axis::Horizontal => px / 8.0,
+            Axis::Vertical => px / 16.0,
+        },
+        Length::Em(em) => match axis {
+            // PLAN.md: 1em = 2 cells wide × 1 line tall.
+            Axis::Horizontal => em * 2.0,
+            Axis::Vertical => em,
+        },
+        Length::Percent(p) => (p / 100.0) * containing_width as f32,
+    };
+    if raw <= 0.0 {
+        0
+    } else {
+        // Nonzero → at least one cell so thin borders and small margins show.
+        raw.round().max(1.0) as i32
+    }
+}
+
+/// Four sides of the box model (`margin`, `padding`, `border-width`).
+/// Initial value is zero on every side (CSS), never `auto` — `auto` is a
+/// legal *written* margin value, not the default.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Edges {
+    pub top: Length,
+    pub right: Length,
+    pub bottom: Length,
+    pub left: Length,
+}
+
+impl Default for Edges {
+    fn default() -> Self {
+        Edges::ZERO
+    }
+}
+
+impl Edges {
+    pub const ZERO: Edges = Edges {
+        top: Length::Zero,
+        right: Length::Zero,
+        bottom: Length::Zero,
+        left: Length::Zero,
+    };
+
+    /// All sides the same length.
+    pub fn all(len: Length) -> Edges {
+        Edges {
+            top: len,
+            right: len,
+            bottom: len,
+            left: len,
+        }
+    }
 }
 
 /// A resolved colour, or the terminal's own. `Default` is the initial value for
@@ -217,6 +318,98 @@ pub fn parse_text_decoration(value: &str) -> Option<bool> {
     seen
 }
 
+/// One length token: `auto`, `0`, `12px`, `1.5em`, `50%`, bare number as px.
+/// Units this engine does not implement (`rem`, `vh`, `ch`, …) are invalid so
+/// the cascade leaves the previous winner standing.
+pub fn parse_length(value: &str) -> Option<Length> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Some(Length::Auto);
+    }
+    if value == "0" {
+        return Some(Length::Zero);
+    }
+    let lower = lower(value);
+    if let Some(rest) = lower.strip_suffix('%') {
+        let n: f32 = rest.trim().parse().ok()?;
+        return Some(Length::Percent(n));
+    }
+    if let Some(rest) = lower.strip_suffix("px") {
+        let n: f32 = rest.trim().parse().ok()?;
+        return Some(if n == 0.0 {
+            Length::Zero
+        } else {
+            Length::Px(n)
+        });
+    }
+    if let Some(rest) = lower.strip_suffix("em") {
+        let n: f32 = rest.trim().parse().ok()?;
+        return Some(if n == 0.0 {
+            Length::Zero
+        } else {
+            Length::Em(n)
+        });
+    }
+    // Bare number = px (common in minified sheets and `border: 1 solid`).
+    if let Ok(n) = lower.parse::<f32>() {
+        return Some(if n == 0.0 {
+            Length::Zero
+        } else {
+            Length::Px(n)
+        });
+    }
+    None
+}
+
+/// `width` / `max-width`. Same tokens as a length; `none` on max-width is Auto.
+pub fn parse_width(value: &str) -> Option<Length> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("none") {
+        return Some(Length::Auto);
+    }
+    parse_length(value)
+}
+
+/// 1–4 value box shorthand (`margin`, `padding`, `border-width`).
+/// CSS order: top, right, bottom, left — with the usual 1/2/3/4 expansion.
+pub fn parse_edges(value: &str) -> Option<Edges> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    match parts.len() {
+        1 => {
+            let a = parse_length(parts[0])?;
+            Some(Edges::all(a))
+        }
+        2 => {
+            let v = parse_length(parts[0])?;
+            let h = parse_length(parts[1])?;
+            Some(Edges {
+                top: v,
+                right: h,
+                bottom: v,
+                left: h,
+            })
+        }
+        3 => {
+            let top = parse_length(parts[0])?;
+            let h = parse_length(parts[1])?;
+            let bottom = parse_length(parts[2])?;
+            Some(Edges {
+                top,
+                right: h,
+                bottom,
+                left: h,
+            })
+        }
+        4 => Some(Edges {
+            top: parse_length(parts[0])?,
+            right: parse_length(parts[1])?,
+            bottom: parse_length(parts[2])?,
+            left: parse_length(parts[3])?,
+        }),
+        _ => None,
+    }
+}
+
 fn lower(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -297,5 +490,62 @@ mod tests {
         // No strikethrough in Attrs: honoured as far as the terminal goes.
         assert_eq!(parse_text_decoration("line-through"), Some(false));
         assert_eq!(parse_text_decoration("wavy"), None);
+    }
+
+    #[test]
+    fn lengths_parse_the_tokens_layout_needs() {
+        assert_eq!(parse_length("auto"), Some(Length::Auto));
+        assert_eq!(parse_length("0"), Some(Length::Zero));
+        assert_eq!(parse_length("0px"), Some(Length::Zero));
+        assert_eq!(parse_length("16px"), Some(Length::Px(16.0)));
+        assert_eq!(parse_length("1em"), Some(Length::Em(1.0)));
+        assert_eq!(parse_length("50%"), Some(Length::Percent(50.0)));
+        assert_eq!(parse_length("8"), Some(Length::Px(8.0)));
+        // Unknown units are invalid, not zero — so the cascade leaves the prior
+        // winner standing rather than silently zeroing a margin.
+        assert_eq!(parse_length("2rem"), None);
+        assert_eq!(parse_length("10vh"), None);
+        assert_eq!(parse_width("none"), Some(Length::Auto));
+        assert_eq!(parse_width("90%"), Some(Length::Percent(90.0)));
+    }
+
+    #[test]
+    fn edge_shorthand_expands_1_2_3_4_values() {
+        assert_eq!(parse_edges("1em"), Some(Edges::all(Length::Em(1.0))));
+        assert_eq!(
+            parse_edges("1em 2em"),
+            Some(Edges {
+                top: Length::Em(1.0),
+                right: Length::Em(2.0),
+                bottom: Length::Em(1.0),
+                left: Length::Em(2.0),
+            })
+        );
+        assert_eq!(
+            parse_edges("1px 2px 3px 4px"),
+            Some(Edges {
+                top: Length::Px(1.0),
+                right: Length::Px(2.0),
+                bottom: Length::Px(3.0),
+                left: Length::Px(4.0),
+            })
+        );
+        assert_eq!(parse_edges(""), None);
+    }
+
+    #[test]
+    fn cell_conversion_matches_plan_unit_table() {
+        // Horizontal: 8px = 1 cell, 1em = 2 cells, 50% of 80 = 40.
+        assert_eq!(Length::Px(8.0).to_cells_h(80), 1);
+        assert_eq!(Length::Em(1.0).to_cells_h(80), 2);
+        assert_eq!(Length::Percent(50.0).to_cells_h(80), 40);
+        assert_eq!(Length::Auto.to_cells_h(80), 0);
+        // Vertical: 16px = 1 line, 1em = 1 line; % still uses width.
+        assert_eq!(Length::Px(16.0).to_cells_v(80), 1);
+        assert_eq!(Length::Em(1.0).to_cells_v(80), 1);
+        assert_eq!(Length::Percent(50.0).to_cells_v(80), 40);
+        // Nonzero but sub-cell rounds up so thin borders still draw.
+        assert_eq!(Length::Px(1.0).to_cells_h(80), 1);
+        assert_eq!(Length::Px(5.0).to_cells_h(80), 1);
     }
 }

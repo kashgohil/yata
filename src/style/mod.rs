@@ -18,12 +18,12 @@ use std::sync::OnceLock;
 use crate::css::{self, Declaration, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
 use matching::RuleIndex;
-use values::{ColorValue, Display, FontStyle, FontWeight, TextAlign};
+use values::{ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
 
 /// What a node looks like once the cascade and inheritance have run. `Default`
 /// is the CSS initial value of every property, which is also what a node with
 /// no matching rule and no parent gets.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ComputedStyle {
     pub display: Display,
     pub color: ColorValue,
@@ -33,6 +33,14 @@ pub struct ComputedStyle {
     /// `text-decoration`, as much of it as a cell grid has: underlined or not.
     pub underline: bool,
     pub text_align: TextAlign,
+    /// Box model (M5.1). None of these inherit — a span does not pad itself
+    /// because its parent paragraph has padding.
+    pub margin: Edges,
+    pub padding: Edges,
+    /// Border widths only; colour/style of borders arrive with paint (M5).
+    pub border: Edges,
+    pub width: Length,
+    pub max_width: Length,
     /// The winning `display` came from the user-agent sheet's `!important` —
     /// this element holds code, metadata or inert markup and is never prose
     /// (see `ua.css`). Layout's never-blank fallback honours this even when it
@@ -61,6 +69,12 @@ impl ComputedStyle {
             font_style: self.font_style,
             underline: self.underline,
             text_align: self.text_align,
+            // Box model does not inherit.
+            margin: Edges::default(),
+            padding: Edges::default(),
+            border: Edges::default(),
+            width: Length::Auto,
+            max_width: Length::Auto,
             // Not inherited: a child of a hidden `<script>` is hidden because
             // its ancestor's subtree is skipped, not because it inherited a
             // verdict about itself.
@@ -246,10 +260,59 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
         "font-weight" => set(&mut computed.font_weight, values::parse_font_weight(value)),
         "font-style" => set(&mut computed.font_style, values::parse_font_style(value)),
         "text-align" => set(&mut computed.text_align, values::parse_text_align(value)),
+        "margin" => set(&mut computed.margin, values::parse_edges(value)),
+        "margin-top" => set(&mut computed.margin.top, values::parse_length(value)),
+        "margin-right" => set(&mut computed.margin.right, values::parse_length(value)),
+        "margin-bottom" => set(&mut computed.margin.bottom, values::parse_length(value)),
+        "margin-left" => set(&mut computed.margin.left, values::parse_length(value)),
+        "padding" => set(&mut computed.padding, values::parse_edges(value)),
+        "padding-top" => set(&mut computed.padding.top, values::parse_length(value)),
+        "padding-right" => set(&mut computed.padding.right, values::parse_length(value)),
+        "padding-bottom" => set(&mut computed.padding.bottom, values::parse_length(value)),
+        "padding-left" => set(&mut computed.padding.left, values::parse_length(value)),
+        "border-width" => set(&mut computed.border, values::parse_edges(value)),
+        "border-top-width" => set(&mut computed.border.top, values::parse_length(value)),
+        "border-right-width" => set(&mut computed.border.right, values::parse_length(value)),
+        "border-bottom-width" => set(&mut computed.border.bottom, values::parse_length(value)),
+        "border-left-width" => set(&mut computed.border.left, values::parse_length(value)),
+        // `border: 1px solid red` — take the first length token; style/colour
+        // are ignored until paint needs them. Invalid if no length appears.
+        "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
+            apply_border_shorthand(computed, declaration.name.as_str(), value)
+        }
+        "width" => set(&mut computed.width, values::parse_width(value)),
+        "max-width" => set(&mut computed.max_width, values::parse_width(value)),
         "text-decoration" | "text-decoration-line" => set(
             &mut computed.underline,
             values::parse_text_decoration(value),
         ),
+        _ => false,
+    }
+}
+
+/// Pull the first parseable length out of a `border` / `border-*` shorthand
+/// and apply it as a width. Style and colour tokens are skipped — paint will
+/// own those later; until then a border is "how many cells thick".
+fn apply_border_shorthand(computed: &mut ComputedStyle, name: &str, value: &str) -> bool {
+    let mut width = None;
+    for token in value.split_whitespace() {
+        if let Some(len) = values::parse_length(token) {
+            width = Some(len);
+            break;
+        }
+    }
+    let Some(width) = width else {
+        return false;
+    };
+    match name {
+        "border" => {
+            computed.border = Edges::all(width);
+            true
+        }
+        "border-top" => set(&mut computed.border.top, Some(width)),
+        "border-right" => set(&mut computed.border.right, Some(width)),
+        "border-bottom" => set(&mut computed.border.bottom, Some(width)),
+        "border-left" => set(&mut computed.border.left, Some(width)),
         _ => false,
     }
 }
@@ -451,6 +514,11 @@ mod tests {
         // Everything the sheet does not mention stays initial.
         assert_eq!(h1.color, ColorValue::Default);
         assert_eq!(h1.text_align, TextAlign::Left);
+        // M5.1: the UA sheet's vertical rhythm lands as real margins.
+        assert_eq!(h1.margin.top, Length::Em(1.0));
+        assert_eq!(h1.margin.bottom, Length::Em(1.0));
+        assert_eq!(h1.margin.left, Length::Zero);
+        assert_eq!(styles.get(find(&dom, "p")).margin.top, Length::Em(1.0));
 
         let a = styles.get(find(&dom, "a"));
         assert!(a.underline);
@@ -460,6 +528,38 @@ mod tests {
 
         assert_eq!(styles.get(find(&dom, "script")).display, Display::None);
         assert_eq!(styles.get(find(&dom, "head")).display, Display::None);
+    }
+
+    #[test]
+    fn box_model_properties_cascade_and_do_not_inherit() {
+        let (dom, styles) = styled(
+            "<div><p>t</p></div>",
+            "div { margin: 1em; padding: 8px; border: 1px solid red; width: 50%; max-width: 40em }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.margin, Edges::all(Length::Em(1.0)));
+        assert_eq!(div.padding, Edges::all(Length::Px(8.0)));
+        assert_eq!(div.border, Edges::all(Length::Px(1.0)));
+        assert_eq!(div.width, Length::Percent(50.0));
+        assert_eq!(div.max_width, Length::Em(40.0));
+        // Children start at zero — box props never inherit.
+        let p = styles.get(find(&dom, "p"));
+        assert_eq!(p.padding, Edges::ZERO);
+        assert_eq!(p.border, Edges::ZERO);
+        assert_eq!(p.width, Length::Auto);
+        // `p` still gets its own UA margin, not the div's.
+        assert_eq!(p.margin.top, Length::Em(1.0));
+        assert_ne!(p.margin, div.margin);
+
+        // Longhands and an invalid token: only the bad declaration drops.
+        let (dom, styles) = styled(
+            "<p>t</p>",
+            "p { margin-left: 2em; margin-right: bananas; width: 10px }",
+        );
+        let p = styles.get(find(&dom, "p"));
+        assert_eq!(p.margin.left, Length::Em(2.0));
+        assert_eq!(p.margin.right, Length::Zero); // bananas dropped
+        assert_eq!(p.width, Length::Px(10.0));
     }
 
     #[test]

@@ -5,9 +5,9 @@
    the cascade, and it is a second proof that the parser handles the CSS this
    project writes.
 
-   Folded in here are M3's hardcoded styles. What could NOT come along is the
-   blank line between paragraphs: that is a margin, and M4 has no margins.
-   layout/mod.rs keeps its BLOCK/TIGHT split until M5 lands the box model. */
+   Folded in here are M3's hardcoded styles. Box-model margins (M5.1) express
+   the blank line between paragraphs that used to live as a tag table in
+   layout; layout still uses that table until M5.2 consumes these values. */
 
 /* Not rendered, and not negotiable: `!important` in a user-agent sheet is the
    one thing a page cannot override (M4.2's cascade ranks). These elements hold
@@ -35,6 +35,19 @@ h1, h2, h3, h4, h5, h6, b, strong, th { font-weight: bold }
 i, em, cite, var, dfn, address { font-style: italic }
 
 th, caption { text-align: center }
+
+/* Vertical rhythm that layout's GAP table used to hardcode. 1em vertical
+   resolves to one line (PLAN.md unit table), so adjacent siblings collapse to
+   a single blank line the way margin-collapsing will. Nested lists take no
+   extra gap because their margin is zeroed below — same as browsers. */
+p, blockquote, pre, figure, form, hr,
+h1, h2, h3, h4, h5, h6 { margin-top: 1em; margin-bottom: 1em }
+
+ul, ol { margin-top: 1em; margin-bottom: 1em; padding-left: 2em }
+ul ul, ol ol, ul ol, ol ul { margin-top: 0; margin-bottom: 0 }
+
+/* Indent a quote the way layout used to with a hardcoded 2-cell step. */
+blockquote { padding-left: 2em }
 
 /* Links: bright blue and underlined, which is what M3 hardcoded. #5c5cff is
    the RGB of ANSI colour 12, so M4.4's nearest-256 mapping lands back on the

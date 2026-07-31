@@ -13,7 +13,7 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::style::Styles;
-use crate::style::values::{ColorValue, Display, FontStyle, FontWeight, TextAlign};
+use crate::style::values::{ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
 
 /// Cell caps for the variable-length parts of a line. Text gets the most room
 /// (it is the content); URLs and comments are context, not content.
@@ -135,7 +135,63 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
         TextAlign::Center => parts.push("center".into()),
         TextAlign::Right => parts.push("right".into()),
     }
+    // Box model (M5.1): only non-initial values, same "interesting only" rule.
+    if let Some(s) = edges_summary("margin", &computed.margin) {
+        parts.push(s);
+    }
+    if let Some(s) = edges_summary("padding", &computed.padding) {
+        parts.push(s);
+    }
+    if let Some(s) = edges_summary("border", &computed.border) {
+        parts.push(s);
+    }
+    if !matches!(computed.width, Length::Auto) {
+        parts.push(format!("w {}", length_summary(computed.width)));
+    }
+    if !matches!(computed.max_width, Length::Auto) {
+        parts.push(format!("max-w {}", length_summary(computed.max_width)));
+    }
     parts.join(" · ")
+}
+
+fn length_summary(len: Length) -> String {
+    match len {
+        Length::Auto => "auto".into(),
+        Length::Zero => "0".into(),
+        Length::Px(n) => format!("{n}px"),
+        Length::Em(n) => format!("{n}em"),
+        Length::Percent(n) => format!("{n}%"),
+    }
+}
+
+/// Compact edge list, or `None` when every side is initial (Auto/zero).
+fn edges_summary(name: &str, edges: &Edges) -> Option<String> {
+    let interesting = |l: Length| !matches!(l, Length::Auto | Length::Zero);
+    if !interesting(edges.top)
+        && !interesting(edges.right)
+        && !interesting(edges.bottom)
+        && !interesting(edges.left)
+    {
+        return None;
+    }
+    // Collapse like CSS shorthand when sides pair up.
+    if edges.top == edges.right && edges.right == edges.bottom && edges.bottom == edges.left {
+        return Some(format!("{name} {}", length_summary(edges.top)));
+    }
+    if edges.top == edges.bottom && edges.right == edges.left {
+        return Some(format!(
+            "{name} {} {}",
+            length_summary(edges.top),
+            length_summary(edges.right)
+        ));
+    }
+    Some(format!(
+        "{name} {} {} {} {}",
+        length_summary(edges.top),
+        length_summary(edges.right),
+        length_summary(edges.bottom),
+        length_summary(edges.left)
+    ))
 }
 
 /// CSS-flavored element summary: `<a#nav.cls href="…">`. `id` and `class`
@@ -315,13 +371,15 @@ mod tests {
     fn one_line_per_element_indented_like_the_tree() {
         // Text nodes get no line: they carry their parent's inherited values,
         // so a line each would just repeat the line above.
+        // `p` carries the UA vertical margin (M5.1); that is real computed
+        // style, so F2 shows it under the same "only if interesting" rule.
         assert_eq!(
             styled("<p>hi</p>", ""),
             [
                 "<html> block",
                 "  <head> none",
                 "  <body> block",
-                "    <p> block",
+                "    <p> block · margin 1em 0",
             ]
         );
     }
@@ -362,9 +420,22 @@ mod tests {
         // screen" is the question it most needs to answer.
         let lines = styled("<p class=ad>gone</p>", ".ad { display: none }");
         let p = lines.iter().find(|l| l.contains("<p.ad>")).unwrap();
-        assert_eq!(p.trim(), "<p.ad> none");
+        assert!(p.contains("none"), "{p}");
         // <script> and <head> too, from the UA sheet.
         assert!(lines.iter().any(|l| l.trim() == "<head> none"));
+    }
+
+    #[test]
+    fn box_model_values_show_when_set() {
+        let lines = styled(
+            "<div>x</div>",
+            "div { margin: 1em; width: 50%; max-width: 40em; padding-left: 8px }",
+        );
+        let div = lines.iter().find(|l| l.contains("<div>")).unwrap();
+        assert!(div.contains("margin 1em"), "{div}");
+        assert!(div.contains("padding"), "{div}");
+        assert!(div.contains("w 50%"), "{div}");
+        assert!(div.contains("max-w 40em"), "{div}");
     }
 
     #[test]
