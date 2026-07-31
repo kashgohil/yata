@@ -1,8 +1,8 @@
 //! The inspector surfaces' tree-to-lines transforms: `F1` turns a parsed `Dom`
-//! into one compact, indented line per node, and `F2` turns the styled tree
-//! into one line per element with its computed values. Pure text — scrolling
-//! and drawing are the `App`'s job, through the same `Viewport` machinery the
-//! page uses.
+//! into one compact, indented line per node, `F2` turns the styled tree into
+//! one line per element with its computed values, and `F3` lists layout boxes
+//! with x,y,w,h. Pure text — scrolling and drawing are the `App`'s job,
+//! through the same `Viewport` machinery the page uses.
 //!
 //! This is deliberately terser than `html::debug_tree` (which `--dump-dom`
 //! prints): the inspector is read on a live terminal, so ids/classes are
@@ -12,6 +12,7 @@
 use unicode_width::UnicodeWidthChar;
 
 use crate::dom::{Dom, NodeData, NodeId};
+use crate::layout::{BoxId, BoxKind, LayoutTree};
 use crate::style::Styles;
 use crate::style::values::{ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
 
@@ -192,6 +193,56 @@ fn edges_summary(name: &str, edges: &Edges) -> Option<String> {
         length_summary(edges.bottom),
         length_summary(edges.left)
     ))
+}
+
+/// The `F3` view: every layout box with its content-box x, y, width, height,
+/// indented like the tree. Line and anonymous boxes are labeled; element boxes
+/// use the same CSS-flavored summary as F1/F2.
+pub fn box_lines(dom: &Dom, tree: &LayoutTree) -> Vec<String> {
+    let mut out = Vec::new();
+    push_box(dom, tree, tree.root, 0, &mut out);
+    out
+}
+
+fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec<String>) {
+    let b = tree.get(id);
+    // Skip the synthetic document root — it is only a container.
+    let skip_label = b.kind == BoxKind::Block && b.node == Some(dom.root);
+    if !skip_label {
+        let label = match b.kind {
+            BoxKind::Block | BoxKind::Inline => {
+                if let Some(nid) = b.node {
+                    match &dom.node(nid).data {
+                        NodeData::Element { tag, attrs } => element_summary(tag, attrs),
+                        NodeData::Text(t) => format!("#text \"{}\"", clip(t, 20)),
+                        _ => format!("{:?}", b.kind),
+                    }
+                } else {
+                    format!("{:?}", b.kind)
+                }
+            }
+            BoxKind::AnonymousBlock => "anonymous".into(),
+            BoxKind::Line => "line".into(),
+            BoxKind::Text => {
+                let t = b.text.as_deref().unwrap_or("");
+                format!("#text \"{}\"", clip(t, 20))
+            }
+        };
+        let d = b.dimensions.content;
+        out.push(format!(
+            "{}{}  x={} y={} w={} h={}",
+            "  ".repeat(depth),
+            label,
+            d.x,
+            d.y,
+            d.width,
+            d.height
+        ));
+    }
+    let child_depth = if skip_label { depth } else { depth + 1 };
+    for &child in &b.children {
+        push_box(dom, tree, child, child_depth, out);
+    }
 }
 
 /// CSS-flavored element summary: `<a#nav.cls href="…">`. `id` and `class`
@@ -444,5 +495,26 @@ mod tests {
         let lines = tree_lines(&dom);
         assert!(lines.iter().any(|l| l.contains("<!doctype html>")));
         assert!(lines.iter().any(|l| l.contains("<!-- note -->")));
+    }
+
+    // ---- F3: layout boxes (M5) --------------------------------------------
+
+    #[test]
+    fn box_lines_show_geometry() {
+        let dom = parse("<p>hi</p>");
+        let styles = crate::style::style_tree(&dom, &[]);
+        let tree =
+            crate::layout::layout_document(&dom, &styles, 40, crate::layout::Hidden::Respect);
+        let lines = box_lines(&dom, &tree);
+        assert!(
+            lines.iter().any(|l| l.contains("<p>") && l.contains("w=")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("#text") && l.contains("hi")),
+            "{lines:?}"
+        );
     }
 }

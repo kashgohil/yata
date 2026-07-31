@@ -7,7 +7,7 @@ use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::Dom;
-use crate::layout;
+use crate::layout::{self, LayoutTree};
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
 use crate::paint::{self, DisplayList};
@@ -58,14 +58,15 @@ enum Fetch {
 }
 
 /// Which surface owns the page area. The inspectors replace the page rather
-/// than overlaying it, and only one at a time: `F1` and `F2` are one selector,
-/// not two flags that can both be true. (`F4`'s timing overlay is different —
-/// it draws *over* whatever is up, so it stays a separate flag.)
+/// than overlaying it, and only one at a time: `F1`/`F2`/`F3` are one selector,
+/// not flags that can all be true. (`F4`'s timing overlay is different — it
+/// draws *over* whatever is up, so it stays a separate flag.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Surface {
     Page,
     Dom,
     Styles,
+    Boxes,
 }
 
 /// Input mode. `Browse` reads the body and scrolls; `UrlInput` is the one-line
@@ -122,7 +123,10 @@ pub struct App {
     /// and scrolled exactly like `dom_view`.
     styles_view: Viewport,
     styles_view_built: bool,
-    /// Which of the page, the DOM tree or the computed styles is on screen.
+    /// The `F3` surface: layout boxes with x,y,w,h.
+    boxes_view: Viewport,
+    boxes_view_built: bool,
+    /// Which of the page, the DOM tree, styles or boxes is on screen.
     surface: Surface,
     /// The page's author stylesheets, one slot per source in **document
     /// order**: `<style>` blocks filled the moment the tree lands, linked ones
@@ -141,6 +145,8 @@ pub struct App {
     /// Painted form of the last layout tree. Scrolling re-emits this at a new
     /// offset without relayout (PLAN.md M5 display list).
     display_list: DisplayList,
+    /// Last layout tree — F3 reads it; rebuilt only on relayout.
+    layout_tree: Option<LayoutTree>,
     /// How many times `relayout` has run. Test-only instrumentation for the
     /// invariant that costs the most if it ever breaks: scrolling relayouts
     /// zero times, a resize exactly once.
@@ -166,11 +172,14 @@ impl App {
             dom_view_built: false,
             styles_view: Viewport::default(),
             styles_view_built: false,
+            boxes_view: Viewport::default(),
+            boxes_view_built: false,
             surface: Surface::Page,
             sheets: Vec::new(),
             styles: None,
             revealed: false,
             display_list: DisplayList::default(),
+            layout_tree: None,
             #[cfg(test)]
             layouts: 0,
         }
@@ -276,6 +285,9 @@ impl App {
                 self.dom = None;
                 self.dom_view_built = false;
                 self.styles_view_built = false;
+                self.boxes_view_built = false;
+                self.layout_tree = None;
+                self.display_list = DisplayList::default();
                 // The old page's stylesheets go with its tree: a sheet from
                 // the page being replaced must not style the new one. Workers
                 // already in flight for it are stale by `FetchId` anyway.
@@ -315,6 +327,7 @@ impl App {
                 // and it must refresh on this repaint.
                 self.dom_view_built = false;
                 self.styles_view_built = false;
+                self.boxes_view_built = false;
                 self.build_visible_inspector();
                 Effect {
                     dirty: true,
@@ -414,6 +427,7 @@ impl App {
             }
             Action::ToggleDom => self.toggle_surface(Surface::Dom),
             Action::ToggleStyles => self.toggle_surface(Surface::Styles),
+            Action::ToggleBoxes => self.toggle_surface(Surface::Boxes),
             Action::ToggleTiming => {
                 self.timing_visible = !self.timing_visible;
                 redraw()
@@ -459,6 +473,10 @@ impl App {
         self.surface == Surface::Styles && self.styles.is_some()
     }
 
+    fn boxes_active(&self) -> bool {
+        self.surface == Surface::Boxes && self.layout_tree.is_some()
+    }
+
     /// Lay the cached tree out at the current column width and hand the lines
     /// to the page surface. Called from exactly two places — a parse landing
     /// and a resize — and never from the scroll path, which only moves an
@@ -492,6 +510,8 @@ impl App {
             }
         };
         self.display_list = paint::paint(&tree);
+        self.layout_tree = Some(tree);
+        self.boxes_view_built = false;
         self.revealed = revealed;
         // The one place `App` reads the clock: fetch and parse are timed by the
         // worker that runs them, but this stage runs here, so it times itself.
@@ -597,6 +617,17 @@ impl App {
         }
     }
 
+    fn build_boxes_view(&mut self) {
+        if self.boxes_view_built {
+            return;
+        }
+        if let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) {
+            let text = inspector::box_lines(dom, tree).join("\n");
+            self.boxes_view.set_content(&text, self.size.0, self.page());
+            self.boxes_view_built = true;
+        }
+    }
+
     /// Refresh whichever inspector is on screen, and only that one. Called when
     /// a surface opens and when its input changes underneath it (a parse, an
     /// arriving stylesheet).
@@ -605,17 +636,20 @@ impl App {
             Surface::Page => {}
             Surface::Dom => self.build_dom_view(),
             Surface::Styles => self.build_styles_view(),
+            Surface::Boxes => self.build_boxes_view(),
         }
     }
 
     /// The view the shared scroll keys act on: the same bindings drive the
-    /// page and the F1 tree, whichever is on screen (the brief's "do not
+    /// page and the inspectors, whichever is on screen (the brief's "do not
     /// invent a second scheme").
     fn scroll_target(&mut self) -> &mut Viewport {
         if self.dom_active() {
             &mut self.dom_view
         } else if self.styles_active() {
             &mut self.styles_view
+        } else if self.boxes_active() {
+            &mut self.boxes_view
         } else {
             &mut self.viewport
         }
@@ -646,6 +680,7 @@ impl App {
             Surface::Page => self.draw_page(frame),
             Surface::Dom => self.draw_dom(frame),
             Surface::Styles => self.draw_styles(frame),
+            Surface::Boxes => self.draw_boxes(frame),
         }
         // Over the page area, after the body and before the bottom row.
         if self.timing_visible {
@@ -702,6 +737,17 @@ impl App {
             return;
         }
         for (row, line) in self.styles_view.visible().iter().enumerate() {
+            paint_line(frame, 0, row as u16, line);
+        }
+    }
+
+    /// The `F3` surface: layout boxes with content-box geometry.
+    fn draw_boxes(&self, frame: &mut Frame) {
+        if self.layout_tree.is_none() {
+            frame.put_str(0, 0, "no boxes yet — open a page (o)", Style::default());
+            return;
+        }
+        for (row, line) in self.boxes_view.visible().iter().enumerate() {
             paint_line(frame, 0, row as u16, line);
         }
     }
@@ -775,6 +821,7 @@ impl App {
             Surface::Page => base,
             Surface::Dom => format!("[dom] {base}"),
             Surface::Styles => format!("[styles] {base}"),
+            Surface::Boxes => format!("[boxes] {base}"),
         }
     }
 
@@ -1860,6 +1907,10 @@ mod tests {
         key(KeyCode::F(2), KeyModifiers::NONE)
     }
 
+    fn f3() -> Msg {
+        key(KeyCode::F(3), KeyModifiers::NONE)
+    }
+
     fn parsed(id: FetchId, html: &str) -> Msg {
         Msg::Parsed {
             id,
@@ -1962,6 +2013,24 @@ mod tests {
         app.draw(&mut frame);
         assert!(row_text(&frame, 0).contains("hello"), "page must come back");
         assert!(!row_text(&frame, 5).contains("[styles]"));
+    }
+
+    #[test]
+    fn f3_shows_box_geometry_and_toggles_back() {
+        let mut app = App::new(60, 6);
+        open_page(&mut app, "<body><p>hello</p></body>");
+        assert_eq!(app.update(f3()), redraw());
+        let mut frame = Frame::new(60, 6);
+        app.draw(&mut frame);
+        let row0 = row_text(&frame, 0);
+        assert!(
+            row0.contains("w=") || row0.contains('<'),
+            "expected box lines, got {row0:?}"
+        );
+        assert!(row_text(&frame, 5).contains("[boxes]"));
+        assert_eq!(app.update(f3()), redraw());
+        app.draw(&mut frame);
+        assert!(row_text(&frame, 0).contains("hello"), "page must come back");
     }
 
     #[test]
