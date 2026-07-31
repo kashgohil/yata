@@ -237,3 +237,28 @@ HN header spacing: `.hnname { margin-right: 5px }` resolves to 1 cell
 (nonzero → ≥1). M5.2 initially only resolved the length on the cascade; the
 review-fix pass applies inline horizontal margins in the IFC, so
 `Hacker Newsnew` becomes `Hacker News new`.
+
+---
+
+## M6 — interaction (2026-07-31)
+
+Mouse hit-testing, link hints, Tab focus, history with scroll restore,
+`:visited`, and `:hover` restyle-without-relayout. Machine A.
+
+Hover is one full `style_tree` + display-list rebuild over the existing box
+tree — the same restyle cost as M4, not an incremental pass. PLAN.md §4 lists
+incremental restyle under "later, only if measured"; today the M4 restyle
+bench (~41 ms Wikipedia) is the ceiling for a hover on a large page. Geometry
+does not re-run: the `layouts` counter stays flat across a hover transition
+(unit test). Hint overlay construction walks the cached layout tree only —
+no restyle, no relayout.
+
+| Measure | Result | Budget |
+|---|---|---|
+| hover path | restyle + recolour + paint; **0** relayouts | keypress &lt; 10 ms target; full restyle is the cost |
+| hint list | layout-tree walk of visible links only | &lt; 10 ms overlay after `f` (no cascade) |
+| scroll step | unchanged path | ≪ 5 ms |
+
+Demo path: open HN, `f` + label to follow a thread, `H` back with scroll
+restored; move the pointer over a link and watch `a:hover` recolour without
+a layout row blip on `F4`.

@@ -109,6 +109,12 @@ impl Viewport {
         self.offset
     }
 
+    /// Jump to an absolute offset (history restore, scroll-into-view). Clamped
+    /// like every other scroll; returns whether the offset changed.
+    pub fn scroll_to_offset(&mut self, target: usize) -> bool {
+        self.scroll_to(target)
+    }
+
     #[cfg(test)]
     pub fn line_count(&self) -> usize {
         self.lines.len()

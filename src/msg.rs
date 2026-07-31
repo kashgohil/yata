@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::css::Stylesheet;
 use crate::dom::Dom;
@@ -12,6 +12,8 @@ use crate::net::FetchId;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Msg {
     Key(KeyEvent),
+    /// SGR mouse (mode 1006). Click → hit-test; move → `:hover` (M6).
+    Mouse(MouseEvent),
     Resize(u16, u16),
     /// The input thread's terminal source is gone for good; the app must exit.
     InputClosed,

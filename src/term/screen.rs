@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crossterm::cursor;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 
 // Tracks whether the terminal is in our modified state. The panic hook must be
@@ -9,8 +10,8 @@ use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 // idempotent (Drop and the hook can both fire), so the state lives here.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Guard for the terminal state: raw mode + alternate screen + hidden cursor.
-/// Dropping it restores the user's terminal.
+/// Guard for the terminal state: raw mode + alternate screen + hidden cursor
+/// + SGR mouse reporting. Dropping it restores the user's terminal.
 pub struct Screen;
 
 impl Screen {
@@ -22,7 +23,9 @@ impl Screen {
         ACTIVE.store(true, Ordering::SeqCst);
         let screen = Screen;
         let mut out = io::stdout();
-        crossterm::queue!(out, EnterAlternateScreen, cursor::Hide)?;
+        // Mouse capture (SGR 1006 via crossterm) is part of the same owned
+        // terminal state as the alternate screen — restore must undo it too.
+        crossterm::queue!(out, EnterAlternateScreen, cursor::Hide, EnableMouseCapture)?;
         out.flush()?;
         Ok(screen)
     }
@@ -47,7 +50,7 @@ fn restore_to(out: &mut impl Write) -> io::Result<bool> {
     // Raw mode may already be off (or stdout may not be a tty under tests);
     // never let that stop the screen sequences from going out.
     let _ = terminal::disable_raw_mode();
-    crossterm::queue!(out, LeaveAlternateScreen, cursor::Show)?;
+    crossterm::queue!(out, DisableMouseCapture, LeaveAlternateScreen, cursor::Show)?;
     out.flush()?;
     // Cleared only after the sequences landed: a failed restore must stay
     // retryable (e.g. Drop retrying after a failed panic-hook attempt).

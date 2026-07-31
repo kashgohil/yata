@@ -7,6 +7,7 @@ use crossterm::event::{self, Event};
 use crossterm::terminal;
 
 use yata::browser::app::{App, Effect};
+use yata::browser::yank;
 use yata::msg::Msg;
 use yata::term::{self, Renderer};
 use yata::{html, layout, net, style};
@@ -105,6 +106,11 @@ fn main() -> io::Result<()> {
         // user is already reading (PLAN.md M4, UX §3.2).
         for (id, slot, url) in effect.sheets {
             net::spawn_stylesheet(id, slot, url, tx.clone());
+        }
+        // Clipboard is a side channel: OSC 52, not the cell buffer (CLAUDE.md).
+        if let Some(text) = effect.yank {
+            write!(out, "{}", yank::osc52_set_clipboard(&text))?;
+            out.flush()?;
         }
         if effect.dirty {
             render(&mut app, &mut renderer, &mut out)?;
@@ -312,6 +318,9 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         // want their own sheets fetched, and a stale generation's are dropped
         // by the id guard in `App::update`, not here.
         effect.sheets.extend(e.sheets);
+        if e.yank.is_some() {
+            effect.yank = e.yank;
+        }
         if e.quit {
             effect.quit = true;
             break;
@@ -344,6 +353,7 @@ fn spawn_input_thread(tx: mpsc::Sender<Msg>) {
         loop {
             let msg = match event::read() {
                 Ok(Event::Key(key)) => Msg::Key(key),
+                Ok(Event::Mouse(mouse)) => Msg::Mouse(mouse),
                 Ok(Event::Resize(w, h)) => Msg::Resize(w, h),
                 Ok(_) => continue,
                 // Input is gone for good. Signal the loop to quit (if it is

@@ -1,19 +1,22 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use crate::browser::hints;
+use crate::browser::history::History;
 use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
-use crate::dom::Dom;
-use crate::layout::{self, LayoutTree};
+use crate::dom::{Dom, NodeId};
+use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
 use crate::paint::{self, DisplayList};
 use crate::style::sources::{self, Source};
-use crate::style::{self, Styles};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::style::{self, StyleContext, Styles};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use unicode_width::UnicodeWidthStr;
 
 use crate::term::{Attrs, Cell, Frame, Style};
@@ -35,6 +38,17 @@ pub struct Effect {
     /// already on screen while they run. Same discipline as `fetch`: `App`
     /// decides, the loop spawns.
     pub sheets: Vec<(FetchId, usize, String)>,
+    /// Text to put on the system clipboard via OSC 52 (M6 yank). Written by
+    /// the event loop, not through the cell buffer.
+    pub yank: Option<String>,
+}
+
+/// Link-hint session (`f` / `F`).
+#[derive(Clone, Debug)]
+struct HintSession {
+    yank: bool,
+    buffer: String,
+    labels: Vec<(String, layout::LinkHit)>,
 }
 
 /// Where the current fetch stands. `Loaded` retains the raw body for the
@@ -147,9 +161,26 @@ pub struct App {
     display_list: DisplayList,
     /// Last layout tree — F3 reads it; rebuilt only on relayout.
     layout_tree: Option<LayoutTree>,
+    /// Session history (back/forward) with scroll positions (M6).
+    history: History,
+    /// Absolute URLs successfully loaded this session — feeds `:visited`.
+    visited: HashSet<String>,
+    /// Element currently under the pointer (`:hover`), if any.
+    hover: Option<NodeId>,
+    /// Keyboard-focused link (`Tab` cycle), if any.
+    focus: Option<NodeId>,
+    /// Active link-hint overlay (`f` / `F`).
+    hint: Option<HintSession>,
+    /// Brief statusline message (e.g. "yanked"), cleared by the next non-yank
+    /// action (scroll, key binding, navigation, …).
+    status_msg: Option<String>,
+    /// Scroll offset to restore after layout of a *specific* fetch generation
+    /// (history back/forward, reload). Tied to `FetchId` so a resize while the
+    /// old page is still on screen cannot consume the restore.
+    pending_scroll: Option<(FetchId, usize)>,
     /// How many times `relayout` has run. Test-only instrumentation for the
     /// invariant that costs the most if it ever breaks: scrolling relayouts
-    /// zero times, a resize exactly once.
+    /// zero times, a resize exactly once. Hover must not increment it (M6).
     #[cfg(test)]
     layouts: usize,
 }
@@ -180,6 +211,13 @@ impl App {
             revealed: false,
             display_list: DisplayList::default(),
             layout_tree: None,
+            history: History::default(),
+            visited: HashSet::new(),
+            hover: None,
+            focus: None,
+            hint: None,
+            status_msg: None,
+            pending_scroll: None,
             #[cfg(test)]
             layouts: 0,
         }
@@ -227,6 +265,7 @@ impl App {
     pub fn update(&mut self, msg: Msg) -> Effect {
         match msg {
             Msg::Key(ev) => self.on_key(ev),
+            Msg::Mouse(ev) => self.on_mouse(ev),
             Msg::Resize(w, h) => {
                 self.size = (w, h);
                 // Resize is a wrap point: re-wrap at the new width, keep offset.
@@ -277,6 +316,9 @@ impl App {
                 // M2's problem, so lossy-decode the raw bytes for now.
                 let text = String::from_utf8_lossy(&body).into_owned();
                 self.viewport.set_content(&text, self.size.0, self.page());
+                // Session-visited set feeds `:visited` (M6). Any terminal
+                // status counts — a 404 is still a place the user has been.
+                self.visited.insert(url.clone());
                 self.fetch = Fetch::Loaded { url, status, body };
                 // The old tree stops matching the body just shown; the F1
                 // surface goes back to its placeholder until this fetch's
@@ -304,6 +346,10 @@ impl App {
                 // sets nothing: the timing table shows the last *completed*
                 // run (PLAN.md §4) until a newer one lands.
                 self.timings.fetch = Some(elapsed);
+                // Interaction state is page-local.
+                self.hover = None;
+                self.focus = None;
+                self.hint = None;
                 redraw()
             }
             Msg::Parsed { id, dom, elapsed } => {
@@ -368,6 +414,11 @@ impl App {
     }
 
     fn on_key(&mut self, ev: KeyEvent) -> Effect {
+        // Hint mode owns label typing until Esc or a completed label — but
+        // quit must always work (PLAN.md §3), so it is checked first.
+        if self.hint.is_some() {
+            return self.on_hint_key(&ev);
+        }
         let mode = match self.mode {
             Mode::Browse => keys::Mode::Browse,
             Mode::UrlInput { .. } => keys::Mode::UrlInput,
@@ -405,7 +456,34 @@ impl App {
         }
     }
 
+    fn on_mouse(&mut self, ev: MouseEvent) -> Effect {
+        // URL bar and inspectors: no page hit-testing. Wheel still scrolls
+        // whichever surface is active.
+        match ev.kind {
+            MouseEventKind::ScrollDown => moved(self.scroll_target().scroll_down()),
+            MouseEventKind::ScrollUp => moved(self.scroll_target().scroll_up()),
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !matches!(self.mode, Mode::Browse) || self.surface != Surface::Page {
+                    return Effect::default();
+                }
+                self.on_click(ev.column, ev.row)
+            }
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                if !matches!(self.mode, Mode::Browse) || self.surface != Surface::Page {
+                    return Effect::default();
+                }
+                self.on_hover_move(ev.column, ev.row)
+            }
+            _ => Effect::default(),
+        }
+    }
+
     fn run(&mut self, action: Action) -> Effect {
+        // Yank *sets* the flash; every other action clears a stale one so the
+        // middle status segment is not stuck on "yanked" forever.
+        if !matches!(action, Action::YankUrl) {
+            self.status_msg = None;
+        }
         match action {
             Action::Quit => Effect {
                 quit: true,
@@ -418,9 +496,16 @@ impl App {
             Action::Top => moved(self.scroll_target().scroll_to_top()),
             Action::Bottom => moved(self.scroll_target().scroll_to_bottom()),
             Action::OpenUrl => {
+                self.hint = None;
                 self.mode = Mode::UrlInput {
                     buffer: String::new(),
                 };
+                redraw()
+            }
+            Action::EditUrl => {
+                self.hint = None;
+                let buffer = self.current_url().unwrap_or_default();
+                self.mode = Mode::UrlInput { buffer };
                 redraw()
             }
             Action::ToggleDom => self.toggle_surface(Surface::Dom),
@@ -432,10 +517,16 @@ impl App {
             }
             Action::Commit => self.commit(),
             Action::Cancel => {
-                // Cancel drops the buffer with no fetch; the bar reverts to the
-                // status row, so a repaint is due.
-                self.mode = Mode::Browse;
-                redraw()
+                if self.hint.take().is_some() {
+                    return redraw();
+                }
+                // URL bar: drop the buffer and return to browse. Already in
+                // browse with nothing to cancel → not dirty (no dead redraw).
+                if matches!(self.mode, Mode::UrlInput { .. }) {
+                    self.mode = Mode::Browse;
+                    return redraw();
+                }
+                Effect::default()
             }
             Action::DeleteChar => {
                 if let Mode::UrlInput { buffer } = &mut self.mode {
@@ -443,11 +534,23 @@ impl App {
                 }
                 redraw()
             }
+            Action::HintFollow => self.start_hints(false),
+            Action::HintYank => self.start_hints(true),
+            Action::FocusNext => self.cycle_focus(1),
+            Action::FocusPrev => self.cycle_focus(-1),
+            Action::FollowFocus => self.follow_focus(),
+            Action::HistoryBack => self.history_go(true),
+            Action::HistoryForward => self.history_go(false),
+            Action::Reload => self.reload(),
+            Action::YankUrl => self.yank_page_url(),
         }
     }
 
     /// Show `surface`, or go back to the page if it is already showing.
     fn toggle_surface(&mut self, surface: Surface) -> Effect {
+        // Hints only paint on the page; leaving the page cancels them so keys
+        // do not navigate against an invisible overlay.
+        self.hint = None;
         self.surface = if self.surface == surface {
             Surface::Page
         } else {
@@ -519,6 +622,16 @@ impl App {
             self.layouts += 1;
         }
         self.viewport.set_lines(lines, self.page());
+        // History/reload restore: only apply when this layout belongs to the
+        // generation that requested it. A resize while the *old* page is still
+        // on screen (fetch Loading, previous DOM live) must not consume it.
+        if let Some((id, scroll)) = self.pending_scroll
+            && Some(id) == self.current_fetch
+            && matches!(self.fetch, Fetch::Loaded { .. })
+        {
+            self.pending_scroll = None;
+            let _ = self.viewport.scroll_to_offset(scroll);
+        }
         // F3 (and any open inspector) must reflect the new geometry — not a
         // stale cache from before this relayout (resize / stylesheet / parse).
         self.build_visible_inspector();
@@ -571,7 +684,8 @@ impl App {
 
     /// Recompute the styled tree from the tree and whatever sheets have
     /// arrived. Called when a page parses and when each sheet lands — never on
-    /// the scroll path (CLAUDE.md: scrolling never restyles).
+    /// the scroll path (CLAUDE.md: scrolling never restyles). Hover and visited
+    /// feed through [`StyleContext`] (M6).
     fn restyle(&mut self) {
         let Some(dom) = &self.dom else {
             self.styles = None;
@@ -582,10 +696,28 @@ impl App {
         // Sheets that have not arrived are simply absent from this pass; the
         // next arrival runs it again.
         let sheets: Vec<&Stylesheet> = self.sheets.iter().flatten().collect();
-        self.styles = Some(style::style_tree(dom, &sheets));
+        let base = self.current_url();
+        let ctx = StyleContext {
+            hover: self.hover,
+            visited: &self.visited,
+            base_url: base.as_deref(),
+        };
+        self.styles = Some(style::style_tree_with(dom, &sheets, &ctx));
         // Timed here for the same reason layout is: this stage runs on the UI
         // thread, so it measures itself rather than arriving as message data.
         self.timings.style = Some(started.elapsed());
+    }
+
+    /// Restyle + rebuild the display list from the existing layout tree — no
+    /// geometry change. Used for `:hover` (PLAN.md M6: restyle + repaint only).
+    fn restyle_and_repaint(&mut self) {
+        self.restyle();
+        self.styles_view_built = false;
+        if let (Some(tree), Some(styles)) = (self.layout_tree.as_mut(), self.styles.as_ref()) {
+            recolour_tree(tree, styles);
+            self.display_list = paint::paint(tree);
+        }
+        self.build_visible_inspector();
     }
 
     /// Render `dom` into the F1 surface's lines at the current size, if it
@@ -665,12 +797,325 @@ impl App {
         };
         let url = net::normalize_url(buffer);
         self.mode = Mode::Browse;
+        self.navigate(url, true)
+    }
+
+    /// Current page URL if one is known (loaded, loading, or failed).
+    fn current_url(&self) -> Option<String> {
+        match &self.fetch {
+            Fetch::Idle => None,
+            Fetch::Loading { url, .. } | Fetch::Loaded { url, .. } | Fetch::Failed { url, .. } => {
+                Some(url.clone())
+            }
+        }
+    }
+
+    /// Start a navigation. When `push_history` is true and there is a current
+    /// page, push it (with scroll) onto the back stack and clear forward.
+    fn navigate(&mut self, url: String, push_history: bool) -> Effect {
+        if push_history && let Some(cur) = self.current_url() {
+            // Same document (including pure fragment): no fetch, no history.
+            if same_document(&cur, &url) {
+                return Effect::default();
+            }
+            self.history.push(cur, self.viewport.offset());
+        }
+        self.pending_scroll = None;
+        self.hover = None;
+        self.focus = None;
+        self.hint = None;
+        self.status_msg = None;
         let id = self.start_fetch(url.clone());
         Effect {
             dirty: true,
             fetch: Some((id, url)),
             ..Effect::default()
         }
+    }
+
+    /// Navigate without pushing history, restoring `scroll` after layout of
+    /// *this* fetch generation.
+    fn navigate_restore(&mut self, url: String, scroll: usize) -> Effect {
+        self.hover = None;
+        self.focus = None;
+        self.hint = None;
+        self.status_msg = None;
+        let id = self.start_fetch(url.clone());
+        self.pending_scroll = Some((id, scroll));
+        Effect {
+            dirty: true,
+            fetch: Some((id, url)),
+            ..Effect::default()
+        }
+    }
+
+    fn history_go(&mut self, back: bool) -> Effect {
+        let Some(cur) = self.current_url() else {
+            return Effect::default();
+        };
+        let scroll = self.viewport.offset();
+        let entry = if back {
+            self.history.go_back(cur, scroll)
+        } else {
+            self.history.go_forward(cur, scroll)
+        };
+        match entry {
+            Some(e) => self.navigate_restore(e.url, e.scroll),
+            None => Effect::default(),
+        }
+    }
+
+    fn reload(&mut self) -> Effect {
+        let Some(url) = self.current_url() else {
+            return Effect::default();
+        };
+        // Reload is not a new history entry; keep scroll via pending restore
+        // tied to the new generation.
+        let scroll = self.viewport.offset();
+        self.hover = None;
+        self.focus = None;
+        self.hint = None;
+        let id = self.start_fetch(url.clone());
+        self.pending_scroll = Some((id, scroll));
+        Effect {
+            dirty: true,
+            fetch: Some((id, url)),
+            ..Effect::default()
+        }
+    }
+
+    fn yank_page_url(&mut self) -> Effect {
+        let Some(url) = self.current_url() else {
+            return Effect::default();
+        };
+        self.status_msg = Some("yanked".into());
+        Effect {
+            dirty: true,
+            yank: Some(url),
+            ..Effect::default()
+        }
+    }
+
+    fn start_hints(&mut self, yank: bool) -> Effect {
+        // Labels only paint on the page surface; activating against F1–F3
+        // would leave an invisible session that steals keys.
+        if self.surface != Surface::Page {
+            return Effect::default();
+        }
+        let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
+            return Effect::default();
+        };
+        let top = self.viewport.offset() as i32;
+        let bottom = top + self.page() as i32;
+        let visible = layout::visible_links(tree, dom, top, bottom);
+        if visible.is_empty() {
+            return Effect::default();
+        }
+        let labels = hints::label_links(&visible);
+        self.hint = Some(HintSession {
+            yank,
+            buffer: String::new(),
+            labels,
+        });
+        self.status_msg = None;
+        redraw()
+    }
+
+    fn on_hint_key(&mut self, ev: &KeyEvent) -> Effect {
+        use crossterm::event::KeyEventKind;
+        if ev.kind != KeyEventKind::Press {
+            return Effect::default();
+        }
+        // Quit always works, even while typing a label (PLAN.md §3).
+        if let Resolution::Action(Action::Quit) = keys::resolve(keys::Mode::Browse, None, ev) {
+            self.hint = None;
+            return self.run(Action::Quit);
+        }
+        // Esc cancels — also bound as Cancel in the table, but hint mode
+        // intercepts before resolve.
+        if matches!(ev.code, KeyCode::Esc) {
+            self.hint = None;
+            return redraw();
+        }
+        if matches!(ev.code, KeyCode::Backspace) {
+            if let Some(h) = &mut self.hint {
+                h.buffer.pop();
+            }
+            return redraw();
+        }
+        let KeyCode::Char(c) = ev.code else {
+            return Effect::default();
+        };
+        if ev
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return Effect::default();
+        }
+        let c = c.to_ascii_lowercase();
+        if !c.is_ascii_alphabetic() {
+            return Effect::default();
+        }
+        let Some(session) = self.hint.as_mut() else {
+            return Effect::default();
+        };
+        session.buffer.push(c);
+        let buffer = session.buffer.clone();
+        let matches: Vec<_> = hints::filter_prefix(&session.labels, &buffer)
+            .into_iter()
+            .cloned()
+            .collect();
+        if matches.is_empty() {
+            // Invalid key: drop the bad character, keep the session (vimium-
+            // style — a typo should not force the user to re-open `f`).
+            session.buffer.pop();
+            return redraw();
+        }
+        if let Some((_label, link)) = matches.iter().find(|(l, _)| l == &buffer) {
+            let href = link.href.clone();
+            let yank = session.yank;
+            self.hint = None;
+            return if yank {
+                let url = self.resolve_href(&href).unwrap_or(href);
+                self.status_msg = Some("yanked".into());
+                Effect {
+                    dirty: true,
+                    yank: Some(url),
+                    ..Effect::default()
+                }
+            } else {
+                self.follow_href(&href)
+            };
+        }
+        // Partial match — keep filtering.
+        redraw()
+    }
+
+    fn cycle_focus(&mut self, dir: i32) -> Effect {
+        let Some(dom) = &self.dom else {
+            return Effect::default();
+        };
+        let links = layout::dom_links(dom);
+        if links.is_empty() {
+            return Effect::default();
+        }
+        let next = match self.focus {
+            None => {
+                if dir >= 0 {
+                    0
+                } else {
+                    links.len() - 1
+                }
+            }
+            Some(cur) => {
+                let idx = links.iter().position(|(n, _)| *n == cur).unwrap_or(0);
+                if dir >= 0 {
+                    (idx + 1) % links.len()
+                } else {
+                    (idx + links.len() - 1) % links.len()
+                }
+            }
+        };
+        self.focus = Some(links[next].0);
+        self.scroll_focus_into_view();
+        redraw()
+    }
+
+    fn follow_focus(&mut self) -> Effect {
+        let (Some(focus), Some(dom)) = (self.focus, &self.dom) else {
+            return Effect::default();
+        };
+        let Some(href) = dom.attr(focus, "href") else {
+            return Effect::default();
+        };
+        let href = href.to_string();
+        self.follow_href(&href)
+    }
+
+    fn scroll_focus_into_view(&mut self) {
+        let (Some(focus), Some(tree)) = (self.focus, &self.layout_tree) else {
+            return;
+        };
+        let Some(y) = layout::first_y(tree, focus) else {
+            return;
+        };
+        let y = y as usize;
+        let page = self.page() as usize;
+        let off = self.viewport.offset();
+        if y < off {
+            let _ = self.viewport.scroll_to_offset(y);
+        } else if y >= off + page {
+            let _ = self
+                .viewport
+                .scroll_to_offset(y.saturating_sub(page.saturating_sub(1)));
+        }
+    }
+
+    fn follow_href(&mut self, href: &str) -> Effect {
+        let Some(url) = self.resolve_href(href) else {
+            return Effect::default();
+        };
+        self.navigate(url, true)
+    }
+
+    fn resolve_href(&self, href: &str) -> Option<String> {
+        let base = self.current_url()?;
+        net::resolve_url(&base, href)
+    }
+
+    /// Frame (col,row) → document cell, or `None` if outside the page column /
+    /// status row.
+    fn frame_to_doc(&self, col: u16, row: u16) -> Option<(i32, i32)> {
+        if row >= self.page() {
+            return None;
+        }
+        let col_info = column(self.size.0);
+        if col < col_info.left || col >= col_info.left + col_info.width {
+            return None;
+        }
+        let doc_x = (col - col_info.left) as i32;
+        let doc_y = row as i32 + self.viewport.offset() as i32;
+        Some((doc_x, doc_y))
+    }
+
+    fn on_click(&mut self, col: u16, row: u16) -> Effect {
+        let Some((x, y)) = self.frame_to_doc(col, row) else {
+            return Effect::default();
+        };
+        let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
+            return Effect::default();
+        };
+        let Some((_node, href)) = layout::link_at(tree, dom, x, y) else {
+            return Effect::default();
+        };
+        self.follow_href(&href)
+    }
+
+    fn on_hover_move(&mut self, col: u16, row: u16) -> Effect {
+        let target = self.frame_to_doc(col, row).and_then(|(x, y)| {
+            let (dom, tree) = self.dom.as_ref().zip(self.layout_tree.as_ref())?;
+            layout::hit_test(tree, x, y).map(|node| {
+                // Hover the nearest element; for text, that is the text node —
+                // `:hover` on `a:hover` needs the anchor. Walk up to the
+                // nearest element... actually CSS :hover matches the element
+                // under the pointer and ancestors. Our matching only checks
+                // `ctx.hover == Some(node)` on the compound's subject. So set
+                // hover to the deepest element (not text).
+                let mut id = node;
+                if !matches!(dom.node(id).data, crate::dom::NodeData::Element { .. }) {
+                    id = dom.node(id).parent.unwrap_or(id);
+                }
+                // Prefer the link itself when inside one so `a:hover` fires.
+                layout::nearest_link(dom, id).map(|(n, _)| n).unwrap_or(id)
+            })
+        });
+        if target == self.hover {
+            return Effect::default();
+        }
+        self.hover = target;
+        // Restyle + repaint only — never relayout (PLAN.md M6).
+        self.restyle_and_repaint();
+        redraw()
     }
 
     /// Paint the whole frame: the visible body slice into the page area, plus
@@ -703,17 +1148,73 @@ impl App {
     fn draw_page(&self, frame: &mut Frame) {
         if self.dom.is_some() {
             let left = column(self.size.0).left;
-            paint::paint_to_frame(
-                &self.display_list,
-                frame,
-                left,
-                self.viewport.offset() as i32,
-                self.page(),
-            );
+            let scroll = self.viewport.offset() as i32;
+            paint::paint_to_frame(&self.display_list, frame, left, scroll, self.page());
+            self.draw_focus_overlay(frame, left, scroll);
+            self.draw_hint_overlay(frame, left, scroll);
             return;
         }
         for (row, line) in self.viewport.visible().iter().enumerate() {
             paint_line(frame, 0, row as u16, line);
+        }
+    }
+
+    /// Reverse-video the focused link's text fragments (UI chrome, not CSS
+    /// `:focus`). Paint-time only — no restyle.
+    fn draw_focus_overlay(&self, frame: &mut Frame, left: u16, scroll: i32) {
+        let (Some(focus), Some(dom), Some(tree)) =
+            (self.focus, self.dom.as_ref(), self.layout_tree.as_ref())
+        else {
+            return;
+        };
+        let page_h = self.page() as i32;
+        let style = reversed();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind != BoxKind::Text {
+                return;
+            }
+            let Some(node) = b.node else {
+                return;
+            };
+            if !layout::is_under(dom, node, focus) {
+                return;
+            }
+            let Some(text) = &b.text else {
+                return;
+            };
+            let screen_y = b.dimensions.content.y - scroll;
+            if screen_y < 0 || screen_y >= page_h {
+                return;
+            }
+            let screen_x = left as i32 + b.dimensions.content.x;
+            if screen_x < 0 {
+                return;
+            }
+            frame.put_str(screen_x as u16, screen_y as u16, text, style);
+        });
+    }
+
+    /// Link-hint labels on top of the page.
+    fn draw_hint_overlay(&self, frame: &mut Frame, left: u16, scroll: i32) {
+        let Some(session) = &self.hint else {
+            return;
+        };
+        let page_h = self.page() as i32;
+        let style = Style {
+            attrs: Attrs::REVERSE | Attrs::BOLD,
+            ..Style::default()
+        };
+        let shown = hints::filter_prefix(&session.labels, &session.buffer);
+        for (label, link) in shown {
+            let screen_y = link.y - scroll;
+            if screen_y < 0 || screen_y >= page_h {
+                continue;
+            }
+            let screen_x = left as i32 + link.x;
+            if screen_x < 0 {
+                continue;
+            }
+            frame.put_str(screen_x as u16, screen_y as u16, label, style);
         }
     }
 
@@ -827,8 +1328,16 @@ impl App {
     }
 
     /// Middle segment: where the fetch stands — spinner + progress, the
-    /// loaded summary, or the failure reason.
+    /// loaded summary, or the failure reason. A flash message (yank) wins
+    /// while present so the user sees confirmation.
     fn status_middle(&self) -> String {
+        if let Some(msg) = &self.status_msg {
+            return msg.clone();
+        }
+        if let Some(session) = &self.hint {
+            let n = hints::filter_prefix(&session.labels, &session.buffer).len();
+            return format!("hints: {} ({n})", session.buffer);
+        }
         match &self.fetch {
             Fetch::Idle => String::new(),
             Fetch::Loading { bytes_so_far, .. } => format!(
@@ -938,6 +1447,30 @@ fn moved(changed: bool) -> Effect {
 /// dishonest `0 KB`.
 fn kb(bytes: u64) -> u64 {
     bytes.div_ceil(1024)
+}
+
+/// Re-apply computed colours/attrs onto an existing layout tree without
+/// changing geometry — the hover path's "repaint without relayout".
+fn recolour_tree(tree: &mut LayoutTree, styles: &Styles) {
+    for b in &mut tree.boxes {
+        let Some(node) = b.node else {
+            continue;
+        };
+        let computed = *styles.get(node);
+        b.computed = computed;
+        if b.kind == BoxKind::Text {
+            b.term_style = layout::term_style(&computed);
+        }
+    }
+}
+
+/// Same document for history / navigation: ignore the fragment. Pure `#foo`
+/// links must not push history or re-fetch (M6 review).
+fn same_document(a: &str, b: &str) -> bool {
+    fn strip(s: &str) -> &str {
+        s.split_once('#').map(|(u, _)| u).unwrap_or(s)
+    }
+    strip(a) == strip(b)
 }
 
 #[cfg(test)]
@@ -2497,5 +3030,342 @@ mod tests {
         let bottom = row_text(&frame, 5);
         assert!(bottom.contains("open:"), "row was {bottom:?}");
         assert!(!bottom.contains("open: F"), "F4 must not type");
+    }
+
+    // ---- M6 interaction ---------------------------------------------------
+
+    fn mouse_down(col: u16, row: u16) -> Msg {
+        Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn mouse_move(col: u16, row: u16) -> Msg {
+        Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// Find a document-space click that hits the first link, then map to frame.
+    fn click_first_link(app: &App) -> Msg {
+        let dom = app.dom.as_ref().unwrap();
+        let tree = app.layout_tree.as_ref().unwrap();
+        let link = layout::collect_links(tree, dom)
+            .into_iter()
+            .next()
+            .expect("fixture needs a link");
+        let left = column(app.size.0).left;
+        mouse_down(
+            (left as i32 + link.x) as u16,
+            (link.y - app.viewport.offset() as i32) as u16,
+        )
+    }
+
+    #[test]
+    fn click_on_a_link_starts_a_fetch_for_the_resolved_url() {
+        let mut app = page(80, 12, "<p>see <a href='/docs'>docs</a> here</p>");
+        let effect = app.update(click_first_link(&app));
+        assert!(effect.dirty);
+        let (id, url) = effect.fetch.expect("click must navigate");
+        // `page` loads with post-redirect URL `http://final/` (see `load`).
+        assert_eq!(url, "http://final/docs");
+        assert_eq!(id, FetchId(2)); // generation after the initial load
+    }
+
+    #[test]
+    fn click_outside_a_link_is_not_dirty() {
+        let mut app = page(80, 12, "<p>no links here at all</p>");
+        let left = column(app.size.0).left;
+        assert_eq!(app.update(mouse_down(left, 0)), Effect::default());
+    }
+
+    #[test]
+    fn f_opens_hints_and_typing_the_label_follows() {
+        let mut app = page(
+            80,
+            12,
+            "<p><a href='/a'>alpha</a> <a href='/b'>beta</a></p>",
+        );
+        assert!(app.update(ch('f')).dirty);
+        assert!(app.hint.is_some());
+        // First visible link is labeled "a" (home-row alphabet).
+        let effect = app.update(ch('a'));
+        assert_eq!(
+            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            Some("http://final/a")
+        );
+        assert!(app.hint.is_none());
+    }
+
+    #[test]
+    fn capital_f_yanks_the_hint_url() {
+        let mut app = page(80, 12, "<p><a href='/z'>zulu</a></p>");
+        app.update(key(KeyCode::Char('F'), KeyModifiers::NONE));
+        let effect = app.update(ch('a'));
+        assert!(effect.fetch.is_none());
+        assert_eq!(effect.yank.as_deref(), Some("http://final/z"));
+    }
+
+    #[test]
+    fn esc_cancels_hints() {
+        let mut app = page(80, 12, "<p><a href='/a'>a</a></p>");
+        app.update(ch('f'));
+        assert!(app.hint.is_some());
+        assert!(app.update(key(KeyCode::Esc, KeyModifiers::NONE)).dirty);
+        assert!(app.hint.is_none());
+    }
+
+    #[test]
+    fn tab_cycles_links_and_enter_follows() {
+        let mut app = page(80, 12, "<p><a href='/1'>one</a> <a href='/2'>two</a></p>");
+        assert!(app.update(key(KeyCode::Tab, KeyModifiers::NONE)).dirty);
+        assert!(app.focus.is_some());
+        // Second Tab → second link.
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            Some("http://final/2")
+        );
+    }
+
+    #[test]
+    fn history_back_restores_scroll_after_layout() {
+        let mut app = page(
+            40,
+            8,
+            "<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>",
+        );
+        // Scroll down on page A.
+        app.update(ch('j'));
+        app.update(ch('j'));
+        let scroll_a = app.viewport.offset();
+        assert!(scroll_a > 0);
+
+        // Navigate to B via URL bar.
+        app.update(ch('o'));
+        for c in "http://y/".chars() {
+            app.update(ch(c));
+        }
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (id, url) = effect.fetch.unwrap();
+        assert_eq!(url, "http://y/");
+        app.update(Msg::Loaded {
+            id,
+            url: url.clone(),
+            status: 200,
+            body: b"<p>page b</p>".to_vec(),
+            elapsed: Duration::ZERO,
+        });
+        app.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse("<p>page b</p>"),
+            elapsed: Duration::ZERO,
+        });
+
+        // Back to A (`http://final/` — the Loaded URL of the first page).
+        let effect = app.update(key(KeyCode::Char('H'), KeyModifiers::NONE));
+        let (id, url) = effect.fetch.unwrap();
+        assert_eq!(url, "http://final/");
+        app.update(Msg::Loaded {
+            id,
+            url: url.clone(),
+            status: 200,
+            body:
+                b"<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>"
+                    .to_vec(),
+            elapsed: Duration::ZERO,
+        });
+        app.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(
+                "<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>",
+            ),
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(app.viewport.offset(), scroll_a);
+    }
+
+    #[test]
+    fn reload_and_edit_url_and_yy() {
+        let mut app = page(80, 10, "<p>hi</p>");
+        let effect = app.update(ch('r'));
+        assert_eq!(
+            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            Some("http://final/")
+        );
+
+        app.update(key(KeyCode::Char('O'), KeyModifiers::NONE));
+        match &app.mode {
+            Mode::UrlInput { buffer } => assert_eq!(buffer, "http://final/"),
+            _ => panic!("O must open the URL bar"),
+        }
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.update(ch('y')); // pending
+        let effect = app.update(ch('y'));
+        assert_eq!(effect.yank.as_deref(), Some("http://final/"));
+    }
+
+    #[test]
+    fn hover_restyles_without_relayout() {
+        let mut app = page(80, 12, "<p><a href='/h'>hover me</a></p>");
+        let layouts_before = app.layouts;
+        let color_before = computed_color(&app, "a");
+
+        let dom = app.dom.as_ref().unwrap();
+        let tree = app.layout_tree.as_ref().unwrap();
+        let link = layout::collect_links(tree, dom).into_iter().next().unwrap();
+        let left = column(app.size.0).left;
+        let col = (left as i32 + link.x) as u16;
+        let row = (link.y - app.viewport.offset() as i32) as u16;
+
+        let effect = app.update(mouse_move(col, row));
+        assert!(effect.dirty);
+        assert_eq!(app.layouts, layouts_before, "hover must not relayout");
+        assert!(app.hover.is_some());
+        let color_after = computed_color(&app, "a");
+        assert_ne!(
+            color_before, color_after,
+            "a:hover should change the link colour"
+        );
+
+        // Same target again → not dirty.
+        assert_eq!(app.update(mouse_move(col, row)), Effect::default());
+
+        // Move off the page area → clear hover.
+        let effect = app.update(mouse_move(0, 0));
+        // May or may not hit a node at (0,0); if hover clears, layouts still
+        // must not increase.
+        assert_eq!(app.layouts, layouts_before);
+        let _ = effect;
+    }
+
+    #[test]
+    fn visited_links_match_after_a_successful_load() {
+        // Visit A, then open B which links back to A — cascade must paint
+        // :visited, not just record membership in the set.
+        let mut app = page(80, 10, "<p><a href='http://visited.test/'>v</a></p>");
+        let effect = app.update(click_first_link(&app));
+        let (id, url) = effect.fetch.unwrap();
+        assert_eq!(url, "http://visited.test/");
+        app.update(Msg::Loaded {
+            id,
+            url: url.clone(),
+            status: 200,
+            body: b"<p>there</p>".to_vec(),
+            elapsed: Duration::ZERO,
+        });
+        assert!(app.visited.contains("http://visited.test/"));
+
+        // Page B with a link to the visited URL.
+        let id2 = app.start_fetch("http://final/b".into());
+        app.update(Msg::Loaded {
+            id: id2,
+            url: "http://final/b".into(),
+            status: 200,
+            body: b"<p><a href='http://visited.test/'>back</a></p>".to_vec(),
+            elapsed: Duration::ZERO,
+        });
+        app.update(Msg::Parsed {
+            id: id2,
+            dom: crate::html::parse("<p><a href='http://visited.test/'>back</a></p>"),
+            elapsed: Duration::ZERO,
+        });
+        // UA a:visited is #af5fff; a:link is #5c5cff.
+        let color = computed_color(&app, "a");
+        assert_eq!(
+            color,
+            crate::style::values::ColorValue::Rgb(0xaf, 0x5f, 0xff),
+            "visited link must take a:visited colour, got {color:?}"
+        );
+    }
+
+    #[test]
+    fn quit_works_while_hints_are_open() {
+        let mut app = page(80, 12, "<p><a href='/a'>a</a></p>");
+        app.update(ch('f'));
+        assert!(app.hint.is_some());
+        let effect = app.update(ch('q'));
+        assert!(effect.quit);
+        // Ctrl-c too.
+        let mut app = page(80, 12, "<p><a href='/a'>a</a></p>");
+        app.update(ch('f'));
+        let effect = app.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(effect.quit);
+    }
+
+    #[test]
+    fn pending_scroll_survives_resize_while_loading() {
+        // History restore must not be consumed by a resize of the *old* page.
+        let mut app = page(
+            40,
+            8,
+            "<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>",
+        );
+        app.update(ch('j'));
+        app.update(ch('j'));
+        let scroll_a = app.viewport.offset();
+        let effect = app.navigate_restore("http://final/restored".into(), scroll_a);
+        let (id, _) = effect.fetch.unwrap();
+        // Still on the old DOM (Loading). Resize must not eat pending_scroll.
+        app.update(Msg::Resize(50, 8));
+        assert!(
+            app.pending_scroll.is_some(),
+            "resize during Loading must not consume history restore"
+        );
+        // Now land the restored page.
+        app.update(Msg::Loaded {
+            id,
+            url: "http://final/restored".into(),
+            status: 200,
+            body:
+                b"<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>"
+                    .to_vec(),
+            elapsed: Duration::ZERO,
+        });
+        app.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(
+                "<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>",
+            ),
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(app.viewport.offset(), scroll_a);
+        assert!(app.pending_scroll.is_none());
+    }
+
+    #[test]
+    fn yanked_status_clears_on_the_next_action() {
+        let mut app = page(80, 10, "<p>hi</p>");
+        app.update(ch('y'));
+        app.update(ch('y'));
+        assert_eq!(app.status_msg.as_deref(), Some("yanked"));
+        app.update(ch('j')); // scroll — must clear the flash
+        assert!(app.status_msg.is_none());
+    }
+
+    #[test]
+    fn same_document_fragment_does_not_fetch() {
+        let mut app = page(80, 10, "<p><a href='#section'>jump</a></p>");
+        let effect = app.update(click_first_link(&app));
+        assert!(effect.fetch.is_none(), "pure fragment must not navigate");
+        assert!(!effect.dirty || effect.fetch.is_none());
+    }
+
+    #[test]
+    fn invalid_hint_key_keeps_the_session() {
+        let mut app = page(80, 12, "<p><a href='/a'>alpha</a></p>");
+        app.update(ch('f'));
+        // First link is "a". Typing "z" matches nothing — session stays open.
+        app.update(ch('z'));
+        assert!(app.hint.is_some());
+        assert_eq!(app.hint.as_ref().map(|h| h.buffer.as_str()), Some(""));
     }
 }

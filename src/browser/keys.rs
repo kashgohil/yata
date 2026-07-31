@@ -12,6 +12,8 @@ pub enum Action {
     Top,
     Bottom,
     OpenUrl,
+    /// Pre-fill the URL bar with the current page URL (M6 `O`).
+    EditUrl,
     ToggleDom,
     ToggleStyles,
     ToggleBoxes,
@@ -19,6 +21,18 @@ pub enum Action {
     Commit,
     Cancel,
     DeleteChar,
+    /// Link hints → follow (`f`).
+    HintFollow,
+    /// Link hints → yank URL (`F`).
+    HintYank,
+    FocusNext,
+    FocusPrev,
+    FollowFocus,
+    HistoryBack,
+    HistoryForward,
+    Reload,
+    /// Yank the current page URL (`yy`).
+    YankUrl,
 }
 
 /// Which key map is live. `App`'s own mode carries the URL buffer; this is the
@@ -95,12 +109,40 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::Char('G'), NONE), Action::Bottom),
     browse(None, chord(KeyCode::End, NONE), Action::Bottom),
     browse(None, chord(KeyCode::Char('o'), NONE), Action::OpenUrl),
+    browse(None, chord(KeyCode::Char('O'), NONE), Action::EditUrl),
     // `F1`–`F4` are the DOM, styles, boxes and timing inspectors
     // (PLAN.md §3 `F1`–`F4`); Browse only — in the URL bar they are unbound.
     browse(None, chord(KeyCode::F(1), NONE), Action::ToggleDom),
     browse(None, chord(KeyCode::F(2), NONE), Action::ToggleStyles),
     browse(None, chord(KeyCode::F(3), NONE), Action::ToggleBoxes),
     browse(None, chord(KeyCode::F(4), NONE), Action::ToggleTiming),
+    // M6 interaction.
+    browse(None, chord(KeyCode::Char('f'), NONE), Action::HintFollow),
+    browse(None, chord(KeyCode::Char('F'), NONE), Action::HintYank),
+    browse(None, chord(KeyCode::Tab, NONE), Action::FocusNext),
+    browse(None, chord(KeyCode::BackTab, NONE), Action::FocusPrev),
+    browse(None, chord(KeyCode::Enter, NONE), Action::FollowFocus),
+    browse(None, chord(KeyCode::Char('H'), NONE), Action::HistoryBack),
+    browse(
+        None,
+        chord(KeyCode::Char('L'), NONE),
+        Action::HistoryForward,
+    ),
+    browse(None, chord(KeyCode::Backspace, NONE), Action::HistoryBack),
+    // Shift-Backspace: some terminals report Backspace+SHIFT.
+    browse(
+        None,
+        chord(KeyCode::Backspace, KeyModifiers::SHIFT),
+        Action::HistoryForward,
+    ),
+    browse(None, chord(KeyCode::Char('r'), NONE), Action::Reload),
+    // `yy`: yank page URL (same two-key shape as `gg`).
+    browse(
+        Some(chord(KeyCode::Char('y'), NONE)),
+        chord(KeyCode::Char('y'), NONE),
+        Action::YankUrl,
+    ),
+    browse(None, chord(KeyCode::Esc, NONE), Action::Cancel),
     browse(None, chord(KeyCode::Char('q'), NONE), Action::Quit),
     browse(None, chord(KeyCode::Char('c'), CTRL), Action::Quit),
     // UrlInput. `q` is absent on purpose: it is a letter here and types.
@@ -325,6 +367,63 @@ mod tests {
     fn unbound_keys_do_nothing() {
         assert_eq!(browse_key(KeyCode::Char('x'), NONE), Resolution::Unbound);
         assert_eq!(browse_key(KeyCode::Char('q'), CTRL), Resolution::Unbound);
+    }
+
+    #[test]
+    fn m6_interaction_bindings() {
+        assert_eq!(
+            browse_key(KeyCode::Char('f'), NONE),
+            Resolution::Action(Action::HintFollow)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('F'), NONE),
+            Resolution::Action(Action::HintYank)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Tab, NONE),
+            Resolution::Action(Action::FocusNext)
+        );
+        assert_eq!(
+            browse_key(KeyCode::BackTab, NONE),
+            Resolution::Action(Action::FocusPrev)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Enter, NONE),
+            Resolution::Action(Action::FollowFocus)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('H'), NONE),
+            Resolution::Action(Action::HistoryBack)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('L'), NONE),
+            Resolution::Action(Action::HistoryForward)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Backspace, NONE),
+            Resolution::Action(Action::HistoryBack)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Backspace, KeyModifiers::SHIFT),
+            Resolution::Action(Action::HistoryForward)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('r'), NONE),
+            Resolution::Action(Action::Reload)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('O'), NONE),
+            Resolution::Action(Action::EditUrl)
+        );
+        let y = chord(KeyCode::Char('y'), NONE);
+        assert_eq!(
+            resolve(Mode::Browse, None, &press(KeyCode::Char('y'), NONE)),
+            Resolution::Pending(y)
+        );
+        assert_eq!(
+            resolve(Mode::Browse, Some(y), &press(KeyCode::Char('y'), NONE)),
+            Resolution::Action(Action::YankUrl)
+        );
     }
 
     #[test]
