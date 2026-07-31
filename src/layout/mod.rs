@@ -57,6 +57,12 @@ pub fn layout_document(dom: &Dom, styles: &Styles, width: u16, hidden: Hidden) -
     layout_tree(dom, styles, width, hidden)
 }
 
+/// Rasterise a laid-out tree into display lines (viewport scroll range,
+/// `--dump-text`). Same tree the display list was painted from.
+pub fn lines_from_tree(tree: &LayoutTree) -> Vec<Line> {
+    lines::from_tree(tree)
+}
+
 /// Lines as text with style markers for tests: `[b]bold[/]`, `[u #5c5cff]…`.
 pub fn debug_lines(lines: &[Line]) -> String {
     let mut out = String::new();

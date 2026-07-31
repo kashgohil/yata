@@ -11,5 +11,6 @@ pub mod html;
 pub mod layout;
 pub mod msg;
 pub mod net;
+pub mod paint;
 pub mod style;
 pub mod term;

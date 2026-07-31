@@ -10,6 +10,7 @@ use crate::dom::Dom;
 use crate::layout;
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
+use crate::paint::{self, DisplayList};
 use crate::style::sources::{self, Source};
 use crate::style::{self, Styles};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -135,9 +136,11 @@ pub struct App {
     revealed: bool,
     /// The styled tree for `dom` and the sheets that have arrived so far.
     /// Recomputed as each one lands — the page renders with what it has and
-    /// restyles, rather than blocking on a round trip (UX §3.2). Nothing draws
-    /// from it until M4.4 moves layout onto computed values.
+    /// restyles, rather than blocking on a round trip (UX §3.2).
     styles: Option<Styles>,
+    /// Painted form of the last layout tree. Scrolling re-emits this at a new
+    /// offset without relayout (PLAN.md M5 display list).
+    display_list: DisplayList,
     /// How many times `relayout` has run. Test-only instrumentation for the
     /// invariant that costs the most if it ever breaks: scrolling relayouts
     /// zero times, a resize exactly once.
@@ -167,6 +170,7 @@ impl App {
             sheets: Vec::new(),
             styles: None,
             revealed: false,
+            display_list: DisplayList::default(),
             #[cfg(test)]
             layouts: 0,
         }
@@ -471,7 +475,23 @@ impl App {
             return;
         };
         let started = Instant::now();
-        let (lines, revealed) = layout::layout_readable(dom, styles, column(self.size.0).width);
+        let width = column(self.size.0).width;
+        // One layout (or two if we have to reveal a page that hid itself).
+        let tree = layout::layout_document(dom, styles, width, layout::Hidden::Respect);
+        let mut lines = layout::lines_from_tree(&tree);
+        let (tree, revealed) = if lines.iter().any(|l| !l.spans.is_empty()) {
+            (tree, false)
+        } else {
+            let alt = layout::layout_document(dom, styles, width, layout::Hidden::Reveal);
+            let alt_lines = layout::lines_from_tree(&alt);
+            if alt_lines.iter().any(|l| !l.spans.is_empty()) {
+                lines = alt_lines;
+                (alt, true)
+            } else {
+                (tree, false)
+            }
+        };
+        self.display_list = paint::paint(&tree);
         self.revealed = revealed;
         // The one place `App` reads the clock: fetch and parse are timed by the
         // worker that runs them, but this stage runs here, so it times itself.
@@ -640,19 +660,24 @@ impl App {
         }
     }
 
-    /// The page: the visible display lines, span by span. A laid-out page sits
-    /// in its centered column; raw body text — still loading, unparsed, or an
-    /// error page — starts at the left edge exactly as it did before M3.2.
-    /// Lines wider than the frame (`<pre>`) clip at the right edge inside
-    /// `put_str`: no wrap here, and no horizontal scroll until M7.
+    /// The page: a laid-out document is painted from the cached display list
+    /// at the current scroll offset (PLAN.md M5 — scroll never relayouts).
+    /// Raw body text — still loading, unparsed, or an error page — still uses
+    /// the line path and starts at the left edge.
     fn draw_page(&self, frame: &mut Frame) {
-        let left = if self.dom.is_some() {
-            column(self.size.0).left
-        } else {
-            0
-        };
+        if self.dom.is_some() {
+            let left = column(self.size.0).left;
+            paint::paint_to_frame(
+                &self.display_list,
+                frame,
+                left,
+                self.viewport.offset() as i32,
+                self.page(),
+            );
+            return;
+        }
         for (row, line) in self.viewport.visible().iter().enumerate() {
-            paint_line(frame, left, row as u16, line);
+            paint_line(frame, 0, row as u16, line);
         }
     }
 

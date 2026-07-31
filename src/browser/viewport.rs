@@ -105,7 +105,6 @@ impl Viewport {
         Some(((self.offset * 100 + max / 2) / max) as u8)
     }
 
-    #[cfg(test)]
     pub fn offset(&self) -> usize {
         self.offset
     }
