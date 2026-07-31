@@ -300,14 +300,16 @@ mod tests {
         let out = lines_styled("<p>hi</p>", "p { text-align: center; margin: 0 }", 20);
         let line = out.iter().find(|l| text(l).contains("hi")).unwrap();
         let t = text(line);
-        // Leading pad spaces before "hi".
-        assert!(t.starts_with(' '), "{t:?}");
-        assert!(t.contains("hi"), "{t:?}");
+        let pad = t.find("hi").unwrap();
+        // Content is 2 cells; pad ≈ (20 - 2) / 2 = 9.
+        assert!(
+            (8..=10).contains(&pad),
+            "expected ~9 cells of pad, got {pad}: {t:?}"
+        );
     }
 
     #[test]
-    fn margin_right_separates_inline_is_not_yet_horizontal_on_inlines() {
-        // Block margin-right shrinks content width; this pins block margins.
+    fn block_horizontal_margins_resolve_to_cells() {
         let (dom, styles) = styled_dom(
             "<div>x</div>",
             "div { margin-left: 16px; margin-right: 16px; margin-top: 0; margin-bottom: 0 }",
@@ -319,6 +321,88 @@ mod tests {
                 assert_eq!(b.dimensions.margin.right, 2);
             }
         });
+    }
+
+    #[test]
+    fn anonymous_block_keeps_previous_block_margin() {
+        // `<p>one</p>two` — the paragraph's margin-bottom must not vanish when
+        // the following text becomes an anonymous block.
+        let out = plain(&lines_styled(
+            "<div><p>one</p>two</div>",
+            "p { margin-top: 0; margin-bottom: 1em } div { margin: 0 }",
+            40,
+        ));
+        let one = out.iter().position(|l| l.contains("one")).unwrap();
+        let two = out.iter().position(|l| l.contains("two")).unwrap();
+        assert!(
+            two > one + 1,
+            "expected a blank row between block and loose text: {out:?}"
+        );
+    }
+
+    #[test]
+    fn inline_margin_right_separates_without_dom_whitespace() {
+        // HN header: `.hnname { margin-right: 5px }` with no text node between.
+        let out = plain(&lines_styled(
+            "<b class=hnname>Hacker News</b><a href=n>new</a>",
+            ".hnname { margin-right: 5px } a { margin: 0 }",
+            40,
+        ));
+        let all = out.join("");
+        assert!(
+            !all.contains("Hacker Newsnew"),
+            "inline margin-right must separate: {all:?}"
+        );
+        assert!(
+            all.contains("Hacker News") && all.contains("new"),
+            "{all:?}"
+        );
+        // At least one cell of gap.
+        let pos = all.find("Hacker News").unwrap() + "Hacker News".len();
+        assert_eq!(&all[pos..pos + 1], " ", "{all:?}");
+    }
+
+    #[test]
+    fn nested_br_inside_inline_forces_a_line_break() {
+        let out = plain(&lines_styled(
+            "<p style='margin:0'><span>a<br>b</span></p>",
+            "",
+            40,
+        ));
+        let content: Vec<_> = out.into_iter().filter(|l| !l.trim().is_empty()).collect();
+        assert!(
+            content.iter().any(|l| l.contains('a')) && content.iter().any(|l| l.contains('b')),
+            "{content:?}"
+        );
+        assert!(content.len() >= 2, "expected two rows, got {content:?}");
+        assert!(
+            !content.iter().any(|l| l.contains("ab")),
+            "br must not glue: {content:?}"
+        );
+    }
+
+    #[test]
+    fn list_item_with_block_child_still_gets_a_bullet() {
+        let out = plain(&lines_styled(
+            "<ul style='margin:0;padding-left:2em'><li><p style='margin:0'>item</p></li></ul>",
+            "",
+            40,
+        ));
+        let all = out.join("\n");
+        assert!(all.contains('•'), "missing bullet: {all:?}");
+        assert!(all.contains("item"), "{all:?}");
+    }
+
+    #[test]
+    fn pre_preserves_mixed_styles() {
+        let out = lines_styled("<pre>a<b>b</b>c</pre>", "", 40);
+        let dbg = debug_lines(&out);
+        assert!(dbg.contains('a') && dbg.contains('c'), "{dbg}");
+        // The bold `b` must keep BOLD in its span, not collapse to one style.
+        assert!(
+            dbg.contains("[b]b[/]") || dbg.contains("[b]"),
+            "bold inside pre lost: {dbg}"
+        );
     }
 
     #[test]

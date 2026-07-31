@@ -154,7 +154,8 @@ impl<'a> Engine<'a> {
                         ),
                         Display::Inline => {
                             // Inline element as a block-container child: wrap.
-                            let items = self.collect_inline(id, pre || tag == "pre");
+                            let items =
+                                self.collect_inline(id, pre || tag == "pre", containing_width);
                             if items.is_empty() {
                                 return None;
                             }
@@ -269,7 +270,28 @@ impl<'a> Engine<'a> {
                         &mut content_y,
                         &mut child_prev_mb,
                     );
-                    marker_pending = false;
+                    // `<li><p>…</p></li>`: bullet before the first block child,
+                    // not dropped when the item has no leading text.
+                    if marker_pending {
+                        if let Some(anon) = self.layout_anonymous_block(
+                            content_x,
+                            content_w,
+                            content_y,
+                            &mut child_prev_mb,
+                            &[InlineItem::Marker {
+                                text: "• ".into(),
+                                style: Style::default(),
+                            }],
+                            computed.text_align,
+                            pre,
+                        ) {
+                            let mb = self.boxes[anon.0 as usize].dimensions.margin_box();
+                            content_y = mb.bottom();
+                            child_prev_mb = self.boxes[anon.0 as usize].dimensions.margin.bottom;
+                            children.push(anon);
+                        }
+                        marker_pending = false;
+                    }
                     if let Some(cid) = self.layout_node(
                         child,
                         content_x,
@@ -292,7 +314,7 @@ impl<'a> Engine<'a> {
                         });
                         marker_pending = false;
                     }
-                    self.push_inline(child, pre, &mut inline_run);
+                    self.push_inline(child, pre, content_w, &mut inline_run);
                 }
             }
         }
@@ -346,8 +368,17 @@ impl<'a> Engine<'a> {
         if items.is_empty() {
             return None;
         }
-        // Anonymous blocks have no margin of their own.
-        let y = y - *prev_margin_bottom;
+        // Same adjacent-sibling collapse as real blocks: the previous sibling
+        // already advanced `y` through its bottom margin; pull back and re-apply
+        // max(anon_top=0, prev_bottom). Zeroing prev (the old path) ate the
+        // gap between `<p>one</p>two`.
+        let y_after_prev = y - *prev_margin_bottom;
+        let used_top = if y_after_prev == 0 && *prev_margin_bottom == 0 {
+            0
+        } else {
+            *prev_margin_bottom
+        };
+        let y = y_after_prev + used_top;
         *prev_margin_bottom = 0;
 
         let box_id = self.alloc(LayoutBox {
@@ -485,7 +516,7 @@ impl<'a> Engine<'a> {
         align: TextAlign,
     ) -> Vec<BoxId> {
         let width = width.max(1);
-        // Flatten to words and break opportunities (collapsed spaces).
+        // Flatten to words, hard breaks, spacers, and soft wrap spaces.
         let mut pieces: Vec<Piece> = Vec::new();
         let mut pending_space: Option<Style> = None;
 
@@ -498,6 +529,32 @@ impl<'a> Engine<'a> {
                         style: *style,
                         node: None,
                         is_space: false,
+                        is_break: false,
+                    });
+                }
+                InlineItem::Spacer { cells } => {
+                    if *cells > 0 {
+                        pieces.push(Piece {
+                            text: " ".repeat(*cells as usize),
+                            cells: *cells,
+                            style: Style::default(),
+                            node: None,
+                            // Not a soft wrap space: margins must not collapse
+                            // or vanish at a line edge the way HTML whitespace does.
+                            is_space: false,
+                            is_break: false,
+                        });
+                    }
+                }
+                InlineItem::Break => {
+                    pending_space = None;
+                    pieces.push(Piece {
+                        text: String::new(),
+                        cells: 0,
+                        style: Style::default(),
+                        node: None,
+                        is_space: false,
+                        is_break: true,
                     });
                 }
                 InlineItem::Text {
@@ -515,6 +572,7 @@ impl<'a> Engine<'a> {
                                 style: pending_space.unwrap_or(*style),
                                 node: None,
                                 is_space: true,
+                                is_break: false,
                             });
                         }
                         first = false;
@@ -525,13 +583,13 @@ impl<'a> Engine<'a> {
                             style: *style,
                             node: Some(*node),
                             is_space: false,
+                            is_break: false,
                         });
                     }
                     if text.ends_with(is_html_space) {
                         pending_space = Some(*style);
                     }
                 }
-                InlineItem::ElementStart { .. } | InlineItem::ElementEnd => {}
             }
         }
 
@@ -541,6 +599,15 @@ impl<'a> Engine<'a> {
         let mut cur_cells = 0i32;
 
         for piece in pieces {
+            if piece.is_break {
+                if cur.is_empty() {
+                    self.emit_empty_line(x, &mut line_y, width, &mut lines);
+                } else {
+                    self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, align);
+                }
+                cur_cells = 0;
+                continue;
+            }
             if piece.is_space {
                 if cur.is_empty() {
                     continue; // leading spaces dropped
@@ -579,6 +646,7 @@ impl<'a> Engine<'a> {
                         style,
                         node,
                         is_space: false,
+                        is_break: false,
                     });
                     rest = &rest[end..];
                     if !rest.is_empty() {
@@ -687,68 +755,120 @@ impl<'a> Engine<'a> {
     }
 
     fn layout_pre(&mut self, items: &[InlineItem], x: i32, y: i32, width: i32) -> Vec<BoxId> {
-        // Concatenate all text preserving newlines; each source line → one line box.
-        let mut buf = String::new();
-        let mut style = Style::default();
-        let mut node = None;
-        for item in items {
-            if let InlineItem::Text {
-                node: n,
-                text,
-                style: s,
-                ..
-            } = item
-            {
-                buf.push_str(text);
-                style = *s;
-                node = Some(*n);
-            }
-        }
+        // Preserve newlines and per-span styles. A `\n` or Break closes the line.
         let mut lines = Vec::new();
         let mut line_y = y;
-        for seg in buf.split('\n') {
-            let cells = seg.width() as i32;
-            let line_id = self.alloc(LayoutBox {
-                kind: BoxKind::Line,
-                node: None,
-                dimensions: Dimensions {
-                    content: Rect {
-                        x,
-                        y: line_y,
-                        width,
-                        height: 1,
-                    },
-                    ..Dimensions::default()
-                },
-                children: Vec::new(),
-                text: None,
-                term_style: Style::default(),
-                computed: ComputedStyle::default(),
-            });
-            if !seg.is_empty() {
-                let tid = self.alloc(LayoutBox {
-                    kind: BoxKind::Text,
-                    node,
-                    dimensions: Dimensions {
-                        content: Rect {
+        let mut cur: Vec<Piece> = Vec::new();
+
+        for item in items {
+            match item {
+                InlineItem::Break => {
+                    if cur.is_empty() {
+                        self.emit_empty_line(x, &mut line_y, width, &mut lines);
+                    } else {
+                        self.emit_line(
+                            &mut cur,
+                            &mut line_y,
+                            &mut lines,
                             x,
-                            y: line_y,
-                            width: cells,
-                            height: 1,
-                        },
-                        ..Dimensions::default()
-                    },
-                    children: Vec::new(),
-                    text: Some(seg.to_string()),
-                    term_style: style,
-                    computed: ComputedStyle::default(),
-                });
-                self.boxes[line_id.0 as usize].children.push(tid);
+                            width,
+                            TextAlign::Left,
+                        );
+                    }
+                }
+                InlineItem::Spacer { cells } => {
+                    if *cells > 0 {
+                        cur.push(Piece {
+                            text: " ".repeat(*cells as usize),
+                            cells: *cells,
+                            style: Style::default(),
+                            node: None,
+                            is_space: false,
+                            is_break: false,
+                        });
+                    }
+                }
+                InlineItem::Marker { text, style } => {
+                    cur.push(Piece {
+                        text: text.clone(),
+                        cells: text.width() as i32,
+                        style: *style,
+                        node: None,
+                        is_space: false,
+                        is_break: false,
+                    });
+                }
+                InlineItem::Text {
+                    node, text, style, ..
+                } => {
+                    let mut rest = text.as_str();
+                    while let Some(nl) = rest.find('\n') {
+                        let before = &rest[..nl];
+                        if !before.is_empty() {
+                            cur.push(Piece {
+                                text: before.to_string(),
+                                cells: before.width() as i32,
+                                style: *style,
+                                node: Some(*node),
+                                is_space: false,
+                                is_break: false,
+                            });
+                        }
+                        if cur.is_empty() {
+                            self.emit_empty_line(x, &mut line_y, width, &mut lines);
+                        } else {
+                            self.emit_line(
+                                &mut cur,
+                                &mut line_y,
+                                &mut lines,
+                                x,
+                                width,
+                                TextAlign::Left,
+                            );
+                        }
+                        rest = &rest[nl + 1..];
+                    }
+                    if !rest.is_empty() {
+                        cur.push(Piece {
+                            text: rest.to_string(),
+                            cells: rest.width() as i32,
+                            style: *style,
+                            node: Some(*node),
+                            is_space: false,
+                            is_break: false,
+                        });
+                    }
+                }
             }
-            lines.push(line_id);
-            line_y += 1;
+        }
+        if !cur.is_empty() {
+            self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, TextAlign::Left);
+        } else if lines.is_empty() {
+            self.emit_empty_line(x, &mut line_y, width, &mut lines);
         }
         lines
+    }
+
+    fn emit_empty_line(&mut self, x: i32, line_y: &mut i32, width: i32, lines: &mut Vec<BoxId>) {
+        let line_id = self.alloc(LayoutBox {
+            kind: BoxKind::Line,
+            node: None,
+            dimensions: Dimensions {
+                content: Rect {
+                    x,
+                    y: *line_y,
+                    width,
+                    height: 1,
+                },
+                ..Dimensions::default()
+            },
+            children: Vec::new(),
+            text: None,
+            term_style: Style::default(),
+            computed: ComputedStyle::default(),
+        });
+        lines.push(line_id);
+        *line_y += 1;
     }
 
     fn child_mode(&self, id: NodeId, _pre: bool) -> ChildMode {
@@ -773,7 +893,7 @@ impl<'a> Engine<'a> {
         }
     }
 
-    fn push_inline(&self, id: NodeId, pre: bool, out: &mut Vec<InlineItem>) {
+    fn push_inline(&self, id: NodeId, pre: bool, containing_width: i32, out: &mut Vec<InlineItem>) {
         match &self.dom.node(id).data {
             NodeData::Text(text) => {
                 out.push(InlineItem::Text {
@@ -788,23 +908,46 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 if tag == "br" {
-                    // br inside inline run: represent as a newline in pre sense
-                    // by splitting — handled as block-level in child_mode.
+                    // Nested `<br>` inside an inline (e.g. `<span>a<br>b</span>`).
+                    out.push(InlineItem::Break);
                     return;
+                }
+                let computed = self.styles.get(id);
+                // Horizontal margin/padding on inlines (HN `.hnname { margin-right }`).
+                let lead = edge_h(computed.margin.left, containing_width)
+                    + edge_h(computed.padding.left, containing_width)
+                    + edge_h(computed.border.left, containing_width);
+                let trail = edge_h(computed.margin.right, containing_width)
+                    + edge_h(computed.padding.right, containing_width)
+                    + edge_h(computed.border.right, containing_width);
+                if lead > 0 {
+                    out.push(InlineItem::Spacer { cells: lead });
                 }
                 let pre = pre || tag == "pre";
                 for child in self.dom.children(id) {
-                    self.push_inline(child, pre, out);
+                    self.push_inline(child, pre, containing_width, out);
+                }
+                if trail > 0 {
+                    out.push(InlineItem::Spacer { cells: trail });
                 }
             }
             _ => {}
         }
     }
 
-    fn collect_inline(&self, id: NodeId, pre: bool) -> Vec<InlineItem> {
+    fn collect_inline(&self, id: NodeId, pre: bool, containing_width: i32) -> Vec<InlineItem> {
         let mut out = Vec::new();
-        self.push_inline(id, pre, &mut out);
+        self.push_inline(id, pre, containing_width, &mut out);
         out
+    }
+}
+
+/// Horizontal length → cells; `auto` is zero for margin edges.
+fn edge_h(len: crate::style::values::Length, containing_width: i32) -> i32 {
+    if len.is_auto() {
+        0
+    } else {
+        len.to_cells_h(containing_width)
     }
 }
 
@@ -827,12 +970,12 @@ enum InlineItem {
         text: String,
         style: Style,
     },
-    #[allow(dead_code)]
-    ElementStart {
-        node: NodeId,
+    /// Fixed-width gap from inline horizontal margin/padding/border.
+    Spacer {
+        cells: i32,
     },
-    #[allow(dead_code)]
-    ElementEnd,
+    /// Forced line break from `<br>` nested in an inline.
+    Break,
 }
 
 struct Piece {
@@ -841,6 +984,7 @@ struct Piece {
     style: Style,
     node: Option<NodeId>,
     is_space: bool,
+    is_break: bool,
 }
 
 /// Resolve horizontal box model for a block in a containing block of width `cw`.
