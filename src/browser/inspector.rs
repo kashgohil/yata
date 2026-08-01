@@ -171,6 +171,11 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
     if computed.box_sizing == BoxSizing::BorderBox {
         parts.push("border-box".into());
     }
+    // M9.3: the same clause F3 prints, for the same reason — a page whose
+    // content disappeared is read from these two panes together.
+    if let Some(o) = overflow_summary(computed) {
+        parts.push(format!("overflow {o}"));
+    }
     parts.join(" · ")
 }
 
@@ -271,19 +276,38 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
         };
         let d = b.dimensions.content;
         out.push(format!(
-            "{}{}  x={} y={} w={} h={}",
+            "{}{}  x={} y={} w={} h={}{}",
             "  ".repeat(depth),
             label,
             d.x,
             d.y,
             d.width,
-            d.height
+            d.height,
+            overflow_summary(&b.computed).map_or(String::new(), |o| format!(" overflow={o}"))
         ));
     }
     let child_depth = if skip_label { depth } else { depth + 1 };
     for &child in &b.children {
         push_box(dom, tree, child, child_depth, out);
     }
+}
+
+/// The `overflow` value of a box that clips (M9.3) — `hidden`, or `x/y` when
+/// the two axes differ — and `None` for the initial `visible`.
+///
+/// Content vanishing from the page is the one thing F3 must be able to
+/// explain, and "which box swallowed it" is the question being asked. Boxes
+/// that clip nothing print nothing, so no existing golden moves.
+fn overflow_summary(computed: &crate::style::ComputedStyle) -> Option<String> {
+    let (x, y) = (computed.overflow_x, computed.overflow_y);
+    if !x.clips() && !y.clips() {
+        return None;
+    }
+    Some(if x == y {
+        x.name().to_string()
+    } else {
+        format!("{}/{}", x.name(), y.name())
+    })
 }
 
 /// CSS-flavored element summary: `<a#nav.cls href="…">`. `id` and `class`

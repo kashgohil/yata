@@ -20,6 +20,30 @@ impl HalfBlockGrid {
         }
         self.cells.get((y * self.width + x) as usize).copied()
     }
+
+    /// The `width` × `height` sub-grid starting at (`x`, `y`) — an image
+    /// cropped by a clip (M9.3) keeps the cells it still covers rather than
+    /// being rescaled into the surviving rectangle, which would squash it.
+    /// Cells outside the source are transparent (`Default`), so a crop asking
+    /// for more than there is degrades instead of panicking.
+    pub fn crop(&self, x: i32, y: i32, width: i32, height: i32) -> HalfBlockGrid {
+        let width = width.max(0);
+        let height = height.max(0);
+        let mut cells = Vec::with_capacity((width * height) as usize);
+        for row in 0..height {
+            for col in 0..width {
+                cells.push(
+                    self.cell(x + col, y + row)
+                        .unwrap_or((Color::Default, Color::Default)),
+                );
+            }
+        }
+        HalfBlockGrid {
+            width,
+            height,
+            cells,
+        }
+    }
 }
 
 /// Scale `img` into a `cells_w` × `cells_h` half-block grid (nearest neighbour).
@@ -115,6 +139,21 @@ mod tests {
         let (fg, bg) = grid.cell(0, 0).unwrap();
         assert_eq!(fg, Color::Rgb(255, 0, 0));
         assert_eq!(bg, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn crop_keeps_the_cells_it_still_covers() {
+        // A clipped image (M9.3) keeps its scale and loses the cells outside
+        // the clip — it is not re-rastered into the surviving rectangle.
+        let img = solid(8, 8, 0, 0, 255);
+        let grid = raster_halfblocks(&img, 4, 4);
+        let cropped = grid.crop(1, 2, 2, 2);
+        assert_eq!((cropped.width, cropped.height), (2, 2));
+        assert_eq!(cropped.cell(0, 0), grid.cell(1, 2));
+        assert_eq!(cropped.cell(1, 1), grid.cell(2, 3));
+        // Asking past the edge degrades to transparent rather than panicking.
+        let past = grid.crop(3, 3, 3, 3);
+        assert_eq!(past.cell(2, 2), Some((Color::Default, Color::Default)));
     }
 
     #[test]

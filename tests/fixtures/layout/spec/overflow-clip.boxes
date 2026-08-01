@@ -1,0 +1,56 @@
+# SPEC GOLDEN — hand-written from CSS 2.1 §11.1.1, never regenerated.
+#
+# `overflow` changes what is *painted*, never where a box goes: every
+# coordinate below is what the same page lays out to with the property
+# removed. What the property adds to this dump is the `overflow=` clause,
+# which is how F3 explains content that vanished.
+#
+# .menu    height 0 -> used height 0, and the flow advances by 0, so the
+#          next sibling starts at the same row. Its two <p> children keep
+#          their boxes at rows 0 and 1 — they exist, they are laid out, and
+#          the clip means they reach no cell.
+# .card    starts at row 0 (the menu took none). max-height 2em = 2 lines
+#          clamps its auto height of 3, so its third <p> at row 2 is outside
+#          the padding box and clipped away.
+# .side    starts at row 2 (0 + .card's used 2). width 10em = 20 cells.
+#          <pre> does not wrap, so its 36-cell line overflows the 20-cell
+#          padding box; overflow-x clips it and overflow-y stays visible,
+#          which is the `hidden/visible` clause.
+#
+# Page height: the flow ends at 3, and the lowest border box (card's third
+# <p>, side's line) also ends at 3.
+#
+# Surviving rows, worked out by hand — pinned as a cell grid by
+# `overflow_clip_snapshot` in tests/snapshots.rs:
+#   row 0  "card one"                 (.menu's row 0 is clipped away)
+#   row 1  "card two"
+#   row 2  "0123456789abcdefghij"     (20 of 36 cells)
+<html>  x=0 y=0 w=40 h=3
+  <body>  x=0 y=0 w=40 h=3
+    <div.menu>  x=0 y=0 w=40 h=0 overflow=hidden
+      <p>  x=0 y=0 w=40 h=1
+        anonymous  x=0 y=0 w=40 h=1
+          line  x=0 y=0 w=40 h=1
+            #text "hidden nav one"  x=0 y=0 w=14 h=1
+      <p>  x=0 y=1 w=40 h=1
+        anonymous  x=0 y=1 w=40 h=1
+          line  x=0 y=1 w=40 h=1
+            #text "hidden nav two"  x=0 y=1 w=14 h=1
+    <div.card>  x=0 y=0 w=40 h=2 overflow=hidden
+      <p>  x=0 y=0 w=40 h=1
+        anonymous  x=0 y=0 w=40 h=1
+          line  x=0 y=0 w=40 h=1
+            #text "card one"  x=0 y=0 w=8 h=1
+      <p>  x=0 y=1 w=40 h=1
+        anonymous  x=0 y=1 w=40 h=1
+          line  x=0 y=1 w=40 h=1
+            #text "card two"  x=0 y=1 w=8 h=1
+      <p>  x=0 y=2 w=40 h=1
+        anonymous  x=0 y=2 w=40 h=1
+          line  x=0 y=2 w=40 h=1
+            #text "card three"  x=0 y=2 w=10 h=1
+    <div.side>  x=0 y=2 w=20 h=1 overflow=hidden/visible
+      <pre>  x=0 y=2 w=20 h=1
+        anonymous  x=0 y=2 w=20 h=1
+          line  x=0 y=2 w=20 h=1
+            #text "0123456789abcdefghi…"  x=0 y=2 w=36 h=1

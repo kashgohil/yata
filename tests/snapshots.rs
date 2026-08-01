@@ -115,3 +115,20 @@ fn simple_box_model_snapshot() {
     );
     assert_snapshot("simple-box-model", &grid);
 }
+
+/// M9.3: the paint half of `layout/spec/overflow-clip`. That golden pins where
+/// the boxes are (clipping moves nothing); this one pins which cells survive,
+/// which is the only place the property is visible.
+#[test]
+fn overflow_clip_snapshot() {
+    let grid = render_grid(&fixture("layout/spec/overflow-clip.html"), 40, 6);
+    let rows: Vec<&str> = grid.lines().collect();
+    // Derived in the golden's header: the collapsed menu paints nothing, the
+    // card shows 2 of its 3 rows, the <pre> keeps 20 of its 36 cells.
+    assert_eq!(
+        rows,
+        ["card one", "card two", "0123456789abcdefghij"],
+        "{grid}"
+    );
+    assert_snapshot("overflow-clip", &grid);
+}

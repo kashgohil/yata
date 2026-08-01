@@ -6,6 +6,7 @@
 //! block/inline children of a block still form a legal CSS box tree.
 
 use crate::dom::NodeId;
+use crate::layout::clip::Clip;
 use crate::layout::dimensions::Dimensions;
 use crate::style::ComputedStyle;
 use crate::term::Style;
@@ -78,6 +79,28 @@ impl LayoutTree {
         f(id, b);
         for &child in &b.children {
             self.walk(child, f);
+        }
+    }
+
+    /// Depth-first walk in paint order, carrying the [`Clip`] each box's own
+    /// output is confined to (M9.3). Paint, hit-testing and `/` search all go
+    /// through this so they cannot disagree about what the reader can see.
+    ///
+    /// Subtrees under a collapsed clip are skipped entirely: a clip only ever
+    /// narrows, so nothing inside one could reach the screen.
+    pub fn walk_clipped(&self, f: &mut dyn FnMut(BoxId, &LayoutBox, Clip)) {
+        self.walk_clipped_from(self.root, Clip::NONE, f);
+    }
+
+    fn walk_clipped_from(&self, id: BoxId, clip: Clip, f: &mut dyn FnMut(BoxId, &LayoutBox, Clip)) {
+        let b = self.get(id);
+        f(id, b, clip);
+        let inside = clip.inside(b);
+        if inside.is_empty() {
+            return;
+        }
+        for &child in &b.children {
+            self.walk_clipped_from(child, inside, f);
         }
     }
 }

@@ -202,6 +202,55 @@ pub fn parse_box_sizing(value: &str) -> Option<BoxSizing> {
     }
 }
 
+/// `overflow` (M9.3): what a box does with content that does not fit inside it.
+///
+/// The five CSS values are kept apart even though four of them do the same
+/// thing here, because F3 prints what the page asked for and "we clipped a
+/// `scroll` box" is a different fact from "we clipped a `hidden` one".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Overflow {
+    #[default]
+    Visible,
+    Hidden,
+    Clip,
+    Scroll,
+    Auto,
+}
+
+impl Overflow {
+    /// Everything but `visible` confines content to the padding box.
+    ///
+    /// `scroll` and `auto` clip too: a terminal has one scroll position, and
+    /// inner scrollers are PLAN.md §M11+. The reader gets the same first
+    /// screenful a browser shows and the remainder is unreachable — a
+    /// deviation, recorded here rather than hidden.
+    pub fn clips(self) -> bool {
+        !matches!(self, Overflow::Visible)
+    }
+
+    /// The keyword, for `F3`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Overflow::Visible => "visible",
+            Overflow::Hidden => "hidden",
+            Overflow::Clip => "clip",
+            Overflow::Scroll => "scroll",
+            Overflow::Auto => "auto",
+        }
+    }
+}
+
+pub fn parse_overflow(value: &str) -> Option<Overflow> {
+    match lower(value).as_str() {
+        "visible" => Some(Overflow::Visible),
+        "hidden" => Some(Overflow::Hidden),
+        "clip" => Some(Overflow::Clip),
+        "scroll" => Some(Overflow::Scroll),
+        "auto" => Some(Overflow::Auto),
+        _ => None,
+    }
+}
+
 /// `display`. Values M4 cannot honour are mapped to the nearest of the three
 /// rather than dropped: danluu.com's list items are `display:flex`, and
 /// dropping that declaration is harmless while treating it as *invalid* would
@@ -582,6 +631,28 @@ mod tests {
         // switch to content-box on a page that asked for border-box).
         assert_eq!(parse_box_sizing("padding-box"), None);
         assert_eq!(parse_box_sizing(""), None);
+    }
+
+    #[test]
+    fn overflow_takes_the_css_keywords_and_nothing_else() {
+        assert_eq!(parse_overflow("hidden"), Some(Overflow::Hidden));
+        assert_eq!(parse_overflow("VISIBLE"), Some(Overflow::Visible));
+        assert_eq!(parse_overflow("clip"), Some(Overflow::Clip));
+        assert_eq!(parse_overflow(" auto "), Some(Overflow::Auto));
+        // `overflow: ellipsis` is on two of the ladder pages and is not CSS
+        // (they mean `text-overflow`): invalid, so the previous winner stands.
+        assert_eq!(parse_overflow("ellipsis"), None);
+        assert_eq!(parse_overflow(""), None);
+        // Only `visible` lets content out of the box.
+        assert!(!Overflow::Visible.clips());
+        for v in [
+            Overflow::Hidden,
+            Overflow::Clip,
+            Overflow::Scroll,
+            Overflow::Auto,
+        ] {
+            assert!(v.clips(), "{v:?} must clip");
+        }
     }
 
     #[test]

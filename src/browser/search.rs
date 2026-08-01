@@ -5,7 +5,7 @@
 //! and link hints — not a display-list command); this module never mutates
 //! the tree.
 
-use crate::layout::{BoxKind, LayoutTree};
+use crate::layout::{BoxKind, Clip, LayoutTree, Rect};
 use unicode_width::UnicodeWidthChar;
 
 /// One match in document cell coordinates.
@@ -17,7 +17,10 @@ pub struct Match {
     pub width: i32,
 }
 
-/// Case-insensitive substring search over every text box, document order.
+/// Case-insensitive substring search over every *visible* text box, document
+/// order. Text clipped away by `overflow` (M9.3) is not a match — the reader
+/// cannot see it — and a match that is only partly visible is trimmed to the
+/// cells that are, so the highlight never lands outside the clip.
 ///
 /// Matching uses full Unicode lowercasing when it preserves 1:1 char length
 /// (the common case for Latin web text). When a character expands under
@@ -35,7 +38,7 @@ pub fn find_matches(tree: &LayoutTree, query: &str) -> Vec<Match> {
         return Vec::new();
     }
     let mut out = Vec::new();
-    tree.walk(tree.root, &mut |_, b| {
+    tree.walk_clipped(&mut |_, b, clip| {
         if b.kind != BoxKind::Text {
             return;
         }
@@ -45,42 +48,52 @@ pub fn find_matches(tree: &LayoutTree, query: &str) -> Vec<Match> {
         if text.is_empty() {
             return;
         }
+        let (x, y) = (b.dimensions.content.x, b.dimensions.content.y);
+        let mut hits = Vec::new();
         let chars: Vec<char> = text.chars().collect();
         let lower_chars: Vec<char> = text.chars().flat_map(|c| c.to_lowercase()).collect();
         // Multi-char case folds break 1:1 indexing; fall back to ASCII-only.
         if lower_chars.len() != chars.len() {
-            find_ascii_fallback(
-                text,
-                &q_chars.iter().collect::<String>(),
-                b.dimensions.content.x,
-                b.dimensions.content.y,
-                &mut out,
-            );
-            return;
-        }
-        let n = lower_chars.len();
-        if m > n {
-            return;
-        }
-        let mut i = 0;
-        while i + m <= n {
-            if lower_chars[i..i + m] == q_chars[..] {
-                let x_off = cells_width(&chars[..i]);
-                let width = cells_width(&chars[i..i + m]);
-                if width > 0 {
-                    out.push(Match {
-                        x: b.dimensions.content.x + x_off as i32,
-                        y: b.dimensions.content.y,
-                        width: width as i32,
-                    });
+            find_ascii_fallback(text, &q_chars.iter().collect::<String>(), x, y, &mut hits);
+        } else {
+            let n = lower_chars.len();
+            let mut i = 0;
+            while i + m <= n {
+                if lower_chars[i..i + m] == q_chars[..] {
+                    let x_off = cells_width(&chars[..i]);
+                    let width = cells_width(&chars[i..i + m]);
+                    if width > 0 {
+                        hits.push(Match {
+                            x: x + x_off as i32,
+                            y,
+                            width: width as i32,
+                        });
+                    }
+                    i += m; // non-overlapping
+                } else {
+                    i += 1;
                 }
-                i += m; // non-overlapping
-            } else {
-                i += 1;
             }
         }
+        out.extend(hits.into_iter().filter_map(|hit| visible(clip, hit)));
     });
     out
+}
+
+/// A match trimmed to the cells its box's clip leaves on screen, or `None`
+/// when the clip hides it entirely (M9.3).
+fn visible(clip: Clip, hit: Match) -> Option<Match> {
+    let rect = clip.apply(Rect {
+        x: hit.x,
+        y: hit.y,
+        width: hit.width,
+        height: 1,
+    });
+    (rect.width > 0 && rect.height > 0).then_some(Match {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+    })
 }
 
 fn cells_width(chars: &[char]) -> usize {
@@ -143,6 +156,35 @@ mod tests {
     fn empty_query_is_no_matches() {
         let t = tree("<p>Hello</p>");
         assert!(find_matches(&t, "  ").is_empty());
+    }
+
+    #[test]
+    fn clipped_away_text_is_not_a_match() {
+        let page = |overflow: &str| {
+            tree(&format!(
+                "<div style='margin:0;max-height:1em;overflow:{overflow}'>\
+                 <p style='margin:0'>visible</p><p style='margin:0'>hidden</p></div>"
+            ))
+        };
+        // Control: with nothing clipping, `/hidden` finds the second row.
+        assert_eq!(find_matches(&page("visible"), "hidden").len(), 1);
+        // Clipped: the box is still in the tree, and the reader cannot see it.
+        assert!(find_matches(&page("hidden"), "hidden").is_empty());
+        assert_eq!(find_matches(&page("hidden"), "visible").len(), 1);
+    }
+
+    #[test]
+    fn a_partly_clipped_match_is_trimmed_to_the_cells_on_screen() {
+        // 5em = 10 cells; `<pre>` does not wrap, so the run reaches cell 12.
+        // "ghijkl" starts at 6 and runs to 12 — four of its cells survive, and
+        // the highlight must cover those and no more.
+        let t = tree(
+            "<div style='margin:0;width:5em;overflow:hidden'>\
+             <pre style='margin:0'>abcdefghijkl</pre></div>",
+        );
+        let hits = find_matches(&t, "ghijkl");
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!((hits[0].x, hits[0].width), (6, 4));
     }
 
     #[test]

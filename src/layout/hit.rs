@@ -2,9 +2,14 @@
 //!
 //! Pure queries: document cell coordinates in, node/href out. No mutation, no
 //! I/O. Click, link hints, Tab focus and `:hover` all share this walk.
+//!
+//! Content clipped away by `overflow` (M9.3) is not here: a box the reader
+//! cannot see is not clickable and gets no link hint. The rule comes from
+//! [`Clip`], the same one paint trims the display list with.
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::layout::boxes::{BoxId, LayoutTree};
+use crate::layout::clip::Clip;
 use crate::layout::dimensions::Rect;
 
 /// One `<a href>` discovered in the layout tree, with the position of its
@@ -26,25 +31,32 @@ pub fn link_at(tree: &LayoutTree, dom: &Dom, x: i32, y: i32) -> Option<(NodeId, 
     nearest_link(dom, node)
 }
 
-/// Deepest box whose border box contains `(x, y)` and that has a `node`.
+/// Deepest box whose border box contains `(x, y)`, that has a `node`, and that
+/// the clips above it leave visible.
 pub fn hit_test(tree: &LayoutTree, x: i32, y: i32) -> Option<NodeId> {
-    hit_box(tree, tree.root, x, y)
+    hit_box(tree, tree.root, x, y, Clip::NONE)
 }
 
-fn hit_box(tree: &LayoutTree, id: BoxId, x: i32, y: i32) -> Option<NodeId> {
+fn hit_box(tree: &LayoutTree, id: BoxId, x: i32, y: i32, clip: Clip) -> Option<NodeId> {
     let b = tree.get(id);
     // Prefer a descendant: later paint order sits on top, and text fragments
     // live under their inline/block ancestors.
     let mut best = None;
-    for &child in &b.children {
-        if let Some(n) = hit_box(tree, child, x, y) {
-            best = Some(n);
+    let inside = clip.inside(b);
+    if !inside.is_empty() {
+        for &child in &b.children {
+            if let Some(n) = hit_box(tree, child, x, y, inside) {
+                best = Some(n);
+            }
         }
     }
     if best.is_some() {
         return best;
     }
-    if contains(b.dimensions.border_box(), x, y) {
+    // The click has to land on a cell this box actually painted: a box hidden
+    // by an ancestor's `overflow` is not under the cursor, whatever its
+    // geometry says.
+    if clip.contains(x, y) && contains(b.dimensions.border_box(), x, y) {
         return b.node;
     }
     None
@@ -70,41 +82,39 @@ pub fn nearest_link(dom: &Dom, node: NodeId) -> Option<(NodeId, String)> {
     None
 }
 
-/// Every link that produced at least one layout box, in document order of
-/// first appearance, with the position of that first fragment.
+/// Every link that produced at least one *visible* layout box, in document
+/// order of first appearance, with the position of that first fragment.
+///
+/// A link whose first fragment is clipped away is registered at the first
+/// fragment that survives, so a hint label always sits on something the reader
+/// can see. A link with no surviving fragment is not listed at all.
 pub fn collect_links(tree: &LayoutTree, dom: &Dom) -> Vec<LinkHit> {
     let mut out = Vec::new();
     let mut seen = Vec::new();
-    collect_walk(tree, tree.root, dom, &mut out, &mut seen);
-    out
-}
-
-fn collect_walk(
-    tree: &LayoutTree,
-    id: BoxId,
-    dom: &Dom,
-    out: &mut Vec<LinkHit>,
-    seen: &mut Vec<NodeId>,
-) {
-    let b = tree.get(id);
-    if let Some(node) = b.node
-        && let Some((link, href)) = nearest_link(dom, node)
-        && !seen.contains(&link)
-    {
+    tree.walk_clipped(&mut |_, b, clip| {
+        let Some(node) = b.node else {
+            return;
+        };
+        if !clip.shows(b) {
+            return;
+        }
+        let Some((link, href)) = nearest_link(dom, node) else {
+            return;
+        };
+        if seen.contains(&link) {
+            return;
+        }
         // Prefer a text fragment's origin when we first meet the link via
         // text; otherwise use this box's content origin.
-        let (x, y) = (b.dimensions.content.x, b.dimensions.content.y);
         seen.push(link);
         out.push(LinkHit {
             node: link,
             href,
-            x,
-            y,
+            x: b.dimensions.content.x,
+            y: b.dimensions.content.y,
         });
-    }
-    for &child in &b.children {
-        collect_walk(tree, child, dom, out, seen);
-    }
+    });
+    out
 }
 
 /// Links whose first fragment lies in the inclusive document y-range
@@ -210,6 +220,45 @@ mod tests {
             nearest_link(&dom, text).map(|(_, h)| h).as_deref(),
             Some("y")
         );
+    }
+
+    /// The same page twice: clipping the second row away, and not (M9.3).
+    /// Without the control, a test that finds one link proves nothing about
+    /// the clip — the page might have generated one link all along.
+    fn two_rows(overflow: &str) -> (crate::dom::Dom, LayoutTree) {
+        laid(&format!(
+            "<body style='margin:0'><div style='margin:0;max-height:1em;overflow:{overflow}'>\
+             <p style='margin:0'>visible <a href=/a>first</a></p>\
+             <p style='margin:0'>hidden <a href=/b>second</a></p></div></body>"
+        ))
+    }
+
+    #[test]
+    fn clipped_away_content_is_not_hit_testable() {
+        let (dom, tree) = two_rows("visible");
+        let control = link_at(&tree, &dom, 8, 1);
+        assert_eq!(
+            control.map(|(_, h)| h).as_deref(),
+            Some("/b"),
+            "the second link is at (8, 1) when nothing clips it"
+        );
+
+        let (dom, tree) = two_rows("hidden");
+        // The box is still in the tree at row 1; it just reaches no cell.
+        assert_eq!(hit_test(&tree, 8, 1), None);
+        assert_eq!(link_at(&tree, &dom, 8, 1), None);
+    }
+
+    #[test]
+    fn a_clipped_away_link_gets_no_hint() {
+        let (dom, tree) = two_rows("visible");
+        assert_eq!(hrefs(&collect_links(&tree, &dom)), ["/a", "/b"]);
+        let (dom, tree) = two_rows("hidden");
+        assert_eq!(hrefs(&collect_links(&tree, &dom)), ["/a"]);
+    }
+
+    fn hrefs(links: &[LinkHit]) -> Vec<&str> {
+        links.iter().map(|l| l.href.as_str()).collect()
     }
 
     #[test]

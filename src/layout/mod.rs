@@ -5,12 +5,14 @@
 //! `--dump-text` keep working until the display-list paint path lands.
 
 mod boxes;
+mod clip;
 mod dimensions;
 mod engine;
 mod hit;
 mod lines;
 
 pub use boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
+pub use clip::Clip;
 pub use dimensions::{Dimensions, EdgeSizes, Rect};
 pub use engine::{Hidden, layout_tree, layout_tree_with, term_color, term_style};
 pub use hit::{
@@ -645,6 +647,26 @@ mod tests {
             }
         });
         assert_eq!(after_y, Some(1), "the flow must advance by the used height");
+    }
+
+    #[test]
+    fn a_clipped_away_row_does_not_extend_the_page() {
+        // The other half of the rule above (M9.3): overflowing rows belong to
+        // the scrollable page because they are *visible*. Clip them and the
+        // page must shrink back, or a collapsed menu leaves the reader
+        // scrolling through blank rows where its content would have been.
+        let source = "<div class=zero>alpha<br>beta<br>gamma</div><div class=after>after</div>";
+        let (dom, styles) = styled_dom(source, "div { margin: 0 } .zero { height: 0 }");
+        let visible = layout_document(&dom, &styles, 40, Hidden::Respect);
+        // Five rows: each `<br>` is a line box of its own between the words.
+        assert_eq!(visible.height, 5, "the overflowing rows are on screen");
+
+        let (dom, styles) = styled_dom(
+            source,
+            "div { margin: 0 } .zero { height: 0; overflow: hidden }",
+        );
+        let clipped = layout_document(&dom, &styles, 40, Hidden::Respect);
+        assert_eq!(clipped.height, 1, "only `after` is left to scroll through");
     }
 
     #[test]

@@ -78,25 +78,35 @@ pub fn layout_tree_with(
             prev_mb = eng.boxes[id.0 as usize].dimensions.margin.bottom;
         }
     }
-    // The document is as tall as the flow *or* as the lowest box in it,
-    // whichever is further down. Those differ once a box is shorter than its
-    // content (M9.2's specified heights): the overflowing rows are still
-    // visible — `overflow: visible` is the initial value — so they have to be
-    // inside the scrollable page, or `lines::from_tree` would drop them.
-    let overflow_bottom = eng
-        .boxes
-        .iter()
-        .map(|b| b.dimensions.border_box().bottom())
-        .max()
-        .unwrap_or(0);
-    let height = y.max(overflow_bottom).max(0);
-    eng.boxes[root.0 as usize].dimensions.content.height = height;
-    LayoutTree {
+    // The document is as tall as the flow *or* as the lowest row anything can
+    // paint into, whichever is further down. Those differ once a box is
+    // shorter than its content (M9.2's specified heights): with the initial
+    // `overflow: visible` the overflowing rows are still on screen, so they
+    // have to be inside the scrollable page, or `lines::from_tree` would drop
+    // them.
+    //
+    // Rows a clip swallowed (M9.3) are not: asking the boxes for their
+    // *visible* rectangle is what keeps a `height: 0; overflow: hidden` menu
+    // from leaving the page scrolling through the blank rows where its content
+    // would have been. This needs the finished tree, because a clip is a fact
+    // about a box's ancestors.
+    let mut tree = LayoutTree {
         boxes: eng.boxes,
         root,
         width,
-        height,
-    }
+        height: 0,
+    };
+    let mut lowest = 0;
+    tree.walk_clipped(&mut |_, b, clip| {
+        let visible = clip.apply(b.dimensions.border_box());
+        if visible.height > 0 {
+            lowest = lowest.max(visible.bottom());
+        }
+    });
+    let height = y.max(lowest).max(0);
+    tree.boxes[root.0 as usize].dimensions.content.height = height;
+    tree.height = height;
+    tree
 }
 
 struct Engine<'a> {

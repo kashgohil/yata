@@ -19,7 +19,9 @@ use std::sync::OnceLock;
 use crate::css::{self, Declaration, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
 use matching::RuleIndex;
-use values::{BoxSizing, ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
+use values::{
+    BoxSizing, ColorValue, Display, Edges, FontStyle, FontWeight, Length, Overflow, TextAlign,
+};
 
 /// Dynamic matching inputs for the cascade (M6): which node is hovered, which
 /// absolute URLs the user has visited, and the base URL for resolving `href`s
@@ -75,6 +77,12 @@ pub struct ComputedStyle {
     pub max_height: Length,
     /// Which box `width`/`height` and the clamps above describe (M9.2).
     pub box_sizing: BoxSizing,
+    /// `overflow-x` / `overflow-y` (M9.3): whether content that does not fit
+    /// this box is clipped to its padding box. Two axes, because
+    /// `overflow-x: hidden` alone must not clip vertically. Not inherited —
+    /// a paragraph inside a clipped menu is not itself a clipping box.
+    pub overflow_x: Overflow,
+    pub overflow_y: Overflow,
     /// The winning `display` came from the user-agent sheet's `!important` —
     /// this element holds code, metadata or inert markup and is never prose
     /// (see `ua.css`). Layout's never-blank fallback honours this even when it
@@ -116,6 +124,10 @@ impl ComputedStyle {
             // `box-sizing` is not inherited either (CSS): pages set it on
             // everything through `*`, which the cascade already handles.
             box_sizing: BoxSizing::default(),
+            // Nor does `overflow` (M9.3): the box that clips is the one the
+            // page put it on.
+            overflow_x: Overflow::default(),
+            overflow_y: Overflow::default(),
             // Not inherited: a child of a hidden `<script>` is hidden because
             // its ancestor's subtree is skipped, not because it inherited a
             // verdict about itself.
@@ -340,12 +352,41 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
         "min-height" => set(&mut computed.min_height, values::parse_width(value)),
         "max-height" => set(&mut computed.max_height, values::parse_width(value)),
         "box-sizing" => set(&mut computed.box_sizing, values::parse_box_sizing(value)),
+        // M9.3. The shorthand takes one or two values (`overflow: hidden auto`
+        // is x then y); either component being invalid drops the whole
+        // declaration, so a half-applied `overflow` cannot clip one axis by
+        // accident.
+        "overflow" => apply_overflow_shorthand(computed, value),
+        "overflow-x" => set(&mut computed.overflow_x, values::parse_overflow(value)),
+        "overflow-y" => set(&mut computed.overflow_y, values::parse_overflow(value)),
         "text-decoration" | "text-decoration-line" => set(
             &mut computed.underline,
             values::parse_text_decoration(value),
         ),
         _ => false,
     }
+}
+
+/// `overflow: <a>` sets both axes; `overflow: <a> <b>` sets x then y.
+fn apply_overflow_shorthand(computed: &mut ComputedStyle, value: &str) -> bool {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    let (x, y) = match parts.len() {
+        1 => {
+            let a = values::parse_overflow(parts[0]);
+            (a, a)
+        }
+        2 => (
+            values::parse_overflow(parts[0]),
+            values::parse_overflow(parts[1]),
+        ),
+        _ => return false,
+    };
+    let (Some(x), Some(y)) = (x, y) else {
+        return false;
+    };
+    computed.overflow_x = x;
+    computed.overflow_y = y;
+    true
 }
 
 /// Pull the first parseable length out of a `border` / `border-*` shorthand
@@ -633,6 +674,34 @@ mod tests {
         // the same thing `Auto`.
         let (dom, styles) = styled("<div>t</div>", "div { max-height: none }");
         assert_eq!(styles.get(find(&dom, "div")).max_height, Length::Auto);
+    }
+
+    #[test]
+    fn overflow_is_two_axes_and_does_not_inherit() {
+        let (dom, styles) = styled("<div><p>t</p></div>", "div { overflow: hidden }");
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.overflow_x, Overflow::Hidden);
+        assert_eq!(div.overflow_y, Overflow::Hidden);
+        // A paragraph inside a clipped menu is not itself a clipping box.
+        let p = styles.get(find(&dom, "p"));
+        assert_eq!(p.overflow_x, Overflow::Visible);
+        assert_eq!(p.overflow_y, Overflow::Visible);
+
+        // Two values are x then y.
+        let (dom, styles) = styled("<div>t</div>", "div { overflow: hidden auto }");
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.overflow_x, Overflow::Hidden);
+        assert_eq!(div.overflow_y, Overflow::Auto);
+
+        // Longhands stand on their own, and one bad component drops the whole
+        // shorthand rather than clipping an axis the page never asked to clip.
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { overflow-y: scroll } div { overflow: hidden bananas }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.overflow_x, Overflow::Visible);
+        assert_eq!(div.overflow_y, Overflow::Scroll);
     }
 
     #[test]

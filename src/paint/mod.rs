@@ -3,6 +3,10 @@
 //! Pure transform. The display list is what scrolling re-emits at a new offset
 //! — no restyle, no relayout (CLAUDE.md). Commands are in document coordinates;
 //! the viewport subtracts the scroll offset when drawing.
+//!
+//! `overflow` (M9.3) is applied *here*, while the list is built: commands come
+//! out already trimmed to the clip they sit under, so `paint_to_frame` stays
+//! the same loop it was and the scroll path never grows per-command clip state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,7 +14,7 @@ use std::sync::Arc;
 use crate::image::{
     DecodedImage, HalfBlockGrid, KittyPlacement, placeholder_grid, raster_halfblocks,
 };
-use crate::layout::{BoxId, BoxKind, LayoutTree, Rect, term_color};
+use crate::layout::{BoxKind, Clip, LayoutBox, LayoutTree, Rect, term_color};
 use crate::style::values::ColorValue;
 use crate::term::{Color, Style};
 
@@ -60,17 +64,20 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
         width: tree.width,
         height: tree.height,
     };
-    paint_box(tree, tree.root, images, &mut list);
+    tree.walk_clipped(&mut |_, b, clip| paint_box(b, images, &mut list, clip));
     list
 }
 
-fn paint_box(tree: &LayoutTree, id: BoxId, images: &ImagePixels, list: &mut DisplayList) {
-    let b = tree.get(id);
+/// Emit one box's commands, trimmed to `clip` — the region an ancestor's
+/// `overflow` leaves for it. The box's *own* `overflow` is not applied here:
+/// it clips this box's content and descendants, which is what the walk hands
+/// them (see [`Clip::inside`]).
+fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: Clip) {
     match b.kind {
         BoxKind::Block => {
             // Background fills the padding box (CSS).
             if let ColorValue::Rgb(r, g, bcol) = b.computed.background_color {
-                let rect = b.dimensions.padding_box();
+                let rect = clip.apply(b.dimensions.padding_box());
                 if rect.width > 0 && rect.height > 0 {
                     list.commands.push(DisplayCommand::FillRect {
                         rect,
@@ -79,9 +86,16 @@ fn paint_box(tree: &LayoutTree, id: BoxId, images: &ImagePixels, list: &mut Disp
                 }
             }
             // Border: any nonzero border edge draws the full rectangle outline.
+            //
+            // Deviation, recorded rather than papered over: a border cut by an
+            // ancestor's clip is emitted as the *intersected* rectangle, so it
+            // closes with corners along the clip edge where a browser would
+            // let it run off. `Border` is one command meaning "outline this
+            // rect", and the honest fix — open-sided borders — would put clip
+            // state into the scroll path, which M9.3 exists to avoid.
             let border = b.dimensions.border;
             if border.top > 0 || border.right > 0 || border.bottom > 0 || border.left > 0 {
-                let rect = b.dimensions.border_box();
+                let rect = clip.apply(b.dimensions.border_box());
                 if rect.width > 0 && rect.height > 0 {
                     list.commands.push(DisplayCommand::Border { rect });
                 }
@@ -90,18 +104,21 @@ fn paint_box(tree: &LayoutTree, id: BoxId, images: &ImagePixels, list: &mut Disp
         BoxKind::Text => {
             if let Some(text) = &b.text
                 && !text.is_empty()
+                && let Some((x, text)) =
+                    clip_text(clip, b.dimensions.content.x, b.dimensions.content.y, text)
             {
                 list.commands.push(DisplayCommand::Text {
-                    x: b.dimensions.content.x,
+                    x,
                     y: b.dimensions.content.y,
-                    text: text.clone(),
+                    text,
                     style: b.term_style,
                 });
             }
         }
         BoxKind::Image => {
             let rect = b.dimensions.content;
-            if rect.width > 0 && rect.height > 0 {
+            let visible = clip.apply(rect);
+            if visible.width > 0 && visible.height > 0 {
                 let (grid, pixels) = match b
                     .image_src
                     .as_ref()
@@ -113,41 +130,96 @@ fn paint_box(tree: &LayoutTree, id: BoxId, images: &ImagePixels, list: &mut Disp
                     ),
                     None => (placeholder_grid(rect.width, rect.height), None),
                 };
-                // Prefer alt text overlay on the first row when still loading
-                // and alt is non-empty — half-block checker stays underneath
-                // for empty alt.
-                if pixels.is_none()
-                    && let Some(alt) = b.text.as_ref().filter(|t| !t.is_empty())
+                // Whether to overlay alt text is about the *image*, not about
+                // the clip: decided before clipping takes the pixels away.
+                let alt = (pixels.is_none())
+                    .then(|| b.text.as_ref().filter(|t| !t.is_empty()))
+                    .flatten();
+                let cropped = visible != rect;
+                let grid = if cropped {
+                    grid.crop(
+                        visible.x - rect.x,
+                        visible.y - rect.y,
+                        visible.width,
+                        visible.height,
+                    )
+                } else {
+                    grid
+                };
+                // Kitty places pixels by cell rectangle: a partially clipped
+                // placement would have to crop the pixels to match, which is
+                // not worth the protocol gymnastics for a rare case. Such an
+                // image falls back to the half-block grid — already cropped
+                // above, so it draws exactly the surviving cells.
+                let pixels = if cropped { None } else { pixels };
+                list.commands.push(DisplayCommand::Image {
+                    rect: visible,
+                    grid,
+                    pixels,
+                });
+                if let Some(alt) = alt
+                    && let Some((x, text)) =
+                        clip_text(clip, rect.x, rect.y, &truncate_cells(alt, rect.width))
                 {
-                    list.commands.push(DisplayCommand::Image {
-                        rect,
-                        grid,
-                        pixels: None,
-                    });
                     list.commands.push(DisplayCommand::Text {
-                        x: rect.x,
+                        x,
                         y: rect.y,
-                        text: truncate_cells(alt, rect.width),
+                        text,
                         style: Style {
                             fg: Color::Rgb(0xc0, 0xc0, 0xc0),
                             bg: Color::Rgb(0x40, 0x40, 0x40),
                             attrs: crate::term::Attrs::NONE,
                         },
                     });
-                    for &child in &b.children {
-                        paint_box(tree, child, images, list);
-                    }
-                    return;
                 }
-                list.commands
-                    .push(DisplayCommand::Image { rect, grid, pixels });
             }
         }
         BoxKind::AnonymousBlock | BoxKind::Line | BoxKind::Inline => {}
     }
-    for &child in &b.children {
-        paint_box(tree, child, images, list);
+}
+
+/// Trim a one-row text run to the cells `clip` leaves visible, returning its
+/// new origin and text — `None` when nothing survives.
+///
+/// Truncation is by **cells** (`unicode-width`, CLAUDE.md), from either end: a
+/// clip that starts mid-run drops the characters to its left and moves the
+/// run's origin to the first surviving cell. A wide glyph straddling an edge is
+/// dropped rather than half-drawn, leaving its far half blank — half a CJK
+/// glyph is not a glyph, and the cell it would occupy belongs to the box on
+/// the other side of the clip.
+fn clip_text(clip: Clip, x: i32, y: i32, text: &str) -> Option<(i32, String)> {
+    use unicode_width::UnicodeWidthChar;
+    if !clip.shows_row(y) {
+        return None;
     }
+    let Some((left, right)) = clip.x_range() else {
+        return Some((x, text.to_string()));
+    };
+    let mut out = String::new();
+    let mut out_x = x;
+    let mut cx = x;
+    for ch in text.chars() {
+        if cx >= right {
+            break;
+        }
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
+        if w == 0 {
+            // Combining marks ride along with the character they modify, and
+            // are dropped with it.
+            if !out.is_empty() {
+                out.push(ch);
+            }
+            continue;
+        }
+        if cx >= left && cx + w <= right {
+            if out.is_empty() {
+                out_x = cx;
+            }
+            out.push(ch);
+        }
+        cx += w;
+    }
+    (!out.is_empty()).then_some((out_x, out))
 }
 
 fn truncate_cells(s: &str, max: i32) -> String {
@@ -446,6 +518,22 @@ mod tests {
         layout::layout_document(&dom, &styles, width, Hidden::Respect)
     }
 
+    /// Every text command as `(x, y, text)`, in paint order.
+    fn texts(list: &DisplayList) -> Vec<(i32, i32, String)> {
+        list.commands
+            .iter()
+            .filter_map(|c| match c {
+                DisplayCommand::Text { x, y, text, .. } => Some((*x, *y, text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(row, text)` per text command — what the reader can actually read.
+    fn rows(list: &DisplayList) -> Vec<(i32, String)> {
+        texts(list).into_iter().map(|(_, y, t)| (y, t)).collect()
+    }
+
     #[test]
     fn text_commands_carry_the_glyphs() {
         let t = tree("<p>hi</p>", "", 40);
@@ -516,6 +604,160 @@ mod tests {
         // Scrolling by one row changes what is on screen.
         let row = |f: &Frame, y| (0..f.width()).map(|x| f.get(x, y).ch).collect::<String>();
         assert_ne!(row(&a, 0), row(&b, 0));
+    }
+
+    // ---- M9.3: overflow clipping, applied while the list is built ----
+
+    #[test]
+    fn a_zero_height_hidden_box_paints_nothing_and_takes_no_room() {
+        // `height: 0; overflow: hidden` — the collapsed menu the whole
+        // property exists for. The three paragraphs still have boxes; none of
+        // them reaches a cell, and the next sibling starts where they are.
+        let t = tree(
+            "<div class=menu><p>one</p><p>two</p><p>three</p></div><p class=after>after</p>",
+            "body,div,p{margin:0} .menu{height:0;overflow:hidden}",
+            40,
+        );
+        assert_eq!(rows(&paint(&t)), [(0, "after".to_string())]);
+    }
+
+    #[test]
+    fn max_height_hidden_keeps_exactly_the_rows_that_fit() {
+        let t = tree(
+            "<div class=card><p>one</p><p>two</p><p>three</p></div>",
+            "body,div,p{margin:0} .card{max-height:2em;overflow:hidden}",
+            40,
+        );
+        assert_eq!(
+            rows(&paint(&t)),
+            [(0, "one".to_string()), (1, "two".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_horizontal_clip_truncates_by_cells_and_drops_a_straddling_wide_glyph() {
+        // 10em = 20 cells, and `<pre>` does not wrap, so the run is wider than
+        // the padding box. 漢 would occupy cells 19–20; cell 20 is outside, so
+        // the glyph goes rather than being drawn as half of itself.
+        let t = tree(
+            "<div class=side><pre>0123456789abcdefghi漢字</pre></div>",
+            "body,div,pre{margin:0} .side{width:10em;overflow:hidden}",
+            40,
+        );
+        let texts = texts(&paint(&t));
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, 0, "the run still starts at the left edge");
+        assert_eq!(texts[0].2, "0123456789abcdefghi");
+    }
+
+    #[test]
+    fn a_clip_starting_mid_run_trims_from_the_left_and_moves_the_origin() {
+        let clip = Clip::ranges(Some((5, 9)), None);
+        assert_eq!(
+            clip_text(clip, 0, 0, "0123456789"),
+            Some((5, "5678".to_string()))
+        );
+        // A wide glyph straddling the left edge is dropped with the cells it
+        // cannot fit into: 漢 spans 4–5, so the run starts at 6.
+        assert_eq!(clip_text(clip, 4, 0, "漢ab"), Some((6, "ab".to_string())));
+        // A row the clip excludes emits nothing at all.
+        assert_eq!(clip_text(Clip::ranges(None, Some((0, 2))), 0, 2, "x"), None);
+    }
+
+    #[test]
+    fn one_clipped_axis_leaves_the_other_alone() {
+        let css = "body,div,pre{margin:0}
+                   .x{width:10em;height:1em;overflow-x:hidden}
+                   .y{width:10em;height:1em;overflow-y:hidden}";
+        // Two rows of 36 and 15 cells in a box 20 cells wide and 1 line tall.
+        let pre = "<pre>0123456789abcdefghijklmnopqrstuvwxyz\nsecond row here</pre>";
+
+        // Horizontal only: the second row still paints past the bottom edge,
+        // and both rows are cut to the 20-cell padding box.
+        let t = tree(&format!("<div class=x>{pre}</div>"), css, 40);
+        let got: Vec<(i32, usize)> = texts(&paint(&t))
+            .iter()
+            .map(|(_, y, s)| (*y, s.chars().count()))
+            .collect();
+        assert_eq!(got, [(0, 20), (1, 15)]);
+
+        // Vertical only: one row survives, and it keeps every one of its 36
+        // cells even though the box is 20 wide.
+        let t = tree(&format!("<div class=y>{pre}</div>"), css, 40);
+        let got = texts(&paint(&t));
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert_eq!(got[0].2, "0123456789abcdefghijklmnopqrstuvwxyz");
+    }
+
+    #[test]
+    fn nested_clips_intersect() {
+        // Outer keeps 3 rows, inner keeps 20 cells: a child sticking out of
+        // both is cut to the inner rectangle of the two.
+        let t = tree(
+            "<div class=outer><div class=inner><pre>0123456789abcdefghijklmnopqrstuvwxyz\n\
+             0123456789abcdefghijklmnopqrstuvwxyz\n0123456789abcdefghijklmnopqrstuvwxyz\n\
+             0123456789abcdefghijklmnopqrstuvwxyz\n0123456789abcdefghijklmnopqrstuvwxyz\
+             </pre></div></div>",
+            "body,div,pre{margin:0} .outer{height:3em;overflow:hidden}
+             .inner{width:10em;height:5em;overflow:hidden}",
+            40,
+        );
+        let got: Vec<(i32, usize)> = texts(&paint(&t))
+            .iter()
+            .map(|(_, y, s)| (*y, s.chars().count()))
+            .collect();
+        assert_eq!(got, [(0, 20), (1, 20), (2, 20)]);
+    }
+
+    #[test]
+    fn a_clipped_image_crops_its_grid_and_falls_back_from_kitty() {
+        // 32×64 px = 4 cells wide, 4 rows tall (PLAN.md unit table).
+        let src = r#"<img src="https://ex/a.png" width="32" height="64" alt="">"#;
+        let render = |html: &str| {
+            let dom = html::parse(html);
+            let styles = style::style_tree(&dom, &[]);
+            let mut ctx = ImageContext::default();
+            for img in crate::image::discover(&dom, Some("https://ex/")) {
+                ctx.by_node.insert(img.node, img);
+            }
+            let tree = layout::layout_document_with(&dom, &styles, 40, Hidden::Respect, &ctx);
+            let mut pixels = ImagePixels::new();
+            pixels.insert(
+                "https://ex/a.png".into(),
+                Arc::new(DecodedImage::new(2, 2, [255, 0, 0, 255].repeat(4))),
+            );
+            paint_with(&tree, &pixels)
+        };
+        let image_of = |list: &DisplayList| {
+            list.commands
+                .iter()
+                .find_map(|c| match c {
+                    DisplayCommand::Image { rect, grid, pixels } => {
+                        Some((*rect, grid.clone(), pixels.is_some()))
+                    }
+                    _ => None,
+                })
+                .expect("an image command")
+        };
+
+        // Unclipped: full rectangle, full grid, and Kitty gets a placement.
+        let list = render(&format!("<div style='margin:0'>{src}</div>"));
+        let (rect, grid, has_pixels) = image_of(&list);
+        assert_eq!((rect.width, rect.height), (4, 4));
+        assert_eq!((grid.width, grid.height), (4, 4));
+        assert!(has_pixels);
+        assert_eq!(kitty_placements(&list, 0, 0, 24, 80, 1).len(), 1);
+
+        // Clipped to one row: the grid is cropped to the cells that survive,
+        // and the placement is dropped — half-blocks draw the visible band.
+        let list = render(&format!(
+            "<div style='margin:0;height:1em;overflow:hidden'>{src}</div>"
+        ));
+        let (rect, grid, has_pixels) = image_of(&list);
+        assert_eq!((rect.width, rect.height), (4, 1));
+        assert_eq!((grid.width, grid.height), (4, 1));
+        assert!(!has_pixels, "a cropped image must not go through Kitty");
+        assert!(kitty_placements(&list, 0, 0, 24, 80, 1).is_empty());
     }
 
     #[test]
