@@ -66,9 +66,9 @@ fn main() -> io::Result<()> {
     }
 
     let (w, h) = terminal::size()?;
-    let caps = term::detect_caps(env::var("COLORTERM").ok().as_deref());
+    let caps = term::detect_caps_from_env();
     let mut renderer = Renderer::new(w, h, caps);
-    let mut app = App::new(w, h);
+    let mut app = App::with_caps(w, h, caps.kitty);
 
     let (tx, rx) = mpsc::channel();
     if let Some(url) = url {
@@ -106,6 +106,10 @@ fn main() -> io::Result<()> {
         // user is already reading (PLAN.md M4, UX §3.2).
         for (id, slot, url) in effect.sheets {
             net::spawn_stylesheet(id, slot, url, tx.clone());
+        }
+        // One worker per image URL (M8), parallel with the page and sheets.
+        for (id, url) in effect.images {
+            net::spawn_image(id, url, tx.clone());
         }
         // Clipboard is a side channel: OSC 52, not the cell buffer (CLAUDE.md).
         if let Some(text) = effect.yank {
@@ -272,9 +276,9 @@ fn run_timing(url: &str) -> i32 {
     // The normal App + Renderer at the real terminal size when there is one
     // (best-effort — a pipe has none), else 80×24.
     let (w, h) = terminal::size().unwrap_or((80, 24));
-    let caps = term::detect_caps(env::var("COLORTERM").ok().as_deref());
+    let caps = term::detect_caps_from_env();
     let mut renderer = Renderer::new(w, h, caps);
-    let mut app = App::new(w, h);
+    let mut app = App::with_caps(w, h, caps.kitty);
     let id = app.start_fetch(url.clone());
     app.update(Msg::Loaded {
         id,
@@ -319,6 +323,9 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         // want their own sheets fetched, and a stale generation's are dropped
         // by the id guard in `App::update`, not here.
         effect.sheets.extend(e.sheets);
+        // Images accumulate like sheets: each parse in a batch may request its
+        // own URLs; stale generations are dropped by the FetchId guard in App.
+        effect.images.extend(e.images);
         if e.yank.is_some() {
             effect.yank = e.yank;
         }
@@ -339,6 +346,12 @@ fn render(app: &mut App, renderer: &mut Renderer, out: &mut impl Write) -> io::R
     }
     app.draw(renderer.frame());
     renderer.present(out)?;
+    // Kitty graphics are a side channel like OSC 52 (CLAUDE.md: only the cell
+    // renderer owns per-cell writes; images ride after the synchronized frame).
+    if let Some(kitty) = app.kitty_frame() {
+        out.write_all(&kitty)?;
+        out.flush()?;
+    }
     // A plain setter, deliberately not a Msg: a message would dirty the app
     // and every frame would schedule the next. The statusline shows this on
     // whatever paint comes next.
@@ -449,6 +462,38 @@ mod tests {
     fn empty_batch_does_nothing() {
         let mut app = App::new(80, 24);
         assert_eq!(apply_batch(&mut app, iter::empty()), Effect::default());
+    }
+
+    #[test]
+    fn batch_forwards_image_urls_from_parsed() {
+        // Regression: apply_batch used to drop effect.images, so the loop never
+        // spawned image workers even though App::update listed them.
+        let mut app = App::new(80, 20);
+        let id = app.start_fetch("http://site.test/page".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://site.test/page".into(),
+            status: 200,
+            body: b"<img src=pic.png width=8 height=16>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        let effect = apply_batch(
+            &mut app,
+            std::iter::once(Msg::Parsed {
+                id,
+                dom: html::parse(r#"<img src="pic.png" width="8" height="16">"#),
+                elapsed: Duration::ZERO,
+            }),
+        );
+        assert!(
+            effect
+                .images
+                .iter()
+                .any(|(i, u)| *i == id && u == "http://site.test/pic.png"),
+            "coalesced effect must carry image URLs: {:?}",
+            effect.images
+        );
     }
 
     #[test]

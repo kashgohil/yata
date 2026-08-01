@@ -13,6 +13,7 @@ use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::{Dom, NodeId};
+use crate::image::ImageSession;
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
@@ -44,6 +45,9 @@ pub struct Effect {
     /// Text to put on the system clipboard via OSC 52 (M6 yank). Written by
     /// the event loop, not through the cell buffer.
     pub yank: Option<String>,
+    /// Absolute image URLs to fetch (page FetchId, url). Parallel workers,
+    /// same discipline as stylesheets (M8).
+    pub images: Vec<(FetchId, String)>,
 }
 
 /// Link-hint session (`f` / `F`).
@@ -213,10 +217,17 @@ pub struct App {
     /// zero times, a resize exactly once. Hover must not increment it (M6).
     #[cfg(test)]
     layouts: usize,
+    /// Images: LRU cache, page discovery, Kitty placement state (M8).
+    images: ImageSession,
 }
 
 impl App {
     pub fn new(w: u16, h: u16) -> Self {
+        Self::with_caps(w, h, false)
+    }
+
+    /// Like [`new`] with an explicit Kitty graphics flag (from `term::Caps`).
+    pub fn with_caps(w: u16, h: u16, kitty_graphics: bool) -> Self {
         App {
             size: (w, h),
             fetch_gen: 0,
@@ -253,6 +264,7 @@ impl App {
             help_view_built: false,
             #[cfg(test)]
             layouts: 0,
+            images: ImageSession::new(kitty_graphics),
         }
     }
 
@@ -397,6 +409,7 @@ impl App {
                 // The page's own CSS: inline blocks are in hand and resolve
                 // now, linked ones go out to the loop and land later.
                 let sheets = self.adopt_sources(id);
+                let images = self.adopt_images(id);
                 self.restyle();
                 // One of exactly two places layout runs. The page surface
                 // switches from the raw body to laid-out lines here, which is
@@ -413,8 +426,30 @@ impl App {
                 Effect {
                     dirty: true,
                     sheets,
+                    images,
                     ..Effect::default()
                 }
+            }
+            Msg::Image { id, url, result } => {
+                if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                match result {
+                    Ok(decoded) => {
+                        let need_relayout =
+                            self.images.needs_relayout(&url, self.layout_tree.as_ref());
+                        self.images.insert(url, decoded);
+                        if need_relayout {
+                            self.relayout();
+                        } else {
+                            self.repaint_images();
+                        }
+                    }
+                    Err(_) => {
+                        // Soft failure: leave placeholder; no layout change.
+                    }
+                }
+                redraw()
             }
             Msg::Stylesheet { id, slot, sheet } => {
                 // Same stale-generation guard as every other net message: a
@@ -659,6 +694,8 @@ impl App {
         self.timings.layout = None;
         self.revealed = false;
         self.search = None;
+        // Page bookkeeping only — the LRU survives for back/forward (M8).
+        self.images.clear_page();
     }
 
     /// Show a synthetic error page (M7) and leave the app in `Fetch::Failed`.
@@ -846,6 +883,27 @@ impl App {
         }
     }
 
+    /// Discover `<img>` tags and return absolute URLs that still need a fetch.
+    fn adopt_images(&mut self, id: FetchId) -> Vec<(FetchId, String)> {
+        let Some(dom) = &self.dom else {
+            return Vec::new();
+        };
+        let base = match &self.fetch {
+            Fetch::Loaded { url, .. } => Some(url.as_str()),
+            _ => None,
+        };
+        self.images.adopt(dom, base, id)
+    }
+
+    /// Rebuild the display list from the existing layout tree after an image
+    /// lands with a firm size (no geometry change).
+    fn repaint_images(&mut self) {
+        if let Some(tree) = &self.layout_tree {
+            let pixels = self.images.pixels();
+            self.display_list = paint::paint_with(tree, &pixels);
+        }
+    }
+
     /// Lay the cached tree out at the current column width and hand the lines
     /// to the page surface. Called from exactly two places — a parse landing
     /// and a resize — and never from the scroll path, which only moves an
@@ -863,13 +921,16 @@ impl App {
         };
         let started = Instant::now();
         let width = column(self.size.0).width;
+        let img_ctx = self.images.context();
         // One layout (or two if we have to reveal a page that hid itself).
-        let tree = layout::layout_document(dom, styles, width, layout::Hidden::Respect);
+        let tree =
+            layout::layout_document_with(dom, styles, width, layout::Hidden::Respect, &img_ctx);
         let mut lines = layout::lines_from_tree(&tree);
         let (tree, revealed) = if lines.iter().any(|l| !l.spans.is_empty()) {
             (tree, false)
         } else {
-            let alt = layout::layout_document(dom, styles, width, layout::Hidden::Reveal);
+            let alt =
+                layout::layout_document_with(dom, styles, width, layout::Hidden::Reveal, &img_ctx);
             let alt_lines = layout::lines_from_tree(&alt);
             if alt_lines.iter().any(|l| !l.spans.is_empty()) {
                 lines = alt_lines;
@@ -878,7 +939,8 @@ impl App {
                 (tree, false)
             }
         };
-        self.display_list = paint::paint(&tree);
+        let pixels = self.images.pixels();
+        self.display_list = paint::paint_with(&tree, &pixels);
         self.layout_tree = Some(tree);
         self.boxes_view_built = false;
         self.revealed = revealed;
@@ -983,9 +1045,29 @@ impl App {
         self.styles_view_built = false;
         if let (Some(tree), Some(styles)) = (self.layout_tree.as_mut(), self.styles.as_ref()) {
             recolour_tree(tree, styles);
-            self.display_list = paint::paint(tree);
+            // Rebuild after recolour; need pixels map from cache.
+        }
+        if let Some(tree) = &self.layout_tree {
+            let pixels = self.images.pixels();
+            self.display_list = paint::paint_with(tree, &pixels);
         }
         self.build_visible_inspector();
+    }
+
+    /// Kitty graphics bytes for the current page view (or `None` to skip).
+    /// Mutates session placement state so identical frames emit nothing.
+    pub fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        let left = column(self.size.0).left;
+        let scroll = self.viewport.offset() as i32;
+        let on_page = self.surface == Surface::Page && self.dom.is_some();
+        self.images.kitty_frame(
+            &self.display_list,
+            left,
+            scroll,
+            self.page(),
+            self.size.0,
+            on_page,
+        )
     }
 
     /// Render `dom` into the F1 surface's lines at the current size, if it
@@ -4001,6 +4083,213 @@ mod tests {
         assert!(
             after.contains('w'),
             "lost paragraph content after resize: {after:?}"
+        );
+    }
+
+    // ---- images (M8) ------------------------------------------------------
+
+    #[test]
+    fn parse_requests_image_fetches_for_unresolved_srcs() {
+        let mut app = App::new(80, 20);
+        let (id, effect) = open_page(
+            &mut app,
+            r#"<p>hi</p><img src="pic.png" width="80" height="48" alt="a">
+               <img src="https://cdn.example/x.jpg">"#,
+        );
+        assert!(
+            effect
+                .images
+                .iter()
+                .any(|(i, u)| *i == id && u == "http://site.test/dir/pic.png"),
+            "{:?}",
+            effect.images
+        );
+        assert!(
+            effect
+                .images
+                .iter()
+                .any(|(_, u)| u == "https://cdn.example/x.jpg"),
+            "{:?}",
+            effect.images
+        );
+        // Layout reserved firm size for the sized image.
+        let tree = app.layout_tree.as_ref().unwrap();
+        let mut found = false;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Image && b.image_size_firm {
+                assert_eq!(b.dimensions.content.width, 10); // 80px / 8
+                assert_eq!(b.dimensions.content.height, 3); // 48px / 16
+                found = true;
+            }
+        });
+        assert!(found, "expected a firm image box");
+    }
+
+    #[test]
+    fn firm_size_image_arrival_repaints_without_relayout() {
+        let mut app = App::new(80, 20);
+        let (id, _) = open_page(
+            &mut app,
+            r#"<img src="pic.png" width="16" height="16" alt="x">"#,
+        );
+        let layouts_before = app.layouts;
+        let decoded = crate::image::DecodedImage::new(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+            ],
+        );
+        assert!(
+            app.update(Msg::Image {
+                id,
+                url: "http://site.test/dir/pic.png".into(),
+                result: Ok(decoded),
+            })
+            .dirty
+        );
+        assert_eq!(
+            app.layouts, layouts_before,
+            "firm attrs must not force relayout"
+        );
+        assert!(app.images.cache_contains("http://site.test/dir/pic.png"));
+        // Display list should have half-block image command with pixels.
+        assert!(
+            app.display_list.commands.iter().any(|c| matches!(
+                c,
+                crate::paint::DisplayCommand::Image {
+                    pixels: Some(_),
+                    ..
+                }
+            )),
+            "expected painted image with pixels"
+        );
+    }
+
+    #[test]
+    fn soft_size_image_arrival_relayouts() {
+        let mut app = App::new(80, 20);
+        let (id, _) = open_page(&mut app, r#"<img src="big.png" alt="x">"#);
+        let layouts_before = app.layouts;
+        // 160×80 px → 20×5 cells
+        let mut rgba = vec![0u8; 160 * 80 * 4];
+        for px in rgba.chunks_mut(4) {
+            px.copy_from_slice(&[0, 255, 0, 255]);
+        }
+        let decoded = crate::image::DecodedImage::new(160, 80, rgba);
+        app.update(Msg::Image {
+            id,
+            url: "http://site.test/dir/big.png".into(),
+            result: Ok(decoded),
+        });
+        assert!(
+            app.layouts > layouts_before,
+            "unknown size must relayout when decode lands"
+        );
+        let tree = app.layout_tree.as_ref().unwrap();
+        let mut h = 0;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Image {
+                h = b.dimensions.content.height;
+            }
+        });
+        assert_eq!(h, 5, "decoded height should be 5 cells");
+    }
+
+    #[test]
+    fn failed_image_is_soft_not_an_error_page() {
+        let mut app = App::new(80, 20);
+        let (id, _) = open_page(&mut app, r#"<p>still here</p><img src="nope.png">"#);
+        app.update(Msg::Image {
+            id,
+            url: "http://site.test/dir/nope.png".into(),
+            result: Err("HTTP 404".into()),
+        });
+        assert!(app.dom.is_some());
+        let mut frame = Frame::new(80, 20);
+        app.draw(&mut frame);
+        let page: String = (0..19)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(page.contains("still here"), "{page}");
+        assert!(!page.contains("Press r to retry"), "{page}");
+    }
+
+    #[test]
+    fn cached_image_skips_network_on_second_page() {
+        let mut app = App::new(80, 20);
+        let (id, effect) = open_page(
+            &mut app,
+            r#"<img src="https://cdn.example/a.png" width="8" height="16">"#,
+        );
+        assert_eq!(effect.images.len(), 1);
+        app.update(Msg::Image {
+            id,
+            url: "https://cdn.example/a.png".into(),
+            result: Ok(crate::image::DecodedImage::new(1, 1, vec![1, 2, 3, 255])),
+        });
+        // Navigate to another page that reuses the same absolute URL.
+        let (_id2, effect2) = open_page(
+            &mut app,
+            r#"<img src="https://cdn.example/a.png" width="8" height="16">"#,
+        );
+        assert!(
+            effect2.images.is_empty(),
+            "cache hit must not re-fetch: {:?}",
+            effect2.images
+        );
+    }
+
+    #[test]
+    fn scroll_with_images_does_not_relayout() {
+        let mut app = App::new(80, 12);
+        let (id, _) = open_page(
+            &mut app,
+            &format!(
+                "{}{}",
+                r#"<img src="x.png" width="80" height="160" alt="big">"#,
+                (0..30)
+                    .map(|i| format!("<p>line{i}</p>"))
+                    .collect::<String>()
+            ),
+        );
+        app.update(Msg::Image {
+            id,
+            url: "http://site.test/dir/x.png".into(),
+            result: Ok(crate::image::DecodedImage::new(4, 4, vec![255; 4 * 4 * 4])),
+        });
+        let layouts_before = app.layouts;
+        for _ in 0..20 {
+            app.update(ch('j'));
+        }
+        assert_eq!(app.layouts, layouts_before, "scroll must never relayout");
+    }
+
+    #[test]
+    fn kitty_frame_is_noop_on_identical_view() {
+        let mut app = App::with_caps(80, 24, true);
+        let (id, _) = open_page(
+            &mut app,
+            r#"<img src="pic.png" width="16" height="16" alt="x">"#,
+        );
+        app.update(Msg::Image {
+            id,
+            url: "http://site.test/dir/pic.png".into(),
+            result: Ok(crate::image::DecodedImage::new(
+                2,
+                2,
+                vec![
+                    255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+                ],
+            )),
+        });
+        let first = app.kitty_frame();
+        assert!(first.is_some(), "first present should emit Kitty");
+        // Same scroll / size / display list → no second write (M8 scroll path).
+        assert!(
+            app.kitty_frame().is_none(),
+            "identical view must not retransmit"
         );
     }
 }

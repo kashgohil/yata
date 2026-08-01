@@ -291,3 +291,31 @@ viewport body; `--dump` still prints any HTTP body (curl semantics).
 Demo path: open a page, `?` to learn bindings, `/alpha` + Enter, `n`/`N` to
 walk hits; kill the network and confirm `r` retries from the error page;
 resize mid-article and stay on the same paragraph.
+
+---
+
+## M8 — images (2026-08-01)
+
+Async `<img>` fetch/decode (`image` crate), replaced boxes, Unicode half-block
+paint, optional Kitty graphics, and a memory-capped RGBA LRU. Machine A.
+
+**Fast gate:** images must not enter the scroll path. Half-block rasters are
+baked into the display list when an image lands (or as a placeholder
+checkerboard); scrolling re-emits that list at a new offset with **0**
+relayouts (unit test: `scroll_with_images_does_not_relayout`).
+
+| Measure | Result | Budget |
+|---|---|---|
+| scroll with image boxes present | same path as text; layouts counter flat | ≪ 5 ms scroll step |
+| firm `width`/`height` + late decode | repaint only (0 relayout) | — |
+| soft size + late decode | one relayout when pixels arrive | — |
+| LRU default cap | 32 MiB RGBA; back/forward hits cache | — |
+
+Kitty is a post-`present` side channel (delete-all + place visible), same
+discipline as OSC 52 yank. Half-blocks always paint into the cell buffer so
+non-Kitty terminals stay correct.
+
+Demo path: open a page with images (or inject via local fixture server);
+placeholders appear immediately; pixels pop in without freezing scroll;
+`j`/`k` stay instant; on Kitty, true pixels overlay the same rects.
+

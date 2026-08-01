@@ -227,6 +227,15 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
                 let t = b.text.as_deref().unwrap_or("");
                 format!("#text \"{}\"", clip(t, 20))
             }
+            BoxKind::Image => {
+                let alt = b.text.as_deref().unwrap_or("");
+                let src = b.image_src.as_deref().unwrap_or("?");
+                if alt.is_empty() {
+                    format!("img {src}")
+                } else {
+                    format!("img \"{}\" {}", clip(alt, 16), src)
+                }
+            }
         };
         let d = b.dimensions.content;
         out.push(format!(

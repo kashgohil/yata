@@ -7,6 +7,7 @@
 mod cache;
 mod halfblock;
 mod kitty;
+mod session;
 
 pub use cache::ImageCache;
 pub use halfblock::{HalfBlockGrid, placeholder_grid, raster_halfblocks};
@@ -14,6 +15,7 @@ pub use kitty::{
     KittyPlacement, delete_all_images, delete_all_placements, place_sequence, placement_sequence,
     transmit_sequence,
 };
+pub use session::ImageSession;
 
 use std::sync::Arc;
 
