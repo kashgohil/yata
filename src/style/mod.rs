@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use crate::css::{self, Declaration, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
 use matching::RuleIndex;
-use values::{ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
+use values::{BoxSizing, ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
 
 /// Dynamic matching inputs for the cascade (M6): which node is hovered, which
 /// absolute URLs the user has visited, and the base URL for resolving `href`s
@@ -66,6 +66,15 @@ pub struct ComputedStyle {
     pub border: Edges,
     pub width: Length,
     pub max_width: Length,
+    /// Sizing added in M9.2 (CSS 2.1 §10.4–10.7). `height` is `Auto` — content
+    /// height — until a page says otherwise; the min/max pairs clamp whatever
+    /// the used value works out to, with `min` winning over `max`.
+    pub min_width: Length,
+    pub height: Length,
+    pub min_height: Length,
+    pub max_height: Length,
+    /// Which box `width`/`height` and the clamps above describe (M9.2).
+    pub box_sizing: BoxSizing,
     /// The winning `display` came from the user-agent sheet's `!important` —
     /// this element holds code, metadata or inert markup and is never prose
     /// (see `ua.css`). Layout's never-blank fallback honours this even when it
@@ -100,6 +109,13 @@ impl ComputedStyle {
             border: Edges::default(),
             width: Length::Auto,
             max_width: Length::Auto,
+            min_width: Length::Auto,
+            height: Length::Auto,
+            min_height: Length::Auto,
+            max_height: Length::Auto,
+            // `box-sizing` is not inherited either (CSS): pages set it on
+            // everything through `*`, which the cascade already handles.
+            box_sizing: BoxSizing::default(),
             // Not inherited: a child of a hidden `<script>` is hidden because
             // its ancestor's subtree is skipped, not because it inherited a
             // verdict about itself.
@@ -316,6 +332,14 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
         }
         "width" => set(&mut computed.width, values::parse_width(value)),
         "max-width" => set(&mut computed.max_width, values::parse_width(value)),
+        // M9.2. `parse_width` is the right parser for all of these: it maps
+        // `none` (the initial `max-*` value as pages write it) to `Auto`,
+        // which is how layout spells "no clamp".
+        "min-width" => set(&mut computed.min_width, values::parse_width(value)),
+        "height" => set(&mut computed.height, values::parse_width(value)),
+        "min-height" => set(&mut computed.min_height, values::parse_width(value)),
+        "max-height" => set(&mut computed.max_height, values::parse_width(value)),
+        "box-sizing" => set(&mut computed.box_sizing, values::parse_box_sizing(value)),
         "text-decoration" | "text-decoration-line" => set(
             &mut computed.underline,
             values::parse_text_decoration(value),
@@ -562,6 +586,53 @@ mod tests {
 
         assert_eq!(styles.get(find(&dom, "script")).display, Display::None);
         assert_eq!(styles.get(find(&dom, "head")).display, Display::None);
+    }
+
+    #[test]
+    fn sizing_properties_cascade_and_do_not_inherit() {
+        // M9.2's vocabulary. `box-sizing` is the one pages set on everything
+        // at once — through `*`, not through inheritance, which is why the
+        // child below must come back `content-box` while the `*` rule that
+        // matches it makes it `border-box`.
+        let (dom, styles) = styled(
+            "<div><p>t</p></div>",
+            "div { height: 20em; min-width: 10em; min-height: 2em; max-height: 30em;
+                   box-sizing: border-box }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.height, Length::Em(20.0));
+        assert_eq!(div.min_width, Length::Em(10.0));
+        assert_eq!(div.min_height, Length::Em(2.0));
+        assert_eq!(div.max_height, Length::Em(30.0));
+        assert_eq!(div.box_sizing, BoxSizing::BorderBox);
+
+        let p = styles.get(find(&dom, "p"));
+        assert_eq!(p.height, Length::Auto);
+        assert_eq!(p.min_height, Length::Auto);
+        assert_eq!(
+            p.box_sizing,
+            BoxSizing::ContentBox,
+            "box-sizing must not inherit"
+        );
+
+        // The way real pages turn it on, and the reason it must not inherit:
+        // the universal selector already reaches every element.
+        let (dom, styles) = styled(
+            "<div><p>t</p></div>",
+            "*, *::before, *::after { box-sizing: border-box }",
+        );
+        for tag in ["div", "p"] {
+            assert_eq!(
+                styles.get(find(&dom, tag)).box_sizing,
+                BoxSizing::BorderBox,
+                "`*` must reach <{tag}>"
+            );
+        }
+
+        // `max-height: none` is how a page spells "no clamp"; layout spells
+        // the same thing `Auto`.
+        let (dom, styles) = styled("<div>t</div>", "div { max-height: none }");
+        assert_eq!(styles.get(find(&dom, "div")).max_height, Length::Auto);
     }
 
     #[test]

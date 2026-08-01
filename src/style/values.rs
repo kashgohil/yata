@@ -49,6 +49,32 @@ impl Length {
         resolve(self, containing_width, Axis::Vertical)
     }
 
+    /// Resolve to lines against a containing block's **height** (M9.2).
+    ///
+    /// This is the rule for `height`/`min-height`/`max-height`, and the only
+    /// place a percentage does not mean "of the containing width": CSS 2.1
+    /// §10.5 resolves those against the containing block's height, while
+    /// percentage `padding`/`margin` keep using the width even vertically —
+    /// which is what [`to_cells_v`] is for. The caller decides whether the
+    /// containing height is definite at all; an indefinite one makes the whole
+    /// property behave as `auto`, so it never reaches here.
+    pub fn to_lines(self, containing_height: i32) -> i32 {
+        match self {
+            // Same rounding rule as every other length: nonzero rounds up to
+            // at least one line, so `height: 5%` of a 12-line block is a row
+            // the reader can see rather than a box that vanished.
+            Length::Percent(p) => {
+                let raw = (p / 100.0) * containing_height as f32;
+                if raw <= 0.0 {
+                    0
+                } else {
+                    raw.round().max(1.0) as i32
+                }
+            }
+            other => resolve(other, 0, Axis::Vertical),
+        }
+    }
+
     pub fn is_auto(self) -> bool {
         matches!(self, Length::Auto)
     }
@@ -155,6 +181,25 @@ pub enum TextAlign {
     Left,
     Center,
     Right,
+}
+
+/// `box-sizing` (M9.2): which box `width`/`height` and their min/max clamps
+/// describe. Not inherited — pages apply it globally through the universal
+/// selector (`*, *::before, *::after { box-sizing: border-box }`), which this
+/// engine already matches, not through inheritance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum BoxSizing {
+    #[default]
+    ContentBox,
+    BorderBox,
+}
+
+pub fn parse_box_sizing(value: &str) -> Option<BoxSizing> {
+    match lower(value).as_str() {
+        "content-box" => Some(BoxSizing::ContentBox),
+        "border-box" => Some(BoxSizing::BorderBox),
+        _ => None,
+    }
 }
 
 /// `display`. Values M4 cannot honour are mapped to the nearest of the three
@@ -510,6 +555,16 @@ mod tests {
     }
 
     #[test]
+    fn box_sizing_takes_the_two_css_keywords_and_nothing_else() {
+        assert_eq!(parse_box_sizing("border-box"), Some(BoxSizing::BorderBox));
+        assert_eq!(parse_box_sizing("CONTENT-BOX"), Some(BoxSizing::ContentBox));
+        // Invalid, so the cascade keeps the previous winner (never a silent
+        // switch to content-box on a page that asked for border-box).
+        assert_eq!(parse_box_sizing("padding-box"), None);
+        assert_eq!(parse_box_sizing(""), None);
+    }
+
+    #[test]
     fn edge_shorthand_expands_1_2_3_4_values() {
         assert_eq!(parse_edges("1em"), Some(Edges::all(Length::Em(1.0))));
         assert_eq!(
@@ -544,6 +599,16 @@ mod tests {
         assert_eq!(Length::Px(16.0).to_cells_v(80), 1);
         assert_eq!(Length::Em(1.0).to_cells_v(80), 1);
         assert_eq!(Length::Percent(50.0).to_cells_v(80), 40);
+        // …except for `height` and its clamps (M9.2), where a percentage is
+        // of the containing block's *height*. Same rounding rule as the rest:
+        // nonzero never disappears.
+        assert_eq!(Length::Percent(50.0).to_lines(20), 10);
+        assert_eq!(Length::Percent(100.0).to_lines(7), 7);
+        assert_eq!(Length::Percent(0.0).to_lines(20), 0);
+        assert_eq!(Length::Percent(1.0).to_lines(20), 1);
+        // Absolute lengths ignore the containing height entirely.
+        assert_eq!(Length::Px(32.0).to_lines(999), 2);
+        assert_eq!(Length::Em(3.0).to_lines(0), 3);
         // Nonzero but sub-cell rounds up so thin borders still draw.
         assert_eq!(Length::Px(1.0).to_cells_h(80), 1);
         assert_eq!(Length::Px(5.0).to_cells_h(80), 1);

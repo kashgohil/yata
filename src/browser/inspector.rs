@@ -14,7 +14,9 @@ use unicode_width::UnicodeWidthChar;
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::layout::{BoxId, BoxKind, LayoutTree};
 use crate::style::Styles;
-use crate::style::values::{ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign};
+use crate::style::values::{
+    BoxSizing, ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign,
+};
 
 /// Cell caps for the variable-length parts of a line. Text gets the most room
 /// (it is the content); URLs and comments are context, not content.
@@ -149,8 +151,25 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
     if !matches!(computed.width, Length::Auto) {
         parts.push(format!("w {}", length_summary(computed.width)));
     }
+    if !matches!(computed.min_width, Length::Auto) {
+        parts.push(format!("min-w {}", length_summary(computed.min_width)));
+    }
     if !matches!(computed.max_width, Length::Auto) {
         parts.push(format!("max-w {}", length_summary(computed.max_width)));
+    }
+    // Sizing (M9.2), same "interesting only" rule: `height: auto` and
+    // `content-box` are the initial values and stay out of the way.
+    if !matches!(computed.height, Length::Auto) {
+        parts.push(format!("h {}", length_summary(computed.height)));
+    }
+    if !matches!(computed.min_height, Length::Auto) {
+        parts.push(format!("min-h {}", length_summary(computed.min_height)));
+    }
+    if !matches!(computed.max_height, Length::Auto) {
+        parts.push(format!("max-h {}", length_summary(computed.max_height)));
+    }
+    if computed.box_sizing == BoxSizing::BorderBox {
+        parts.push("border-box".into());
     }
     parts.join(" · ")
 }
@@ -509,6 +528,26 @@ mod tests {
         assert!(div.contains("padding"), "{div}");
         assert!(div.contains("w 50%"), "{div}");
         assert!(div.contains("max-w 40em"), "{div}");
+    }
+
+    #[test]
+    fn sizing_values_show_when_set() {
+        let lines = styled(
+            "<div>x</div><p>y</p>",
+            "div { height: 3em; min-width: 10em; min-height: 2em; max-height: 30em;
+                   box-sizing: border-box }",
+        );
+        let div = lines.iter().find(|l| l.contains("<div>")).unwrap();
+        assert!(div.contains("h 3em"), "{div}");
+        assert!(div.contains("min-w 10em"), "{div}");
+        assert!(div.contains("min-h 2em"), "{div}");
+        assert!(div.contains("max-h 30em"), "{div}");
+        assert!(div.contains("border-box"), "{div}");
+        // The initial values stay out of the way: an untouched element shows
+        // none of this (F2 would be unreadable on Wikipedia otherwise).
+        let p = lines.iter().find(|l| l.contains("<p>")).unwrap();
+        assert!(!p.contains("h "), "{p}");
+        assert!(!p.contains("border-box"), "{p}");
     }
 
     #[test]

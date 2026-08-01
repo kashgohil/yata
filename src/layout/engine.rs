@@ -8,7 +8,7 @@ use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
 use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
-use crate::style::values::{Display, FontStyle, FontWeight, TextAlign};
+use crate::style::values::{BoxSizing, Display, FontStyle, FontWeight, Length, TextAlign};
 use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -67,15 +67,30 @@ pub fn layout_tree_with(
     let mut y = 0i32;
     let mut prev_mb = 0i32;
     for child in dom.children(dom.root) {
-        if let Some(id) = eng.layout_node(child, 0, width, y, &mut prev_mb, false) {
+        // `None` height: the page column scrolls, so it has no definite height
+        // for a percentage to resolve against. `height: 100%` on a top-level
+        // element therefore means "as tall as my content", never "as tall as
+        // the terminal" (CSS 2.1 §10.5, and M9.2's definiteness rule).
+        if let Some(id) = eng.layout_node(child, 0, width, None, y, &mut prev_mb, false) {
             eng.boxes[root.0 as usize].children.push(id);
             let mb = eng.boxes[id.0 as usize].dimensions.margin_box();
             y = mb.bottom();
             prev_mb = eng.boxes[id.0 as usize].dimensions.margin.bottom;
         }
     }
-    eng.boxes[root.0 as usize].dimensions.content.height = y.max(0);
-    let height = y.max(0);
+    // The document is as tall as the flow *or* as the lowest box in it,
+    // whichever is further down. Those differ once a box is shorter than its
+    // content (M9.2's specified heights): the overflowing rows are still
+    // visible — `overflow: visible` is the initial value — so they have to be
+    // inside the scrollable page, or `lines::from_tree` would drop them.
+    let overflow_bottom = eng
+        .boxes
+        .iter()
+        .map(|b| b.dimensions.border_box().bottom())
+        .max()
+        .unwrap_or(0);
+    let height = y.max(overflow_bottom).max(0);
+    eng.boxes[root.0 as usize].dimensions.content.height = height;
     LayoutTree {
         boxes: eng.boxes,
         root,
@@ -107,11 +122,16 @@ impl<'a> Engine<'a> {
     /// Layout one DOM node as a child of a block container. Returns `None` for
     /// nodes that generate no box (`display:none`, comments, empty whitespace
     /// between blocks).
+    #[allow(clippy::too_many_arguments)]
     fn layout_node(
         &mut self,
         id: NodeId,
         x: i32,
         containing_width: i32,
+        // The containing block's content height when it is definite (M9.2):
+        // what a percentage `height` resolves against, `None` when there is
+        // nothing definite to resolve against.
+        containing_height: Option<i32>,
         y: i32,
         prev_margin_bottom: &mut i32,
         pre: bool,
@@ -173,6 +193,7 @@ impl<'a> Engine<'a> {
                             computed,
                             x,
                             containing_width,
+                            containing_height,
                             y,
                             prev_margin_bottom,
                             pre || tag == "pre",
@@ -210,6 +231,7 @@ impl<'a> Engine<'a> {
         computed: ComputedStyle,
         containing_x: i32,
         containing_width: i32,
+        containing_height: Option<i32>,
         y: i32,
         prev_margin_bottom: &mut i32,
         pre: bool,
@@ -247,6 +269,18 @@ impl<'a> Engine<'a> {
             image_src: None,
             image_size_firm: false,
         });
+
+        // The vertical axis (CSS 2.1 §10.5–10.7). A specified height is known
+        // *before* the children are laid out, and that is exactly what makes
+        // it definite: it is what percentage heights inside this box resolve
+        // against. An auto height is only known afterwards, and stays
+        // indefinite for the subtree.
+        let v_axis = Axis {
+            edges: dims.padding.top + dims.padding.bottom + dims.border.top + dims.border.bottom,
+            box_sizing: computed.box_sizing,
+        };
+        let specified_height =
+            definite_v(computed.height, containing_height).map(|h| v_axis.content_from(h));
 
         // List marker / tag-driven extras before children.
         let bullet = tag == "li";
@@ -326,6 +360,7 @@ impl<'a> Engine<'a> {
                         child,
                         content_x,
                         content_w,
+                        specified_height,
                         content_y,
                         &mut child_prev_mb,
                         pre,
@@ -376,8 +411,19 @@ impl<'a> Engine<'a> {
             children.push(anon);
         }
 
-        // Empty blocks (div with no content) get zero height — fine.
-        let content_height = (content_y - dims.content.y).max(0);
+        // Used height: the specified one if there is one, else the content's
+        // (an empty div is zero rows), then the min/max clamps. Children keep
+        // the boxes and positions they were given, so a box shorter than its
+        // content lets that content overflow and paint past the bottom edge —
+        // `overflow: visible` is the initial value, and clipping is M9.3.
+        // The flow advances by *this* height, which is what makes `height: 0`
+        // collapse a box whose children still exist.
+        let auto_height = (content_y - dims.content.y).max(0);
+        let content_height = v_axis.clamp(
+            specified_height.unwrap_or(auto_height),
+            definite_v(computed.min_height, containing_height),
+            definite_v(computed.max_height, containing_height),
+        );
         self.boxes[box_id.0 as usize].dimensions.content.height = content_height;
         self.boxes[box_id.0 as usize].children = children;
 
@@ -1248,6 +1294,59 @@ struct Piece {
 }
 
 /// Resolve horizontal box model for a block in a containing block of width `cw`.
+/// One axis of CSS 2.1 §10.4/§10.7 sizing. Width and height share it so the
+/// clamp order and the `box-sizing` arithmetic cannot drift apart between the
+/// two axes — the bug that makes `min-width` and `min-height` disagree.
+#[derive(Clone, Copy)]
+struct Axis {
+    /// Padding + border on this axis, in cells: what `border-box` counts as
+    /// part of the specified size and `content-box` does not.
+    edges: i32,
+    box_sizing: BoxSizing,
+}
+
+impl Axis {
+    /// A specified value (already in cells) as a **content-box** size.
+    /// Degenerate `border-box` boxes — padding and border wider than the
+    /// declared width — floor at zero rather than going negative.
+    fn content_from(self, specified: i32) -> i32 {
+        match self.box_sizing {
+            BoxSizing::ContentBox => specified.max(0),
+            BoxSizing::BorderBox => (specified - self.edges).max(0),
+        }
+    }
+
+    /// CSS 2.1 §10.4: clamp by `max`, then by `min`. The order is the rule —
+    /// applying `min` last is what makes it win a conflict with a smaller
+    /// `max`, which is the behaviour pages rely on.
+    fn clamp(self, size: i32, min: Option<i32>, max: Option<i32>) -> i32 {
+        let mut size = size;
+        if let Some(max) = max {
+            size = size.min(self.content_from(max));
+        }
+        if let Some(min) = min {
+            size = size.max(self.content_from(min));
+        }
+        size.max(0)
+    }
+}
+
+/// A vertical size property as a number layout can use, or `None` for "behave
+/// as `auto`".
+///
+/// A percentage needs a containing block whose height is **definite** — one
+/// whose own used height came from a specified length, transitively. The page
+/// column is not: it scrolls, so its height is whatever the content turns out
+/// to be. That is why `height: 100%` on a top-level element means "as tall as
+/// my content" here and not "as tall as the terminal".
+fn definite_v(len: Length, containing_height: Option<i32>) -> Option<i32> {
+    match len {
+        Length::Auto => None,
+        Length::Percent(_) => containing_height.map(|h| len.to_lines(h)),
+        other => Some(other.to_lines(0)),
+    }
+}
+
 fn resolve_block_dims(computed: &ComputedStyle, containing_width: i32) -> Dimensions {
     let pad = EdgeSizes {
         top: computed.padding.top.to_cells_v(containing_width),
@@ -1287,9 +1386,15 @@ fn resolve_block_dims(computed: &ComputedStyle, containing_width: i32) -> Dimens
     let under =
         |w: i32| w + pad.left + pad.right + border.left + border.right + margin.left + margin.right;
 
-    // Content width.
-    let mut width = if computed.width.is_auto() {
+    // Content width (CSS 2.1 §10.4): the specified width, then max, then min.
+    let axis = Axis {
+        edges: pad.left + pad.right + border.left + border.right,
+        box_sizing: computed.box_sizing,
+    };
+    let tentative = if computed.width.is_auto() {
         // Fill available: content = containing - margin - border - padding.
+        // Already a content-box size whatever `box-sizing` says — `auto` sizes
+        // the margin box to the containing block either way.
         (containing_width
             - margin.left
             - margin.right
@@ -1299,17 +1404,18 @@ fn resolve_block_dims(computed: &ComputedStyle, containing_width: i32) -> Dimens
             - pad.right)
             .max(0)
     } else {
-        computed.width.to_cells_h(containing_width)
+        axis.content_from(computed.width.to_cells_h(containing_width))
     };
+    let resolve_h = |len: Length| (!len.is_auto()).then(|| len.to_cells_h(containing_width));
+    let width = axis.clamp(
+        tentative,
+        resolve_h(computed.min_width),
+        resolve_h(computed.max_width),
+    );
 
-    if !computed.max_width.is_auto() {
-        let max_w = computed.max_width.to_cells_h(containing_width);
-        if width > max_w {
-            width = max_w;
-        }
-    }
-
-    // If width was specified and margins are auto, centre the block.
+    // Auto margins centre against the *final* width, clamps included — an
+    // element narrowed by `max-width` or widened by `min-width` still sits in
+    // the middle of what is left.
     let used = under(width);
     if used < containing_width {
         let free = containing_width - used;

@@ -1,0 +1,24 @@
+<html>  x=0 y=0 w=40 h=5
+  <body>  x=0 y=0 w=40 h=5
+    <div.short>  x=0 y=0 w=40 h=3
+      anonymous  x=0 y=0 w=40 h=4
+        line  x=0 y=0 w=40 h=1
+          #text "one two three four …"  x=0 y=0 w=39 h=1
+        line  x=0 y=1 w=40 h=1
+          #text "nine ten eleven twe…"  x=0 y=1 w=40 h=1
+        line  x=0 y=2 w=40 h=1
+          #text "fifteen sixteen sev…"  x=0 y=2 w=34 h=1
+        line  x=0 y=3 w=40 h=1
+          #text "nineteen twenty twe…"  x=0 y=3 w=35 h=1
+    <div.after>  x=0 y=3 w=40 h=1
+      anonymous  x=0 y=3 w=40 h=1
+        line  x=0 y=3 w=40 h=1
+          #text "after the short box"  x=0 y=3 w=19 h=1
+    <div.zero>  x=0 y=4 w=40 h=0
+      anonymous  x=0 y=4 w=40 h=1
+        line  x=0 y=4 w=40 h=1
+          #text "collapsed but the t…"  x=0 y=4 w=38 h=1
+    <div.last>  x=0 y=4 w=40 h=1
+      anonymous  x=0 y=4 w=40 h=1
+        line  x=0 y=4 w=40 h=1
+          #text "last"  x=0 y=4 w=4 h=1

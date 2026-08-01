@@ -1,0 +1,16 @@
+<!-- width: 40 -->
+<!doctype html>
+<html><head><style>
+body { margin: 0 }
+div { margin: 0 }
+/* min beats a smaller max, on both axes (CSS 2.1 §10.4, §10.7). */
+.wide { width: 80px; min-width: 240px; max-width: 160px }
+.tall { min-height: 80px; max-height: 32px }
+/* max alone still clamps. */
+.capped { width: 320px; max-width: 80px }
+</style></head>
+<body>
+<div class="wide">wide</div>
+<div class="tall">tall</div>
+<div class="capped">capped</div>
+</body></html>

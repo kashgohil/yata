@@ -1,0 +1,26 @@
+# SPEC GOLDEN — hand-written from CSS 2.1 §10.4 plus css-ui `box-sizing`,
+# never regenerated. Both divs are written identically apart from the keyword:
+# width 160px, padding 8px, border 8px.
+#
+# In cells: width 160px = 20 · padding 8px = 1 cell wide, 1 line tall (8/16
+# rounds up, it is not zero) · border 8px = 1 cell wide, 1 line tall.
+# Horizontal edges = border 1 + padding 1 on each side = 4 cells.
+#
+# .bb  border-box: the 20 cells *include* the edges -> content 20 - 4 = 16
+# .cb  content-box: the 20 cells are the content    -> content 20
+#      exactly 4 cells wider, which is the padding+border it stopped counting
+#
+# Content origin is border + padding either way: x = 1 + 1 = 2.
+# Vertically both are 1 line of text inside 1 line of padding inside 1 line of
+# border, so each border box is 5 rows: .bb owns 0..5, .cb starts at 5 and its
+# content sits at 5 + 1 + 1 = 7. Page is 10 rows.
+<html>  x=0 y=0 w=60 h=10
+  <body>  x=0 y=0 w=60 h=10
+    <div.bb>  x=2 y=2 w=16 h=1
+      anonymous  x=2 y=2 w=16 h=1
+        line  x=2 y=2 w=16 h=1
+          #text "bb"  x=2 y=2 w=2 h=1
+    <div.cb>  x=2 y=7 w=20 h=1
+      anonymous  x=2 y=7 w=20 h=1
+        line  x=2 y=7 w=20 h=1
+          #text "cb"  x=2 y=7 w=2 h=1

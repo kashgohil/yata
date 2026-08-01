@@ -1,0 +1,29 @@
+# SPEC GOLDEN — hand-written from CSS 2.1 §10.5, never regenerated.
+#
+# A percentage height needs a containing block with a *definite* height: one
+# whose used height came from a specified length. Otherwise the declaration
+# behaves as `auto`.
+#
+# .definite      height 320px = 20 lines (320/16) -> definite
+# .half            height 50% of 20 = 10 lines
+#                  the parent still measures 20, not the 10 its content used:
+#                  a specified height is the used height
+#
+# .auto-parent   no height -> auto -> indefinite, even though it ends up
+#                being exactly 1 line tall
+# .half-of-auto    height 50% against an indefinite parent -> auto -> its own
+#                  content height, 1 line
+#
+# Rows: .definite owns 0..20, .auto-parent starts at 20 and is 1 line. Page 21.
+<html>  x=0 y=0 w=40 h=21
+  <body>  x=0 y=0 w=40 h=21
+    <div.definite>  x=0 y=0 w=40 h=20
+      <div.half>  x=0 y=0 w=40 h=10
+        anonymous  x=0 y=0 w=40 h=1
+          line  x=0 y=0 w=40 h=1
+            #text "half"  x=0 y=0 w=4 h=1
+    <div.auto-parent>  x=0 y=20 w=40 h=1
+      <div.half-of-auto>  x=0 y=20 w=40 h=1
+        anonymous  x=0 y=20 w=40 h=1
+          line  x=0 y=20 w=40 h=1
+            #text "auto"  x=0 y=20 w=4 h=1

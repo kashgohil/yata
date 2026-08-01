@@ -520,6 +520,75 @@ mod tests {
         assert!(saw_text);
     }
 
+    // ---- M9.2 sizing: the cases a golden cannot show -----------------------
+
+    /// Every rect in the tree, for the invariants that must hold everywhere.
+    fn all_rects(tree: &LayoutTree) -> Vec<Rect> {
+        let mut out = Vec::new();
+        tree.walk(tree.root, &mut |_, b| out.push(b.dimensions.content));
+        out
+    }
+
+    #[test]
+    fn a_border_box_narrower_than_its_own_padding_floors_at_zero() {
+        // 16px = 2 cells of declared width, but padding alone is 2 cells a side
+        // and the border another 1. `border-box` subtracts more than there is;
+        // the answer is an empty content box, not a negative one, and layout
+        // must survive laying text out into it.
+        let (dom, styles) = styled_dom(
+            "<div>squeezed</div>",
+            "div { box-sizing: border-box; width: 16px; padding: 16px; border: 8px solid }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let div = all_rects(&tree)
+            .into_iter()
+            .find(|r| r.x == 3)
+            .expect("the content box sits inside border 1 + padding 2");
+        assert_eq!(div.width, 0, "content width must floor at zero");
+        for r in all_rects(&tree) {
+            assert!(
+                r.width >= 0 && r.height >= 0,
+                "negative rect in the tree: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn content_overflowing_a_short_box_still_rasterises() {
+        // `height: 0` with three lines inside: the box takes no rows in the
+        // flow, but `overflow: visible` means those lines are still on the
+        // page. If the document height only counted the flow, `from_tree`
+        // would drop them (they sit below its last row).
+        let (dom, styles) = styled_dom(
+            "<div class=zero>alpha<br>beta<br>gamma</div>",
+            "div { margin: 0; height: 0 }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let out = plain(&lines_from_tree(&tree));
+        let all = out.join("\n");
+        for word in ["alpha", "beta", "gamma"] {
+            assert!(all.contains(word), "overflowing row lost: {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_specified_height_is_the_used_height_whatever_the_content_does() {
+        // Three lines of content in a 1-line box: the *next* sibling starts on
+        // row 1, not row 3. This is the property flex will depend on.
+        let (dom, styles) = styled_dom(
+            "<div class=short>alpha<br>beta<br>gamma</div><div class=after>after</div>",
+            "div { margin: 0 } .short { height: 1em }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut after_y = None;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text && b.text.as_deref() == Some("after") {
+                after_y = Some(b.dimensions.content.y);
+            }
+        });
+        assert_eq!(after_y, Some(1), "the flow must advance by the used height");
+    }
+
     #[test]
     fn img_attrs_become_cell_size() {
         let dom = html::parse(r#"<img src="a.png" width="80" height="48" alt="pic">"#);

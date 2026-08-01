@@ -1,0 +1,10 @@
+<html>  x=0 y=0 w=40 h=7
+  <body>  x=0 y=0 w=40 h=7
+    <div>  x=2 y=2 w=16 h=3
+      anonymous  x=2 y=2 w=16 h=3
+        line  x=2 y=2 w=16 h=1
+          #text "sized by the"  x=2 y=2 w=12 h=1
+        line  x=2 y=3 w=16 h=1
+          #text "universal"  x=2 y=3 w=9 h=1
+        line  x=2 y=4 w=16 h=1
+          #text "selector"  x=2 y=4 w=8 h=1

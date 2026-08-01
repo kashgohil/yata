@@ -1,0 +1,12 @@
+<html>  x=0 y=0 w=40 h=3
+  <body>  x=0 y=0 w=40 h=3
+    <div.narrowed>  x=10 y=0 w=20 h=2
+      anonymous  x=10 y=0 w=20 h=2
+        line  x=10 y=0 w=20 h=1
+          #text "narrowed then"  x=10 y=0 w=13 h=1
+        line  x=10 y=1 w=20 h=1
+          #text "centred"  x=10 y=1 w=7 h=1
+    <div.widened>  x=5 y=2 w=30 h=1
+      anonymous  x=5 y=2 w=30 h=1
+        line  x=5 y=2 w=30 h=1
+          #text "widened then centred"  x=5 y=2 w=20 h=1
