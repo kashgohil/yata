@@ -9,6 +9,7 @@ mod clip;
 mod dimensions;
 mod engine;
 mod hit;
+mod intrinsic;
 mod lines;
 
 pub use boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
@@ -19,6 +20,7 @@ pub use hit::{
     LinkHit, collect_links, dom_links, first_y, hit_test, is_under, link_at, nearest_link,
     visible_links,
 };
+pub use intrinsic::IntrinsicSizer;
 
 use crate::dom::Dom;
 use crate::image::ImageContext;

@@ -1235,7 +1235,7 @@ impl<'a> Engine<'a> {
 }
 
 /// Horizontal length → cells; `auto` is zero for margin edges.
-fn edge_h(len: crate::style::values::Length, containing_width: i32) -> i32 {
+pub(super) fn edge_h(len: crate::style::values::Length, containing_width: i32) -> i32 {
     if len.is_auto() {
         0
     } else {
@@ -1308,18 +1308,18 @@ struct Piece {
 /// clamp order and the `box-sizing` arithmetic cannot drift apart between the
 /// two axes — the bug that makes `min-width` and `min-height` disagree.
 #[derive(Clone, Copy)]
-struct Axis {
+pub(super) struct Axis {
     /// Padding + border on this axis, in cells: what `border-box` counts as
     /// part of the specified size and `content-box` does not.
-    edges: i32,
-    box_sizing: BoxSizing,
+    pub(super) edges: i32,
+    pub(super) box_sizing: BoxSizing,
 }
 
 impl Axis {
     /// A specified value (already in cells) as a **content-box** size.
     /// Degenerate `border-box` boxes — padding and border wider than the
     /// declared width — floor at zero rather than going negative.
-    fn content_from(self, specified: i32) -> i32 {
+    pub(super) fn content_from(self, specified: i32) -> i32 {
         match self.box_sizing {
             BoxSizing::ContentBox => specified.max(0),
             BoxSizing::BorderBox => (specified - self.edges).max(0),
@@ -1329,7 +1329,7 @@ impl Axis {
     /// CSS 2.1 §10.4: clamp by `max`, then by `min`. The order is the rule —
     /// applying `min` last is what makes it win a conflict with a smaller
     /// `max`, which is the behaviour pages rely on.
-    fn clamp(self, size: i32, min: Option<i32>, max: Option<i32>) -> i32 {
+    pub(super) fn clamp(self, size: i32, min: Option<i32>, max: Option<i32>) -> i32 {
         let mut size = size;
         if let Some(max) = max {
             size = size.min(self.content_from(max));
@@ -1491,6 +1491,14 @@ pub fn term_color(color: crate::style::values::ColorValue) -> Color {
     }
 }
 
-fn is_html_space(c: char) -> bool {
+/// Where a line may be broken: HTML whitespace, and nothing else.
+///
+/// The line breaker splits text runs on this predicate, so it is also what
+/// decides a run's break opportunities — which is why intrinsic sizing (M9.4)
+/// measures with it rather than its own idea of whitespace. If the two
+/// disagreed, a flex item's min-content width would be a width its own text
+/// cannot actually wrap into, and the boxes flex computes would not match what
+/// gets painted.
+pub(super) fn is_html_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
 }
