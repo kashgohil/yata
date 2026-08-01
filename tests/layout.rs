@@ -152,10 +152,22 @@ fn check_golden(
         return Ok(outcome);
     }
     match expected {
-        None => Err(format!(
-            "missing golden {}\n  create it with: {REGENERATE}",
-            golden_path.display()
-        )),
+        // A spec golden is written by hand, so pointing at the regeneration
+        // command would send the reader to a command that refuses to write it.
+        None => Err(match tier {
+            Tier::Regression => format!(
+                "missing golden {}\n  create it with: {REGENERATE}",
+                golden_path.display()
+            ),
+            // Deliberately not printing today's output next to this message:
+            // a spec golden pasted from the dump is the one thing this tier
+            // exists to prevent.
+            Tier::Spec => format!(
+                "missing spec golden {}\n  write it by hand from the CSS — \
+                 regeneration will not create it",
+                golden_path.display()
+            ),
+        }),
         Some(e) if e == got => Ok(Outcome::Unchanged),
         Some(e) => Err(describe_mismatch(golden_path, tier, e, got)),
     }

@@ -406,13 +406,25 @@ pub fn parse_length(value: &str) -> Option<Length> {
     None
 }
 
-/// `width` / `max-width`. Same tokens as a length; `none` on max-width is Auto.
+/// The sizing properties: `width`/`height` and their `min-`/`max-` clamps.
+/// Same tokens as a length, plus `none` (how a page spells "no clamp") for
+/// `Auto`.
+///
+/// Negative values are **invalid**, not zero: CSS 2.1 §10 gives these
+/// properties a non-negative range, so `height: -1px` is a dropped
+/// declaration and the previous winner stands. Resolving it to zero instead
+/// would collapse the box — a page's typo would erase its own content.
+/// (`margin` is different: negative margins are legal CSS, and `parse_edges`
+/// keeps taking them.)
 pub fn parse_width(value: &str) -> Option<Length> {
     let value = value.trim();
     if value.eq_ignore_ascii_case("none") {
         return Some(Length::Auto);
     }
-    parse_length(value)
+    match parse_length(value)? {
+        Length::Px(n) | Length::Em(n) | Length::Percent(n) if n < 0.0 => None,
+        len => Some(len),
+    }
 }
 
 /// 1–4 value box shorthand (`margin`, `padding`, `border-width`).
@@ -552,6 +564,14 @@ mod tests {
         assert_eq!(parse_length("10vh"), None);
         assert_eq!(parse_width("none"), Some(Length::Auto));
         assert_eq!(parse_width("90%"), Some(Length::Percent(90.0)));
+        // Negative sizes are invalid (CSS 2.1 §10), so the declaration drops
+        // and whatever won before still stands. Zero would collapse the box.
+        assert_eq!(parse_width("-1px"), None);
+        assert_eq!(parse_width("-2em"), None);
+        assert_eq!(parse_width("-50%"), None);
+        assert_eq!(parse_width("0"), Some(Length::Zero));
+        // Margins keep taking negatives — those are legal CSS.
+        assert_eq!(parse_length("-1px"), Some(Length::Px(-1.0)));
     }
 
     #[test]

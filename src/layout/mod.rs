@@ -66,18 +66,36 @@ pub fn layout_document_readable(
     images: &ImageContext,
 ) -> (LayoutTree, bool) {
     let tree = layout_tree_with(dom, styles, width, Hidden::Respect, images);
-    if lines::from_tree(&tree).iter().any(|l| !l.spans.is_empty()) {
+    if has_visible_content(&tree) {
         return (tree, false);
     }
     let revealed = layout_tree_with(dom, styles, width, Hidden::Reveal, images);
-    if lines::from_tree(&revealed)
-        .iter()
-        .any(|l| !l.spans.is_empty())
-    {
+    if has_visible_content(&revealed) {
         (revealed, true)
     } else {
         (tree, false)
     }
+}
+
+/// Does this tree put anything on screen? The reveal fallback's question,
+/// asked of the boxes rather than of a rasterised copy of them: a caller that
+/// wants the lines builds them once afterwards, and one that only wants the
+/// tree (`F3`, `--dump-boxes`, the layout goldens) never builds them at all.
+fn has_visible_content(tree: &LayoutTree) -> bool {
+    // A tree with no rows cannot show anything, whatever boxes it holds —
+    // `lines::from_tree` says the same by returning nothing.
+    if tree.height <= 0 {
+        return false;
+    }
+    let mut visible = false;
+    tree.walk(tree.root, &mut |_, b| {
+        visible |= match b.kind {
+            BoxKind::Text => b.text.as_deref().is_some_and(|t| !t.is_empty()),
+            BoxKind::Image => true,
+            _ => false,
+        };
+    });
+    visible
 }
 
 /// Lay the document out at `width` cells and return display lines.
@@ -503,6 +521,46 @@ mod tests {
             "{:?}",
             plain(&lines)
         );
+    }
+
+    #[test]
+    fn a_page_of_only_images_counts_as_readable() {
+        // The reveal fallback asks "does this tree show anything?". A page
+        // whose whole body is one image has no text box at all — answering
+        // from text alone would declare it blank and then "reveal" a page
+        // that was never hidden.
+        let dom = html::parse(r#"<body><img src="a.png" width="80" height="48" alt=""></body>"#);
+        let styles = style::style_tree(&dom, &[]);
+        let imgs = crate::image::discover(&dom, Some("https://ex/"));
+        let mut cache = crate::image::ImageCache::default();
+        let ctx = crate::image::ImageContext::from_discovery(&imgs, &mut cache);
+        let (_tree, revealed) = layout_document_readable(&dom, &styles, 40, &ctx);
+        assert!(!revealed, "an image-only page is not a blank page");
+    }
+
+    #[test]
+    fn a_negative_height_is_ignored_not_a_collapsed_box() {
+        // CSS 2.1 §10: the sizing properties are non-negative, so `-50px` is
+        // an invalid declaration. Resolving it to zero instead would let a
+        // page's typo erase its own content.
+        let (dom, styles) = styled_dom(
+            "<div>visible text</div>",
+            "div { margin: 0; height: -50px; width: -10px }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let out = plain(&lines_from_tree(&tree));
+        assert!(
+            out.iter().any(|l| l.contains("visible text")),
+            "content vanished: {out:?}"
+        );
+        let div = tree
+            .get(tree.root)
+            .children
+            .first()
+            .map(|&c| tree.get(c).dimensions.content)
+            .expect("the div must still generate a box");
+        assert_eq!(div.height, 1, "height fell back to content height");
+        assert_eq!(div.width, 40, "width fell back to auto");
     }
 
     #[test]
