@@ -1,0 +1,14 @@
+<html>  x=0 y=0 w=30 h=3
+  <body …>  x=0 y=0 w=30 h=3
+    <p …>  x=0 y=0 w=30 h=1
+      anonymous  x=0 y=0 w=30 h=1
+        line  x=0 y=0 w=30 h=1
+          #text "centred"  x=11 y=0 w=7 h=1
+    <p …>  x=0 y=1 w=30 h=1
+      anonymous  x=0 y=1 w=30 h=1
+        line  x=0 y=1 w=30 h=1
+          #text "right edge"  x=20 y=1 w=10 h=1
+    <p …>  x=0 y=2 w=30 h=1
+      anonymous  x=0 y=2 w=30 h=1
+        line  x=0 y=2 w=30 h=1
+          #text "left"  x=0 y=2 w=4 h=1

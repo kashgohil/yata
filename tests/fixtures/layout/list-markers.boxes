@@ -1,0 +1,22 @@
+<html>  x=0 y=0 w=40 h=8
+  <body …>  x=0 y=0 w=40 h=8
+    <ul>  x=4 y=0 w=36 h=3
+      <li>  x=4 y=0 w=36 h=1
+        anonymous  x=4 y=0 w=36 h=1
+          line  x=4 y=0 w=36 h=1
+            #text "• first item"  x=4 y=0 w=12 h=1
+      <li>  x=4 y=1 w=36 h=2
+        anonymous  x=4 y=1 w=36 h=2
+          line  x=4 y=1 w=36 h=1
+            #text "• second item that …"  x=4 y=1 w=36 h=1
+          line  x=4 y=2 w=36 h=1
+            #text "wrap onto another l…"  x=4 y=2 w=22 h=1
+    <ol>  x=4 y=5 w=36 h=2
+      <li>  x=4 y=5 w=36 h=1
+        anonymous  x=4 y=5 w=36 h=1
+          line  x=4 y=5 w=36 h=1
+            #text "• one"  x=4 y=5 w=5 h=1
+      <li>  x=4 y=6 w=36 h=1
+        anonymous  x=4 y=6 w=36 h=1
+          line  x=4 y=6 w=36 h=1
+            #text "• two"  x=4 y=6 w=5 h=1

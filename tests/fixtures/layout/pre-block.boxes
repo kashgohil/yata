@@ -1,0 +1,14 @@
+<html>  x=0 y=0 w=40 h=5
+  <body …>  x=0 y=0 w=40 h=5
+    <pre>  x=0 y=0 w=40 h=3
+      anonymous  x=0 y=0 w=40 h=3
+        line  x=0 y=0 w=40 h=1
+          #text "fn main() {"  x=0 y=0 w=11 h=1
+        line  x=0 y=1 w=40 h=1
+          #text "println!("two space…"  x=0 y=1 w=35 h=1
+        line  x=0 y=2 w=40 h=1
+          #text "}"  x=0 y=2 w=1 h=1
+    <p …>  x=0 y=4 w=40 h=1
+      anonymous  x=0 y=4 w=40 h=1
+        line  x=0 y=4 w=40 h=1
+          #text "after"  x=0 y=4 w=5 h=1

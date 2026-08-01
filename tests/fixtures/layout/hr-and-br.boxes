@@ -1,0 +1,16 @@
+<html>  x=0 y=0 w=30 h=7
+  <body …>  x=0 y=0 w=30 h=7
+    <p …>  x=0 y=0 w=30 h=3
+      anonymous  x=0 y=0 w=30 h=1
+        line  x=0 y=0 w=30 h=1
+          #text "one"  x=0 y=0 w=3 h=1
+      line  x=0 y=1 w=30 h=1
+      anonymous  x=0 y=2 w=30 h=1
+        line  x=0 y=2 w=30 h=1
+          #text "two"  x=0 y=2 w=3 h=1
+    Block  x=0 y=4 w=30 h=1
+      #text "───────────────────…"  x=0 y=4 w=30 h=1
+    <p …>  x=0 y=6 w=30 h=1
+      anonymous  x=0 y=6 w=30 h=1
+        line  x=0 y=6 w=30 h=1
+          #text "after the rule"  x=0 y=6 w=14 h=1

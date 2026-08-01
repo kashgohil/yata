@@ -1,0 +1,23 @@
+# SPEC GOLDEN — hand-written from the text, never regenerated.
+#
+# Greedy line breaking at 24 cells. Widths are cells (unicode-width), one word
+# at a time, plus the space that joins it to the line:
+#
+#   "the quick brown fox"    3+1+5+1+5+1+3 = 19   + " jumps" = 25 > 24, break
+#   "jumps over the lazy dog"              = 23   + " and"   = 27 > 24, break
+#   "and keeps running"      3+1+5+1+7     = 17   end of text
+#
+# So: 3 lines, and the paragraph is 3 lines tall. Each line box spans the full
+# 24-cell content width; the text run inside it is only as wide as its words.
+# `#text` labels are clipped to 20 cells by the box dump — that is the dump's
+# formatting, the width on the same line is the assertion.
+<html>  x=0 y=0 w=24 h=3
+  <body>  x=0 y=0 w=24 h=3
+    <p>  x=0 y=0 w=24 h=3
+      anonymous  x=0 y=0 w=24 h=3
+        line  x=0 y=0 w=24 h=1
+          #text "the quick brown fox"  x=0 y=0 w=19 h=1
+        line  x=0 y=1 w=24 h=1
+          #text "jumps over the lazy…"  x=0 y=1 w=23 h=1
+        line  x=0 y=2 w=24 h=1
+          #text "and keeps running"  x=0 y=2 w=17 h=1

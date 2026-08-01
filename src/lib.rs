@@ -7,6 +7,7 @@
 pub mod browser;
 pub mod css;
 pub mod dom;
+pub mod headless;
 pub mod html;
 pub mod image;
 pub mod layout;

@@ -1,0 +1,10 @@
+<html>  x=0 y=0 w=24 h=3
+  <body …>  x=0 y=0 w=24 h=3
+    <p …>  x=0 y=0 w=24 h=3
+      anonymous  x=0 y=0 w=24 h=3
+        line  x=0 y=0 w=24 h=1
+          #text "the quick brown fox"  x=0 y=0 w=19 h=1
+        line  x=0 y=1 w=24 h=1
+          #text "jumps over the lazy…"  x=0 y=1 w=23 h=1
+        line  x=0 y=2 w=24 h=1
+          #text "and keeps running"  x=0 y=2 w=17 h=1

@@ -1,0 +1,18 @@
+<html>  x=0 y=0 w=40 h=9
+  <body …>  x=0 y=0 w=40 h=9
+    <p …>  x=0 y=0 w=40 h=1
+      anonymous  x=0 y=0 w=40 h=1
+        line  x=0 y=0 w=40 h=1
+          #text "first"  x=0 y=0 w=5 h=1
+    <p …>  x=0 y=3 w=40 h=1
+      anonymous  x=0 y=3 w=40 h=1
+        line  x=0 y=3 w=40 h=1
+          #text "second"  x=0 y=3 w=6 h=1
+    <div …>  x=0 y=5 w=40 h=1
+      anonymous  x=0 y=5 w=40 h=1
+        line  x=0 y=5 w=40 h=1
+          #text "tight"  x=0 y=5 w=5 h=1
+    <div …>  x=0 y=8 w=40 h=1
+      anonymous  x=0 y=8 w=40 h=1
+        line  x=0 y=8 w=40 h=1
+          #text "after a big gap"  x=0 y=8 w=15 h=1

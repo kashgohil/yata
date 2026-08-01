@@ -1,0 +1,26 @@
+# SPEC GOLDEN — hand-written from the CSS, never regenerated.
+#
+# Cell mapping (PLAN.md §4): 8px = 1 cell wide, 16px = 1 line tall; a nonzero
+# length rounds up to at least one cell, so an 8px border is 1 line tall.
+#
+# .outer  width 240px         -> content 30 cells
+#         border 8px          -> 1 cell left/right, 1 line top/bottom
+#         padding 16px        -> 2 cells left/right, 1 line top/bottom
+#   content origin = (border 1 + padding 2, border 1 + padding 1) = (3, 2)
+#
+# .inner  width 80px          -> content 10 cells
+#         padding 8px         -> 1 cell left/right, 1 line top/bottom (8/16
+#                                rounds up, it is not zero)
+#   content origin = (3 + 1, 2 + 1) = (4, 3)
+#   "inner" is 5 cells, fits in 10 -> 1 line tall
+#
+# heights, inside out: .inner content 1 + padding 2       = 3 border-box
+#                      .outer content 3 + padding 2 + border 2 = 7 border-box
+#                      body/html content                  = 7
+<html>  x=0 y=0 w=40 h=7
+  <body>  x=0 y=0 w=40 h=7
+    <div.outer>  x=3 y=2 w=30 h=3
+      <div.inner>  x=4 y=3 w=10 h=1
+        anonymous  x=4 y=3 w=10 h=1
+          line  x=4 y=3 w=10 h=1
+            #text "inner"  x=4 y=3 w=5 h=1

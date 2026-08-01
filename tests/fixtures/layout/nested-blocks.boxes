@@ -1,0 +1,7 @@
+<html>  x=0 y=0 w=40 h=7
+  <body …>  x=0 y=0 w=40 h=7
+    <div …>  x=3 y=2 w=30 h=3
+      <div …>  x=4 y=3 w=10 h=1
+        anonymous  x=4 y=3 w=10 h=1
+          line  x=4 y=3 w=10 h=1
+            #text "inner"  x=4 y=3 w=5 h=1

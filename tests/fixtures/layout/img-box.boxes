@@ -1,0 +1,15 @@
+<html>  x=0 y=0 w=40 h=10
+  <body …>  x=0 y=0 w=40 h=10
+    <p …>  x=0 y=0 w=40 h=4
+      anonymous  x=0 y=0 w=40 h=4
+        img "sized" https://fixture.test/sized.png  x=0 y=0 w=10 h=4
+    <p …>  x=0 y=4 w=40 h=3
+      anonymous  x=0 y=4 w=40 h=3
+        img "no size yet" https://fixture.test/unknown.png  x=0 y=4 w=20 h=3
+    <p …>  x=0 y=7 w=40 h=3
+      anonymous  x=0 y=7 w=40 h=3
+        line  x=0 y=7 w=40 h=1
+          #text "text"  x=0 y=7 w=4 h=1
+        img "tiny" https://fixture.test/inline.png  x=0 y=8 w=2 h=1
+        line  x=0 y=9 w=40 h=1
+          #text "after"  x=0 y=9 w=5 h=1

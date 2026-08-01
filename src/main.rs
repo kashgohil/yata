@@ -18,6 +18,7 @@ fn main() -> io::Result<()> {
     let dump = args.iter().any(|a| a == "--dump");
     let dump_dom = args.iter().any(|a| a == "--dump-dom");
     let dump_text = args.iter().any(|a| a == "--dump-text");
+    let dump_boxes = args.iter().any(|a| a == "--dump-boxes");
     let timing = args.iter().any(|a| a == "--timing");
     // `yata <url>`: the first non-flag argument (`--panic` etc. are flags,
     // not URLs). In the TUI, no argument → no fetch, blank page.
@@ -27,8 +28,8 @@ fn main() -> io::Result<()> {
     // `Screen::new`, raw mode, or the input thread exist. `--dump`'s stdout
     // carries body bytes and nothing else, so piping to a file is byte-exact.
     // Exit codes are part of the spec: 0 success · 1 fetch failure · 2 usage.
-    if dump || dump_dom || dump_text || timing {
-        if [dump, dump_dom, dump_text, timing]
+    if dump || dump_dom || dump_text || dump_boxes || timing {
+        if [dump, dump_dom, dump_text, dump_boxes, timing]
             .into_iter()
             .filter(|&f| f)
             .count()
@@ -45,6 +46,8 @@ fn main() -> io::Result<()> {
             run_dump_dom(&url)
         } else if dump_text {
             run_dump_text(&url)
+        } else if dump_boxes {
+            run_dump_boxes(&url)
         } else {
             run_timing(&url)
         });
@@ -125,7 +128,7 @@ fn main() -> io::Result<()> {
 
 /// The one usage line. Returns the usage exit code for `main` to exit with.
 fn usage() -> i32 {
-    eprintln!("usage: yata [--dump | --dump-dom | --dump-text | --timing] <url>");
+    eprintln!("usage: yata [--dump | --dump-dom | --dump-text | --dump-boxes | --timing] <url>");
     2
 }
 
@@ -242,6 +245,37 @@ fn run_dump_text(url: &str) -> i32 {
                 }
                 text.push('\n');
             }
+            let mut out = io::stdout();
+            if out
+                .write_all(text.as_bytes())
+                .and_then(|()| out.flush())
+                .is_err()
+            {
+                return 1;
+            }
+            0
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            1
+        }
+    }
+}
+
+/// `--dump-boxes`: the layout stage's box tree on stdout — exactly the lines
+/// `F3` shows, at the fixed `DUMP_TEXT_WIDTH` column so the output is the same
+/// everywhere. This is the hook `tests/layout.rs` goldens are read against, so
+/// the flag, the inspector and the harness all print through one function
+/// (`inspector::box_lines`): a divergence between them would make the goldens
+/// pin something no one can see on screen.
+fn run_dump_boxes(url: &str) -> i32 {
+    let rx = headless_fetch(url);
+    let loaded = recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p)));
+    match loaded {
+        Ok(((final_url, ..), (dom, _))) => {
+            // Relative `src` resolves against the URL the body actually came
+            // from (redirects included), like the TUI's discovery does.
+            let text = yata::headless::box_dump(&dom, Some(&final_url), DUMP_TEXT_WIDTH);
             let mut out = io::stdout();
             if out
                 .write_all(text.as_bytes())

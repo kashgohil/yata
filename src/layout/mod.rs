@@ -49,17 +49,34 @@ pub fn layout_readable_with(
     width: u16,
     images: &ImageContext,
 ) -> (Vec<Line>, bool) {
+    let (tree, revealed) = layout_document_readable(dom, styles, width, images);
+    (lines::from_tree(&tree), revealed)
+}
+
+/// The box tree behind [`layout_readable_with`]: the `Hidden::Respect` tree,
+/// or the revealed one when respecting `display:none` leaves nothing to read.
+/// The `bool` is "this page hid itself and we overrode it".
+///
+/// The tree, not the lines, is what `F3` and `--dump-boxes` show, so both go
+/// through here rather than re-deciding which of the two trees is the page.
+pub fn layout_document_readable(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    images: &ImageContext,
+) -> (LayoutTree, bool) {
     let tree = layout_tree_with(dom, styles, width, Hidden::Respect, images);
-    let lines = lines::from_tree(&tree);
-    if lines.iter().any(|line| !line.spans.is_empty()) {
-        return (lines, false);
+    if lines::from_tree(&tree).iter().any(|l| !l.spans.is_empty()) {
+        return (tree, false);
     }
     let revealed = layout_tree_with(dom, styles, width, Hidden::Reveal, images);
-    let revealed_lines = lines::from_tree(&revealed);
-    if revealed_lines.iter().any(|line| !line.spans.is_empty()) {
-        (revealed_lines, true)
+    if lines::from_tree(&revealed)
+        .iter()
+        .any(|l| !l.spans.is_empty())
+    {
+        (revealed, true)
     } else {
-        (lines, false)
+        (tree, false)
     }
 }
 

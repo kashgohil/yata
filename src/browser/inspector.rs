@@ -197,7 +197,8 @@ fn edges_summary(name: &str, edges: &Edges) -> Option<String> {
 
 /// The `F3` view: every layout box with its content-box x, y, width, height,
 /// indented like the tree. Line and anonymous boxes are labeled; element boxes
-/// use the same CSS-flavored summary as F1/F2.
+/// use the same CSS-flavored summary as F1/F2. Empty anonymous blocks (the
+/// whitespace between block tags) are left out — see [`push_box`].
 pub fn box_lines(dom: &Dom, tree: &LayoutTree) -> Vec<String> {
     let mut out = Vec::new();
     push_box(dom, tree, tree.root, 0, &mut out);
@@ -206,6 +207,18 @@ pub fn box_lines(dom: &Dom, tree: &LayoutTree) -> Vec<String> {
 
 fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec<String>) {
     let b = tree.get(id);
+    // An anonymous block with no children and no height is what the whitespace
+    // between two block tags lays out to: it holds nothing and paints nothing,
+    // and on a real page there is one of them per source newline. Showing them
+    // buries the boxes someone opened F3 to find — the same reason F1 hides
+    // whitespace-only text nodes. Anonymous boxes that *contain* something
+    // stay: those are real structure.
+    if b.kind == BoxKind::AnonymousBlock
+        && b.children.is_empty()
+        && b.dimensions.content.height == 0
+    {
+        return;
+    }
     // Skip the synthetic document root — it is only a container.
     let skip_label = b.kind == BoxKind::Block && b.node == Some(dom.root);
     if !skip_label {
@@ -524,6 +537,28 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("#text") && l.contains("hi")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn empty_anonymous_boxes_are_hidden_but_filled_ones_stay() {
+        // The newlines between these block tags each lay out to an empty
+        // anonymous block. They are noise; the anonymous block wrapping the
+        // paragraph's text is structure.
+        let dom = parse("<div>a</div>\n<div>b</div>\n");
+        let styles = crate::style::style_tree(&dom, &[]);
+        let tree =
+            crate::layout::layout_document(&dom, &styles, 40, crate::layout::Hidden::Respect);
+        let lines = box_lines(&dom, &tree);
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("anonymous") && l.contains("h=0")),
+            "empty anonymous boxes leaked into F3: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("anonymous")),
+            "the anonymous block holding inline content must stay: {lines:?}"
         );
     }
 }

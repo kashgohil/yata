@@ -234,11 +234,53 @@ fn timing_against_a_closed_port_reports_the_reason_and_exits_1() {
 }
 
 #[test]
+fn dump_boxes_prints_the_box_tree_to_stdout() {
+    // The layout stage's headless hook (M9.1): one line per box with its
+    // geometry, indented like the tree — the same text F3 shows and the same
+    // text `tests/layout.rs` compares its goldens against.
+    let body = r#"<body style="margin: 0"><p style="margin: 0">hi</p>
+<img src="pic.png" width="80" height="64" alt="cat"></body>"#;
+    let addr = serve_once(response_with_body("200 OK", body.as_bytes()));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.starts_with("<html>  x=0 y=0 w=80"),
+        "the dump must start at the root box, at the fixed 80-cell column:\n{text}"
+    );
+    assert!(
+        text.contains(r#"#text "hi"  x=0 y=0 w=2 h=1"#),
+        "no text box with geometry:\n{text}"
+    );
+    // Images are discovered headlessly, so the dump shows the boxes the screen
+    // shows: 80px/8 = 10 cells wide, 64px/16 = 4 lines tall.
+    assert!(
+        text.contains(r#"img "cat" http://"#) && text.contains("w=10 h=4"),
+        "no image box:\n{text}"
+    );
+    assert!(
+        !text.contains('\u{1b}'),
+        "an escape reached stdout:\n{text}"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn a_headless_flag_without_a_url_is_a_usage_error() {
     for flags in [
         &["--dump"][..],
         &["--dump-dom"][..],
         &["--dump-text"][..],
+        &["--dump-boxes"][..],
         &["--timing"][..],
     ] {
         let out = yata(flags);
@@ -264,6 +306,8 @@ fn two_headless_flags_together_is_a_usage_error() {
         ["--dump", "--dump-text"],
         ["--dump-dom", "--dump-text"],
         ["--dump-text", "--timing"],
+        ["--dump-boxes", "--dump-text"],
+        ["--dump-boxes", "--timing"],
     ] {
         let out = yata(&[flags[0], flags[1], "http://127.0.0.1:9/"]);
         assert_eq!(out.status.code(), Some(2), "flags: {flags:?}");
