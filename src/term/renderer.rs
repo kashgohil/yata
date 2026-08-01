@@ -13,13 +13,39 @@ const INVALID: char = '\u{1}';
 #[derive(Clone, Copy, Debug)]
 pub struct Caps {
     pub truecolor: bool,
+    /// Kitty graphics protocol (M8). Env heuristic only — no blocking query.
+    pub kitty: bool,
 }
 
-/// Capability detection as a pure function of the env value, so it's testable.
-/// Call as `detect_caps(std::env::var("COLORTERM").ok().as_deref())`.
+/// Capability detection as a pure function of env values, so it's testable.
+/// Call as `detect_caps(std::env::var("COLORTERM").ok().as_deref())` for the
+/// colour half; prefer [`detect_caps_from_env`] at process start.
 pub fn detect_caps(colorterm: Option<&str>) -> Caps {
+    detect_caps_env(colorterm, None, None, None)
+}
+
+/// Full env-based capability detection (truecolor + Kitty).
+pub fn detect_caps_from_env() -> Caps {
+    detect_caps_env(
+        std::env::var("COLORTERM").ok().as_deref(),
+        std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+    )
+}
+
+pub fn detect_caps_env(
+    colorterm: Option<&str>,
+    kitty_window_id: Option<&str>,
+    term: Option<&str>,
+    term_program: Option<&str>,
+) -> Caps {
+    let kitty = kitty_window_id.is_some()
+        || term.is_some_and(|t| t.to_ascii_lowercase().contains("kitty"))
+        || term_program.is_some_and(|t| t.eq_ignore_ascii_case("kitty"));
     Caps {
         truecolor: matches!(colorterm, Some("truecolor") | Some("24bit")),
+        kitty,
     }
 }
 
@@ -180,7 +206,10 @@ fn nearest_ansi256(r: u8, g: u8, b: u8) -> u8 {
 mod tests {
     use super::*;
 
-    const TRUE: Caps = Caps { truecolor: true };
+    const TRUE: Caps = Caps {
+        truecolor: true,
+        kitty: false,
+    };
 
     fn present(r: &mut Renderer) -> String {
         let mut out = Vec::new();
@@ -281,7 +310,14 @@ mod tests {
 
     #[test]
     fn rgb_degrades_to_nearest_ansi256() {
-        let mut r = Renderer::new(2, 1, Caps { truecolor: false });
+        let mut r = Renderer::new(
+            2,
+            1,
+            Caps {
+                truecolor: false,
+                kitty: false,
+            },
+        );
         let style = Style {
             fg: Color::Rgb(255, 0, 0),
             bg: Color::Ansi(17),
