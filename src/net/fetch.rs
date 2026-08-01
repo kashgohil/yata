@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::css;
 use crate::html;
+use crate::image;
 use crate::msg::Msg;
 use crate::net::FetchId;
 
@@ -117,6 +118,20 @@ pub fn spawn_stylesheet(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) 
             _ => None,
         };
         let _ = tx.send(Msg::Stylesheet { id, slot, sheet });
+    });
+}
+
+/// Fetch and decode one `<img>` on a detached worker (M8). One `Msg::Image`
+/// goes out — success or soft failure. Never an error page: a broken image is
+/// a degraded page, not a navigation failure.
+pub fn spawn_image(id: FetchId, url: String, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let result = match get(&url) {
+            Ok((status, body)) if (200..300).contains(&status) => image::decode(&body),
+            Ok((status, _)) => Err(format!("HTTP {status}")),
+            Err(e) => Err(e),
+        };
+        let _ = tx.send(Msg::Image { id, url, result });
     });
 }
 

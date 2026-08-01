@@ -4,6 +4,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 
 use crate::css::Stylesheet;
 use crate::dom::Dom;
+use crate::image::DecodedImage;
 use crate::net::FetchId;
 
 /// Everything the UI thread reacts to arrives as one of these over the single
@@ -64,5 +65,13 @@ pub enum Msg {
         id: FetchId,
         url: String,
         reason: String,
+    },
+    /// One `<img>` decode finished (or failed). Soft failure: a broken image
+    /// never becomes an error page. `id` is the page generation that requested
+    /// the fetch so a late arrival after navigation is ignored.
+    Image {
+        id: FetchId,
+        url: String,
+        result: Result<DecodedImage, String>,
     },
 }

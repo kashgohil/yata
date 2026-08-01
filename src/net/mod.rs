@@ -1,6 +1,6 @@
 mod fetch;
 
-pub use fetch::{is_document, spawn_fetch, spawn_stylesheet};
+pub use fetch::{is_document, spawn_fetch, spawn_image, spawn_stylesheet};
 
 /// Default a bare URL to `https://`. The single place scheme defaulting lives,
 /// applied to both the CLI argument and URL-bar input before either reaches the

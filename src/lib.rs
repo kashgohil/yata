@@ -8,6 +8,7 @@ pub mod browser;
 pub mod css;
 pub mod dom;
 pub mod html;
+pub mod image;
 pub mod layout;
 pub mod msg;
 pub mod net;
