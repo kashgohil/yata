@@ -29,6 +29,8 @@ pub enum BoxKind {
     /// An inline-level element that contributed no text of its own (used so
     /// F3 / hit-testing can still name the element). Rarely painted alone.
     Inline,
+    /// Replaced `<img>`: fixed cell rectangle, painted as half-blocks / Kitty.
+    Image,
 }
 
 /// One node of the layout tree.
@@ -41,12 +43,17 @@ pub struct LayoutBox {
     pub dimensions: Dimensions,
     pub children: Vec<BoxId>,
     /// For `BoxKind::Text`: the characters drawn in this fragment.
+    /// For `BoxKind::Image`: alt text (placeholder / dump-text).
     pub text: Option<String>,
     /// Terminal style for text fragments (cascade → attrs + colour).
     pub term_style: Style,
     /// Computed style for the generating element — backgrounds, borders, and
     /// F3. Anonymous/line/text boxes carry `Default`.
     pub computed: ComputedStyle,
+    /// Absolute image URL for `BoxKind::Image` (paint looks up pixels).
+    pub image_src: Option<String>,
+    /// When true, a late decode must not force relayout (attrs or known size).
+    pub image_size_firm: bool,
 }
 
 /// The laid-out page: an arena of boxes plus the root and the content height.

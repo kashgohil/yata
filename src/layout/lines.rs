@@ -6,7 +6,7 @@
 
 use crate::layout::boxes::{BoxKind, LayoutTree};
 use crate::layout::{Line, Span};
-use crate::term::Style;
+use crate::term::{Color, Style};
 use unicode_width::UnicodeWidthStr;
 
 /// Flatten text boxes into rows. Empty rows (pure vertical margin) become empty
@@ -19,20 +19,41 @@ pub fn from_tree(tree: &LayoutTree) -> Vec<Line> {
     let mut rows: Vec<Vec<(i32, String, Style)>> = vec![Vec::new(); height];
 
     tree.walk(tree.root, &mut |_id, b| {
-        if b.kind != BoxKind::Text {
-            return;
+        match b.kind {
+            BoxKind::Text => {
+                let Some(text) = b.text.as_ref() else {
+                    return;
+                };
+                if text.is_empty() {
+                    return;
+                }
+                let y = b.dimensions.content.y;
+                if y < 0 || y as usize >= height {
+                    return;
+                }
+                rows[y as usize].push((b.dimensions.content.x, text.clone(), b.term_style));
+            }
+            // Dump-text / viewport lines: show alt (or a marker) on the first
+            // row of the image box so `--dump-text` still greps.
+            BoxKind::Image => {
+                let y = b.dimensions.content.y;
+                if y < 0 || y as usize >= height {
+                    return;
+                }
+                let alt = b.text.as_deref().unwrap_or("");
+                let label = if alt.is_empty() {
+                    "[img]".to_string()
+                } else {
+                    format!("[{alt}]")
+                };
+                let style = Style {
+                    fg: Color::Ansi(8),
+                    ..Style::default()
+                };
+                rows[y as usize].push((b.dimensions.content.x, label, style));
+            }
+            _ => {}
         }
-        let Some(text) = b.text.as_ref() else {
-            return;
-        };
-        if text.is_empty() {
-            return;
-        }
-        let y = b.dimensions.content.y;
-        if y < 0 || y as usize >= height {
-            return;
-        }
-        rows[y as usize].push((b.dimensions.content.x, text.clone(), b.term_style));
     });
 
     rows.into_iter()

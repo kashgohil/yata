@@ -12,13 +12,14 @@ mod lines;
 
 pub use boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
 pub use dimensions::{Dimensions, EdgeSizes, Rect};
-pub use engine::{Hidden, layout_tree, term_color, term_style};
+pub use engine::{Hidden, layout_tree, layout_tree_with, term_color, term_style};
 pub use hit::{
     LinkHit, collect_links, dom_links, first_y, hit_test, is_under, link_at, nearest_link,
     visible_links,
 };
 
 use crate::dom::Dom;
+use crate::image::ImageContext;
 use crate::style::Styles;
 use crate::term::{Attrs, Color, Style};
 
@@ -38,12 +39,22 @@ pub struct Line {
 /// Lay the document out, and if honouring `display:none` leaves nothing to
 /// read, lay it out again revealing what the page hid.
 pub fn layout_readable(dom: &Dom, styles: &Styles, width: u16) -> (Vec<Line>, bool) {
-    let tree = layout_tree(dom, styles, width, Hidden::Respect);
+    layout_readable_with(dom, styles, width, &ImageContext::default())
+}
+
+/// Like [`layout_readable`] with image metrics (M8).
+pub fn layout_readable_with(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    images: &ImageContext,
+) -> (Vec<Line>, bool) {
+    let tree = layout_tree_with(dom, styles, width, Hidden::Respect, images);
     let lines = lines::from_tree(&tree);
     if lines.iter().any(|line| !line.spans.is_empty()) {
         return (lines, false);
     }
-    let revealed = layout_tree(dom, styles, width, Hidden::Reveal);
+    let revealed = layout_tree_with(dom, styles, width, Hidden::Reveal, images);
     let revealed_lines = lines::from_tree(&revealed);
     if revealed_lines.iter().any(|line| !line.spans.is_empty()) {
         (revealed_lines, true)
@@ -60,6 +71,17 @@ pub fn layout(dom: &Dom, styles: &Styles, width: u16, hidden: Hidden) -> Vec<Lin
 /// Full box tree (for paint, F3, benches).
 pub fn layout_document(dom: &Dom, styles: &Styles, width: u16, hidden: Hidden) -> LayoutTree {
     layout_tree(dom, styles, width, hidden)
+}
+
+/// Full box tree with image context (M8).
+pub fn layout_document_with(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    hidden: Hidden,
+    images: &ImageContext,
+) -> LayoutTree {
+    layout_tree_with(dom, styles, width, hidden, images)
 }
 
 /// Rasterise a laid-out tree into display lines (viewport scroll range,
@@ -281,19 +303,17 @@ mod tests {
         // Find the div box.
         let mut found = false;
         tree.walk(tree.root, &mut |_id, b| {
-            if b.kind == BoxKind::Block && b.node.is_some() {
-                if let Some(n) = b.node {
-                    if matches!(&dom.node(n).data, crate::dom::NodeData::Element { tag, .. } if tag == "div")
-                    {
-                        // 80px / 8 = 10 cells max content width.
-                        assert!(
-                            b.dimensions.content.width <= 10,
-                            "width {}",
-                            b.dimensions.content.width
-                        );
-                        found = true;
-                    }
-                }
+            if b.kind == BoxKind::Block
+                && let Some(n) = b.node
+                && matches!(&dom.node(n).data, crate::dom::NodeData::Element { tag, .. } if tag == "div")
+            {
+                // 80px / 8 = 10 cells max content width.
+                assert!(
+                    b.dimensions.content.width <= 10,
+                    "width {}",
+                    b.dimensions.content.width
+                );
+                found = true;
             }
         });
         assert!(found, "div box missing");
@@ -481,6 +501,27 @@ mod tests {
             }
         });
         assert!(saw_text);
+    }
+
+    #[test]
+    fn img_attrs_become_cell_size() {
+        let dom = html::parse(r#"<img src="a.png" width="80" height="48" alt="pic">"#);
+        let styles = style::style_tree(&dom, &[]);
+        let imgs = crate::image::discover(&dom, Some("https://ex/"));
+        let mut cache = crate::image::ImageCache::default();
+        let ctx = crate::image::ImageContext::from_discovery(&imgs, &mut cache);
+        let tree = layout_document_with(&dom, &styles, 40, Hidden::Respect, &ctx);
+        let mut found = false;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Image {
+                assert_eq!(b.dimensions.content.width, 10);
+                assert_eq!(b.dimensions.content.height, 3);
+                assert!(b.image_size_firm);
+                assert_eq!(b.image_src.as_deref(), Some("https://ex/a.png"));
+                found = true;
+            }
+        });
+        assert!(found);
     }
 
     #[test]

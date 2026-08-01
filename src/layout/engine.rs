@@ -5,6 +5,7 @@
 //! wrapping. Unit conversion lives on `Length` (M5.1).
 
 use crate::dom::{Dom, NodeData, NodeId};
+use crate::image::ImageContext;
 use crate::layout::boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
 use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
 use crate::style::values::{Display, FontStyle, FontWeight, TextAlign};
@@ -22,11 +23,24 @@ pub enum Hidden {
 /// Lay the document out. Returns the box tree; callers that still need lines
 /// (dump-text, transition paint) rasterise via `super::lines::from_tree`.
 pub fn layout_tree(dom: &Dom, styles: &Styles, width: u16, hidden: Hidden) -> LayoutTree {
+    layout_tree_with(dom, styles, width, hidden, &ImageContext::default())
+}
+
+/// Layout with image metrics (M8). `images` is a pure snapshot of known sizes
+/// and discovered `<img>` nodes — no network, no mutation.
+pub fn layout_tree_with(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    hidden: Hidden,
+    images: &ImageContext,
+) -> LayoutTree {
     let width = width.max(1) as i32;
     let mut eng = Engine {
         dom,
         styles,
         hidden,
+        images,
         boxes: Vec::new(),
     };
     // Synthetic root: full column width, no margins of its own. Children of
@@ -47,6 +61,8 @@ pub fn layout_tree(dom: &Dom, styles: &Styles, width: u16, hidden: Hidden) -> La
         text: None,
         term_style: Style::default(),
         computed: ComputedStyle::default(),
+        image_src: None,
+        image_size_firm: false,
     });
     let mut y = 0i32;
     let mut prev_mb = 0i32;
@@ -72,6 +88,7 @@ struct Engine<'a> {
     dom: &'a Dom,
     styles: &'a Styles,
     hidden: Hidden,
+    images: &'a ImageContext,
     boxes: Vec<LayoutBox>,
 }
 
@@ -140,6 +157,14 @@ impl<'a> Engine<'a> {
                 match tag.as_str() {
                     "br" => self.layout_br(x, containing_width, y, prev_margin_bottom, computed),
                     "hr" => self.layout_hr(x, containing_width, y, prev_margin_bottom, computed),
+                    "img" => self.layout_img_block(
+                        id,
+                        computed,
+                        x,
+                        containing_width,
+                        y,
+                        prev_margin_bottom,
+                    ),
                     _ => match computed.display {
                         Display::None => None,
                         Display::Block => self.layout_block(
@@ -175,6 +200,9 @@ impl<'a> Engine<'a> {
         }
     }
 
+    // Geometry args are the block-layout signature; grouping them would
+    // obscure the pure-transform call sites more than the lint helps.
+    #[allow(clippy::too_many_arguments)]
     fn layout_block(
         &mut self,
         id: NodeId,
@@ -216,6 +244,8 @@ impl<'a> Engine<'a> {
             text: None,
             term_style: Style::default(),
             computed,
+            image_src: None,
+            image_size_firm: false,
         });
 
         // List marker / tag-driven extras before children.
@@ -327,8 +357,8 @@ impl<'a> Engine<'a> {
         );
 
         // Empty <li> still gets a bullet line.
-        if marker_pending {
-            if let Some(anon) = self.layout_anonymous_block(
+        if marker_pending
+            && let Some(anon) = self.layout_anonymous_block(
                 content_x,
                 content_w,
                 content_y,
@@ -339,11 +369,11 @@ impl<'a> Engine<'a> {
                 }],
                 computed.text_align,
                 pre,
-            ) {
-                let mb = self.boxes[anon.0 as usize].dimensions.margin_box();
-                content_y = mb.bottom();
-                children.push(anon);
-            }
+            )
+        {
+            let mb = self.boxes[anon.0 as usize].dimensions.margin_box();
+            content_y = mb.bottom();
+            children.push(anon);
         }
 
         // Empty blocks (div with no content) get zero height — fine.
@@ -355,6 +385,7 @@ impl<'a> Engine<'a> {
         Some(box_id)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn layout_anonymous_block(
         &mut self,
         x: i32,
@@ -397,6 +428,8 @@ impl<'a> Engine<'a> {
             text: None,
             term_style: Style::default(),
             computed: ComputedStyle::default(),
+            image_src: None,
+            image_size_firm: false,
         });
 
         let line_ids = if pre {
@@ -414,6 +447,46 @@ impl<'a> Engine<'a> {
         self.boxes[box_id.0 as usize].dimensions.content.height = height;
         self.boxes[box_id.0 as usize].children = line_ids;
         Some(box_id)
+    }
+
+    /// Block-container child `<img>`: wrap as a single replaced box.
+    fn layout_img_block(
+        &mut self,
+        id: NodeId,
+        computed: ComputedStyle,
+        x: i32,
+        containing_width: i32,
+        y: i32,
+        prev_margin_bottom: &mut i32,
+    ) -> Option<BoxId> {
+        let Some(img) = self.images.by_node.get(&id) else {
+            // No src / not discovered — nothing to show.
+            return None;
+        };
+        let (cw, ch, firm) = self.images.size_for(img, containing_width);
+        let y = y - *prev_margin_bottom;
+        *prev_margin_bottom = 0;
+        let w = cw.min(containing_width).max(1);
+        let h = ch.max(1);
+        Some(self.alloc(LayoutBox {
+            kind: BoxKind::Image,
+            node: Some(id),
+            dimensions: Dimensions {
+                content: Rect {
+                    x,
+                    y,
+                    width: w,
+                    height: h,
+                },
+                ..Dimensions::default()
+            },
+            children: Vec::new(),
+            text: Some(img.alt.clone()),
+            term_style: Style::default(),
+            computed,
+            image_src: Some(img.url.clone()),
+            image_size_firm: firm,
+        }))
     }
 
     fn layout_br(
@@ -443,6 +516,8 @@ impl<'a> Engine<'a> {
             text: None,
             term_style: Style::default(),
             computed,
+            image_src: None,
+            image_size_firm: false,
         });
         Some(line)
     }
@@ -492,6 +567,8 @@ impl<'a> Engine<'a> {
             text: Some(text),
             term_style: Style::default(),
             computed: ComputedStyle::default(),
+            image_src: None,
+            image_size_firm: false,
         });
         let box_id = self.alloc(LayoutBox {
             kind: BoxKind::Block,
@@ -501,6 +578,8 @@ impl<'a> Engine<'a> {
             text: None,
             term_style: Style::default(),
             computed,
+            image_src: None,
+            image_size_firm: false,
         });
         *prev_margin_bottom = dims.margin.bottom;
         Some(box_id)
@@ -516,25 +595,26 @@ impl<'a> Engine<'a> {
         align: TextAlign,
     ) -> Vec<BoxId> {
         let width = width.max(1);
-        // Flatten to words, hard breaks, spacers, and soft wrap spaces.
-        let mut pieces: Vec<Piece> = Vec::new();
+        // Flatten to words / breaks / atomic images. Images flush the current
+        // text line and occupy `cells_h` rows of their own (M8).
+        let mut frags: Vec<InlineFrag> = Vec::new();
         let mut pending_space: Option<Style> = None;
 
         for item in items {
             match item {
                 InlineItem::Marker { text, style } => {
-                    pieces.push(Piece {
+                    frags.push(InlineFrag::Piece(Piece {
                         text: text.clone(),
                         cells: text.width() as i32,
                         style: *style,
                         node: None,
                         is_space: false,
                         is_break: false,
-                    });
+                    }));
                 }
                 InlineItem::Spacer { cells } => {
                     if *cells > 0 {
-                        pieces.push(Piece {
+                        frags.push(InlineFrag::Piece(Piece {
                             text: " ".repeat(*cells as usize),
                             cells: *cells,
                             style: Style::default(),
@@ -543,18 +623,38 @@ impl<'a> Engine<'a> {
                             // or vanish at a line edge the way HTML whitespace does.
                             is_space: false,
                             is_break: false,
-                        });
+                        }));
                     }
                 }
                 InlineItem::Break => {
                     pending_space = None;
-                    pieces.push(Piece {
+                    frags.push(InlineFrag::Piece(Piece {
                         text: String::new(),
                         cells: 0,
                         style: Style::default(),
                         node: None,
                         is_space: false,
                         is_break: true,
+                    }));
+                }
+                InlineItem::Image {
+                    node,
+                    url,
+                    alt,
+                    cells_w,
+                    cells_h,
+                    firm,
+                    computed,
+                } => {
+                    pending_space = None;
+                    frags.push(InlineFrag::Image {
+                        node: *node,
+                        url: url.clone(),
+                        alt: alt.clone(),
+                        cells_w: *cells_w,
+                        cells_h: *cells_h,
+                        firm: *firm,
+                        computed: *computed,
                     });
                 }
                 InlineItem::Text {
@@ -566,25 +666,25 @@ impl<'a> Engine<'a> {
                     let mut first = true;
                     for word in text.split(is_html_space).filter(|w| !w.is_empty()) {
                         if !first || pending_space.is_some() {
-                            pieces.push(Piece {
+                            frags.push(InlineFrag::Piece(Piece {
                                 text: " ".into(),
                                 cells: 1,
                                 style: pending_space.unwrap_or(*style),
                                 node: None,
                                 is_space: true,
                                 is_break: false,
-                            });
+                            }));
                         }
                         first = false;
                         pending_space = None;
-                        pieces.push(Piece {
+                        frags.push(InlineFrag::Piece(Piece {
                             text: word.to_string(),
                             cells: word.width() as i32,
                             style: *style,
                             node: Some(*node),
                             is_space: false,
                             is_break: false,
-                        });
+                        }));
                     }
                     if text.ends_with(is_html_space) {
                         pending_space = Some(*style);
@@ -598,7 +698,54 @@ impl<'a> Engine<'a> {
         let mut cur: Vec<Piece> = Vec::new();
         let mut cur_cells = 0i32;
 
-        for piece in pieces {
+        let flush_cur = |eng: &mut Engine<'a>,
+                         cur: &mut Vec<Piece>,
+                         line_y: &mut i32,
+                         lines: &mut Vec<BoxId>,
+                         cur_cells: &mut i32| {
+            if cur.is_empty() {
+                return;
+            }
+            if cur.last().is_some_and(|p| p.is_space) {
+                cur.pop();
+            }
+            if !cur.is_empty() {
+                eng.emit_line(cur, line_y, lines, x, width, align);
+            }
+            *cur_cells = 0;
+        };
+
+        for frag in frags {
+            let piece = match frag {
+                InlineFrag::Image {
+                    node,
+                    url,
+                    alt,
+                    cells_w,
+                    cells_h,
+                    firm,
+                    computed,
+                } => {
+                    flush_cur(self, &mut cur, &mut line_y, &mut lines, &mut cur_cells);
+                    self.emit_image(
+                        &mut line_y,
+                        &mut lines,
+                        x,
+                        width,
+                        &InlineItem::Image {
+                            node,
+                            url,
+                            alt,
+                            cells_w,
+                            cells_h,
+                            firm,
+                            computed,
+                        },
+                    );
+                    continue;
+                }
+                InlineFrag::Piece(p) => p,
+            };
             if piece.is_break {
                 if cur.is_empty() {
                     self.emit_empty_line(x, &mut line_y, width, &mut lines);
@@ -671,6 +818,53 @@ impl<'a> Engine<'a> {
         lines
     }
 
+    /// Place a replaced image: one multi-row `BoxKind::Image` on its own
+    /// line-box-equivalent span. Flushes vertical space by advancing `line_y`.
+    fn emit_image(
+        &mut self,
+        line_y: &mut i32,
+        lines: &mut Vec<BoxId>,
+        x: i32,
+        containing_width: i32,
+        img: &InlineItem,
+    ) {
+        let InlineItem::Image {
+            node,
+            url,
+            alt,
+            cells_w,
+            cells_h,
+            firm,
+            computed,
+        } = img
+        else {
+            return;
+        };
+        let w = (*cells_w).clamp(1, containing_width);
+        let h = (*cells_h).max(1);
+        let img_id = self.alloc(LayoutBox {
+            kind: BoxKind::Image,
+            node: Some(*node),
+            dimensions: Dimensions {
+                content: Rect {
+                    x,
+                    y: *line_y,
+                    width: w,
+                    height: h,
+                },
+                ..Dimensions::default()
+            },
+            children: Vec::new(),
+            text: Some(alt.clone()),
+            term_style: Style::default(),
+            computed: *computed,
+            image_src: Some(url.clone()),
+            image_size_firm: *firm,
+        });
+        lines.push(img_id);
+        *line_y += h;
+    }
+
     fn emit_line(
         &mut self,
         cur: &mut Vec<Piece>,
@@ -711,6 +905,8 @@ impl<'a> Engine<'a> {
             text: None,
             term_style: Style::default(),
             computed: ComputedStyle::default(),
+            image_src: None,
+            image_size_firm: false,
         });
         // Merge adjacent same-style pieces.
         let mut merged: Vec<Piece> = Vec::new();
@@ -745,6 +941,8 @@ impl<'a> Engine<'a> {
                 text: Some(p.text),
                 term_style: p.style,
                 computed: ComputedStyle::default(),
+                image_src: None,
+                image_size_firm: false,
             });
             cx += p.cells;
             child_ids.push(tid);
@@ -797,6 +995,19 @@ impl<'a> Engine<'a> {
                         is_space: false,
                         is_break: false,
                     });
+                }
+                img @ InlineItem::Image { .. } => {
+                    if !cur.is_empty() {
+                        self.emit_line(
+                            &mut cur,
+                            &mut line_y,
+                            &mut lines,
+                            x,
+                            width,
+                            TextAlign::Left,
+                        );
+                    }
+                    self.emit_image(&mut line_y, &mut lines, x, width, img);
                 }
                 InlineItem::Text {
                     node, text, style, ..
@@ -866,6 +1077,8 @@ impl<'a> Engine<'a> {
             text: None,
             term_style: Style::default(),
             computed: ComputedStyle::default(),
+            image_src: None,
+            image_size_firm: false,
         });
         lines.push(line_id);
         *line_y += 1;
@@ -881,6 +1094,14 @@ impl<'a> Engine<'a> {
                 }
                 if tag == "br" || tag == "hr" {
                     return ChildMode::Block;
+                }
+                // Block-level `display:block` img goes through layout_node;
+                // default inline img stays in the IFC as an atomic replaced box.
+                if tag == "img" {
+                    return match self.styles.get(id).display {
+                        Display::Block => ChildMode::Block,
+                        _ => ChildMode::Inline,
+                    };
                 }
                 match self.styles.get(id).display {
                     // Reveal: a page-hidden box is walked as block so its
@@ -910,6 +1131,21 @@ impl<'a> Engine<'a> {
                 if tag == "br" {
                     // Nested `<br>` inside an inline (e.g. `<span>a<br>b</span>`).
                     out.push(InlineItem::Break);
+                    return;
+                }
+                if tag == "img" {
+                    if let Some(img) = self.images.by_node.get(&id) {
+                        let (cw, ch, firm) = self.images.size_for(img, containing_width);
+                        out.push(InlineItem::Image {
+                            node: id,
+                            url: img.url.clone(),
+                            alt: img.alt.clone(),
+                            cells_w: cw,
+                            cells_h: ch,
+                            firm,
+                            computed: *self.styles.get(id),
+                        });
+                    }
                     return;
                 }
                 let computed = self.styles.get(id);
@@ -976,6 +1212,30 @@ enum InlineItem {
     },
     /// Forced line break from `<br>` nested in an inline.
     Break,
+    /// Atomic replaced `<img>` (M8).
+    Image {
+        node: NodeId,
+        url: String,
+        alt: String,
+        cells_w: i32,
+        cells_h: i32,
+        firm: bool,
+        computed: ComputedStyle,
+    },
+}
+
+/// Intermediate fragment while building an IFC (text pieces + atomic images).
+enum InlineFrag {
+    Piece(Piece),
+    Image {
+        node: NodeId,
+        url: String,
+        alt: String,
+        cells_w: i32,
+        cells_h: i32,
+        firm: bool,
+        computed: ComputedStyle,
+    },
 }
 
 struct Piece {
