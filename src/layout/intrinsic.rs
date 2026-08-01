@@ -749,4 +749,460 @@ mod tests {
         let css = "div { margin: 0 } .gone { display: none }";
         assert_eq!(sizes_of(src, css, "div"), (2, 2));
     }
+
+    /// The agreement test above, widened to the committed ladder pages.
+    ///
+    /// `push_pieces` reproduces `layout_inline`'s collapsing rules by hand, so
+    /// the only thing keeping the two from drifting is a test that asks the
+    /// breaker what it really does. One hand-written `<div>` cannot do that: it
+    /// has no nested inlines, no inline margins, no `<br>`, no `pre`. These
+    /// pages have all of it.
+    ///
+    /// Two framings of the same question, because no single one reaches every
+    /// element:
+    ///
+    /// - **Narrowed** (`narrowing_agrees`): size the page so the element's
+    ///   content box is *exactly* its max-content width. Nothing inside may
+    ///   wrap — it must produce the same line boxes as it does with room to
+    ///   spare — and one cell narrower something must. At min-content, no row
+    ///   may stick out past the box. This needs the element's width to follow
+    ///   the page's, which is not true everywhere: HN's `#hnmain` carries a
+    ///   `min-width`, so nothing inside it can ever be narrowed to its
+    ///   intrinsic size.
+    /// - **Roomy** (`widest_row_agrees`): with room to spare, the widest row
+    ///   the breaker produces inside the element must be *exactly* its
+    ///   max-content width. That is the definition, checked directly, and it
+    ///   needs no control over the width at all — but it only reads cleanly
+    ///   for an element whose content is all inline, where every line box is
+    ///   its own and no nested block can hide edges from the sum.
+    ///
+    /// Between them, every page below gets real coverage; each element is put
+    /// through whichever framings it admits, and a page where none of them
+    /// reached anything fails rather than passing quietly.
+    mod ladder_agreement {
+        use super::*;
+        use crate::layout::{BoxId, BoxKind, LayoutTree, layout_document_with};
+        use std::fs;
+
+        /// How many elements of one page to measure. Each costs a handful of
+        /// full layouts (the search for the page width that hands the element
+        /// its intrinsic width), so this is a sample, spread across the
+        /// document, not a sweep.
+        const SAMPLE: usize = 6;
+
+        /// Refuse to pass vacuously: if the filters below ever skip a whole
+        /// page, the test has stopped testing and should say so.
+        const MIN_CHECKED: usize = 3;
+
+        fn fixture(name: &str) -> String {
+            fs::read_to_string(format!(
+                "{}/tests/fixtures/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        }
+
+        /// One document under test, with the image metrics *both* sides must
+        /// be given: the engine and the sizer have to be looking at the same
+        /// images, or they would disagree about `<img>` for a reason that has
+        /// nothing to do with line breaking.
+        struct Page<'a> {
+            label: &'a str,
+            dom: &'a Dom,
+            styles: &'a Styles,
+            images: &'a ImageContext,
+        }
+
+        impl Page<'_> {
+            fn lay_out(&self, width: i32) -> LayoutTree {
+                layout_document_with(
+                    self.dom,
+                    self.styles,
+                    width.clamp(1, u16::MAX as i32) as u16,
+                    Hidden::Respect,
+                    self.images,
+                )
+            }
+
+            fn content_width(&self, node: NodeId, width: i32) -> Option<i32> {
+                let tree = self.lay_out(width);
+                content_width(&tree, node)
+            }
+
+            /// The narrowest page width that gives `node` a content box of
+            /// exactly `want` cells, or `None` if no width in range does.
+            ///
+            /// An element's available width is the page width minus whatever
+            /// its ancestors take out of it, and that inset is not always a
+            /// constant (a percentage-width ancestor scales with the page).
+            /// Searching for the width and then *verifying* the box really
+            /// came out at `want` is what makes this work regardless, and what
+            /// makes an element it cannot hit skip rather than fail.
+            fn page_width_giving(&self, node: NodeId, want: i32) -> Option<i32> {
+                let (mut lo, mut hi) = (1i32, want + 200);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    match self.content_width(node, mid) {
+                        Some(w) if w >= want => hi = mid,
+                        _ => lo = mid + 1,
+                    }
+                }
+                (self.content_width(node, lo) == Some(want)).then_some(lo)
+            }
+        }
+
+        /// The block box generated for `node`, if it generated one.
+        fn box_of(tree: &LayoutTree, node: NodeId) -> Option<BoxId> {
+            let mut found = None;
+            tree.walk(tree.root, &mut |id, b| {
+                if found.is_none() && b.node == Some(node) && b.kind == BoxKind::Block {
+                    found = Some(id);
+                }
+            });
+            found
+        }
+
+        fn content_width(tree: &LayoutTree, node: NodeId) -> Option<i32> {
+            box_of(tree, node).map(|id| tree.get(id).dimensions.content.width)
+        }
+
+        /// The widest row under `root`, as cells of content.
+        ///
+        /// Summing a line box's children rather than measuring how far right
+        /// they reach is deliberate: `text-align` shifts a line's contents
+        /// without making the line any wider, and HN wraps its whole page in
+        /// `<center>`. A replaced image is a row of its own — the engine gives
+        /// it one — so it counts as one here.
+        fn widest_row(tree: &LayoutTree, root: BoxId) -> i32 {
+            let mut out = 0;
+            tree.walk(root, &mut |_, b| match b.kind {
+                BoxKind::Line => {
+                    let cells: i32 = b
+                        .children
+                        .iter()
+                        .map(|&c| tree.get(c).dimensions.content.width)
+                        .sum();
+                    out = out.max(cells);
+                }
+                BoxKind::Image => out = out.max(b.dimensions.content.width),
+                _ => {}
+            });
+            out
+        }
+
+        /// Line boxes under `root` — the count that goes up when text wraps.
+        fn line_boxes(tree: &LayoutTree, root: BoxId) -> usize {
+            let mut n = 0;
+            tree.walk(root, &mut |_, b| {
+                if b.kind == BoxKind::Line {
+                    n += 1;
+                }
+            });
+            n
+        }
+
+        /// How far past the left edge of `root`'s content box any text under it
+        /// reaches.
+        fn text_extent(tree: &LayoutTree, root: BoxId) -> i32 {
+            let left = tree.get(root).dimensions.content.x;
+            let mut out = 0;
+            tree.walk(root, &mut |_, b| {
+                if b.kind == BoxKind::Text {
+                    out = out.max(b.dimensions.content.right() - left);
+                }
+            });
+            out
+        }
+
+        fn tag_of(dom: &Dom, node: NodeId) -> &str {
+            match &dom.node(node).data {
+                NodeData::Element { tag, .. } => tag,
+                _ => "?",
+            }
+        }
+
+        /// Does any node in this subtree (including `node`) satisfy `f`?
+        fn subtree_any(dom: &Dom, node: NodeId, f: &dyn Fn(NodeId) -> bool) -> bool {
+            f(node) || dom.children(node).any(|c| subtree_any(dom, c, f))
+        }
+
+        impl Page<'_> {
+            /// The elements of this page the three assertions can be asked of.
+            ///
+            /// Three exclusions, each because the assertion would be meaningless
+            /// rather than because it would be inconvenient:
+            ///
+            /// - nothing to wrap: no text anywhere inside.
+            /// - a `<li>` inside: the engine injects a `"• "` marker into a list
+            ///   item's first line that intrinsic sizing deliberately does not
+            ///   count, so every ancestor of an `li` is two cells adrift by
+            ///   design. That divergence is real and is being tracked for M9.6;
+            ///   this test is not the place to relitigate it.
+            /// - a specified `width` / `min-width` / `max-width` inside: such a box
+            ///   is the width it was told to be no matter how much room there is,
+            ///   so no page width narrows it and "one cell narrower and it wraps"
+            ///   has nothing to observe. The unit tests above cover specified
+            ///   widths directly.
+            fn measurable_blocks(&self) -> Vec<NodeId> {
+                let (dom, styles) = (self.dom, self.styles);
+                let mut out = Vec::new();
+                let mut stack = vec![dom.root];
+                while let Some(node) = stack.pop() {
+                    stack.extend(dom.children(node));
+                    if !matches!(&dom.node(node).data, NodeData::Element { .. })
+                        || styles.get(node).display != Display::Block
+                    {
+                        continue;
+                    }
+                    let has_text = subtree_any(dom, node, &|n| {
+                        matches!(&dom.node(n).data, NodeData::Text(t) if !t.trim().is_empty())
+                            && styles.get(n).display != Display::None
+                    });
+                    if !has_text {
+                        continue;
+                    }
+                    let is_list_item = subtree_any(dom, node, &|n| tag_of(dom, n) == "li");
+                    let sized = subtree_any(dom, node, &|n| {
+                        let c = styles.get(n);
+                        !c.width.is_auto() || !c.min_width.is_auto() || !c.max_width.is_auto()
+                    });
+                    if is_list_item || sized {
+                        continue;
+                    }
+                    out.push(node);
+                }
+                out.sort_by_key(|n| n.0);
+                out
+            }
+
+            /// Put a sample of this page's blocks through both framings, and
+            /// refuse to pass if the filters left nothing to measure.
+            fn check(&self) {
+                let mut sizer = IntrinsicSizer::new(self.dom, self.styles, self.images);
+                let candidates = self.measurable_blocks();
+                let step = (candidates.len() / SAMPLE).max(1);
+                let mut checked = 0;
+                for node in candidates.into_iter().step_by(step).take(SAMPLE) {
+                    let max = sizer.max_content_width(node);
+                    let min = sizer.min_content_width(node);
+                    if max <= 0 || min <= 0 {
+                        continue;
+                    }
+                    let what = format!(
+                        "{}: <{}> #{} (max {max}, min {min})",
+                        self.label,
+                        tag_of(self.dom, node),
+                        node.0
+                    );
+                    let mut reached = self.widest_row_agrees(node, max, &what);
+                    reached |= self.narrowing_agrees(node, max, min, &what);
+                    if reached {
+                        checked += 1;
+                    }
+                }
+                assert!(
+                    checked >= MIN_CHECKED,
+                    "{}: only {checked} elements were measurable — the filters \
+                     have eaten the test",
+                    self.label
+                );
+            }
+
+            /// Roomy framing: given more width than it wants, the breaker's
+            /// widest row inside this element is exactly its max-content width.
+            ///
+            /// Only asked of elements whose content is all inline — a nested
+            /// block brings its own margins, padding and (for `<hr>`) a
+            /// full-width rule, none of which a sum over rows can see.
+            fn widest_row_agrees(&self, node: NodeId, max: i32, what: &str) -> bool {
+                let has_block_child = self.dom.children(node).any(|c| {
+                    subtree_any(self.dom, c, &|n| is_block_element(self.dom, self.styles, n))
+                });
+                if has_block_child {
+                    return false;
+                }
+                let tree = self.lay_out(max + 200);
+                let Some(id) = box_of(&tree, node) else {
+                    return false;
+                };
+                // Room to spare is the premise; without it nothing is shown.
+                if tree.get(id).dimensions.content.width < max {
+                    return false;
+                }
+                assert_eq!(
+                    widest_row(&tree, id),
+                    max,
+                    "{what}: the breaker's widest unwrapped row is not max-content"
+                );
+                true
+            }
+
+            /// Narrowed framing: at exactly max-content nothing wraps, one cell
+            /// under it something does, and at min-content every row still fits.
+            fn narrowing_agrees(&self, node: NodeId, max: i32, min: i32, what: &str) -> bool {
+                let Some(page) = self.page_width_giving(node, max) else {
+                    return false;
+                };
+                // With room to spare, and at exactly max-content: the same
+                // lines, because nothing wrapped at either width.
+                let roomy = self.lay_out(page + 40);
+                let at_max = self.lay_out(page);
+                let (Some(roomy_box), Some(max_box)) =
+                    (box_of(&roomy, node), box_of(&at_max, node))
+                else {
+                    return false;
+                };
+                assert_eq!(
+                    line_boxes(&at_max, max_box),
+                    line_boxes(&roomy, roomy_box),
+                    "{what}: content wrapped at its own max-content width"
+                );
+
+                // One cell narrower, something must give — unless this content
+                // has no break in it at all (`min == max`: a `pre` block, whose
+                // lines never wrap however narrow the box gets). Then there is
+                // nothing the engine could do differently and nothing to
+                // assert.
+                let at_narrow = self.lay_out(page - 1);
+                if min < max
+                    && let Some(narrow_box) = box_of(&at_narrow, node)
+                {
+                    assert!(
+                        line_boxes(&at_narrow, narrow_box) > line_boxes(&at_max, max_box),
+                        "{what}: nothing wrapped one cell below max-content, so \
+                         max-content is wider than the run really needs"
+                    );
+                }
+
+                // At min-content, every row the breaker produces fits.
+                if let Some(page) = self.page_width_giving(node, min) {
+                    let tree = self.lay_out(page);
+                    if let Some(min_box) = box_of(&tree, node) {
+                        assert!(
+                            text_extent(&tree, min_box) <= min,
+                            "{what}: a row overflows min-content by {} cells",
+                            text_extent(&tree, min_box) - min
+                        );
+                    }
+                }
+                true
+            }
+        }
+
+        fn is_block_element(dom: &Dom, styles: &Styles, node: NodeId) -> bool {
+            matches!(&dom.node(node).data, NodeData::Element { .. })
+                && styles.get(node).display == Display::Block
+        }
+
+        fn check(name: &str, extra_css: Option<&str>) {
+            let source = fixture(name);
+            let dom = html::parse(&source);
+            let inline = style::sources::inline_sheets(&dom);
+            let page = extra_css.map(|css| crate::css::parse(&fixture(css)));
+            let mut sheets: Vec<&crate::css::Stylesheet> = inline.iter().collect();
+            if let Some(page) = &page {
+                sheets.push(page);
+            }
+            let styles = style::style_tree(&dom, &sheets);
+            Page {
+                label: name,
+                dom: &dom,
+                styles: &styles,
+                images: &ImageContext::default(),
+            }
+            .check();
+        }
+
+        #[test]
+        fn example_com() {
+            check("example.com.html", None);
+        }
+
+        #[test]
+        fn motherfuckingwebsite_com() {
+            check("motherfuckingwebsite.com.html", None);
+        }
+
+        #[test]
+        fn danluu_com() {
+            check("danluu.com.html", None);
+        }
+
+        #[test]
+        fn news_ycombinator_com() {
+            check(
+                "news.ycombinator.com.html",
+                Some("news.ycombinator.com.news.css"),
+            );
+        }
+
+        #[test]
+        fn shapes_the_ladder_pages_do_not_have() {
+            // No page on the ladder contains a `<pre>`, and the inline
+            // margin/padding pieces only appear on HN. Rather than add a
+            // fixture, one document written for the purpose puts every shape
+            // `push_pieces` handles through the same two framings:
+            //
+            // - runs of collapsible whitespace, including at the very start and
+            //   end of a block, where the breaker drops them entirely;
+            // - an inline with horizontal margin *and* padding nested inside a
+            //   text run;
+            // - forced breaks, both as a direct child of the block and nested
+            //   inside an inline — different paths on both sides;
+            // - a `pre` whose widest line is several pieces, so that "no
+            //   collapsing, no wrapping" is pinned for min-content as well as
+            //   max-content;
+            // - loose text on both sides of a block child, which the engine
+            //   splits into two anonymous blocks and the sizer into two runs;
+            // - wide glyphs.
+            let (dom, styles) = styled(
+                concat!(
+                    "<div class=doc>",
+                    "<div class=para>a  bb   ccc dddd</div>",
+                    "<div class=ws>   spaced out   </div>",
+                    "<div class=nested>lead <b class=tight>bold</b> tail</div>",
+                    "<div class=brs>alpha<br>beta gamma<br>d</div>",
+                    "<div class=nbr>x <span>alpha<br>beta gamma</span> y</div>",
+                    "<pre>xx  <b>yy</b> zzzz\nshort\nq</pre>",
+                    "<div class=mixed>loose words before",
+                    "<div class=inner>inner block</div>and words after</div>",
+                    "<div class=cjk>世界 hi こんにちは</div>",
+                    "</div>",
+                ),
+                "div, pre { margin: 0 } .tight { margin-left: 8px; padding-right: 16px }",
+            );
+            Page {
+                label: "synthetic shapes",
+                dom: &dom,
+                styles: &styles,
+                images: &ImageContext::default(),
+            }
+            .check();
+        }
+
+        #[test]
+        fn an_inline_image_is_atomic_on_both_sides() {
+            // The one shape that needs an image context: an inline `<img>` is
+            // a row of its own, so it ends the segment around it rather than
+            // widening it. Both sides are handed the same context — the engine
+            // would otherwise not place an image at all.
+            let dom = html::parse(concat!(
+                "<div class=doc><div class=img>",
+                r#"text before <img src="a.png" width="48" height="16"> text after"#,
+                "</div></div>",
+            ));
+            let sheet = crate::css::parse("div { margin: 0 }");
+            let styles = style::style_tree(&dom, &[&sheet]);
+            let imgs = crate::image::discover(&dom, Some("https://fixture.test/page"));
+            let mut cache = crate::image::ImageCache::default();
+            let images = ImageContext::from_discovery(&imgs, &mut cache);
+            Page {
+                label: "inline image",
+                dom: &dom,
+                styles: &styles,
+                images: &images,
+            }
+            .check();
+        }
+    }
 }
