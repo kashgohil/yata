@@ -1363,7 +1363,18 @@ impl App {
         let Some(dom) = &self.dom else {
             return Effect::default();
         };
-        let links = layout::dom_links(dom);
+        // Only links the reader can see (M9.3): Tab must not park focus on a
+        // link an `overflow` clip removed from the page, because `Enter` would
+        // then follow something invisible. Same predicate the hint labels use.
+        // Before layout has run there is no clip to ask about, so the DOM
+        // order is all there is.
+        let links: Vec<NodeId> = match &self.layout_tree {
+            Some(tree) => layout::collect_links(tree, dom)
+                .into_iter()
+                .map(|l| l.node)
+                .collect(),
+            None => layout::dom_links(dom).into_iter().map(|(n, _)| n).collect(),
+        };
         if links.is_empty() {
             return Effect::default();
         }
@@ -1376,7 +1387,7 @@ impl App {
                 }
             }
             Some(cur) => {
-                let idx = links.iter().position(|(n, _)| *n == cur).unwrap_or(0);
+                let idx = links.iter().position(|n| *n == cur).unwrap_or(0);
                 if dir >= 0 {
                     (idx + 1) % links.len()
                 } else {
@@ -1384,7 +1395,7 @@ impl App {
                 }
             }
         };
-        self.focus = Some(links[next].0);
+        self.focus = Some(links[next]);
         self.scroll_focus_into_view();
         redraw()
     }
@@ -1586,7 +1597,10 @@ impl App {
         };
         let page_h = self.page() as i32;
         let style = reversed();
-        tree.walk(tree.root, &mut |_, b| {
+        // Clip-aware (M9.3): this overlay *writes glyphs*, so a clip-blind
+        // walk would put a focused link's text back on a page that clipped it
+        // away — the one surface that can undo the display list's trimming.
+        tree.walk_clipped(&mut |_, b, clip| {
             if b.kind != BoxKind::Text {
                 return;
             }
@@ -1599,15 +1613,19 @@ impl App {
             let Some(text) = &b.text else {
                 return;
             };
-            let screen_y = b.dimensions.content.y - scroll;
+            let (x, y) = (b.dimensions.content.x, b.dimensions.content.y);
+            let Some((x, text)) = clip.trim_text(x, y, text) else {
+                return;
+            };
+            let screen_y = y - scroll;
             if screen_y < 0 || screen_y >= page_h {
                 return;
             }
-            let screen_x = left as i32 + b.dimensions.content.x;
+            let screen_x = left as i32 + x;
             if screen_x < 0 {
                 return;
             }
-            frame.put_str(screen_x as u16, screen_y as u16, text, style);
+            frame.put_str(screen_x as u16, screen_y as u16, &text, style);
         });
     }
 
@@ -3552,6 +3570,60 @@ mod tests {
         assert!(app.hint.is_some());
         assert!(app.update(key(KeyCode::Esc, KeyModifiers::NONE)).dirty);
         assert!(app.hint.is_none());
+    }
+
+    /// M9.3 review. The focus overlay *writes glyphs*, so walking the tree
+    /// clip-blind put a clipped-away link's text back on the page the moment
+    /// Tab reached it — undoing the display list's trimming from the one
+    /// surface that can. Tab reaching it at all was the other half: `Enter`
+    /// would follow a link nobody could see.
+    #[test]
+    fn tab_neither_reaches_nor_repaints_a_clipped_away_link() {
+        let markup = |overflow: &str| {
+            format!(
+                "<body style='margin:0'><div style='margin:0;max-height:1em;overflow:{overflow}'>\
+                 <p style='margin:0'><a href='/shown'>shown</a></p>\
+                 <p style='margin:0'><a href='/gone'>SECRET</a></p></div></body>"
+            )
+        };
+        let screen = |app: &App| {
+            let mut frame = Frame::new(40, 8);
+            app.draw(&mut frame);
+            (0..8).map(|y| row_text(&frame, y)).collect::<String>()
+        };
+
+        // Control: with nothing clipping, the second row is a real, reachable
+        // link — so the assertions below are about the clip, not the markup.
+        let mut app = page(40, 8, &markup("visible"));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(screen(&app).contains("SECRET"));
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE))
+                .fetch
+                .as_ref()
+                .map(|(_, u)| u.as_str()),
+            Some("http://final/gone")
+        );
+
+        // Clipped: the row paints nothing before or after Tab, and Tab has
+        // exactly one link to cycle through however often it is pressed.
+        let mut app = page(40, 8, &markup("hidden"));
+        assert!(!screen(&app).contains("SECRET"));
+        for _ in 0..3 {
+            app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+            assert!(
+                !screen(&app).contains("SECRET"),
+                "the focus overlay repainted clipped-away text"
+            );
+        }
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE))
+                .fetch
+                .as_ref()
+                .map(|(_, u)| u.as_str()),
+            Some("http://final/shown")
+        );
     }
 
     #[test]

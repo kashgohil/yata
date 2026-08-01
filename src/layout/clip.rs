@@ -98,13 +98,57 @@ impl Clip {
 
     /// Is any of document row `y` visible? (Text runs are one row tall, so the
     /// vertical question is answered once for the whole run.)
-    pub fn shows_row(self, y: i32) -> bool {
+    fn shows_row(self, y: i32) -> bool {
         self.y.is_none_or(|(s, e)| y >= s && y < e)
     }
 
-    /// The horizontal bounds, or `None` when this clip leaves the axis alone.
-    pub fn x_range(self) -> Option<(i32, i32)> {
-        self.x
+    /// Trim a one-row text run starting at (`x`, `y`) to the cells this clip
+    /// leaves visible, returning its new origin and text — `None` when nothing
+    /// survives.
+    ///
+    /// Truncation is by **cells** (`unicode-width`, CLAUDE.md), from either
+    /// end: a clip that starts mid-run drops the characters to its left and
+    /// moves the run's origin to the first surviving cell. A wide glyph
+    /// straddling an edge is dropped rather than half-drawn, leaving its far
+    /// half blank — half a CJK glyph is not a glyph, and the cell it would
+    /// occupy belongs to the box on the other side of the clip.
+    ///
+    /// Paint trims the display list with this, and the focus overlay trims
+    /// what it reverse-videos with it. Two implementations of "what does the
+    /// reader see" is exactly one too many.
+    pub fn trim_text(self, x: i32, y: i32, text: &str) -> Option<(i32, String)> {
+        use unicode_width::UnicodeWidthChar;
+        if !self.shows_row(y) {
+            return None;
+        }
+        let Some((left, right)) = self.x else {
+            return Some((x, text.to_string()));
+        };
+        let mut out = String::new();
+        let mut out_x = x;
+        let mut cx = x;
+        for ch in text.chars() {
+            if cx >= right {
+                break;
+            }
+            let w = UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
+            if w == 0 {
+                // Combining marks ride along with the character they modify,
+                // and are dropped with it.
+                if !out.is_empty() {
+                    out.push(ch);
+                }
+                continue;
+            }
+            if cx >= left && cx + w <= right {
+                if out.is_empty() {
+                    out_x = cx;
+                }
+                out.push(ch);
+            }
+            cx += w;
+        }
+        (!out.is_empty()).then_some((out_x, out))
     }
 
     /// Does `b` put anything on screen under this clip? Used by hit-testing
@@ -171,7 +215,10 @@ mod tests {
         assert_eq!(Clip::NONE.apply(r), r);
         assert!(Clip::NONE.contains(-5, 999));
         assert!(!Clip::NONE.is_empty());
-        assert!(Clip::NONE.x_range().is_none());
+        assert_eq!(
+            Clip::NONE.trim_text(3, 4, "untouched"),
+            Some((3, "untouched".to_string()))
+        );
     }
 
     #[test]

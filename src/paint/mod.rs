@@ -105,7 +105,7 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
             if let Some(text) = &b.text
                 && !text.is_empty()
                 && let Some((x, text)) =
-                    clip_text(clip, b.dimensions.content.x, b.dimensions.content.y, text)
+                    clip.trim_text(b.dimensions.content.x, b.dimensions.content.y, text)
             {
                 list.commands.push(DisplayCommand::Text {
                     x,
@@ -159,7 +159,7 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
                 });
                 if let Some(alt) = alt
                     && let Some((x, text)) =
-                        clip_text(clip, rect.x, rect.y, &truncate_cells(alt, rect.width))
+                        clip.trim_text(rect.x, rect.y, &truncate_cells(alt, rect.width))
                 {
                     list.commands.push(DisplayCommand::Text {
                         x,
@@ -176,50 +176,6 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
         }
         BoxKind::AnonymousBlock | BoxKind::Line | BoxKind::Inline => {}
     }
-}
-
-/// Trim a one-row text run to the cells `clip` leaves visible, returning its
-/// new origin and text — `None` when nothing survives.
-///
-/// Truncation is by **cells** (`unicode-width`, CLAUDE.md), from either end: a
-/// clip that starts mid-run drops the characters to its left and moves the
-/// run's origin to the first surviving cell. A wide glyph straddling an edge is
-/// dropped rather than half-drawn, leaving its far half blank — half a CJK
-/// glyph is not a glyph, and the cell it would occupy belongs to the box on
-/// the other side of the clip.
-fn clip_text(clip: Clip, x: i32, y: i32, text: &str) -> Option<(i32, String)> {
-    use unicode_width::UnicodeWidthChar;
-    if !clip.shows_row(y) {
-        return None;
-    }
-    let Some((left, right)) = clip.x_range() else {
-        return Some((x, text.to_string()));
-    };
-    let mut out = String::new();
-    let mut out_x = x;
-    let mut cx = x;
-    for ch in text.chars() {
-        if cx >= right {
-            break;
-        }
-        let w = UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
-        if w == 0 {
-            // Combining marks ride along with the character they modify, and
-            // are dropped with it.
-            if !out.is_empty() {
-                out.push(ch);
-            }
-            continue;
-        }
-        if cx >= left && cx + w <= right {
-            if out.is_empty() {
-                out_x = cx;
-            }
-            out.push(ch);
-        }
-        cx += w;
-    }
-    (!out.is_empty()).then_some((out_x, out))
 }
 
 fn truncate_cells(s: &str, max: i32) -> String {
@@ -654,14 +610,14 @@ mod tests {
     fn a_clip_starting_mid_run_trims_from_the_left_and_moves_the_origin() {
         let clip = Clip::ranges(Some((5, 9)), None);
         assert_eq!(
-            clip_text(clip, 0, 0, "0123456789"),
+            clip.trim_text(0, 0, "0123456789"),
             Some((5, "5678".to_string()))
         );
         // A wide glyph straddling the left edge is dropped with the cells it
         // cannot fit into: 漢 spans 4–5, so the run starts at 6.
-        assert_eq!(clip_text(clip, 4, 0, "漢ab"), Some((6, "ab".to_string())));
+        assert_eq!(clip.trim_text(4, 0, "漢ab"), Some((6, "ab".to_string())));
         // A row the clip excludes emits nothing at all.
-        assert_eq!(clip_text(Clip::ranges(None, Some((0, 2))), 0, 2, "x"), None);
+        assert_eq!(Clip::ranges(None, Some((0, 2))).trim_text(0, 2, "x"), None);
     }
 
     #[test]
@@ -707,6 +663,57 @@ mod tests {
             .map(|(_, y, s)| (*y, s.chars().count()))
             .collect();
         assert_eq!(got, [(0, 20), (1, 20), (2, 20)]);
+    }
+
+    #[test]
+    fn a_clipped_background_and_border_are_trimmed_rather_than_dropped() {
+        let rects = |list: &DisplayList| -> Vec<Rect> {
+            list.commands
+                .iter()
+                .filter_map(|c| match c {
+                    DisplayCommand::FillRect { rect, .. } | DisplayCommand::Border { rect } => {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        // A background four rows tall inside a box that shows two: the fill
+        // covers the two surviving rows, not none of them and not four.
+        let t = tree(
+            "<div class=card><div class=fill><p>a</p><p>b</p><p>c</p><p>d</p></div></div>",
+            "body,div,p{margin:0} .card{max-height:2em;overflow:hidden}
+             .fill{background:#eee}",
+            40,
+        );
+        assert_eq!(
+            rects(&paint(&t)),
+            [Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 2
+            }]
+        );
+
+        // The recorded deviation, pinned so it cannot change unnoticed: a
+        // border cut by the clip is emitted as the intersected rectangle, so
+        // it closes along the clip edge instead of running off it.
+        let t = tree(
+            "<div class=card><div class=edged><p>a</p><p>b</p><p>c</p><p>d</p></div></div>",
+            "body,div,p{margin:0} .card{max-height:2em;overflow:hidden}
+             .edged{border:1px solid black}",
+            40,
+        );
+        assert_eq!(
+            rects(&paint(&t)),
+            [Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 2
+            }]
+        );
     }
 
     #[test]
