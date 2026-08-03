@@ -1414,6 +1414,45 @@ mod tests {
     }
 
     #[test]
+    fn min_height_is_a_definite_cross_size_for_a_row() {
+        // Found reviewing M9.10. A container's clamps are part of how much room
+        // it has, so a stage that divides its cross axis has to apply them —
+        // which is the rule M9.9 already applies to a column's *main* axis, for
+        // exactly this reason. Left out, `min-height` bought rows that nothing
+        // was allowed to use: the line was as tall as its tallest item and the
+        // rest of the container was blank.
+        let row = "<div id=r><div>a</div></div>";
+        let css = "#r { display: flex; min-height: 6em; align-items: center }
+                   #r div { flex: 0 0 160px }";
+        // 5 rows to place a 1-row item in, and the odd row goes above it — the
+        // same rule every other split in this engine follows.
+        assert_eq!(cross(row, css, 40), [(3, 1)]);
+        // ...and the container really is 6 rows, as it always was: the clamp
+        // `layout_box_at` applies afterwards now re-applies an already-clamped
+        // value, which is the point of doing it here.
+        assert_eq!(flex_box(row, css, 40).3, 6);
+
+        // `stretch` — the initial value — fills those rows rather than leaving
+        // them blank.
+        let stretch = "#r { display: flex; min-height: 6em } #r div { flex: 0 0 160px }";
+        assert_eq!(cross(row, stretch, 40), [(0, 6)]);
+
+        // `max-height` is the same rule from the other end: a line shorter than
+        // its content, with the overflow packed at cross-start.
+        let capped = "#r { display: flex; max-height: 1em; align-items: center }
+                      #r div { flex: 0 0 160px; height: 4em }";
+        assert_eq!(cross(row, capped, 40), [(0, 4)]);
+
+        // And on the wrapping path it is what gives `align-content` anything to
+        // do: two lines of one row in six, centred, sit at 2 and 3.
+        let two = "<div id=r><div>a</div><div>b</div></div>";
+        let wrapped = "#r { display: flex; flex-wrap: wrap; min-height: 6em;
+                       align-content: center }
+                       #r div { flex: 0 0 640px }";
+        assert_eq!(cross(two, wrapped, 80), [(2, 1), (3, 1)]);
+    }
+
+    #[test]
     fn a_rule_widens_a_wrapping_columns_line() {
         // **A divergence on the record**, found reviewing M9.10 and left in
         // deliberately. §9.4 step 8 sizes a line from its items' hypothetical

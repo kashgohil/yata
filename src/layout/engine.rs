@@ -777,7 +777,7 @@ impl<'a> Engine<'a> {
         // nothing knows until the content has been laid out, and for a column a
         // line's cross size is the widest item on it, which nothing knows until
         // line collection has said which items those are.
-        let cross = self.align_cross(&items, &children, &lines, &axis, &computed, content);
+        let cross = self.align_cross(&items, &children, &lines, &axis, box_id, heights);
 
         // The container's used content height, whichever axis produced it: a
         // row's lines stack down the page, while a column's cross axis runs
@@ -870,17 +870,21 @@ impl<'a> Engine<'a> {
         boxes: &[BoxId],
         lines: &[Range<usize>],
         axis: &FlexAxis,
-        container: &ComputedStyle,
-        // The container's *content* box: items are positioned inside its
-        // padding and border, never against its border box.
-        content: Rect,
+        box_id: BoxId,
+        heights: BlockHeight,
     ) -> i32 {
+        // Read off the container's own box rather than taking them as
+        // arguments: its content rect (items sit inside its padding and border,
+        // never against its border box), its edges, and its style.
+        let dims = self.boxes[box_id.0 as usize].dimensions;
+        let container = self.boxes[box_id.0 as usize].computed;
+        let content = dims.content;
         let cross_items: Vec<flex::CrossItem> = items
             .iter()
             .zip(boxes)
             .map(|(item, &b)| {
                 let c = &item.computed;
-                let align = cross_align(c, axis, container);
+                let align = cross_align(c, axis, &container);
                 let dims = self.boxes[b.0 as usize].dimensions;
                 let outer = if axis.vertical {
                     dims.margin_box().width
@@ -926,18 +930,48 @@ impl<'a> Engine<'a> {
             .map(|line| flex::cross_size(&cross_items[line.clone()]))
             .collect();
 
+        // The container's own inner cross size, which is the number
+        // `align-content` divides. A column's is its content width, definite
+        // before anything was laid out. A row's is its `height` when it has
+        // one, its lines' total when it does not — and **either way through its
+        // own `min-height` and `max-height`**, which is what makes those
+        // definite too.
+        //
+        // That last clause is the rule M9.9 already applies to a column's main
+        // axis, for exactly the reason it applies here: a container's free
+        // space depends on its clamps, so a stage that leaves them to the clamp
+        // every block gets afterwards divides the wrong number. Left out, a
+        // `min-height: 20em` row centred its items in the tallest of them and
+        // then sat in twenty rows of blank space. `layout_box_at`'s later clamp
+        // re-applies to an already-clamped value and does nothing, which is the
+        // point: one rule, applied at one site.
+        let cross_axis = Axis {
+            edges: dims.padding.top + dims.padding.bottom + dims.border.top + dims.border.bottom,
+            box_sizing: container.box_sizing,
+        };
+        let inner_cross = if axis.vertical {
+            content.width
+        } else {
+            cross_axis.clamp(
+                heights
+                    .specified
+                    .unwrap_or_else(|| flex::used_cross(&line_cross, gap)),
+                heights.min,
+                heights.max,
+            )
+        };
+
         // §9.4 step 7: a **single-line** container — `nowrap`, and the spec
         // means the property rather than "happened to fit on one line" — hands
-        // its definite inner cross size to its one line, which is what makes
+        // its inner cross size to its one line. That is what makes
         // `align-items: center` inside a `height: 10em` container centre in ten
-        // rows rather than in the tallest item. Every other line keeps the size
-        // its own items gave it, and `align-content` below is what decides
-        // where the container's leftover cross space goes instead.
-        let definite_cross = axis.cross_base;
-        if let (Some(cross), false) = (definite_cross, axis.wraps) {
-            line_cross[0] = cross;
+        // rows rather than in the tallest item; when nothing made the container
+        // definite the two numbers are equal anyway and this changes nothing.
+        // A wrapping container keeps its content-sized lines, and
+        // `align-content` decides where the leftover goes instead.
+        if !axis.wraps {
+            line_cross[0] = inner_cross;
         }
-        let inner_cross = definite_cross.unwrap_or_else(|| flex::used_cross(&line_cross, gap));
         let placed_lines =
             flex::align_lines(&line_cross, gap, inner_cross, container.align_content);
 
@@ -963,7 +997,12 @@ impl<'a> Engine<'a> {
                 let (b, p, ci) = (boxes[item], placed[idx], cross_items[item]);
                 let c = &items[item].computed;
                 if ci.align == AlignItems::Stretch {
-                    self.stretch_item(b, c, axis, placed_line.cross, definite_cross);
+                    // A percentage `min-height` on an item still resolves
+                    // against the container's *specified* height and nothing
+                    // else: a height that only became a number because of the
+                    // container's own `min-height` is not one a percentage
+                    // inside it may resolve against (CSS 2.1 §10.5).
+                    self.stretch_item(b, c, axis, placed_line.cross, axis.cross_base);
                 }
                 // Read the box back: `stretch_item` may just have changed the
                 // very size the offsets below are measured against, and a
@@ -2641,6 +2680,12 @@ struct FlexAxis {
     /// The same question on the cross axis, and the same asymmetry seen from
     /// the other side: a column's cross size is a width and always definite, a
     /// row's is its `height` and often is not.
+    ///
+    /// **Not the same number as the container's used inner cross size**, which
+    /// `align_cross` computes and which its own `min-height`/`max-height` can
+    /// decide. This one is what a *percentage inside the container* resolves
+    /// against, and a height that only became a number because of a clamp is
+    /// not one a percentage may resolve against (CSS 2.1 §10.5).
     cross_base: Option<i32>,
 }
 
