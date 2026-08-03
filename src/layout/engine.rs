@@ -1216,14 +1216,52 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// The row of the first line box in this subtree, in paint order — which
-    /// for a box that contains text is the row its first line of text is on.
+    /// The baseline row of the first line box in this subtree, in paint order —
+    /// which for a box that contains text is the row its first line of text is
+    /// on.
     fn first_line_row(&self, b: BoxId) -> Option<i32> {
         let bx = &self.boxes[b.0 as usize];
         if bx.kind == BoxKind::Line {
-            return Some(bx.dimensions.content.y);
+            return Some(self.line_baseline_row(b));
         }
         bx.children.iter().find_map(|&c| self.first_line_row(c))
+    }
+
+    /// The same question asked of the **last** line box: what an atomic
+    /// inline's own baseline is (CSS 2.1 §10.8.1).
+    fn last_line_row(&self, b: BoxId) -> Option<i32> {
+        let bx = &self.boxes[b.0 as usize];
+        if bx.kind == BoxKind::Line {
+            return Some(self.line_baseline_row(b));
+        }
+        bx.children
+            .iter()
+            .rev()
+            .find_map(|&c| self.last_line_row(c))
+    }
+
+    /// Which of a line box's rows carries its baseline.
+    ///
+    /// A line box was one row tall until M9.11, so its top row *was* its
+    /// baseline; a line with an atomic inline on it can be several, and the
+    /// baseline is the row its text sits on. Reading it back off the text
+    /// rather than storing it keeps the answer in one place — the line box
+    /// puts every piece on the page, and a second copy of "which row" could
+    /// disagree with where they went. A line with no text on it takes the
+    /// baseline of whatever box is on it instead, and an empty one is its own
+    /// first row.
+    fn line_baseline_row(&self, line: BoxId) -> i32 {
+        let bx = &self.boxes[line.0 as usize];
+        for &c in &bx.children {
+            let child = &self.boxes[c.0 as usize];
+            if child.kind == BoxKind::Text {
+                return child.dimensions.content.y;
+            }
+        }
+        bx.children
+            .iter()
+            .find_map(|&c| self.last_line_row(c))
+            .unwrap_or(bx.dimensions.content.y)
     }
 
     /// Move a box and everything under it `dx` cells across the page and `dy`
@@ -1919,39 +1957,37 @@ impl<'a> Engine<'a> {
         for item in items {
             match item {
                 InlineItem::Marker { text, style } => {
-                    frags.push(InlineFrag::Piece(Piece {
-                        text: text.clone(),
-                        cells: text.width() as i32,
-                        style: *style,
-                        node: None,
-                        is_space: false,
-                        is_break: false,
-                    }));
+                    frags.push(InlineFrag::Piece(Piece::word(
+                        text.clone(),
+                        text.width() as i32,
+                        *style,
+                        None,
+                    )));
                 }
                 InlineItem::Spacer { cells } => {
                     if *cells > 0 {
-                        frags.push(InlineFrag::Piece(Piece {
-                            text: " ".repeat(*cells as usize),
-                            cells: *cells,
-                            style: Style::default(),
-                            node: None,
-                            // Not a soft wrap space: margins must not collapse
-                            // or vanish at a line edge the way HTML whitespace does.
-                            is_space: false,
-                            is_break: false,
-                        }));
+                        // A `Word`, not a space: margins must not collapse or
+                        // vanish at a line edge the way HTML whitespace does.
+                        frags.push(InlineFrag::Piece(Piece::word(
+                            " ".repeat(*cells as usize),
+                            *cells,
+                            Style::default(),
+                            None,
+                        )));
                     }
                 }
                 InlineItem::Break => {
                     pending_space = None;
-                    frags.push(InlineFrag::Piece(Piece {
-                        text: String::new(),
-                        cells: 0,
-                        style: Style::default(),
-                        node: None,
-                        is_space: false,
-                        is_break: true,
-                    }));
+                    frags.push(InlineFrag::Piece(Piece::line_break()));
+                }
+                // An atomic inline is one piece of the line, so the space
+                // before it is a real break opportunity — unlike an image,
+                // which takes rows of its own and drops the space with them.
+                InlineItem::Atomic { node } => {
+                    if let Some(style) = pending_space.take() {
+                        frags.push(InlineFrag::Piece(Piece::space(style)));
+                    }
+                    frags.push(InlineFrag::Atomic { node: *node });
                 }
                 InlineItem::Image {
                     node,
@@ -1982,25 +2018,18 @@ impl<'a> Engine<'a> {
                     let mut first = true;
                     for word in text.split(is_html_space).filter(|w| !w.is_empty()) {
                         if !first || pending_space.is_some() {
-                            frags.push(InlineFrag::Piece(Piece {
-                                text: " ".into(),
-                                cells: 1,
-                                style: pending_space.unwrap_or(*style),
-                                node: None,
-                                is_space: true,
-                                is_break: false,
-                            }));
+                            frags.push(InlineFrag::Piece(Piece::space(
+                                pending_space.unwrap_or(*style),
+                            )));
                         }
                         first = false;
                         pending_space = None;
-                        frags.push(InlineFrag::Piece(Piece {
-                            text: word.to_string(),
-                            cells: word.width() as i32,
-                            style: *style,
-                            node: Some(*node),
-                            is_space: false,
-                            is_break: false,
-                        }));
+                        frags.push(InlineFrag::Piece(Piece::word(
+                            word.to_string(),
+                            word.width() as i32,
+                            *style,
+                            Some(*node),
+                        )));
                     }
                     if text.ends_with(is_html_space) {
                         pending_space = Some(*style);
@@ -2022,7 +2051,7 @@ impl<'a> Engine<'a> {
             if cur.is_empty() {
                 return;
             }
-            if cur.last().is_some_and(|p| p.is_space) {
+            if cur.last().is_some_and(|p| p.is_space()) {
                 cur.pop();
             }
             if !cur.is_empty() {
@@ -2060,9 +2089,29 @@ impl<'a> Engine<'a> {
                     );
                     continue;
                 }
+                // An atomic inline is sized against the room left on *this*
+                // line (CSS 2.1 §10.3.9), so it can only be built here — and
+                // if what comes back does not fit, the line breaks before it
+                // and it is sized again against a whole one. Never split: a
+                // box that had to wrap internally already did so, inside
+                // itself, at the width it was given.
+                InlineFrag::Atomic { node } => {
+                    let mut dims = self.atomic_dims(node, width, width - cur_cells);
+                    if !cur.is_empty() && cur_cells + dims.margin_box_width() > width {
+                        if cur.last().is_some_and(|p| p.is_space()) {
+                            cur.pop();
+                        }
+                        self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, align);
+                        cur_cells = 0;
+                        dims = self.atomic_dims(node, width, width);
+                    }
+                    // `false`: an atomic inside a `<pre>` reaches the breaker
+                    // through `layout_pre`, never through here.
+                    self.build_atomic(node, dims, x + cur_cells, line_y, false)
+                }
                 InlineFrag::Piece(p) => p,
             };
-            if piece.is_break {
+            if matches!(piece.kind, PieceKind::Break) {
                 if cur.is_empty() {
                     self.emit_empty_line(x, &mut line_y, width, &mut lines);
                 } else {
@@ -2071,7 +2120,7 @@ impl<'a> Engine<'a> {
                 cur_cells = 0;
                 continue;
             }
-            if piece.is_space {
+            if piece.is_space() {
                 if cur.is_empty() {
                     continue; // leading spaces dropped
                 }
@@ -2079,10 +2128,20 @@ impl<'a> Engine<'a> {
                 cur_cells += 1;
                 continue;
             }
+            if matches!(piece.kind, PieceKind::Atomic(_)) {
+                // Already placed on the line it belongs to, above. It can still
+                // be wider than the line — a box whose min-content width does
+                // not fit overflows rather than being broken — and that is the
+                // same overflow a too-long unbreakable word has, not a case of
+                // its own.
+                cur_cells += piece.cells;
+                cur.push(piece);
+                continue;
+            }
 
             // Overlong word: hard-break by cells.
             if piece.cells > width {
-                if cur.last().is_some_and(|p| p.is_space) {
+                if cur.last().is_some_and(|p| p.is_space()) {
                     cur.pop();
                 }
                 if !cur.is_empty() {
@@ -2103,14 +2162,12 @@ impl<'a> Engine<'a> {
                         cells += w;
                         end = i + ch.len_utf8();
                     }
-                    cur.push(Piece {
-                        text: rest[..end].to_string(),
-                        cells: cells as i32,
+                    cur.push(Piece::word(
+                        rest[..end].to_string(),
+                        cells as i32,
                         style,
                         node,
-                        is_space: false,
-                        is_break: false,
-                    });
+                    ));
                     rest = &rest[end..];
                     if !rest.is_empty() {
                         self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, align);
@@ -2122,7 +2179,7 @@ impl<'a> Engine<'a> {
 
             // Word that does not fit: wrap (consume trailing space).
             if !cur.is_empty() && cur_cells + piece.cells > width {
-                if cur.last().is_some_and(|p| p.is_space) {
+                if cur.last().is_some_and(|p| p.is_space()) {
                     cur.pop();
                 }
                 self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, align);
@@ -2132,6 +2189,104 @@ impl<'a> Engine<'a> {
         }
         self.emit_line(&mut cur, &mut line_y, &mut lines, x, width, align);
         lines
+    }
+
+    /// How wide an atomic inline is, and what its edges are, given `available`
+    /// cells left on the line for its **margin box** (M9.11).
+    ///
+    /// CSS 2.1 §10.3.9: an inline-block with a `width` is that wide, and one
+    /// without is *shrink-to-fit* —
+    /// `min(max(min-content, available), max-content)`. Then M9.2's `min-width`
+    /// / `max-width` clamps and `box-sizing`, which is why the block resolver
+    /// does the first pass: everything but the `auto` branch is identical, and
+    /// two copies of the clamp order is how the two drift apart.
+    ///
+    /// No box is built here. Sizing and building are separate because the
+    /// breaker has to know how wide the box *would* be before it can decide
+    /// which line it goes on — and if it goes on the next one, the answer
+    /// changes, because `available` did.
+    fn atomic_dims(&mut self, node: NodeId, containing_width: i32, available: i32) -> Dimensions {
+        let computed = *self.styles.get(node);
+        let mut dims = resolve_block_dims(&computed, containing_width);
+        // An `auto` margin on an inline-level box is zero (CSS 2.1 §10.3.9),
+        // not the free space of its containing block: a badge in a sentence
+        // does not centre itself in the paragraph.
+        if computed.margin.left.is_auto() {
+            dims.margin.left = 0;
+        }
+        if computed.margin.right.is_auto() {
+            dims.margin.right = 0;
+        }
+        if computed.width.is_auto() {
+            let edges = dims.margin_box_width() - dims.content.width;
+            let (min_content, max_content) = self.sizer.content_widths(node);
+            let axis = Axis {
+                edges: dims.padding.left
+                    + dims.padding.right
+                    + dims.border.left
+                    + dims.border.right,
+                box_sizing: computed.box_sizing,
+            };
+            let resolve = |len: Length| (!len.is_auto()).then(|| len.to_cells_h(containing_width));
+            dims.content.width = axis.clamp(
+                shrink_to_fit(min_content, max_content, available - edges),
+                resolve(computed.min_width),
+                resolve(computed.max_width),
+            );
+        }
+        dims
+    }
+
+    /// Build an atomic inline's box at `x`, `y` — its margin-box origin — and
+    /// return the piece the line places.
+    ///
+    /// Provisional coordinates: the line does not know its baseline row until
+    /// every piece on it is sized, so [`emit_line`](Self::emit_line) moves this
+    /// subtree once it does. Building it here rather than there is what lets
+    /// the box report the two numbers the line needs — how many rows it is, and
+    /// which of them carries its baseline — since both are answers only its own
+    /// contents can give.
+    fn build_atomic(
+        &mut self,
+        node: NodeId,
+        mut dims: Dimensions,
+        x: i32,
+        y: i32,
+        pre: bool,
+    ) -> Piece {
+        let computed = *self.styles.get(node);
+        let tag = match &self.dom.node(node).data {
+            NodeData::Element { tag, .. } => tag.clone(),
+            _ => String::new(),
+        };
+        let cells = dims.margin_box_width();
+        dims.content.x = x + dims.margin.left + dims.border.left + dims.padding.left;
+        dims.content.y = y + dims.margin.top + dims.border.top + dims.padding.top;
+        dims.content.height = 0;
+        // `None`: a line box has no definite height of its own, so a percentage
+        // height inside an atomic inline behaves as `auto` — M9.2's rule for
+        // any box whose containing block is sized by its content.
+        let box_id = self.layout_box_at(node, &tag, computed, dims, None, pre);
+        Piece::atomic(box_id, cells, node)
+    }
+
+    /// How many rows an atomic inline's margin box occupies, and which of them
+    /// carries its baseline, counted from its top.
+    ///
+    /// CSS 2.1 §10.8.1: that baseline is the baseline of the box's **last**
+    /// line box — the last row of text in it, which is what makes a two-line
+    /// badge line up with the sentence by its second line and not its first.
+    /// A box with no line box at all (an empty one, or one holding only
+    /// another box) takes its bottom margin edge instead, one row past its
+    /// last: it then sits entirely above the text beside it, the way a letter
+    /// sits on a rule.
+    fn atomic_rows(&self, box_id: BoxId) -> (i32, i32) {
+        let margin_box = self.boxes[box_id.0 as usize].dimensions.margin_box();
+        let baseline = match self.last_line_row(box_id) {
+            Some(row) => row - margin_box.y,
+            None => margin_box.height,
+        };
+        (margin_box.height, baseline)
     }
 
     /// Place a replaced image: one multi-row `BoxKind::Image` on its own
@@ -2193,13 +2348,32 @@ impl<'a> Engine<'a> {
         if cur.is_empty() {
             return;
         }
-        while cur.last().is_some_and(|p| p.is_space) {
+        while cur.last().is_some_and(|p| p.is_space()) {
             cur.pop();
         }
         if cur.is_empty() {
             return;
         }
-        let content_cells: i32 = cur.iter().map(|p| p.cells).sum();
+        // How wide the line's content is, and how many rows it needs either
+        // side of its baseline. One pass, because this is the inner loop of
+        // every inline formatting context on the page — and for a line of
+        // plain text both depths are zero, so the arithmetic below collapses
+        // to "one row, text on it", exactly as it was before M9.11.
+        let mut content_cells = 0;
+        let mut above = 0;
+        let mut below = 0;
+        for p in cur.iter() {
+            content_cells += p.cells;
+            if let PieceKind::Atomic(box_id) = p.kind {
+                let (height, baseline) = self.atomic_rows(box_id);
+                above = above.max(baseline);
+                below = below.max((height - 1 - baseline).max(0));
+            }
+        }
+        let height = above + 1 + below;
+        // The row everything on this line is aligned on: text sits on it, and
+        // an atomic inline hangs `baseline` rows above it.
+        let baseline_row = *line_y + above;
         let shift = match align {
             TextAlign::Left => 0,
             TextAlign::Center => ((width - content_cells) / 2).max(0),
@@ -2213,7 +2387,7 @@ impl<'a> Engine<'a> {
                     x,
                     y: *line_y,
                     width,
-                    height: 1,
+                    height,
                 },
                 ..Dimensions::default()
             },
@@ -2224,11 +2398,12 @@ impl<'a> Engine<'a> {
             image_src: None,
             image_size_firm: false,
         });
-        // Merge adjacent same-style pieces.
+        // Merge adjacent same-style pieces. An atomic inline is a box, not
+        // characters, so it merges with nothing on either side.
         let mut merged: Vec<Piece> = Vec::new();
         for p in cur.drain(..) {
             match merged.last_mut() {
-                Some(last) if last.style == p.style => {
+                Some(last) if !p.is_atomic() && !last.is_atomic() && last.style == p.style => {
                     last.text.push_str(&p.text);
                     last.cells += p.cells;
                     if last.node.is_none() {
@@ -2241,31 +2416,42 @@ impl<'a> Engine<'a> {
         let mut cx = x + shift;
         let mut child_ids = Vec::new();
         for p in merged {
-            let tid = self.alloc(LayoutBox {
-                kind: BoxKind::Text,
-                node: p.node,
-                dimensions: Dimensions {
-                    content: Rect {
-                        x: cx,
-                        y: *line_y,
-                        width: p.cells,
-                        height: 1,
+            let id = match p.kind {
+                // Built before the line knew where it would go, so it moves
+                // now: across by the text-align shift and whatever preceded
+                // it, and down to hang off the shared baseline row.
+                PieceKind::Atomic(box_id) => {
+                    let placed = self.boxes[box_id.0 as usize].dimensions.margin_box();
+                    let (_, baseline) = self.atomic_rows(box_id);
+                    self.shift_subtree(box_id, cx - placed.x, (baseline_row - baseline) - placed.y);
+                    box_id
+                }
+                _ => self.alloc(LayoutBox {
+                    kind: BoxKind::Text,
+                    node: p.node,
+                    dimensions: Dimensions {
+                        content: Rect {
+                            x: cx,
+                            y: baseline_row,
+                            width: p.cells,
+                            height: 1,
+                        },
+                        ..Dimensions::default()
                     },
-                    ..Dimensions::default()
-                },
-                children: Vec::new(),
-                text: Some(p.text),
-                term_style: p.style,
-                computed: ComputedStyle::default(),
-                image_src: None,
-                image_size_firm: false,
-            });
+                    children: Vec::new(),
+                    text: Some(p.text),
+                    term_style: p.style,
+                    computed: ComputedStyle::default(),
+                    image_src: None,
+                    image_size_firm: false,
+                }),
+            };
             cx += p.cells;
-            child_ids.push(tid);
+            child_ids.push(id);
         }
         self.boxes[line_id.0 as usize].children = child_ids;
         lines.push(line_id);
-        *line_y += 1;
+        *line_y += height;
     }
 
     fn layout_pre(&mut self, items: &[InlineItem], x: i32, y: i32, width: i32) -> Vec<BoxId> {
@@ -2292,25 +2478,25 @@ impl<'a> Engine<'a> {
                 }
                 InlineItem::Spacer { cells } => {
                     if *cells > 0 {
-                        cur.push(Piece {
-                            text: " ".repeat(*cells as usize),
-                            cells: *cells,
-                            style: Style::default(),
-                            node: None,
-                            is_space: false,
-                            is_break: false,
-                        });
+                        cur.push(Piece::word(
+                            " ".repeat(*cells as usize),
+                            *cells,
+                            Style::default(),
+                            None,
+                        ));
                     }
                 }
                 InlineItem::Marker { text, style } => {
-                    cur.push(Piece {
-                        text: text.clone(),
-                        cells: text.width() as i32,
-                        style: *style,
-                        node: None,
-                        is_space: false,
-                        is_break: false,
-                    });
+                    cur.push(Piece::word(text.clone(), text.width() as i32, *style, None));
+                }
+                // Nothing wraps in a `<pre>`, so an atomic inline here is
+                // simply sized against what is left of the line and placed:
+                // there is no second line for it to move to.
+                InlineItem::Atomic { node } => {
+                    let placed: i32 = cur.iter().map(|p| p.cells).sum();
+                    let dims = self.atomic_dims(*node, width, width - placed);
+                    let piece = self.build_atomic(*node, dims, x + placed, line_y, true);
+                    cur.push(piece);
                 }
                 img @ InlineItem::Image { .. } => {
                     if !cur.is_empty() {
@@ -2332,14 +2518,12 @@ impl<'a> Engine<'a> {
                     while let Some(nl) = rest.find('\n') {
                         let before = &rest[..nl];
                         if !before.is_empty() {
-                            cur.push(Piece {
-                                text: before.to_string(),
-                                cells: before.width() as i32,
-                                style: *style,
-                                node: Some(*node),
-                                is_space: false,
-                                is_break: false,
-                            });
+                            cur.push(Piece::word(
+                                before.to_string(),
+                                before.width() as i32,
+                                *style,
+                                Some(*node),
+                            ));
                         }
                         if cur.is_empty() {
                             self.emit_empty_line(x, &mut line_y, width, &mut lines);
@@ -2356,14 +2540,12 @@ impl<'a> Engine<'a> {
                         rest = &rest[nl + 1..];
                     }
                     if !rest.is_empty() {
-                        cur.push(Piece {
-                            text: rest.to_string(),
-                            cells: rest.width() as i32,
-                            style: *style,
-                            node: Some(*node),
-                            is_space: false,
-                            is_break: false,
-                        });
+                        cur.push(Piece::word(
+                            rest.to_string(),
+                            rest.width() as i32,
+                            *style,
+                            Some(*node),
+                        ));
                     }
                 }
             }
@@ -2420,12 +2602,17 @@ impl<'a> Engine<'a> {
                         ChildMode::Inline
                     };
                 }
-                match self.styles.get(id).display {
-                    Display::Inline => ChildMode::Inline,
+                let display = self.styles.get(id).display;
+                // An atomic inline joins the line for the same reason a plain
+                // inline does — it is inline-*level* — and differs only in
+                // what the inline formatting context then does with it.
+                if display == Display::Inline || is_atomic_inline(display) {
+                    ChildMode::Inline
+                } else {
                     // Reveal: a page-hidden box is walked as block so its
                     // subtree can surface. UA-important none never gets here.
                     // Everything left is block-level.
-                    _ => ChildMode::Block,
+                    ChildMode::Block
                 }
             }
         }
@@ -2466,6 +2653,14 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let computed = self.styles.get(id);
+                // An atomic inline goes on the line whole, edges and all: its
+                // margins and padding belong to its own box rather than
+                // becoming spacers, and its contents are laid out inside it
+                // rather than flowing into this line (M9.11).
+                if is_atomic_inline(computed.display) {
+                    out.push(InlineItem::Atomic { node: id });
+                    return;
+                }
                 // Horizontal margin/padding on inlines (HN `.hnname { margin-right }`).
                 let lead = edge_h(computed.margin.left, containing_width)
                     + edge_h(computed.padding.left, containing_width)
@@ -2998,7 +3193,7 @@ pub(super) enum FlexItemSource {
 /// *max*. Reversal changes neither — reversing the order of a sum or a maximum
 /// does not change it.
 pub(super) fn lays_out_as_flex(computed: &ComputedStyle) -> bool {
-    computed.display == Display::Flex
+    matches!(computed.display, Display::Flex | Display::InlineFlex)
 }
 
 /// Does this flex container's main axis run down the page? Intrinsic sizing
@@ -3093,6 +3288,12 @@ enum InlineItem {
         firm: bool,
         computed: ComputedStyle,
     },
+    /// An atomic inline: `inline-block` or `inline-flex` (M9.11). Only the node
+    /// travels, because nothing about the box can be decided here — its width
+    /// depends on how much of the line is left when the breaker reaches it.
+    Atomic {
+        node: NodeId,
+    },
 }
 
 /// Intermediate fragment while building an IFC (text pieces + atomic images).
@@ -3115,15 +3316,94 @@ enum InlineFrag {
         firm: bool,
         computed: ComputedStyle,
     },
+    /// An atomic inline, still unsized: it becomes a [`Piece`] only once the
+    /// breaker knows how much room is left on the line (M9.11).
+    Atomic {
+        node: NodeId,
+    },
 }
 
+/// One unit the line breaker places: it fits on the current line, or the line
+/// breaks before it.
 struct Piece {
     text: String,
+    /// Cells this piece occupies on the line — for an atomic inline, its whole
+    /// *margin* box, which is what the next piece has to start after.
     cells: i32,
     style: Style,
     node: Option<NodeId>,
-    is_space: bool,
-    is_break: bool,
+    kind: PieceKind,
+}
+
+/// What a piece is. Three of the four are text the line draws itself; the
+/// fourth is a box that was built before the line existed.
+#[derive(Clone, Copy)]
+enum PieceKind {
+    /// A word, a list marker, or a fixed-width spacer from an inline's
+    /// horizontal edges: drawn as text, never split except by the overlong-word
+    /// path.
+    Word,
+    /// Collapsible HTML whitespace: dropped at either end of a line.
+    Space,
+    /// A forced break (`<br>`).
+    Break,
+    /// An atomic inline (M9.11): a box already built and sized, which the line
+    /// places whole and never breaks into. How many rows it needs is read back
+    /// off the box ([`Engine::atomic_rows`]) rather than carried here — a
+    /// second copy could disagree with the box, and this struct is the inner
+    /// loop of every inline formatting context on the page, so it stays the
+    /// size it was before atomic inlines existed.
+    Atomic(BoxId),
+}
+
+impl Piece {
+    fn word(text: String, cells: i32, style: Style, node: Option<NodeId>) -> Piece {
+        Piece {
+            text,
+            cells,
+            style,
+            node,
+            kind: PieceKind::Word,
+        }
+    }
+
+    fn space(style: Style) -> Piece {
+        Piece {
+            text: " ".into(),
+            cells: 1,
+            style,
+            node: None,
+            kind: PieceKind::Space,
+        }
+    }
+
+    fn line_break() -> Piece {
+        Piece {
+            text: String::new(),
+            cells: 0,
+            style: Style::default(),
+            node: None,
+            kind: PieceKind::Break,
+        }
+    }
+
+    fn atomic(box_id: BoxId, cells: i32, node: NodeId) -> Piece {
+        Piece {
+            text: String::new(),
+            cells,
+            style: Style::default(),
+            node: Some(node),
+            kind: PieceKind::Atomic(box_id),
+        }
+    }
+
+    fn is_space(&self) -> bool {
+        matches!(self.kind, PieceKind::Space)
+    }
+
+    fn is_atomic(&self) -> bool {
+        matches!(self.kind, PieceKind::Atomic(_))
+    }
 }
 
 /// Resolve horizontal box model for a block in a containing block of width `cw`.
@@ -3326,6 +3606,20 @@ pub fn term_color(color: crate::style::values::ColorValue) -> Color {
 /// second code path on either side.
 pub(super) fn is_block_level(display: Display) -> bool {
     matches!(display, Display::Block | Display::Flex)
+}
+
+/// Does this `display` generate an **atomic inline** — a box that joins the
+/// line beside it, sized and placed as one unbreakable piece rather than
+/// flowing its contents into that line as words (M9.11)?
+///
+/// This is the other half of the keyword [`is_block_level`] reads, and the two
+/// are exhaustive over the box-generating modes: a box is block-level, atomic
+/// inline, or plain inline. What runs *inside* an atomic one is still
+/// [`lays_out_as_flex`]'s question — that separation is what lets
+/// `inline-block` and `inline-flex` share every line of placement code and
+/// differ only in which formatting context fills the box.
+pub(super) fn is_atomic_inline(display: Display) -> bool {
+    matches!(display, Display::InlineBlock | Display::InlineFlex)
 }
 
 /// Where a line may be broken: HTML whitespace, and nothing else.

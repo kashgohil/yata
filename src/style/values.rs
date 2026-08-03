@@ -8,17 +8,30 @@
 //! This is where M4.1's deliberate ignorance ends — the parser handed over raw
 //! source text, and this module is the first code that knows `red` is a colour.
 
-/// The display modes this engine implements. M4 had three — a line-breaking
-/// block, inline text, or gone — and M9.5 adds the fourth: a flex container,
-/// which is block-level and lays its children out along an axis. Until M9.6
-/// implements that axis, layout treats it as a block (`engine::is_block_level`,
-/// the one place that decision is made).
+/// The display modes this engine implements.
+///
+/// A `display` keyword says two things at once: whether the box is block-level
+/// or inline-level *outside*, and which formatting context it runs *inside*.
+/// M4 had three modes that never needed the distinction, M9.5 added `Flex`
+/// (block outside, flex inside), and M9.11 adds the two that only exist because
+/// the two halves come apart: `InlineBlock` and `InlineFlex` are inline-level
+/// outside — they sit on a line beside their siblings — with a block container
+/// and a flex container inside.
+///
+/// Layout reads the outside half through `engine::is_block_level` and
+/// `engine::is_atomic_inline`, and the inside half through
+/// `engine::lays_out_as_flex`. Those three are the only places either decision
+/// is made.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Display {
     Block,
     #[default]
     Inline,
     Flex,
+    /// Inline-level, block container inside: an atomic inline (M9.11).
+    InlineBlock,
+    /// Inline-level, flex container inside.
+    InlineFlex,
     None,
 }
 
@@ -276,13 +289,15 @@ pub fn parse_overflow(value: &str) -> Option<Overflow> {
 pub fn parse_display(value: &str) -> Option<Display> {
     match lower(value).as_str() {
         "none" => Some(Display::None),
-        // `inline-flex` is an inline-*level* box with a flex *inner* mode. The
-        // inner mode is the half that matters for the children, and it is the
-        // half M9.6 implements, so it wins for now: an inline-flex box is
-        // block-level here. M9.11 (atomic inlines) is where it becomes a real
-        // inline-level box that sits on a line with its siblings.
-        "flex" | "inline-flex" => Some(Display::Flex),
-        "inline" | "inline-block" | "inline-grid" | "contents" => Some(Display::Inline),
+        "flex" => Some(Display::Flex),
+        // Both halves of the keyword, since M9.11: inline-level outside, and a
+        // block or flex formatting context inside. `inline-grid` still folds
+        // into `InlineBlock` — the outside half is the one this engine can
+        // honour, and a grid laid out as a block container is the same
+        // approximation `grid` already gets.
+        "inline-block" | "inline-grid" => Some(Display::InlineBlock),
+        "inline-flex" => Some(Display::InlineFlex),
+        "inline" | "contents" => Some(Display::Inline),
         "block" | "flow-root" | "list-item" | "grid" | "table" | "table-row" | "table-cell"
         | "table-row-group" | "table-header-group" | "table-footer-group" | "table-caption"
         | "inline-table" => Some(Display::Block),
@@ -976,12 +991,17 @@ mod tests {
         assert_eq!(parse_display("INLINE"), Some(Display::Inline));
         assert_eq!(parse_display("none"), Some(Display::None));
         // M9.5: `flex` is its own mode now — it stopped being spelled `Block`
-        // the moment there was a `Flex` to spell it. `inline-flex` joins it
-        // until M9.11 makes inline-level boxes real.
+        // the moment there was a `Flex` to spell it. M9.11 does the same for
+        // the two inline-level modes: an `inline-flex` badge that cascaded to
+        // `Flex` became a full-width row, and an `inline-block` that cascaded
+        // to `Inline` lost its width, padding and background.
         assert_eq!(parse_display("flex"), Some(Display::Flex));
-        assert_eq!(parse_display("INLINE-FLEX"), Some(Display::Flex));
+        assert_eq!(parse_display("INLINE-FLEX"), Some(Display::InlineFlex));
         assert_eq!(parse_display("table-cell"), Some(Display::Block));
-        assert_eq!(parse_display("inline-block"), Some(Display::Inline));
+        assert_eq!(parse_display("inline-block"), Some(Display::InlineBlock));
+        // No mode of its own, so it keeps the nearest one that has the right
+        // outside half.
+        assert_eq!(parse_display("inline-grid"), Some(Display::InlineBlock));
         assert_eq!(parse_display("bananas"), None);
     }
 

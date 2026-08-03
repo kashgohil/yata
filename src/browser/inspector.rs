@@ -110,14 +110,23 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
     let mut parts = vec![match computed.display {
         Display::Block => "block".to_string(),
         Display::Inline => "inline".to_string(),
+        Display::InlineBlock => "inline-block".to_string(),
         Display::None => "none".to_string(),
         // A flex container prints its axis with the display keyword — `flex
         // row`, and `flex row wrap` when it wraps — because "which way does
         // this stack, and does it wrap" is the first thing to know about a
         // flex box, and `flex-flow` is how CSS spells the pair. The rest of
         // the flex properties follow the usual "interesting only" rule below.
-        Display::Flex => {
-            let mut s = format!("flex {}", computed.flex_direction.name());
+        // An `inline-flex` box says both halves: it flexes inside and sits on
+        // a line outside, and which of the two surprised the reader is exactly
+        // what they opened F2 to find out.
+        Display::Flex | Display::InlineFlex => {
+            let keyword = if computed.display == Display::InlineFlex {
+                "inline-flex"
+            } else {
+                "flex"
+            };
+            let mut s = format!("{keyword} {}", computed.flex_direction.name());
             if computed.flex_wrap != FlexWrap::default() {
                 s.push(' ');
                 s.push_str(computed.flex_wrap.name());
@@ -202,7 +211,7 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
 /// became `flex` is a page bug F2 should be able to show.
 fn flex_summary(computed: &crate::style::ComputedStyle) -> Vec<String> {
     let mut parts = Vec::new();
-    if computed.display != Display::Flex {
+    if !matches!(computed.display, Display::Flex | Display::InlineFlex) {
         // Named in full here, unlike the `flex row wrap` clause above: on a box
         // that is not a flex container a bare `column` would read like any
         // other one-word clause, and the point of printing it is that it is

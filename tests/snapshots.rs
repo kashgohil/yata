@@ -160,6 +160,38 @@ fn overflow_clip_snapshot() {
     assert_snapshot("overflow-clip", &grid);
 }
 
+/// M9.11: a badge inside a paragraph, through the paint path.
+///
+/// The layout goldens say where the box is; this says that being a box is what
+/// it looks like — a background that fills its own padded rectangle and stops,
+/// with the sentence running past it on the baseline row. As a plain `inline`
+/// (what `inline-block` degraded to before M9.11) there was no rectangle to
+/// fill: the padding and the background went nowhere.
+#[test]
+fn an_inline_block_badge_paints_its_own_box_inside_the_line() {
+    let html = r#"<!doctype html>
+<html><head><style>
+body { margin: 0 } p { margin: 0 }
+.badge { display: inline-block; padding: 0 8px; background: #eee }
+</style></head>
+<body><p>build <span class="badge">passing</span> now</p></body></html>"#;
+    let grid = render_grid(html, 24, 3);
+    // "build " is 6 cells, the badge is 7 + 2 of padding, " now" follows at 15.
+    assert_eq!(
+        grid.lines().collect::<Vec<_>>(),
+        ["build  passing  now"],
+        "{grid}"
+    );
+    let backgrounds = render_backgrounds(html, 24, 3);
+    assert_eq!(
+        backgrounds.lines().collect::<Vec<_>>(),
+        ["      #########"],
+        "the badge's background did not fill its padding box:\n{backgrounds}"
+    );
+    assert_snapshot("inline-block-badge", &grid);
+    assert_snapshot("inline-block-badge-backgrounds", &backgrounds);
+}
+
 /// M9.8: the paint half of `layout/spec/flex-stretch`. That golden says the
 /// stretched item's box is 3 rows tall; this says its background actually
 /// fills them, which is the whole reason a page asks for `stretch` — equal

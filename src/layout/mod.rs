@@ -183,6 +183,7 @@ pub fn debug_lines(lines: &[Line]) -> String {
 mod tests {
     use super::*;
     use crate::html;
+    use crate::layout::engine::is_atomic_inline;
     use crate::style;
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -1598,13 +1599,13 @@ mod tests {
     }
 
     #[test]
-    fn an_inline_flex_span_breaks_its_line_until_m9_11() {
-        // The one place M9.5 does change what a page looks like, pinned so
-        // M9.11 has to come here and say so. `inline-flex` is an inline-level
-        // box with a flex inner mode; this engine takes the inner half and
-        // makes the box block-level, so a `<span>` that a browser leaves on
-        // the line gets a row of its own. No ladder fixture uses `inline-flex`,
-        // which is exactly why this test exists rather than a snapshot.
+    fn an_inline_level_box_stays_on_the_line_beside_its_text() {
+        // M9.5 left this test failing on purpose: `inline-flex` cascaded to
+        // `Flex`, which is block-level, so a badge a browser leaves in the
+        // sentence got a row of its own. M9.11 is where the *outside* half of
+        // the keyword starts being read, and both inline-level modes come back
+        // onto the line — an `inline-block` that used to flow its contents into
+        // the sentence as words, and an `inline-flex` that used to break it.
         let src = "<p>before <span class=b>btn</span> after</p>";
         assert_eq!(
             plain(&lines_styled(src, "span.b { display: inline-block }", 40)),
@@ -1612,10 +1613,168 @@ mod tests {
         );
         assert_eq!(
             plain(&lines_styled(src, "span.b { display: inline-flex }", 40)),
-            ["before", "btn", "after", ""],
-            "when M9.11 gives inline-level boxes a line to sit on, this becomes \
-             one row again"
+            ["before btn after", ""]
         );
+    }
+
+    /// The used content width of the one atomic inline in this document, laid
+    /// out in a column `width` cells wide.
+    fn atomic_width(html_src: &str, css: &str, width: u16) -> i32 {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        let mut found = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.node
+                .is_some_and(|n| is_atomic_inline(styles.get(n).display))
+            {
+                found.push(b.dimensions.content.width);
+            }
+        });
+        assert_eq!(found.len(), 1, "expected exactly one atomic inline");
+        found[0]
+    }
+
+    #[test]
+    fn shrink_to_fit_stops_at_max_content_and_never_goes_under_min_content() {
+        // CSS 2.1 §10.3.9, as a property rather than three numbers: whatever
+        // the line has left, the box is somewhere between the width its
+        // content cannot go under and the width it would take unwrapped. The
+        // interesting half is the *upper* bound — a box that filled the line
+        // like a block is what `inline-block` looked like before M9.11, and it
+        // is the bound a naive "use the available width" would break.
+        let src = "<p>x <span class=b>alpha beta gamma</span></p>";
+        let css = "span.b { display: inline-block }";
+        // "gamma" is the widest word it cannot break, "alpha beta gamma" is the
+        // whole of it on one line.
+        let (min_content, max_content) = (5, 16);
+        for width in 8..40u16 {
+            let used = atomic_width(src, css, width);
+            assert!(
+                (min_content..=max_content).contains(&used),
+                "in {width} cells the box came out {used} wide"
+            );
+            // "x " takes two of them, and the box takes what is left until
+            // there is more than enough.
+            let available = width as i32 - 2;
+            let want = available.clamp(min_content, max_content);
+            assert_eq!(used, want, "in {width} cells");
+        }
+    }
+
+    #[test]
+    fn an_atomic_inline_that_does_not_fit_moves_to_the_next_line_whole() {
+        // The line breaker's rule for a box: it fits, or the line breaks
+        // before it. Never "part of it fits" — a box has no interior break
+        // opportunity a line may use, however much text is inside it.
+        let src = "<p>lead <span class=b>alpha beta</span></p>";
+        let css = "span.b { display: inline-block; width: 8em }";
+        // 16 cells of box after "lead " needs 21; a 20-cell column has to break.
+        let rows = plain(&lines_styled(src, css, 20));
+        assert_eq!(rows[0].trim_end(), "lead", "{rows:?}");
+        assert_eq!(rows[1].trim_end(), "alpha beta", "{rows:?}");
+        // One box for the element on the second row, not two fragments split
+        // across the break.
+        let (dom, styles) = styled_dom(src, css);
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let mut boxes = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.node
+                .is_some_and(|n| is_atomic_inline(styles.get(n).display))
+            {
+                boxes.push(b.dimensions.content);
+            }
+        });
+        assert_eq!(boxes.len(), 1, "the box was split: {boxes:?}");
+        assert_eq!((boxes[0].x, boxes[0].y, boxes[0].width), (0, 1, 16));
+    }
+
+    #[test]
+    fn text_beside_a_tall_atomic_inline_sits_on_its_last_baseline() {
+        // CSS 2.1 §10.8.1. A three-row box whose last line is its third means
+        // the sentence beside it is level with that third row — not with the
+        // top of the box, which is what "align them by their boxes" would do
+        // and is the thing baselines exist to prevent.
+        // A 2-cell box takes one word per row, so "a b c" is three rows. The
+        // sentence resumes past the box's full 2 cells — the second of which
+        // its one-cell last line does not use — because what the line advances
+        // by is the box, not the text in it.
+        let src = "<p>tag <span class=b>a b c</span> end</p>";
+        let css = "span.b { display: inline-block; width: 1em }";
+        let rows = plain(&lines_styled(src, css, 40));
+        assert_eq!(
+            rows.iter().map(|r| r.trim_end()).collect::<Vec<_>>(),
+            ["    a", "    b", "tag c  end", ""],
+            "{rows:?}"
+        );
+    }
+
+    /// Every box in this document that was generated by an atomic inline,
+    /// as `(border box x, y, width, height)`.
+    fn atomic_boxes(html_src: &str, css: &str, width: u16) -> Vec<(i32, i32, i32, i32)> {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        let mut out = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.node
+                .is_some_and(|n| is_atomic_inline(styles.get(n).display))
+            {
+                let r = b.dimensions.border_box();
+                out.push((r.x, r.y, r.width, r.height));
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn an_atomic_inline_is_shifted_by_text_align_with_the_rest_of_its_line() {
+        // A box on a line is a piece of that line and nothing more special:
+        // whatever moves the words moves it too. Centring 6 cells of content in
+        // 20 leaves 7 either side, so the sentence starts at 7 and the box —
+        // "x" with a cell of padding — sits at 10.
+        let src = "<p class=c>hi <span class=b>x</span></p>";
+        let css = "p.c { text-align: center } span.b { display: inline-block; padding: 0 8px }";
+        assert_eq!(atomic_boxes(src, css, 20), [(10, 0, 3, 1)]);
+        let rows = plain(&lines_styled(src, css, 20));
+        assert_eq!(rows[0].trim_end(), "       hi  x", "{rows:?}");
+    }
+
+    #[test]
+    fn an_atomic_inline_inside_pre_is_a_box_on_the_preformatted_line() {
+        // `<pre>` runs its own line breaker (nothing collapses, nothing wraps),
+        // so an atomic inline there needs placing by that one too. The failure
+        // this pins is not a misplaced box but a missing one: a `<pre>` that
+        // silently dropped the box would still look like a plausible page.
+        let src = "<pre>a <span class=b>x</span> b</pre>";
+        let css = "span.b { display: inline-block; padding: 0 8px }";
+        assert_eq!(atomic_boxes(src, css, 20), [(2, 0, 3, 1)]);
+        let rows = plain(&lines_styled(src, css, 20));
+        assert_eq!(rows[0].trim_end(), "a  x  b", "{rows:?}");
+    }
+
+    #[test]
+    fn a_link_inside_an_inline_block_is_clickable_and_searchable() {
+        // Hit-testing, link hints and `/` search all walk the layout tree, and
+        // an atomic inline puts a whole subtree of boxes under a *line* box for
+        // the first time. Nothing about that walk changed, which is exactly why
+        // it is worth a test rather than an assumption.
+        let src = "<p>see <span class=b><a href='/x'>doc</a></span> now</p>";
+        let css = "span.b { display: inline-block; padding: 0 8px }";
+        let (dom, styles) = styled_dom(src, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+
+        let hits = crate::browser::search::find_matches(&tree, "doc");
+        assert_eq!(hits.len(), 1, "the search missed the box: {hits:?}");
+        let hit = hits[0].clone();
+        assert_eq!(
+            link_at(&tree, &dom, hit.x, hit.y).map(|(_, href)| href),
+            Some("/x".to_string()),
+            "a click on the link's own cells missed it"
+        );
+        // ...and the link is reachable by Tab / link hints, with the position
+        // the hint is drawn at inside the box.
+        let links = collect_links(&tree, &dom);
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!((links[0].x, links[0].y), (hit.x, hit.y));
     }
 
     #[test]

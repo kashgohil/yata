@@ -1,0 +1,79 @@
+# SPEC GOLDEN — hand-derived from CSS 2.1 §10.3.9 (shrink-to-fit) and §10.8.1
+# (the baseline of an atomic inline) before the code existed. Never regenerated.
+#
+# An atomic inline is one piece of a line that happens to be a box: the breaker
+# either fits it whole or breaks before it, and everything inside it was laid
+# out at a width the line handed it. Three paragraphs, one per way that width
+# can be decided.
+#
+# Cell arithmetic throughout: 1em is 2 cells across and 1 row down, 8px is one
+# cell across and 16px one row down (PLAN.md §1.4).
+#
+# --- 1. A box told how wide to be -------------------------------------------
+#
+# `width: 10em` is 20 cells and `padding: 1em` is 2 cells either side and 1 row
+# above and below, so the margin box is 24 × 3. "before " is 7 cells, and
+# 7 + 24 = 31 fits in 40, so the box starts at x = 7 and its content at x = 9;
+# " after" follows at 31. The point of the display type is that all of this
+# applies at all — as a plain `inline` the width and padding were ignored and
+# "btn" was three more words in the sentence.
+#
+# The rows are where the baseline rule shows. The box's baseline is its last
+# line box — "btn", one row below its own top because of the padding — so it
+# reaches 1 row above the line's baseline row and 1 below it: the line is
+# 1 + 1 + 1 = 3 rows, with the text either side of the box on the middle one.
+#
+# --- 2. No width: shrink to fit ---------------------------------------------
+#
+# min(max(min-content, available), max-content), with available the cells left
+# on the line: max(5, 36) = 36, capped at the 16 cells "alpha beta gamma" wants
+# unwrapped. So the box is 16 wide — its max-content width — and nothing in it
+# wraps. A line of one row again, because a box one row tall whose baseline is
+# its only line box needs no rows above or below the text beside it.
+#
+# --- 3. No width, and not much line left ------------------------------------
+#
+# The same box in a 20-cell column, after "one two " has taken 8 of them:
+# max(5, 12) = 12, under the 16 it wants, so it takes the 12 that are there and
+# wraps *inside itself* into "alpha beta" / "gamma". Never below its 5-cell
+# min-content width, and never above its 16-cell max-content one — the two ends
+# of the formula.
+#
+# Its baseline is its *last* line box, "gamma", so it hangs 1 row above the
+# line's baseline row and none below: a 2-row line with "one two " on the lower
+# row, level with the box's second line rather than its first. " tail" then
+# needs 5 more cells than the 20 the line has, so it wraps whole to a line of
+# its own — the box did not have to be split for the line to break.
+<html>  x=0 y=0 w=40 h=7
+  <body>  x=0 y=0 w=40 h=7
+    <p>  x=0 y=0 w=40 h=3
+      anonymous  x=0 y=0 w=40 h=3
+        line  x=0 y=0 w=40 h=3
+          #text "before"  x=0 y=1 w=7 h=1
+          <span.pad>  x=9 y=1 w=20 h=1
+            anonymous  x=9 y=1 w=20 h=1
+              line  x=9 y=1 w=20 h=1
+                #text "btn"  x=9 y=1 w=3 h=1
+          #text "after"  x=31 y=1 w=6 h=1
+    <p>  x=0 y=3 w=40 h=1
+      anonymous  x=0 y=3 w=40 h=1
+        line  x=0 y=3 w=40 h=1
+          #text "one"  x=0 y=3 w=4 h=1
+          <span.fit>  x=4 y=3 w=16 h=1
+            anonymous  x=4 y=3 w=16 h=1
+              line  x=4 y=3 w=16 h=1
+                #text "alpha beta gamma"  x=4 y=3 w=16 h=1
+          #text "two"  x=20 y=3 w=4 h=1
+    <div.col>  x=0 y=4 w=20 h=3
+      <p>  x=0 y=4 w=20 h=3
+        anonymous  x=0 y=4 w=20 h=3
+          line  x=0 y=4 w=20 h=2
+            #text "one two"  x=0 y=5 w=8 h=1
+            <span.fit>  x=8 y=4 w=12 h=2
+              anonymous  x=8 y=4 w=12 h=2
+                line  x=8 y=4 w=12 h=1
+                  #text "alpha beta"  x=8 y=4 w=10 h=1
+                line  x=8 y=5 w=12 h=1
+                  #text "gamma"  x=8 y=5 w=5 h=1
+          line  x=0 y=6 w=20 h=1
+            #text "tail"  x=0 y=6 w=4 h=1

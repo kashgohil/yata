@@ -1,0 +1,69 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §3 (an `inline-flex` box is
+# inline-level outside and a flex container inside), CSS 2.1 §10.3.9 and
+# §10.8.1 before the code existed. Never regenerated.
+#
+# --- 1. A flex row inside a sentence ----------------------------------------
+#
+# This is the case M9.5 could not have: `inline-flex` cascaded to `Flex`, which
+# is block-level, so a three-item badge became a full-width row of its own and
+# the sentence broke around it. Now it is one piece of the line.
+#
+# Its width is shrink-to-fit like any other atomic inline, and what it asks for
+# is the flex row's max-content width (M9.4): three items of 1 cell with 1 cell
+# of padding either side, 9 cells in all, well under the 36 the line has left
+# after "say ". So the container is 9 wide at x = 4, its items are placed by
+# §9.5 inside it at x = 5, 8 and 11, and " now" carries on at 13 — on the same
+# row, which is the whole point.
+#
+# --- 2. A box that does not fit moves whole ---------------------------------
+#
+# "a line that ends near the edge" is 30 cells and the box is `width: 12em`,
+# 24 cells, which no shrink-to-fit can reduce: a specified width is the used
+# width. 30 + 1 + 24 overruns 40, so the line breaks *before* it, dropping the
+# space it broke at, and the box starts a line of its own — placed whole, never
+# split, because a box is not a word and has no interior break opportunities
+# the line can use.
+#
+# --- 3. A box with no line box of its own -----------------------------------
+#
+# `.chip` is empty: 4em × 2em, 8 cells by 2 rows, and nothing inside it to have
+# a baseline. §10.8.1 says such a box takes its **bottom margin edge** as its
+# baseline, so it sits one row past its own last row — entirely above the text
+# beside it, the way a letter sits on a rule. That is 2 rows above the line's
+# baseline row and none below, so the line is 3 rows tall and "tag" and "end"
+# are on the last of them, level with nothing but each other.
+<html>  x=0 y=0 w=40 h=6
+  <body>  x=0 y=0 w=40 h=6
+    <p>  x=0 y=0 w=40 h=1
+      anonymous  x=0 y=0 w=40 h=1
+        line  x=0 y=0 w=40 h=1
+          #text "say"  x=0 y=0 w=4 h=1
+          <span.row> flex row  x=4 y=0 w=9 h=1
+            <span>  x=5 y=0 w=1 h=1
+              anonymous  x=5 y=0 w=1 h=1
+                line  x=5 y=0 w=1 h=1
+                  #text "a"  x=5 y=0 w=1 h=1
+            <span>  x=8 y=0 w=1 h=1
+              anonymous  x=8 y=0 w=1 h=1
+                line  x=8 y=0 w=1 h=1
+                  #text "b"  x=8 y=0 w=1 h=1
+            <span>  x=11 y=0 w=1 h=1
+              anonymous  x=11 y=0 w=1 h=1
+                line  x=11 y=0 w=1 h=1
+                  #text "c"  x=11 y=0 w=1 h=1
+          #text "now"  x=13 y=0 w=4 h=1
+    <p>  x=0 y=1 w=40 h=2
+      anonymous  x=0 y=1 w=40 h=2
+        line  x=0 y=1 w=40 h=1
+          #text "a line that ends ne…"  x=0 y=1 w=30 h=1
+        line  x=0 y=2 w=40 h=1
+          <span.wide>  x=0 y=2 w=24 h=1
+            anonymous  x=0 y=2 w=24 h=1
+              line  x=0 y=2 w=24 h=1
+                #text "x"  x=0 y=2 w=1 h=1
+    <p>  x=0 y=3 w=40 h=3
+      anonymous  x=0 y=3 w=40 h=3
+        line  x=0 y=3 w=40 h=3
+          #text "tag"  x=0 y=5 w=4 h=1
+          <span.chip>  x=4 y=3 w=8 h=2
+          #text "end"  x=12 y=5 w=4 h=1

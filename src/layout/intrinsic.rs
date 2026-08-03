@@ -28,8 +28,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::engine::{
-    Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_block_level, is_column,
-    is_html_space, lays_out_as_flex,
+    Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_atomic_inline,
+    is_block_level, is_column, is_html_space, lays_out_as_flex,
 };
 use crate::style::Styles;
 use crate::style::values::{Display, FlexBasis, FlexWrap, Length};
@@ -447,7 +447,7 @@ impl<'a> IntrinsicSizer<'a> {
     /// The `<li>` marker is missing on purpose: the bullet is decoration the
     /// engine injects while building boxes, and none of M9.4's rules mention
     /// it.
-    fn push_pieces(&self, node: NodeId, run: &mut Run) {
+    fn push_pieces(&mut self, node: NodeId, run: &mut Run) {
         let dom = self.dom;
         match &dom.node(node).data {
             NodeData::Text(text) => {
@@ -509,6 +509,21 @@ impl<'a> IntrinsicSizer<'a> {
                     }
                     return;
                 }
+                // An atomic inline (M9.11) is one box on the line, so it is one
+                // piece here — and the only piece with two different widths.
+                // It cannot be broken into, which is what makes it a piece at
+                // all; but it can wrap *inside itself*, so the narrowest the
+                // line can get is its own min-content width, while the widest
+                // it wants is its max-content one. Measuring it the way this
+                // module measures an inline — by flattening its words into the
+                // surrounding run — would report a paragraph that can wrap
+                // where the engine will not break.
+                if is_atomic_inline(self.styles.get(node).display) {
+                    let edges = self.outer_edges(node);
+                    let sizes = self.sizes(node).grown_by(edges);
+                    run.atomic(sizes.min, sizes.max);
+                    return;
+                }
                 let computed = self.styles.get(node);
                 // Horizontal margin/padding/border on an inline becomes a
                 // fixed-width piece on the line (HN's `.hnname`). Zero
@@ -522,7 +537,12 @@ impl<'a> IntrinsicSizer<'a> {
                 if lead > 0 {
                     run.piece(lead);
                 }
-                for child in self.dom.children(node) {
+                // `dom`, not `self.dom`: the reference was copied out at the top
+                // of this function, so the walk borrows nothing from `self` and
+                // the recursion needs no collected child list to hand it one.
+                // An allocation here is per *element*, on the measuring path
+                // every flex item on the page goes through.
+                for child in dom.children(node) {
                     self.push_pieces(child, run);
                 }
                 if trail > 0 {
@@ -556,11 +576,12 @@ impl<'a> IntrinsicSizer<'a> {
                         ChildMode::Inline
                     };
                 }
-                match display {
-                    Display::Inline => ChildMode::Inline,
+                if display == Display::Inline || is_atomic_inline(display) {
+                    ChildMode::Inline
+                } else {
                     // Block-level is what remains, and so is a revealed
                     // `display:none` — the engine walks one as a block.
-                    _ => ChildMode::Block,
+                    ChildMode::Block
                 }
             }
         }
@@ -716,6 +737,13 @@ impl Run {
 
     /// An unbreakable piece of `cells` cells.
     fn piece(&mut self, cells: i32) {
+        self.push(cells, cells);
+    }
+
+    /// A piece that takes `cells` on a segment but can be as narrow as `min`
+    /// when the line is squeezed — the two numbers a word cannot tell apart
+    /// and an atomic inline can.
+    fn push(&mut self, cells: i32, min: i32) {
         if self.pending_space {
             self.pending_space = false;
             if !self.at_start {
@@ -723,7 +751,7 @@ impl Run {
             }
         }
         self.cur += cells;
-        self.min = self.min.max(cells);
+        self.min = self.min.max(min);
         self.at_start = false;
     }
 
@@ -737,6 +765,13 @@ impl Run {
         self.line_break();
         self.piece(cells);
         self.line_break();
+    }
+
+    /// An atomic inline (M9.11): unbreakable like a word, but with room to
+    /// wrap inside itself, so what it costs the segment and what it costs the
+    /// narrowest line are two different numbers.
+    fn atomic(&mut self, min: i32, max: i32) {
+        self.push(max, min);
     }
 
     /// End the current segment (`<br>`, a `\n` in `pre`, or the end of the
@@ -862,6 +897,32 @@ mod tests {
         assert_eq!(sizer.max_content_width(outer), 7);
         // min-content likewise: the padded child's word (5) plus its padding.
         assert_eq!(sizer.min_content_width(outer), 7);
+    }
+
+    #[test]
+    fn an_atomic_inline_is_one_piece_with_two_widths() {
+        // M9.11. An `inline-block` is unbreakable on the line around it, like a
+        // word — but unlike a word it can wrap *inside itself*, so what it
+        // costs an unwrapped line and how narrow it can be squeezed are two
+        // different numbers, and it is the only piece with that property.
+        //
+        // `.b` is "aa bb" (5 cells unwrapped, 2 when it wraps) with a cell of
+        // padding each side: outer 7 and outer 4. So the paragraph's
+        // max-content is "xxx" + a space + 7 = 11, and its min-content is the
+        // widest single piece — the box at 4, not the 3-cell word beside it.
+        //
+        // Measuring it the way this module measures a plain inline — flattening
+        // its words into the surrounding run — would report a min-content of 3,
+        // a width at which the engine cannot break the box and does not.
+        let src = "<p>xxx <span class=b>aa bb</span></p>";
+        let css = "p { margin: 0 } span.b { display: inline-block; padding: 0 8px }";
+        assert_eq!(sizes_of(src, css, "p"), (4, 11));
+        // And the engine agrees at both ends: nothing wraps at max-content, and
+        // at min-content every row still fits.
+        assert_eq!(rows(src, css, 11).len(), 1, "max-content must not wrap");
+        for row in rows(src, css, 4) {
+            assert!(row.width() <= 4, "min-content 4 cannot hold {row:?}");
+        }
     }
 
     #[test]
