@@ -32,7 +32,7 @@ use crate::layout::engine::{
     is_html_space, lays_out_as_flex,
 };
 use crate::style::Styles;
-use crate::style::values::{Display, FlexBasis, Length};
+use crate::style::values::{Display, FlexBasis, FlexWrap, Length};
 
 /// The containing width handed to image sizing, and to nothing else.
 ///
@@ -278,11 +278,20 @@ impl<'a> IntrinsicSizer<'a> {
     /// A flex container's sizes (§9.9), and the one place the *direction*
     /// changes a measurement.
     ///
-    /// A **row**'s items sit side by side, so both widths are sums where a
-    /// block container's are maxima. That difference is the whole reason this
-    /// function exists — measuring a flex row like a block reports the width of
-    /// its widest item, which is what a two-item row would be if it were
-    /// allowed to wrap, and it is not (`nowrap`).
+    /// A **row**'s items sit side by side, so its max-content width is a sum
+    /// where a block container's is a maximum. That difference is the whole
+    /// reason this function exists — measuring a flex row like a block reports
+    /// the width of its widest item, which is what a row would be if it were
+    /// allowed to wrap.
+    ///
+    /// Which, since M9.10, some rows are: a **wrapping** row's *min*-content
+    /// width is the largest single item rather than the sum of them all
+    /// (§9.9.1), because "the narrowest this can be" is the narrowest column of
+    /// wrapped items, not one long line. Its max-content stays the sum — at
+    /// that width everything fits on one line and nothing wraps. Getting this
+    /// wrong is not a visible bug in the container itself: it is a wrapping row
+    /// nested inside another one, refusing to shrink below the width of all its
+    /// items at once, and so never wrapping at all.
     ///
     /// A **column**'s items stack, so the width it is being asked for is its
     /// *cross* axis: a max over its items' outer widths, with no gap term at
@@ -308,15 +317,20 @@ impl<'a> IntrinsicSizer<'a> {
             return Sizes::ZERO;
         }
         let column = is_column(computed);
+        let wraps = computed.flex_wrap != FlexWrap::NoWrap;
         // Gaps are part of what a row asks for: three items with a one-cell gap
         // need two cells nothing will ever draw in. Zero containing width, per
-        // this module's percentage rule.
+        // this module's percentage rule. A wrapping row's min-content is a
+        // single item, and a single item has no gap beside it.
         let gap = if column {
             0
         } else {
             edge_h(computed.gap.column, 0).max(0) * (sources.len() as i32 - 1)
         };
-        let mut out = Sizes { min: gap, max: gap };
+        let mut out = Sizes {
+            min: if wraps { 0 } else { gap },
+            max: gap,
+        };
         for source in sources {
             let sizes = match source {
                 FlexItemSource::Element(child) => {
@@ -336,7 +350,11 @@ impl<'a> IntrinsicSizer<'a> {
                 out.max_with(sizes)
             } else {
                 Sizes {
-                    min: out.min + sizes.min,
+                    min: if wraps {
+                        out.min.max(sizes.min)
+                    } else {
+                        out.min + sizes.min
+                    },
                     max: out.max + sizes.max,
                 }
             };
@@ -940,6 +958,47 @@ mod tests {
         // column would report 20 cells of width it never uses.
         let basis = "#r { display: flex; flex-direction: column } div div { flex: 0 0 160px }";
         assert_eq!(sizes_of(markup, basis, "div"), (4, 4));
+    }
+
+    #[test]
+    fn a_wrapping_row_asks_for_its_widest_item_as_a_minimum() {
+        // M9.10, §9.9.1. "The narrowest this row can be" stops being the sum of
+        // its items the moment they are allowed to wrap: it is the widest
+        // single item, because everything else can go on another line. The
+        // max-content is still the sum — at that width nothing has to wrap.
+        let markup = "<div id=r><div>aaaa</div><div>bb</div></div>";
+        let nowrap = "#r { display: flex; column-gap: 1em }";
+        assert_eq!(sizes_of(markup, nowrap, "div"), (8, 8));
+        let wraps = "#r { display: flex; flex-wrap: wrap; column-gap: 1em }";
+        assert_eq!(
+            sizes_of(markup, wraps, "div"),
+            (4, 8),
+            "the widest item, and no gap beside a line of one"
+        );
+
+        // Which is the difference between a wrapping row nested in another one
+        // wrapping and never wrapping at all. The inner row holds two 20-cell
+        // items and is given 20 cells to live in: as a `nowrap` row it would
+        // have claimed 40 as its automatic minimum size (§4.5) and overflowed
+        // in one line, and here it takes 20 and puts its items on two.
+        let nested = "<div id=outer><div id=inner><div>a</div><div>b</div></div></div>";
+        let css = "#outer { display: flex } #inner { display: flex; flex-wrap: wrap }
+                   #inner div { flex: 0 0 160px }";
+        let (dom, styles) = styled(nested, css);
+        let tree = crate::layout::layout_document(&dom, &styles, 20, Hidden::Respect);
+        let mut rows = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == crate::layout::BoxKind::Flex {
+                rows.push((
+                    b.dimensions.content.width,
+                    b.children
+                        .iter()
+                        .map(|&c| tree.get(c).dimensions.content.y)
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        });
+        assert_eq!(rows[1], (20, vec![0, 1]), "the inner row: {rows:?}");
     }
 
     #[test]
