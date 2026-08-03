@@ -1414,6 +1414,45 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_widens_a_wrapping_columns_line() {
+        // **A divergence on the record**, found reviewing M9.10 and left in
+        // deliberately. §9.4 step 8 sizes a line from its items' hypothetical
+        // cross sizes, and a rule with no content asks for nothing — so a
+        // browser lets the other items decide this column's width and stretches
+        // the `<hr>` into it. Here the rule asks for the whole content box, and
+        // the column comes out 40 cells wide instead of 2.
+        //
+        // The reason is not flex: `layout_hr` builds the rule's glyphs from the
+        // width it is given, and a column item is built before its line exists,
+        // so a rule asking for 0 would be a correctly sized box with no rule in
+        // it — worse than a column that is too wide. This test is here so that
+        // whoever makes a rule re-sizable finds the flex half of the bill.
+        let col = "<div id=r><div>aa</div><hr><div>bb</div></div>";
+        let css = "#r { display: flex; flex-direction: column; flex-wrap: wrap;
+                   height: 32px; align-content: flex-start } hr { margin: 0 }";
+        assert_eq!(
+            item_boxes(col, css, 40),
+            [(0, 0, 40, 1), (0, 1, 40, 1), (40, 0, 2, 1)],
+            "the rule decided the first column's width, pushing the second one \
+             off the container's right edge"
+        );
+        // The rule really is drawn, which is the half that must not regress: a
+        // column too wide is a layout bug, a rule that vanished is a hole.
+        assert_eq!(
+            plain(&lines_styled(col, css, 40))[1].trim_end(),
+            "─".repeat(40)
+        );
+
+        // Without the rule the same three items give the columns their own
+        // widths, which is what the fix would restore.
+        let plain_col = "<div id=r><div>aa</div><div>x</div><div>bb</div></div>";
+        assert_eq!(
+            item_boxes(plain_col, css, 40),
+            [(0, 0, 2, 1), (0, 1, 2, 1), (2, 0, 2, 1)]
+        );
+    }
+
+    #[test]
     fn a_wrapped_link_hit_tests_where_it_was_drawn() {
         // The rest of the browser has to agree with the wrap. Two 20-cell links
         // in a 30-cell container: the second one wraps to row 1, and `/2` must

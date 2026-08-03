@@ -1469,7 +1469,23 @@ impl<'a> Engine<'a> {
                     "img" => self.sizer.content_widths(node).1,
                     // A `<br>` is a break and an `<hr>` a rule across the box
                     // they were handed: no content to shrink-wrap and nothing
-                    // to stretch.
+                    // to stretch, so they take the whole content box.
+                    //
+                    // **A known divergence in a wrapping column, and the reason
+                    // it is not fixed here.** §9.4 step 8 would size the line
+                    // from this item's *hypothetical* cross size, which for a
+                    // rule with no content is 0 — so a browser lets the other
+                    // items decide the column's width and stretches the rule
+                    // into it. This engine cannot: `layout_hr` generates the
+                    // rule's glyphs from the width it is built at, and a column
+                    // item is built before its line exists. Built at 0 and
+                    // widened afterwards, an `<hr>` is a correctly sized box
+                    // containing no rule at all, which is worse than a column
+                    // that came out too wide. The cost is `<hr>` in a wrapping
+                    // column widening its line to the container, pinned by
+                    // `a_rule_widens_a_wrapping_columns_line`; the fix is a
+                    // rule that can be re-sized after it is built, which is a
+                    // change to the replaced-box path rather than to flex.
                     "br" | "hr" => avail,
                     _ => self.column_cross_size(node, &c, align, axis, avail, h_edges),
                 };
