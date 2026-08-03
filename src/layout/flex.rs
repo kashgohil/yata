@@ -11,9 +11,11 @@
 //!
 //! **Main-axis coordinates.** [`place`] talks in distances from *main-start*,
 //! never in `x`. That is what makes a reversed direction a mapping in the
-//! engine — main-start is the far edge, so the same offsets are subtracted
-//! instead of added — rather than a second copy of the placement rules with the
-//! signs changed. [`cross_place`] and [`align_lines`] are written the same way,
+//! engine — main-start is the far edge, so the same offsets are counted back
+//! from it instead of added to the near one — rather than a second copy of the
+//! placement rules with the signs changed. (Back from *which* far edge is the
+//! engine's problem and a sharper question than it looks: see its
+//! `from_far_edge`.) [`cross_place`] and [`align_lines`] are written the same way,
 //! in distances from *cross-start*, so `wrap-reverse` is the same mapping on
 //! the other axis. Between them they serve all four directions and both wrap
 //! orders: nothing in this file knows which physical axis is which, or which
@@ -393,6 +395,12 @@ pub(super) fn place(
     // overflow a browser hides at the start edge is recoverable — the reader
     // scrolls left — and in a terminal it is not: there is no negative column,
     // and the first item would simply be gone.
+    //
+    // Packing at main-start is only half of keeping that promise, and the
+    // engine's `from_far_edge` is the other half: on a reversed direction
+    // main-start *is* the far edge, so these offsets are counted back from it,
+    // and counting an overflowing line back from the container's own edge lands
+    // items at exactly the negative columns this paragraph rules out.
     let free = inner_main.saturating_sub(used).max(0);
 
     let mut placed = vec![Placed::default(); n];

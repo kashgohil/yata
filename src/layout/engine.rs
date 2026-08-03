@@ -675,10 +675,10 @@ impl<'a> Engine<'a> {
         let metrics: Vec<flex::Item> = items.iter().map(|i| i.metrics).collect();
         let lines = flex::collect_lines(&metrics, inner_main, gap, axis.wraps);
 
-        // The container's main-start content edge in tree coordinates, and the
-        // far edge a reversed direction counts back from.
+        // The container's near content edge on the main axis, in tree
+        // coordinates — its left for a row, its top for a column, whichever end
+        // of the axis main-start turns out to be.
         let main_origin = if axis.vertical { content.y } else { content.x };
-        let main_far = main_origin.saturating_add(inner_main);
 
         // §9.7 and §9.5, once per line. Every line divides the container's
         // whole inner main size — lines do not share it, they take turns at it
@@ -716,6 +716,17 @@ impl<'a> Engine<'a> {
             // first, then `justify-content`.
             let placed = flex::place(&slots, gap, inner_main, computed.justify_content);
 
+            // What this line really takes, which is more than the container's
+            // inner main size exactly when it overflows — the number a reversed
+            // direction has to count back from instead of the container's own
+            // edge. Auto margins are not in it because a line with free space
+            // for them to take is a line that fits.
+            let line_used = slots
+                .iter()
+                .fold(gap.saturating_mul(line.len() as i32 - 1), |acc, slot| {
+                    acc.saturating_add(slot.outer)
+                });
+
             for (idx, (item, &main_size)) in line_items.iter().zip(&sizes).enumerate() {
                 let p = placed[idx];
                 let outer_main = slots[idx]
@@ -723,16 +734,15 @@ impl<'a> Engine<'a> {
                     .saturating_add(p.auto_start)
                     .saturating_add(p.auto_end);
                 // Main-axis offset → the physical near edge of the item's
-                // margin box: added to the container's near edge, or subtracted
-                // from its far one when the axis is reversed. Saturating,
-                // because an offset can be enormous — `gap: 1e11em` is a legal
-                // thing for a stylesheet to say, and an item shoved off the
-                // page is what it asks for, where an overflowing add would be a
-                // panic a page could trigger.
+                // margin box: added to the container's near edge, or counted
+                // back from the far one when the axis is reversed
+                // ([`from_far_edge`]). Saturating throughout, because an offset
+                // can be enormous — `gap: 1e11em` is a legal thing for a
+                // stylesheet to say, and an item shoved off the page is what it
+                // asks for, where an overflowing add would be a panic a page
+                // could trigger.
                 let near = if axis.reverse {
-                    main_far
-                        .saturating_sub(p.main_start)
-                        .saturating_sub(outer_main)
+                    from_far_edge(main_origin, inner_main, line_used, p.main_start, outer_main)
                 } else {
                     main_origin.saturating_add(p.main_start)
                 };
@@ -975,11 +985,14 @@ impl<'a> Engine<'a> {
         let placed_lines =
             flex::align_lines(&line_cross, gap, inner_cross, container.align_content);
 
-        // The container's cross-start content edge, and the far edge
-        // `wrap-reverse` counts back from — the same mapping the main axis
-        // makes for a `-reverse` direction, on the other axis.
+        // The container's near content edge on the cross axis, and how much of
+        // that axis the lines really took — more than the container's inner
+        // cross size exactly when they overflow it, which is what
+        // `wrap-reverse` has to count back from ([`from_far_edge`]).
         let cross_origin = if axis.vertical { content.x } else { content.y };
-        let cross_far = cross_origin.saturating_add(inner_cross);
+        let occupied = placed_lines
+            .last()
+            .map_or(0, |line| line.cross_start.saturating_add(line.cross));
 
         for (line, placed_line) in lines.iter().zip(&placed_lines) {
             let placed = flex::cross_place(&cross_items[line.clone()], placed_line.cross);
@@ -987,9 +1000,13 @@ impl<'a> Engine<'a> {
             // its left for a column, whichever end of the cross axis
             // cross-start turns out to be.
             let line_near = if axis.cross_reverse {
-                cross_far
-                    .saturating_sub(placed_line.cross_start)
-                    .saturating_sub(placed_line.cross)
+                from_far_edge(
+                    cross_origin,
+                    inner_cross,
+                    occupied,
+                    placed_line.cross_start,
+                    placed_line.cross,
+                )
             } else {
                 cross_origin.saturating_add(placed_line.cross_start)
             };
@@ -1019,14 +1036,12 @@ impl<'a> Engine<'a> {
                     .saturating_add(p.auto_end);
                 // Cross-axis offset → the physical near edge of the item's
                 // margin box, and the auto-margin shares named for the sides
-                // they are painted on. The same arithmetic §9.5 does on the
-                // main axis, and for the same reason: an offset from
-                // cross-start is subtracted when cross-start is the far edge.
+                // they are painted on. The same arithmetic the main axis does,
+                // one level down: the line is this item's container, and an
+                // item taller than its line hangs off the line's far end rather
+                // than off the top of the page.
                 let near = if axis.cross_reverse {
-                    line_near
-                        .saturating_add(placed_line.cross)
-                        .saturating_sub(p.cross_start)
-                        .saturating_sub(span)
+                    from_far_edge(line_near, placed_line.cross, span, p.cross_start, span)
                 } else {
                     line_near.saturating_add(p.cross_start)
                 };
@@ -2510,6 +2525,32 @@ fn shrink_to_fit(min_content: i32, max_content: i32, available: i32) -> i32 {
         .max(available)
         .min(max_content.max(min_content))
         .max(0)
+}
+
+/// The physical near edge of something placed `offset` cells from a
+/// **reversed** axis's start edge: `row-reverse` and `column-reverse` on the
+/// main axis, `wrap-reverse` on the cross one.
+///
+/// A reversed axis starts at the far edge, so offsets are subtracted rather
+/// than added. The subtlety is *which* far edge, and getting it wrong is a bug
+/// with teeth. It is the container's while the content fits — and the content's
+/// own when it does not. Counting back from the container's edge through
+/// content that overflows it puts the overflow *before* the near edge, at a
+/// negative row or column: a terminal has no row above 0 and no column left of
+/// it, so that content is not merely off-screen, it is unreachable by any
+/// amount of scrolling. Measuring from the content's own far edge instead
+/// leaves the near end exactly where a forward axis would have left it, with
+/// the overflow running off the far end, which is the end a reader can still
+/// get to. That is the same "safe" reasoning §9.5 and §9.6 already apply
+/// *within* a line, finally applied to the mapping around it.
+///
+/// `occupied` is how much room the content really takes, which is what makes
+/// the guarantee provable: everything placed on the axis fits inside
+/// `offset + size <= occupied`, so the result is never less than `near`.
+fn from_far_edge(near: i32, available: i32, occupied: i32, offset: i32, size: i32) -> i32 {
+    near.saturating_add(available.max(occupied))
+        .saturating_sub(offset)
+        .saturating_sub(size)
 }
 
 /// `align-self` resolved against the container's `align-items`, and then

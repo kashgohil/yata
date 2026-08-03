@@ -27,12 +27,25 @@
 #   negative free space there is nothing to put between them.
 #
 # Row 3 — the same overflow under `row-reverse`, where main-start is the right
-#   edge and the overflow therefore runs off the *left*:
-#   a: 80 - 0 - 40 = 40,  b: 80 - 40 - 40 = 0,  c: 80 - 80 - 40 = -40.
-#   A negative x is a box off the left of the page. It is recorded here rather
-#   than clamped away: layout says where the boxes are, and clipping to the
-#   screen is paint's job (M9.3), which is what keeps the two stages honest
-#   about each other.
+#   edge. **Rewritten in M9.10's review, and the reason is two paragraphs up.**
+#
+#   This row used to read x = 40, 0, -40: main-start was taken to be the
+#   container's right edge whatever the content did, so the line was measured
+#   back from 80 and the third item landed at a negative column. That is
+#   precisely the outcome the `safe center` paragraph above rejects — an item
+#   before the near edge is not clipped, it is gone, and no amount of scrolling
+#   reaches a column that does not exist — so the file argued for one rule on
+#   the forward axis and recorded its opposite on the reversed one.
+#
+#   A reversed axis now counts back from the far edge of the *content* when the
+#   content overflows, which is the container's far edge whenever it fits and
+#   so changes nothing anywhere else. The line needs 120 cells, so:
+#   a: 120 - 0 - 40 = 80,  b: 120 - 40 - 40 = 40,  c: 120 - 80 - 40 = 0.
+#   The reversed order is intact — a is still the rightmost item — and the
+#   overflow runs off the same edge every other overflow in the engine runs
+#   off, where paint clips it (M9.3). What it costs is that the item left
+#   on screen is the last one rather than the first; what it buys is that no
+#   stage downstream of layout is ever handed a negative coordinate.
 <html>  x=0 y=0 w=80 h=3
   <body>  x=0 y=0 w=80 h=3
     <div.row> flex row  x=0 y=0 w=80 h=1
@@ -62,15 +75,15 @@
           line  x=80 y=1 w=40 h=1
             #text "c"  x=80 y=1 w=1 h=1
     <div.row.rev> flex row-reverse  x=0 y=2 w=80 h=1
+      <div>  x=80 y=2 w=40 h=1
+        anonymous  x=80 y=2 w=40 h=1
+          line  x=80 y=2 w=40 h=1
+            #text "a"  x=80 y=2 w=1 h=1
       <div>  x=40 y=2 w=40 h=1
         anonymous  x=40 y=2 w=40 h=1
           line  x=40 y=2 w=40 h=1
-            #text "a"  x=40 y=2 w=1 h=1
+            #text "b"  x=40 y=2 w=1 h=1
       <div>  x=0 y=2 w=40 h=1
         anonymous  x=0 y=2 w=40 h=1
           line  x=0 y=2 w=40 h=1
-            #text "b"  x=0 y=2 w=1 h=1
-      <div>  x=-40 y=2 w=40 h=1
-        anonymous  x=-40 y=2 w=40 h=1
-          line  x=-40 y=2 w=40 h=1
-            #text "c"  x=-40 y=2 w=1 h=1
+            #text "c"  x=0 y=2 w=1 h=1

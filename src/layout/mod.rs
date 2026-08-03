@@ -1414,6 +1414,55 @@ mod tests {
     }
 
     #[test]
+    fn no_reversed_axis_ever_puts_a_box_before_its_container() {
+        // Found reviewing M9.10, fixed across all three properties that reverse
+        // an axis. A reversed axis starts at the far edge, so offsets are
+        // subtracted — and subtracting an overflowing line's offsets from the
+        // container's own edge lands boxes at negative rows and columns. A
+        // terminal has no row above 0 and no column left of it: that content is
+        // not clipped, it is unreachable, and every stage downstream of layout
+        // then has to be careful with a coordinate that should never have
+        // existed. `flex-justify-overflow`'s row 3 used to record x = -40.
+        //
+        // The rule is one line in `from_far_edge`: count back from the far edge
+        // of the *content* when the content overflows, which is the container's
+        // own edge whenever it fits. This sweep is the rule stated as a
+        // property — every direction, every wrap, every width, overflowing on
+        // both axes at once.
+        let markup = "<div id=r><div>alpha</div><div>beta</div><div>gamma</div>\
+                      <div>delta</div></div>";
+        for direction in ["row", "row-reverse", "column", "column-reverse"] {
+            for wrap in ["nowrap", "wrap", "wrap-reverse"] {
+                let css = format!(
+                    "#r {{ display: flex; flex-direction: {direction}; flex-wrap: {wrap};
+                       height: 2em }}
+                     #r div {{ flex: 0 0 240px; height: 2em }}"
+                );
+                for width in 10..=100u16 {
+                    let (dom, styles) = styled_dom(markup, &css);
+                    let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+                    let mut checked = false;
+                    tree.walk(tree.root, &mut |_, b| {
+                        if b.kind != BoxKind::Flex {
+                            return;
+                        }
+                        checked = true;
+                        let origin = b.dimensions.content;
+                        for &c in &b.children {
+                            let mb = tree.get(c).dimensions.margin_box();
+                            let label =
+                                format!("{direction} {wrap} at {width}: {mb:?} in {origin:?}");
+                            assert!(mb.x >= origin.x, "{label}: before the left edge");
+                            assert!(mb.y >= origin.y, "{label}: above the top edge");
+                        }
+                    });
+                    assert!(checked, "{direction} {wrap} at {width}: no container");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn min_height_is_a_definite_cross_size_for_a_row() {
         // Found reviewing M9.10. A container's clamps are part of how much room
         // it has, so a stage that divides its cross axis has to apply them —
