@@ -1,0 +1,70 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.5 before the code existed,
+# never regenerated. The overflow case: what alignment does when there is no
+# free space to align *with*.
+#
+# Three `flex: 0 0 320px` (= 40 cell) items in an 80-cell container. Grow and
+# shrink are both 0, so §9.7 hands each item its 40 cells and the line needs
+# 120: free space is -40.
+#
+# Negative free space is not distributed. §9.5 step 1 only fires "if the
+# remaining free space is positive", so auto margins are zero, and every
+# packing value falls back to `flex-start` — a browser's "safe" behaviour.
+# Centring an overflowing row would push its first item 20 cells off the
+# main-start edge, where nothing can bring it back: a terminal scrolls
+# vertically, and there is no negative column to scroll to.
+#
+# Row 1 — `justify-content: center`, packed from main-start anyway:
+#   x = 0, 40, 80. The third item is entirely past the right edge, which is
+#   what "overflow" means; painting clips it to the screen.
+#
+# Row 2 — `justify-content: space-between`, likewise: x = 0, 40, 80. With
+#   negative free space there is nothing to put between them.
+#
+# Row 3 — the same overflow under `row-reverse`, where main-start is the right
+#   edge and the overflow therefore runs off the *left*:
+#   a: 80 - 0 - 40 = 40,  b: 80 - 40 - 40 = 0,  c: 80 - 80 - 40 = -40.
+#   A negative x is a box off the left of the page. It is recorded here rather
+#   than clamped away: layout says where the boxes are, and clipping to the
+#   screen is paint's job (M9.3), which is what keeps the two stages honest
+#   about each other.
+<html>  x=0 y=0 w=80 h=3
+  <body>  x=0 y=0 w=80 h=3
+    <div.row> flex row  x=0 y=0 w=80 h=1
+      <div>  x=0 y=0 w=40 h=1
+        anonymous  x=0 y=0 w=40 h=1
+          line  x=0 y=0 w=40 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div>  x=40 y=0 w=40 h=1
+        anonymous  x=40 y=0 w=40 h=1
+          line  x=40 y=0 w=40 h=1
+            #text "b"  x=40 y=0 w=1 h=1
+      <div>  x=80 y=0 w=40 h=1
+        anonymous  x=80 y=0 w=40 h=1
+          line  x=80 y=0 w=40 h=1
+            #text "c"  x=80 y=0 w=1 h=1
+    <div.row.between> flex row  x=0 y=1 w=80 h=1
+      <div>  x=0 y=1 w=40 h=1
+        anonymous  x=0 y=1 w=40 h=1
+          line  x=0 y=1 w=40 h=1
+            #text "a"  x=0 y=1 w=1 h=1
+      <div>  x=40 y=1 w=40 h=1
+        anonymous  x=40 y=1 w=40 h=1
+          line  x=40 y=1 w=40 h=1
+            #text "b"  x=40 y=1 w=1 h=1
+      <div>  x=80 y=1 w=40 h=1
+        anonymous  x=80 y=1 w=40 h=1
+          line  x=80 y=1 w=40 h=1
+            #text "c"  x=80 y=1 w=1 h=1
+    <div.row.rev> flex row-reverse  x=0 y=2 w=80 h=1
+      <div>  x=40 y=2 w=40 h=1
+        anonymous  x=40 y=2 w=40 h=1
+          line  x=40 y=2 w=40 h=1
+            #text "a"  x=40 y=2 w=1 h=1
+      <div>  x=0 y=2 w=40 h=1
+        anonymous  x=0 y=2 w=40 h=1
+          line  x=0 y=2 w=40 h=1
+            #text "b"  x=0 y=2 w=1 h=1
+      <div>  x=-40 y=2 w=40 h=1
+        anonymous  x=-40 y=2 w=40 h=1
+          line  x=-40 y=2 w=40 h=1
+            #text "c"  x=-40 y=2 w=1 h=1

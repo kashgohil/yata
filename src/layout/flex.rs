@@ -1,11 +1,18 @@
 //! Flexbox's core arithmetic: css-flexbox-1 §9.7, *resolve the flexible
-//! lengths*, in whole terminal cells (PLAN.md M9, task M9.6).
+//! lengths* (M9.6), and §9.5, *main-axis alignment* (M9.7), in whole terminal
+//! cells (PLAN.md M9).
 //!
 //! Kept out of `engine` deliberately. This is the part of flex layout that is
 //! pure arithmetic over numbers — no DOM, no styles, no boxes — so it can be
 //! read against the spec's pseudocode line by line and tested the same way.
 //! `engine` decides what the items *are* (§4) and where their resolved sizes
 //! go; everything between those two ends is here.
+//!
+//! **Main-axis coordinates.** [`place`] talks in distances from *main-start*,
+//! never in `x`. That is what makes `row-reverse` a mapping in the engine —
+//! main-start is the right edge, so the same offsets are subtracted instead of
+//! added — rather than a second copy of the placement rules with the signs
+//! changed.
 //!
 //! **Whole cells.** The spec distributes fractions of a pixel and lets the
 //! rasteriser sort it out; a terminal has no such luxury, so the fractions are
@@ -14,6 +21,8 @@
 //! items in main-axis order. That keeps two invariants a reader can see —
 //! items that grow to fill a line leave no hole at its end, and no item is
 //! ever a fraction of a cell narrower than its neighbour for no reason.
+
+use crate::style::values::JustifyContent;
 
 /// One flex item's inputs to §9.7, all in cells and all on the main axis.
 #[derive(Clone, Copy, Debug)]
@@ -235,6 +244,190 @@ fn quantize(items: &[Item], target: &[f64], space: f64) -> Vec<i32> {
     sizes
 }
 
+/// One item as §9.5 sees it: how much of the line it takes, and whether either
+/// of its main-axis margins is `auto` and so entitled to a share of what is
+/// left. Nothing else about an item matters to alignment.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Slot {
+    /// Outer main size: the size §9.7 resolved plus this item's own margin,
+    /// border and padding, with any `auto` margin counted as zero.
+    pub(super) outer: i32,
+    pub(super) auto_start: bool,
+    pub(super) auto_end: bool,
+}
+
+/// Where §9.5 put one item, in main-axis coordinates.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Placed {
+    /// Cells from the container's main-start content edge to this item's
+    /// main-start *margin* edge.
+    pub(super) main_start: i32,
+    /// Cells this item's main-start `auto` margin absorbed, and its main-end
+    /// one. Zero unless the item asked for an auto margin on that side and
+    /// there was free space to give it.
+    pub(super) auto_start: i32,
+    pub(super) auto_end: i32,
+}
+
+/// §9.5 *main-axis alignment*: hand out the space §9.7 left over and say where
+/// each item's margin edge starts.
+///
+/// `items` is the line in main-axis order — each item's outer main size (the
+/// size §9.7 resolved plus its own margin, border and padding) and which of
+/// its two main-axis margins are `auto`. `row-reverse` passes its items in the
+/// same order and flips the offsets afterwards.
+///
+/// The order of business is the spec's and matters: gaps come out first (they
+/// are not free space, they are structure), then **auto margins take
+/// everything that is left**, and only if none claimed it does
+/// `justify-content` get to distribute. `margin-left: auto` on the last nav
+/// item is how the web pushes it to the right, and a `justify-content` that
+/// ran anyway would fight it.
+pub(super) fn place(
+    items: &[Slot],
+    gap: i32,
+    inner_main: i32,
+    justify: JustifyContent,
+) -> Vec<Placed> {
+    let n = items.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Saturating throughout: these numbers come from a stylesheet, and a page
+    // is free to write `gap: 99999em`. The line ends up overflowing, which is
+    // what such a gap asks for — a panic would not be a page (PLAN.md §1.5).
+    let total_gap = gap.saturating_mul(n as i32 - 1);
+    let used = items
+        .iter()
+        .fold(total_gap, |acc, item| acc.saturating_add(item.outer));
+    // Negative free space is *overflow*, and there is nothing to distribute:
+    // auto margins are treated as zero (§9.5 step 1 only fires "if the
+    // remaining free space is positive") and every `justify-content` value
+    // falls back to packing at main-start, which is what a browser's "safe"
+    // behaviour does. Centring an overflowing row would push its first item
+    // off the main-start edge, where nothing can scroll it back into view.
+    let free = inner_main.saturating_sub(used).max(0);
+
+    let mut placed = vec![Placed::default(); n];
+
+    // Nothing to hand out, or nowhere to hand it but the end of the line: the
+    // items pack at main-start and no slot arithmetic is needed. This is the
+    // overflow case, and it is also what most rows on a real page are —
+    // `flex-start` is the initial value — so it is worth not allocating for.
+    if free == 0 || (justify == JustifyContent::FlexStart && !any_auto(items)) {
+        return offsets(placed, items, gap, 0, &[]);
+    }
+
+    // §9.5 step 1: auto margins absorb *all* the free space, split equally
+    // between every auto margin on the line — not per item, so one item with
+    // `margin: 0 auto` and one with a single `margin-left: auto` do not get
+    // the same share.
+    if any_auto(items) {
+        let auto_slots: Vec<i32> = items
+            .iter()
+            .flat_map(|item| [i32::from(item.auto_start), i32::from(item.auto_end)])
+            .collect();
+        let shares = split(free, &auto_slots);
+        for (idx, item) in placed.iter_mut().enumerate() {
+            item.auto_start = shares[idx * 2];
+            item.auto_end = shares[idx * 2 + 1];
+        }
+        return offsets(placed, items, gap, 0, &[]);
+    }
+
+    // §9.5 step 6: whatever is left, distributed by `justify-content`. Every
+    // value is the same shape — some space before the first item, some between
+    // each adjacent pair, some after the last — so the six of them are six
+    // weightings of those slots rather than six placement loops. `space-around`
+    // is why the weights are integers: its end spaces are half its inner ones,
+    // which in halves is 1 and 2.
+    let (lead_w, between_w, end_w) = match justify {
+        JustifyContent::FlexStart => (0, 0, 1),
+        JustifyContent::FlexEnd => (1, 0, 0),
+        JustifyContent::Center => (1, 0, 1),
+        // A single item has no "between" to put the space in, so it stays at
+        // main-start and the space goes after it.
+        JustifyContent::SpaceBetween if n > 1 => (0, 1, 0),
+        JustifyContent::SpaceBetween => (0, 0, 1),
+        JustifyContent::SpaceAround => (1, 2, 1),
+        JustifyContent::SpaceEvenly => (1, 1, 1),
+    };
+    let mut weights = Vec::with_capacity(n + 1);
+    weights.push(lead_w);
+    weights.extend(std::iter::repeat_n(between_w, n - 1));
+    weights.push(end_w);
+    let spacing = split(free, &weights);
+    offsets(placed, items, gap, spacing[0], &spacing[1..n])
+}
+
+fn any_auto(items: &[Slot]) -> bool {
+    items.iter().any(|i| i.auto_start || i.auto_end)
+}
+
+/// Walk the line once, main-start to main-end, adding up what each item and
+/// the space beside it costs.
+///
+/// This is the only place an item's main-axis position is decided, for every
+/// alignment and both row directions — which is what keeps `Σ(outer sizes) +
+/// gaps + spacing == inner main size` a property of the code rather than a
+/// coincidence that has to be re-checked per value.
+fn offsets(
+    mut placed: Vec<Placed>,
+    items: &[Slot],
+    gap: i32,
+    lead: i32,
+    between: &[i32],
+) -> Vec<Placed> {
+    let mut cursor = lead;
+    for (idx, item) in placed.iter_mut().enumerate() {
+        item.main_start = cursor;
+        cursor = cursor
+            .saturating_add(items[idx].outer)
+            .saturating_add(item.auto_start)
+            .saturating_add(item.auto_end);
+        if idx + 1 < items.len() {
+            // An empty `between` is the packed case: gaps still separate the
+            // items, there is simply nothing extra to put beside them.
+            let extra = between.get(idx).copied().unwrap_or(0);
+            cursor = cursor.saturating_add(gap).saturating_add(extra);
+        }
+    }
+    placed
+}
+
+/// Split `total` cells between weighted slots, whole cells only.
+///
+/// Every slot gets the floor of its share and the cells rounding dropped go to
+/// the **earliest** slots that asked for any — the same rule [`quantize`] uses
+/// on item sizes, for the same reason: one rule for leftover cells is one rule
+/// to remember, and it makes `Σ(slots) == total` exact. The visible
+/// consequence is that an odd number of cells to centre leaves the extra one
+/// before the item rather than after it.
+fn split(total: i32, weights: &[i32]) -> Vec<i32> {
+    let sum: i64 = weights.iter().map(|&w| w as i64).sum();
+    if total <= 0 || sum <= 0 {
+        return vec![0; weights.len()];
+    }
+    let mut out: Vec<i32> = weights
+        .iter()
+        .map(|&w| (total as i64 * w as i64 / sum) as i32)
+        .collect();
+    // Each slot lost less than a whole cell to the floor, so the leftover is
+    // smaller than the number of slots that wanted anything and this loop
+    // always empties it.
+    let mut leftover = total - out.iter().sum::<i32>();
+    for (slot, &weight) in out.iter_mut().zip(weights) {
+        if leftover == 0 {
+            break;
+        }
+        if weight > 0 {
+            *slot += 1;
+            leftover -= 1;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,6 +586,239 @@ mod tests {
             let used: i32 = sizes.iter().sum::<i32>() + 2;
             assert_eq!(used, width, "width {width}: {sizes:?}");
             assert_eq!(sizes.len(), 3, "no item was lost");
+        }
+    }
+
+    // §9.5, main-axis alignment (M9.7). Everything below is in main-axis
+    // coordinates: `main_start` counts from main-start, whichever edge that is.
+
+    const ALL: [JustifyContent; 6] = [
+        JustifyContent::FlexStart,
+        JustifyContent::FlexEnd,
+        JustifyContent::Center,
+        JustifyContent::SpaceBetween,
+        JustifyContent::SpaceAround,
+        JustifyContent::SpaceEvenly,
+    ];
+
+    /// A line of items with no auto margins, from their outer main sizes.
+    fn line(outer: &[i32]) -> Vec<Slot> {
+        outer
+            .iter()
+            .map(|&outer| slot(outer, false, false))
+            .collect()
+    }
+
+    fn slot(outer: i32, auto_start: bool, auto_end: bool) -> Slot {
+        Slot {
+            outer,
+            auto_start,
+            auto_end,
+        }
+    }
+
+    /// Where each item's margin edge lands, for a line with no auto margins.
+    fn starts(outer: &[i32], gap: i32, inner: i32, justify: JustifyContent) -> Vec<i32> {
+        place(&line(outer), gap, inner, justify)
+            .iter()
+            .map(|p| p.main_start)
+            .collect()
+    }
+
+    #[test]
+    fn justify_content_distributes_the_free_space_six_ways() {
+        // Three 20-cell items in 80 cells: 20 cells to place.
+        let outer = [20, 20, 20];
+        assert_eq!(
+            starts(&outer, 0, 80, JustifyContent::FlexStart),
+            [0, 20, 40]
+        );
+        assert_eq!(starts(&outer, 0, 80, JustifyContent::FlexEnd), [20, 40, 60]);
+        assert_eq!(starts(&outer, 0, 80, JustifyContent::Center), [10, 30, 50]);
+        assert_eq!(
+            starts(&outer, 0, 80, JustifyContent::SpaceBetween),
+            [0, 30, 60],
+            "first at main-start, last at main-end, 10 between each pair"
+        );
+        // 20 cells over 6 half-slots is 3.33 each: floors to 3 / 6 / 6 / 3 and
+        // the 2 cells rounding dropped go to the earliest slots, so the lead
+        // becomes 4 and the first inner space 7.
+        assert_eq!(
+            starts(&outer, 0, 80, JustifyContent::SpaceAround),
+            [4, 31, 57]
+        );
+        assert_eq!(
+            starts(&outer, 0, 80, JustifyContent::SpaceEvenly),
+            [5, 30, 55],
+            "four equal spaces of 5, ends included"
+        );
+    }
+
+    #[test]
+    fn gaps_are_reserved_before_justify_content_divides_anything() {
+        // Three 20-cell items and two 8-cell gaps in 80: 16 cells are
+        // structure, so only 4 are free. `space-between` puts 2 in each inner
+        // slot on top of the gap already there, and the row ends flush.
+        let outer = [20, 20, 20];
+        assert_eq!(
+            starts(&outer, 8, 80, JustifyContent::SpaceBetween),
+            [0, 30, 60]
+        );
+        assert_eq!(starts(&outer, 8, 80, JustifyContent::Center), [2, 30, 58]);
+        // A gap never appears before the first item or after the last: with
+        // `flex-start` the row starts at 0 and the 4 spare cells stay at the
+        // end.
+        assert_eq!(
+            starts(&outer, 8, 80, JustifyContent::FlexStart),
+            [0, 28, 56]
+        );
+    }
+
+    #[test]
+    fn space_between_needs_two_items_to_have_a_between() {
+        // One item has no inner slot, so `space-between` leaves it at
+        // main-start rather than centring it or pushing it to main-end.
+        assert_eq!(starts(&[20], 0, 80, JustifyContent::SpaceBetween), [0]);
+        // Two items go to the two edges.
+        assert_eq!(
+            starts(&[20, 20], 0, 80, JustifyContent::SpaceBetween),
+            [0, 60]
+        );
+        // `space-around` and `space-evenly` do centre a single item — both
+        // reduce to one space at each end.
+        assert_eq!(starts(&[20], 0, 80, JustifyContent::SpaceAround), [30]);
+        assert_eq!(starts(&[20], 0, 80, JustifyContent::SpaceEvenly), [30]);
+    }
+
+    #[test]
+    fn an_odd_cell_lands_before_the_item_rather_than_after_it() {
+        // 5 cells to centre 5 cells of item. A terminal has no half cells, and
+        // the rule for the one that is left over is M9.6's: earliest slot
+        // first, which here is the lead.
+        assert_eq!(starts(&[5], 0, 10, JustifyContent::Center), [3]);
+    }
+
+    #[test]
+    fn auto_margins_take_the_free_space_before_justify_content_sees_it() {
+        // §9.5 step 1 runs first and leaves step 6 nothing. `margin-left: auto`
+        // on the last of three items is the nav-bar idiom: everything packs at
+        // main-start and the last item is pushed to main-end — even though the
+        // container asked for `center`, which would have started the row at 10.
+        let placed = place(
+            &[
+                slot(20, false, false),
+                slot(20, false, false),
+                slot(20, true, false),
+            ],
+            0,
+            80,
+            JustifyContent::Center,
+        );
+        assert_eq!(
+            placed.iter().map(|p| p.main_start).collect::<Vec<_>>(),
+            [0, 20, 40]
+        );
+        assert_eq!(placed[2].auto_start, 20, "the auto margin took all 20");
+        assert_eq!(placed[2].auto_end, 0);
+    }
+
+    #[test]
+    fn free_space_is_split_between_auto_margins_not_between_items() {
+        // `margin: 0 auto` on the only item: two auto margins, 30 cells each,
+        // which is what centres it.
+        let placed = place(&[slot(20, true, true)], 0, 80, JustifyContent::FlexStart);
+        assert_eq!(placed[0].main_start, 0);
+        assert_eq!((placed[0].auto_start, placed[0].auto_end), (30, 30));
+
+        // One auto margin on each of two items: 60 free cells, two margins, 30
+        // each. The split counts *margins*, so an item with two of them would
+        // have taken twice what these get.
+        let placed = place(
+            &[slot(10, true, false), slot(10, true, false)],
+            0,
+            80,
+            JustifyContent::FlexStart,
+        );
+        assert_eq!(
+            placed.iter().map(|p| p.main_start).collect::<Vec<_>>(),
+            [0, 40],
+            "the first item's margin box is 30 + 10 cells wide"
+        );
+        assert_eq!(placed[0].auto_start, 30);
+        assert_eq!(placed[1].auto_start, 30);
+    }
+
+    #[test]
+    fn overflow_packs_from_main_start_whatever_the_alignment_asked_for() {
+        // Negative free space is not distributed: auto margins are zero (§9.5
+        // step 1 only fires when free space is positive) and every packing
+        // value falls back to main-start. Centring here would push the first
+        // item 20 cells off the main-start edge, where nothing can scroll it
+        // back into view.
+        for justify in ALL {
+            assert_eq!(
+                starts(&[40, 40, 40], 0, 80, justify),
+                [0, 40, 80],
+                "{justify:?}"
+            );
+        }
+        let placed = place(
+            &[slot(50, true, true), slot(50, false, false)],
+            0,
+            80,
+            JustifyContent::Center,
+        );
+        assert_eq!((placed[0].auto_start, placed[0].auto_end), (0, 0));
+        assert_eq!(placed[1].main_start, 50);
+    }
+
+    #[test]
+    fn every_cell_of_the_line_is_accounted_for_at_every_width() {
+        // The integer-cell invariant for placement, swept the way
+        // `the_line_is_filled_exactly_at_every_width` sweeps sizing: items
+        // never overlap, never move backwards, always leave at least the gap
+        // between them, and the space handed out is exactly the space there
+        // was — no cell invented, none lost to a floor.
+        let outer = [7, 13, 5];
+        let gap = 2;
+        for inner in 20..=120 {
+            for justify in ALL {
+                let placed = place(&line(&outer), gap, inner, justify);
+                let free = inner - outer.iter().sum::<i32>() - gap * 2;
+                let lead = placed[0].main_start;
+                let between: Vec<i32> = (0..2)
+                    .map(|i| placed[i + 1].main_start - placed[i].main_start - outer[i])
+                    .collect();
+                let end = placed[2].main_start + outer[2];
+                let label = format!("inner {inner}, {justify:?}: {placed:?}");
+                assert!(
+                    between.iter().all(|&b| b >= gap),
+                    "{label}: items overlap or ate a gap"
+                );
+                if free < 0 {
+                    // Overflow: nothing to hand out, and nothing handed out.
+                    assert_eq!(lead, 0, "{label}");
+                    assert_eq!(between, [gap, gap], "{label}");
+                    continue;
+                }
+                assert!(lead >= 0, "{label}");
+                // No cell invented: a row with room to spare never reaches past
+                // its own edge, however the free space rounded.
+                assert!(end <= inner, "{label}: the row overflowed by rounding");
+                // No cell lost: `space-between` claims both edges, so it is the
+                // value that has to land exactly on the far one.
+                if justify == JustifyContent::SpaceBetween {
+                    assert_eq!(end, inner, "{label}: space-between left a hole");
+                }
+                // `space-evenly` claims every space is the same size, which in
+                // whole cells means within one of every other.
+                if justify == JustifyContent::SpaceEvenly {
+                    let spaces = [lead, between[0] - gap, between[1] - gap, inner - end];
+                    let lo = spaces.iter().min().copied().unwrap();
+                    let hi = spaces.iter().max().copied().unwrap();
+                    assert!(hi - lo <= 1, "{label}: uneven spaces {spaces:?}");
+                }
+            }
         }
     }
 }

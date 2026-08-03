@@ -1,0 +1,61 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.5 step 1 (auto margins)
+# before the code existed, never regenerated.
+#
+# §9.5 fixes the order, and this fixture is that order: **auto margins take
+# every cell of positive free space, and `justify-content` only sees what is
+# left — which is nothing.** Every row here sets a `justify-content` that would
+# put the items somewhere else, so a row that ignored auto margins would show
+# it immediately.
+#
+# `flex: 0 0 160px` is 20 cells, `flex: 0 0 80px` is 10, and no item can grow
+# or shrink, so §9.7 hands every item its basis and §9.5 gets the rest.
+#
+# Row 1 — `justify-content: center`, three 20-cell items, `margin-left: auto`
+#   on the last. Free space = 80 - 60 = 20, one auto margin, so that margin
+#   takes all 20. Items pack from main-start: a at 0, b at 20, and c's *margin*
+#   box at 40 with 20 cells of margin before it, so its content starts at 60.
+#   That is the nav-bar idiom — "everything left, this one right" — and it is
+#   why skipping auto margins is not an option. Centred, the three items would
+#   have started at 10.
+#
+# Row 2 — `justify-content: flex-end`, one 20-cell item, `margin: 0 auto`.
+#   Free space = 80 - 20 = 60 split equally between *two* auto margins: 30
+#   each, so the item is centred at 30. `flex-end` would have put it at 60.
+#
+# Row 3 — `justify-content: center`, two 10-cell items, `margin-left: auto` on
+#   both. Free space = 80 - 20 = 60, two auto margins, 30 cells each — the
+#   split is per auto *margin*, not per item. The first item's margin box
+#   spans 0..40 with its content at 30; the second's spans 40..80 with its
+#   content at 70. Centred, they would have sat together at 30 and 40.
+#
+# In all three rows the items plus their margins fill the line exactly, which
+# is what "auto margins absorb the free space" means arithmetically.
+<html>  x=0 y=0 w=80 h=3
+  <body>  x=0 y=0 w=80 h=3
+    <div.row> flex row  x=0 y=0 w=80 h=1
+      <div>  x=0 y=0 w=20 h=1
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div>  x=20 y=0 w=20 h=1
+        anonymous  x=20 y=0 w=20 h=1
+          line  x=20 y=0 w=20 h=1
+            #text "b"  x=20 y=0 w=1 h=1
+      <div.push>  x=60 y=0 w=20 h=1
+        anonymous  x=60 y=0 w=20 h=1
+          line  x=60 y=0 w=20 h=1
+            #text "c"  x=60 y=0 w=1 h=1
+    <div.row.last> flex row  x=0 y=1 w=80 h=1
+      <div.solo>  x=30 y=1 w=20 h=1
+        anonymous  x=30 y=1 w=20 h=1
+          line  x=30 y=1 w=20 h=1
+            #text "a"  x=30 y=1 w=1 h=1
+    <div.row> flex row  x=0 y=2 w=80 h=1
+      <div.thin.push>  x=30 y=2 w=10 h=1
+        anonymous  x=30 y=2 w=10 h=1
+          line  x=30 y=2 w=10 h=1
+            #text "a"  x=30 y=2 w=1 h=1
+      <div.thin.push>  x=70 y=2 w=10 h=1
+        anonymous  x=70 y=2 w=10 h=1
+          line  x=70 y=2 w=10 h=1
+            #text "b"  x=70 y=2 w=1 h=1

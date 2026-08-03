@@ -521,10 +521,17 @@ impl<'a> Engine<'a> {
     /// divided) and §9.5 (where they go). Returns the container's used content
     /// height, which for a single row is its tallest item.
     ///
-    /// Scope, M9.6: `flex-direction: row`, `flex-wrap: nowrap`, main axis only.
-    /// Items sit at main-start and keep their natural heights — M9.7 places
-    /// leftover main-axis space, M9.8 sizes and aligns the cross axis, M9.9
-    /// brings the column directions and M9.10 wrapping.
+    /// Scope, M9.7: `flex-direction: row` and `row-reverse`, `flex-wrap:
+    /// nowrap`, main axis only. Items keep their natural heights — M9.8 sizes
+    /// and aligns the cross axis, M9.9 brings the column directions and M9.10
+    /// wrapping.
+    ///
+    /// **Alignment places, it never moves.** Every item is positioned before
+    /// its contents are laid out, so a centred item's text is built at the
+    /// centred `x` and no subtree ever has to be translated afterwards. The
+    /// classic flex bug — a box that moved and left its text behind — is not
+    /// possible in this shape, which is why the order here is: size the whole
+    /// line, place the whole line, *then* build the boxes.
     fn layout_flex_contents(
         &mut self,
         id: NodeId,
@@ -566,17 +573,71 @@ impl<'a> Engine<'a> {
             total_gap,
         );
 
-        // §9.5: place the items along the main axis, one after the next from
-        // main-start. Whatever room is left over stays at the end of the line
-        // until M9.7 has an opinion about where it should go.
-        let mut cursor = content.x;
+        // The axis flip, and the whole of what `row-reverse` costs. Main-start
+        // is the container's right edge, so an offset from main-start counts
+        // leftwards instead of rightwards and an item's main-start margin is
+        // its `margin-right`. Everything else — §9.7 above, §9.5 below — is
+        // written in main-axis terms and does not know which way the axis
+        // points.
+        let reverse = computed.flex_direction == FlexDirection::RowReverse;
+        let slots: Vec<flex::Slot> = items
+            .iter()
+            .zip(&sizes)
+            .map(|(item, &main_size)| {
+                let left = item.computed.margin.left.is_auto();
+                let right = item.computed.margin.right.is_auto();
+                let (auto_start, auto_end) = if reverse {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                flex::Slot {
+                    outer: main_size + item.metrics.outer_edges,
+                    auto_start,
+                    auto_end,
+                }
+            })
+            .collect();
+
+        // §9.5: hand out what §9.7 could not give away — auto margins first,
+        // then `justify-content`.
+        let placed = flex::place(&slots, gap, inner_main, computed.justify_content);
+
         let mut children = Vec::with_capacity(items.len());
         let mut tallest = 0;
-        for (item, &main_size) in items.iter().zip(&sizes) {
-            let (child, outer_main) = self.layout_flex_item(
+        for (idx, (item, &main_size)) in items.iter().zip(&sizes).enumerate() {
+            let p = placed[idx];
+            let outer_main = slots[idx]
+                .outer
+                .saturating_add(p.auto_start)
+                .saturating_add(p.auto_end);
+            // Main-axis offset → the physical left edge of the item's margin
+            // box: added to the left edge for a row, subtracted from the right
+            // for a reversed one. Saturating, because an offset can be
+            // enormous — `gap: 1e11em` is a legal thing for a stylesheet to
+            // say, and an item shoved past the right edge is what it asks for,
+            // where an overflowing add would be a panic a page could trigger.
+            let left = if reverse {
+                content
+                    .right()
+                    .saturating_sub(p.main_start)
+                    .saturating_sub(outer_main)
+            } else {
+                content.x.saturating_add(p.main_start)
+            };
+            let (auto_left, auto_right) = if reverse {
+                (p.auto_end, p.auto_start)
+            } else {
+                (p.auto_start, p.auto_end)
+            };
+            let child = self.layout_flex_item(
                 item,
-                main_size,
-                cursor,
+                ItemPlacement {
+                    left,
+                    main_size,
+                    auto_left,
+                    auto_right,
+                },
                 content,
                 computed.text_align,
                 specified_height,
@@ -585,12 +646,6 @@ impl<'a> Engine<'a> {
             let mb = self.boxes[child.0 as usize].dimensions.margin_box();
             tallest = tallest.max(mb.bottom() - content.y);
             children.push(child);
-            // Saturating for the same reason `total_gap` is: `gap: 1e11em`
-            // saturates the cast to cells at `i32::MAX`, and a cursor that
-            // added it would overflow — a panic a stylesheet can trigger, so a
-            // page could crash the browser. The item lands off the right edge
-            // instead, which is what such a gap asks for.
-            cursor = cursor.saturating_add(outer_main).saturating_add(gap);
         }
         self.boxes[box_id.0 as usize].children = children;
         // A row's cross size is its tallest item (§9.4, single line). The
@@ -600,19 +655,23 @@ impl<'a> Engine<'a> {
         tallest.max(0)
     }
 
-    /// Build one item's box at `main_start` with the main size §9.7 resolved
-    /// for it, and report the outer main size the cursor must advance by.
-    #[allow(clippy::too_many_arguments)]
+    /// Build one item's box where §9.5 placed it, at the main size §9.7
+    /// resolved for it.
     fn layout_flex_item(
         &mut self,
         item: &FlexItem,
-        main_size: i32,
-        main_start: i32,
+        place: ItemPlacement,
         container: Rect,
         align: TextAlign,
         containing_height: Option<i32>,
         pre: bool,
-    ) -> (BoxId, i32) {
+    ) -> BoxId {
+        let ItemPlacement {
+            left,
+            main_size,
+            auto_left,
+            auto_right,
+        } = place;
         match item.source {
             FlexItemSource::Element(node) => {
                 let tag = match &self.dom.node(node).data {
@@ -620,24 +679,24 @@ impl<'a> Engine<'a> {
                     _ => String::new(),
                 };
                 let mut dims = resolve_block_dims(&item.computed, container.width);
-                // An `auto` margin on a flex item absorbs free space rather
-                // than centring the box in its containing block (§9.5 step 1),
-                // and free space is M9.7's to place. Until then an auto margin
-                // on the main axis is zero, which is what `resolve_block_dims`
-                // starts from before it centres.
+                // An `auto` margin on a flex item absorbs the line's free space
+                // rather than centring the box in its containing block (§9.5
+                // step 1) — a different rule with a different answer, so the
+                // block one is overwritten with the share `flex::place`
+                // computed. Zero when there was no free space to take.
                 if item.computed.margin.left.is_auto() {
-                    dims.margin.left = 0;
+                    dims.margin.left = auto_left;
                 }
                 if item.computed.margin.right.is_auto() {
-                    dims.margin.right = 0;
+                    dims.margin.right = auto_right;
                 }
-                // What the cursor owes this item, whichever path builds its
-                // box. `outer_edges` is the same six lengths `dims` resolved,
-                // summed against the same containing width, so every item
-                // advances the line by exactly the outer size §9.7 divided it
-                // into — the invariant the whole line's arithmetic rests on.
+                // What this item costs the line, whichever path builds its box.
+                // `outer_edges` is the same six lengths `dims` resolved, summed
+                // against the same containing width, so an item occupies
+                // exactly the outer size §9.7 divided the line into and §9.5
+                // placed — the invariant the whole line's arithmetic rests on.
                 let lead = dims.margin.left + dims.border.left + dims.padding.left;
-                let outer_main = main_size + item.metrics.outer_edges;
+                let outer_main = main_size + item.metrics.outer_edges + auto_left + auto_right;
 
                 // Replaced and line-generating children keep their own layout
                 // paths rather than being re-derived here: an `<img>` item is
@@ -649,7 +708,7 @@ impl<'a> Engine<'a> {
                     let mut prev_mb = 0;
                     if let Some(child) = self.layout_node(
                         node,
-                        main_start,
+                        left,
                         outer_main,
                         containing_height,
                         container.y,
@@ -666,10 +725,10 @@ impl<'a> Engine<'a> {
                             // the line silently kept free space the algorithm
                             // had already given away.
                             let dims = &mut self.boxes[child.0 as usize].dimensions;
-                            dims.content.x = main_start + lead;
+                            dims.content.x = left + lead;
                             dims.content.width = main_size;
                         }
-                        return (child, outer_main);
+                        return child;
                     }
                     // One that generates no box at all (an `<img>` the image
                     // context never heard of) falls through and gets an empty
@@ -681,12 +740,10 @@ impl<'a> Engine<'a> {
                 // width `resolve_block_dims` computed from `width`/`auto` is
                 // replaced rather than clamped again.
                 dims.content.width = main_size;
-                dims.content.x = main_start + lead;
+                dims.content.x = left + lead;
                 dims.content.y = container.y + dims.margin.top + dims.border.top + dims.padding.top;
                 dims.content.height = 0;
-                let child =
-                    self.layout_box_at(node, &tag, item.computed, dims, containing_height, pre);
-                (child, outer_main)
+                self.layout_box_at(node, &tag, item.computed, dims, containing_height, pre)
             }
             FlexItemSource::Text(ref nodes) => {
                 // An anonymous flex item: one inline formatting context over a
@@ -696,20 +753,18 @@ impl<'a> Engine<'a> {
                     self.push_inline(node, pre, main_size, &mut run);
                 }
                 let mut prev_mb = 0;
-                let child = self
-                    .layout_anonymous_block(
-                        main_start,
-                        main_size,
-                        container.y,
-                        &mut prev_mb,
-                        &run,
-                        // An anonymous box has no style of its own, so the
-                        // alignment it uses is the container's.
-                        align,
-                        pre,
-                    )
-                    .expect("an anonymous flex item always has inline content");
-                (child, main_size)
+                self.layout_anonymous_block(
+                    left,
+                    main_size,
+                    container.y,
+                    &mut prev_mb,
+                    &run,
+                    // An anonymous box has no style of its own, so the
+                    // alignment it uses is the container's.
+                    align,
+                    pre,
+                )
+                .expect("an anonymous flex item always has inline content")
             }
         }
     }
@@ -1668,6 +1723,24 @@ struct FlexItem {
     metrics: flex::Item,
 }
 
+/// One item's place on the line, in the physical terms box-building needs:
+/// §9.5's main-axis offsets already mapped through the container's direction.
+///
+/// `auto_left` / `auto_right` are the cells that item's `auto` margins
+/// absorbed, named for the sides they are painted on rather than for the ends
+/// of the main axis — under `row-reverse` the main-start one is the right.
+#[derive(Clone, Copy)]
+struct ItemPlacement {
+    /// Left edge of the item's margin box, in the tree's coordinates. Not
+    /// "main-start": under `row-reverse` that is the item's *right* edge, and
+    /// this is the number box-building needs.
+    left: i32,
+    /// The used main size §9.7 resolved, content-box.
+    main_size: i32,
+    auto_left: i32,
+    auto_right: i32,
+}
+
 pub(super) enum FlexItemSource {
     Element(NodeId),
     /// A contiguous run of text between two element children: one anonymous
@@ -1677,17 +1750,22 @@ pub(super) enum FlexItemSource {
 
 /// Does this box lay its children out by css-flexbox-1 §9, here and now?
 ///
-/// `display: flex` is necessary and not sufficient: M9.6 implements the *row*
-/// direction, so a column container keeps stacking its children as a block
-/// until M9.9 — which is what it did before flex layout existed, and much
-/// closer to what a column means than laying it out sideways would be. The
-/// reversals go the same way.
+/// `display: flex` is necessary and not sufficient: M9.7 implements the two
+/// *row* directions, so a column container keeps stacking its children as a
+/// block until M9.9 — which is what it did before flex layout existed, and much
+/// closer to what a column means than laying it out sideways would be.
 ///
 /// Both the engine and intrinsic sizing ask this. They must agree, or a flex
 /// container's measured width and its laid-out width would come from different
-/// algorithms.
+/// algorithms. `row-reverse` needs nothing of its own from the measuring side:
+/// a row asks for the sum of its items either way round, and reversing the
+/// order of a sum does not change it.
 pub(super) fn lays_out_as_flex(computed: &ComputedStyle) -> bool {
-    computed.display == Display::Flex && computed.flex_direction == FlexDirection::Row
+    computed.display == Display::Flex
+        && matches!(
+            computed.flex_direction,
+            FlexDirection::Row | FlexDirection::RowReverse
+        )
 }
 
 /// §4 item generation: which of a flex container's children become items, and

@@ -1,0 +1,16 @@
+<!-- width: 80 -->
+<!doctype html>
+<html><head><style>
+body { margin: 0 }
+.row { display: flex; justify-content: center }
+.last { justify-content: flex-end }
+.row div { flex: 0 0 160px }
+.row div.thin { flex: 0 0 80px }
+.row div.push { margin-left: auto }
+.row div.solo { margin: 0 auto }
+</style></head>
+<body>
+<div class="row"><div>a</div><div>b</div><div class="push">c</div></div>
+<div class="row last"><div class="solo">a</div></div>
+<div class="row"><div class="thin push">a</div><div class="thin push">b</div></div>
+</body></html>

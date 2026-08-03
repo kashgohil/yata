@@ -1,0 +1,76 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §5.1 (flex-direction) and §9.5
+# before the code existed, never regenerated.
+#
+# `row-reverse` does not reorder the document and does not change the
+# arithmetic: it points the main axis the other way. **Main-start becomes the
+# container's right edge**, so the first item in order-modified document order
+# is the rightmost one, `flex-start` packs right, and every offset §9.5
+# computes from main-start is subtracted from the right edge instead of added
+# to the left. That mapping is the whole of what this direction costs — the
+# same placement pass produces both rows.
+#
+# The boxes are still listed in main-axis order, first item first, which is why
+# x *descends* down each row below. Order-modified document order is what the
+# layout tree holds (M9.6, `order`), and the DOM is untouched.
+#
+# Three `flex: 0 0 160px` (= 20 cell) items in 80 cells again: 60 used, 20 to
+# place.
+#
+# Row 1 — `flex-start`. Lead 0, so item a sits *at* main-start:
+#   a: 80 - 0 - 20 = 60,  b: 80 - 20 - 20 = 40,  c: 80 - 40 - 20 = 20.
+#   The 20 spare cells are at main-end, which here is the left edge — the
+#   mirror image of what `flex-start` leaves on a plain row.
+#
+# Row 2 — `space-between`: 20 cells over 2 inner slots, 10 each. Offsets from
+#   main-start are 0, 30, 60, so
+#   a: 80 - 0 - 20 = 60,  b: 80 - 30 - 20 = 30,  c: 80 - 60 - 20 = 0.
+#   First item at main-start (the right edge), last at main-end (the left) —
+#   the definition read in the direction the axis actually points.
+#
+# Row 3 — `gap: 1em` = 2 cells, `flex-start`. Reserved 4, free 16 at main-end.
+#   Offsets 0, 22, 44, so
+#   a: 60,  b: 80 - 22 - 20 = 38,  c: 80 - 44 - 20 = 16.
+#
+# Text inside an item is unaffected: a reversed main axis reverses the order of
+# the boxes, not the direction the words in them run.
+<html>  x=0 y=0 w=80 h=3
+  <body>  x=0 y=0 w=80 h=3
+    <div.row> flex row-reverse  x=0 y=0 w=80 h=1
+      <div>  x=60 y=0 w=20 h=1
+        anonymous  x=60 y=0 w=20 h=1
+          line  x=60 y=0 w=20 h=1
+            #text "a"  x=60 y=0 w=1 h=1
+      <div>  x=40 y=0 w=20 h=1
+        anonymous  x=40 y=0 w=20 h=1
+          line  x=40 y=0 w=20 h=1
+            #text "b"  x=40 y=0 w=1 h=1
+      <div>  x=20 y=0 w=20 h=1
+        anonymous  x=20 y=0 w=20 h=1
+          line  x=20 y=0 w=20 h=1
+            #text "c"  x=20 y=0 w=1 h=1
+    <div.row.between> flex row-reverse  x=0 y=1 w=80 h=1
+      <div>  x=60 y=1 w=20 h=1
+        anonymous  x=60 y=1 w=20 h=1
+          line  x=60 y=1 w=20 h=1
+            #text "a"  x=60 y=1 w=1 h=1
+      <div>  x=30 y=1 w=20 h=1
+        anonymous  x=30 y=1 w=20 h=1
+          line  x=30 y=1 w=20 h=1
+            #text "b"  x=30 y=1 w=1 h=1
+      <div>  x=0 y=1 w=20 h=1
+        anonymous  x=0 y=1 w=20 h=1
+          line  x=0 y=1 w=20 h=1
+            #text "c"  x=0 y=1 w=1 h=1
+    <div.row.gap> flex row-reverse  x=0 y=2 w=80 h=1
+      <div>  x=60 y=2 w=20 h=1
+        anonymous  x=60 y=2 w=20 h=1
+          line  x=60 y=2 w=20 h=1
+            #text "a"  x=60 y=2 w=1 h=1
+      <div>  x=38 y=2 w=20 h=1
+        anonymous  x=38 y=2 w=20 h=1
+          line  x=38 y=2 w=20 h=1
+            #text "b"  x=38 y=2 w=1 h=1
+      <div>  x=16 y=2 w=20 h=1
+        anonymous  x=16 y=2 w=20 h=1
+          line  x=16 y=2 w=20 h=1
+            #text "c"  x=16 y=2 w=1 h=1

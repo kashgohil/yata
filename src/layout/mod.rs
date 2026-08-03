@@ -339,6 +339,28 @@ mod tests {
     }
 
     #[test]
+    fn row_gap_is_the_cross_axis_gap_and_a_row_has_one_line() {
+        // `gap: <row> <column>`: the row gap goes *between lines*, and a
+        // `nowrap` row has a single line, so it must not reach the main axis or
+        // the container's height. M9.10 is where it starts doing something.
+        let row = "<div id=r><div>a</div><div>b</div></div>";
+        let sizing = "#r div { flex: 0 0 80px }";
+        let both = format!("#r {{ display: flex; gap: 4em 1em }} {sizing}");
+        let column_only = format!("#r {{ display: flex; gap: 0 1em }} {sizing}");
+        assert_eq!(items(row, &both, 40), items(row, &column_only, 40));
+
+        let (dom, styles) = styled_dom(row, &both);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut height = 0;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                height = b.dimensions.content.height;
+            }
+        });
+        assert_eq!(height, 1, "a four-line row gap on a one-line row");
+    }
+
+    #[test]
     fn order_moves_an_item_visually_and_leaves_the_document_alone() {
         let row = "<div id=r><a href=/1>one</a><a class=second href=/2>two</a></div>";
         let css = "#r { display: flex } a { flex-basis: 25% }";
@@ -631,6 +653,134 @@ mod tests {
     }
 
     #[test]
+    fn alignment_moves_everything_inside_the_item_it_moves() {
+        // The classic flex bug is a centred item whose text stayed at the old
+        // x. It cannot happen in this engine's shape — an item is *placed*
+        // before its contents are laid out, so there is no second position to
+        // forget to update — and this is the test that says so rather than
+        // leaving it to a reader of the code.
+        let row = "<div id=r><div class=i><b>hi</b> there</div></div>";
+        let css = "#r { display: flex; justify-content: center } .i { flex: 0 0 160px }";
+        // One 20-cell item in 80 cells: 60 free, 30 of it before the item.
+        assert_eq!(items(row, css, 80), [(30, 20)]);
+
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 80, Hidden::Respect);
+        let mut texts = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text {
+                texts.push((
+                    b.text.clone().unwrap_or_default(),
+                    b.dimensions.content.x,
+                    b.dimensions.content.right(),
+                ));
+            }
+        });
+        assert!(!texts.is_empty(), "the item has text to move");
+        for (text, left, right) in &texts {
+            assert!(
+                *left >= 30 && *right <= 50,
+                "{text:?} at {left}..{right} is outside the centred item"
+            );
+        }
+        assert_eq!(texts[0].1, 30, "the line starts at the item's content edge");
+        // ...and it is really on screen where the boxes say: the rasterised row
+        // has 30 blank cells before the text.
+        let row_text = &plain(&lines_styled(row, css, 80))[0];
+        assert!(row_text.starts_with(&" ".repeat(30)), "{row_text:?}");
+        assert_eq!(row_text.trim_end(), format!("{}hi there", " ".repeat(30)));
+    }
+
+    #[test]
+    fn row_reverse_starts_at_the_right_edge_and_hit_tests_where_it_drew() {
+        // Main-start is the container's right edge, so the *first* item in
+        // document order is the rightmost one and `flex-start` leaves its free
+        // space on the left. Two 10-cell links in 40 cells: /1 at 30, /2 at 20,
+        // and 20 cells spare at main-end.
+        let row = "<div id=r><a href=/1>one</a><a href=/2>two</a></div>";
+        let css = "#r { display: flex; flex-direction: row-reverse } a { flex: 0 0 80px }";
+        assert_eq!(items(row, css, 40), [(30, 10), (20, 10)]);
+
+        // The rest of the browser has to agree with that. Hit-testing is
+        // geometric, so a link answers where it was drawn...
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        assert_eq!(
+            hit::link_at(&tree, &dom, 30, 0).map(|(_, u)| u),
+            Some("/1".into())
+        );
+        assert_eq!(
+            hit::link_at(&tree, &dom, 20, 0).map(|(_, u)| u),
+            Some("/2".into())
+        );
+        // ...and the DOM is untouched: a reversed axis is a layout instruction,
+        // not an edit, so `/` search and F1 still see the document as written.
+        assert_eq!(
+            hit::dom_links(&dom)
+                .iter()
+                .map(|(_, u)| u.as_str())
+                .collect::<Vec<_>>(),
+            ["/1", "/2"]
+        );
+    }
+
+    #[test]
+    fn an_aligned_row_neither_overlaps_nor_overflows_at_any_width() {
+        // The placement half of the integer-cell invariant, swept through the
+        // whole stage. Three items that cannot flex, so every width leaves real
+        // free space for `justify-content` to round: whatever it does with it,
+        // the items stay in main-axis order, keep their gap, and stay inside
+        // the container whenever there is room for them.
+        let markup = "<div id=r><div>a</div><div>b</div><div>c</div></div>";
+        for justify in [
+            "flex-start",
+            "flex-end",
+            "center",
+            "space-between",
+            "space-around",
+            "space-evenly",
+        ] {
+            let css = format!(
+                "#r {{ display: flex; gap: 1em; justify-content: {justify} }}
+                 #r div {{ flex: 0 0 80px }}"
+            );
+            for width in 20..=120u16 {
+                let (dom, styles) = styled_dom(markup, &css);
+                let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+                let mut boxes = Vec::new();
+                tree.walk(tree.root, &mut |_, b| {
+                    if b.kind == BoxKind::Flex {
+                        boxes = b
+                            .children
+                            .iter()
+                            .map(|&c| {
+                                let mb = tree.get(c).dimensions.margin_box();
+                                (mb.x, mb.width)
+                            })
+                            .collect();
+                    }
+                });
+                let label = format!("{justify} at {width}: {boxes:?}");
+                assert_eq!(boxes.len(), 3, "{label}");
+                for pair in boxes.windows(2) {
+                    // Two cells of gap between every adjacent pair, never less.
+                    assert!(pair[1].0 - (pair[0].0 + pair[0].1) >= 2, "{label}");
+                }
+                // 3 items of 10 cells and 2 gaps of 2 need 34 cells. Narrower
+                // than that the row overflows the end edge from main-start,
+                // which is the overflow fallback and is pinned above.
+                if width >= 34 {
+                    assert!(boxes[0].0 >= 0, "{label}");
+                    let end = boxes[2].0 + boxes[2].1;
+                    assert!(end <= i32::from(width), "{label}");
+                } else {
+                    assert_eq!(boxes[0].0, 0, "{label}: overflow must pack at 0");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_length_no_layout_can_hold_lays_out_instead_of_crashing() {
         // A stylesheet is untrusted input, and `gap: 1e11em` is a legal thing
         // for one to say. Layout has to answer it with boxes — principle §1.5:
@@ -661,23 +811,30 @@ mod tests {
 
     #[test]
     fn a_column_flex_container_still_stacks_until_m9_9() {
-        // M9.6 implements the *row* direction. A column container keeps the
+        // M9.7 implements both *row* directions. A column container keeps the
         // block layout it had before flex existed, which is far closer to what
-        // a column means than laying it out sideways would be — and the same
-        // for the reversals. `engine::lays_out_as_flex` is the one predicate,
-        // and intrinsic sizing asks it too.
+        // a column means than laying it out sideways would be.
+        // `engine::lays_out_as_flex` is the one predicate, and intrinsic sizing
+        // asks it too.
         let markup = "<div id=r><div>one</div><div>two</div></div>";
         let block = geometry(markup, "#r { display: block }", 20);
         for css in [
             "#r { display: flex; flex-direction: column }",
             "#r { display: flex; flex-direction: column-reverse }",
-            "#r { display: flex; flex-direction: row-reverse }",
         ] {
             assert_eq!(geometry(markup, css, 20), block, "css: {css}");
         }
-        // ...and the row direction really does something different, so the
+        // ...and both row directions really do something different, so the
         // comparison above is not vacuous.
         assert_ne!(geometry(markup, "#r { display: flex }", 20), block);
+        assert_ne!(
+            geometry(
+                markup,
+                "#r { display: flex; flex-direction: row-reverse }",
+                20
+            ),
+            block
+        );
     }
 
     #[test]

@@ -1,0 +1,86 @@
+# SPEC GOLDEN — hand-derived from css-align-3 §8 (gaps) and css-flexbox-1 §9.5
+# before the code existed, never regenerated.
+#
+# A gap is not free space. It is reserved before anything is distributed, it
+# sits only *between* adjacent items — never at the ends of the line — and
+# `justify-content` divides what is left after it, not before. Every row here
+# holds the same three `flex: 0 0 160px` (= 20 cell) items, so the items use 60
+# of 80 cells and the arithmetic is all in the 20 that are left.
+#
+# `gap: 10%` resolves against the container's own inner main size (§8.1):
+# 10% of 80 cells = 8. Two gaps between three items = 16 cells reserved, so
+# `justify-content` is handed 80 - 60 - 16 = 4 cells and no more.
+#
+# Row 1 — `flex-start` (the initial value). Lead 0, so:
+#   x = 0, 0 + 20 + 8 = 28, 28 + 20 + 8 = 56. The row ends at 76 and the 4
+#   spare cells sit after the last item. There is no gap before a first item or
+#   after a last one, which is the difference between a gap and a margin.
+#
+# Row 2 — `space-between` over 4 cells across 2 inner slots: 2 cells each, and
+#   each slot is a gap *plus* its share: 8 + 2 = 10.
+#   x = 0, 0 + 20 + 10 = 30, 30 + 20 + 10 = 60, and the last item ends at
+#   exactly 80. If the gaps had been left in the free space, this row would
+#   have distributed 20 across the two slots and pushed the last item 16 cells
+#   past the container's edge.
+#
+# Row 3 — `center` over the same 4 cells: lead 2, end 2.
+#   x = 2, 2 + 20 + 8 = 30, 30 + 20 + 8 = 58, ending at 78.
+#
+# Row 4 — `gap: 1em`, a length rather than a percentage: 1em = 16px = 2 cells
+#   (PLAN.md's unit table, 8px per cell). Two gaps = 4 cells reserved, free
+#   space 16, `flex-start` leaves it at the end.
+#   x = 0, 0 + 20 + 2 = 22, 22 + 20 + 2 = 44.
+<html>  x=0 y=0 w=80 h=4
+  <body>  x=0 y=0 w=80 h=4
+    <div.row> flex row  x=0 y=0 w=80 h=1
+      <div>  x=0 y=0 w=20 h=1
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div>  x=28 y=0 w=20 h=1
+        anonymous  x=28 y=0 w=20 h=1
+          line  x=28 y=0 w=20 h=1
+            #text "b"  x=28 y=0 w=1 h=1
+      <div>  x=56 y=0 w=20 h=1
+        anonymous  x=56 y=0 w=20 h=1
+          line  x=56 y=0 w=20 h=1
+            #text "c"  x=56 y=0 w=1 h=1
+    <div.row.between> flex row  x=0 y=1 w=80 h=1
+      <div>  x=0 y=1 w=20 h=1
+        anonymous  x=0 y=1 w=20 h=1
+          line  x=0 y=1 w=20 h=1
+            #text "a"  x=0 y=1 w=1 h=1
+      <div>  x=30 y=1 w=20 h=1
+        anonymous  x=30 y=1 w=20 h=1
+          line  x=30 y=1 w=20 h=1
+            #text "b"  x=30 y=1 w=1 h=1
+      <div>  x=60 y=1 w=20 h=1
+        anonymous  x=60 y=1 w=20 h=1
+          line  x=60 y=1 w=20 h=1
+            #text "c"  x=60 y=1 w=1 h=1
+    <div.row.mid> flex row  x=0 y=2 w=80 h=1
+      <div>  x=2 y=2 w=20 h=1
+        anonymous  x=2 y=2 w=20 h=1
+          line  x=2 y=2 w=20 h=1
+            #text "a"  x=2 y=2 w=1 h=1
+      <div>  x=30 y=2 w=20 h=1
+        anonymous  x=30 y=2 w=20 h=1
+          line  x=30 y=2 w=20 h=1
+            #text "b"  x=30 y=2 w=1 h=1
+      <div>  x=58 y=2 w=20 h=1
+        anonymous  x=58 y=2 w=20 h=1
+          line  x=58 y=2 w=20 h=1
+            #text "c"  x=58 y=2 w=1 h=1
+    <div.row.tight> flex row  x=0 y=3 w=80 h=1
+      <div>  x=0 y=3 w=20 h=1
+        anonymous  x=0 y=3 w=20 h=1
+          line  x=0 y=3 w=20 h=1
+            #text "a"  x=0 y=3 w=1 h=1
+      <div>  x=22 y=3 w=20 h=1
+        anonymous  x=22 y=3 w=20 h=1
+          line  x=22 y=3 w=20 h=1
+            #text "b"  x=22 y=3 w=1 h=1
+      <div>  x=44 y=3 w=20 h=1
+        anonymous  x=44 y=3 w=20 h=1
+          line  x=44 y=3 w=20 h=1
+            #text "c"  x=44 y=3 w=1 h=1

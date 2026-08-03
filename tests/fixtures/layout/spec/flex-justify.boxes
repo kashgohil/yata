@@ -1,0 +1,122 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.5 (main-axis alignment)
+# before the code existed, never regenerated.
+#
+# Six rows, one per `justify-content` value, each with the same three items:
+# `flex: 0 0 160px` is grow 0, shrink 0, basis 160px = 20 cells, so §9.7 leaves
+# every item at 20 whatever the container does. Three of them use 60 of the
+# container's 80 cells, and §9.5 is what happens to the 20 that are left.
+#
+# No item has an `auto` margin, so step 1 takes nothing and step 6 — the
+# `justify-content` distribution — gets all 20 cells.
+#
+# Every value is the same shape: some space before the first item, some
+# between each adjacent pair, some after the last. In halves, because
+# `space-around`'s end spaces are half its inner ones:
+#
+#   value           lead  between  end   total   cells (lead / between / end)
+#   flex-start        0      0      1      1     0  /  0,  0  / 20
+#   flex-end          1      0      0      1     20 /  0,  0  /  0
+#   center            1      0      1      2     10 /  0,  0  / 10
+#   space-between     0      1      0      2     0  / 10, 10  /  0
+#   space-around      1      2      1      6     ?  — see below
+#   space-evenly      1      1      1      4     5  /  5,  5  /  5
+#
+# `space-around` is the one that does not divide: 20 cells over 6 halves is
+# 3.33 per half, and a terminal has no thirds of a cell. Every slot floors —
+# 3 / 6 / 6 / 3 = 18 — and the 2 cells rounding dropped go to the earliest
+# slots that asked for any, which is the same rule M9.6's `quantize` uses on
+# item sizes. So the lead becomes 4 and the first inner space 7:
+# 4 + 20 + 7 + 20 + 6 + 20 + 3 = 80, exactly.
+#
+# x, then, is the running total of items and the space beside them:
+#   flex-start     0, 20, 40          (the 20 spare cells sit after item c)
+#   flex-end       20, 40, 60
+#   center         10, 30, 50
+#   space-between  0, 30, 60          first at main-start, last at main-end
+#   space-around   4, 31, 57          (4+20+7 = 31, 31+20+6 = 57)
+#   space-evenly   5, 30, 55
+#
+# Each item is one cell of text in a 20-cell box, so its anonymous block and
+# line box are the item's own width and the `#text` box is 1 — and all of them
+# sit at the item's x, which is what it means for alignment to move a box
+# together with everything inside it.
+<html>  x=0 y=0 w=80 h=6
+  <body>  x=0 y=0 w=80 h=6
+    <div.row.start> flex row  x=0 y=0 w=80 h=1
+      <div>  x=0 y=0 w=20 h=1
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div>  x=20 y=0 w=20 h=1
+        anonymous  x=20 y=0 w=20 h=1
+          line  x=20 y=0 w=20 h=1
+            #text "b"  x=20 y=0 w=1 h=1
+      <div>  x=40 y=0 w=20 h=1
+        anonymous  x=40 y=0 w=20 h=1
+          line  x=40 y=0 w=20 h=1
+            #text "c"  x=40 y=0 w=1 h=1
+    <div.row.end> flex row  x=0 y=1 w=80 h=1
+      <div>  x=20 y=1 w=20 h=1
+        anonymous  x=20 y=1 w=20 h=1
+          line  x=20 y=1 w=20 h=1
+            #text "a"  x=20 y=1 w=1 h=1
+      <div>  x=40 y=1 w=20 h=1
+        anonymous  x=40 y=1 w=20 h=1
+          line  x=40 y=1 w=20 h=1
+            #text "b"  x=40 y=1 w=1 h=1
+      <div>  x=60 y=1 w=20 h=1
+        anonymous  x=60 y=1 w=20 h=1
+          line  x=60 y=1 w=20 h=1
+            #text "c"  x=60 y=1 w=1 h=1
+    <div.row.mid> flex row  x=0 y=2 w=80 h=1
+      <div>  x=10 y=2 w=20 h=1
+        anonymous  x=10 y=2 w=20 h=1
+          line  x=10 y=2 w=20 h=1
+            #text "a"  x=10 y=2 w=1 h=1
+      <div>  x=30 y=2 w=20 h=1
+        anonymous  x=30 y=2 w=20 h=1
+          line  x=30 y=2 w=20 h=1
+            #text "b"  x=30 y=2 w=1 h=1
+      <div>  x=50 y=2 w=20 h=1
+        anonymous  x=50 y=2 w=20 h=1
+          line  x=50 y=2 w=20 h=1
+            #text "c"  x=50 y=2 w=1 h=1
+    <div.row.between> flex row  x=0 y=3 w=80 h=1
+      <div>  x=0 y=3 w=20 h=1
+        anonymous  x=0 y=3 w=20 h=1
+          line  x=0 y=3 w=20 h=1
+            #text "a"  x=0 y=3 w=1 h=1
+      <div>  x=30 y=3 w=20 h=1
+        anonymous  x=30 y=3 w=20 h=1
+          line  x=30 y=3 w=20 h=1
+            #text "b"  x=30 y=3 w=1 h=1
+      <div>  x=60 y=3 w=20 h=1
+        anonymous  x=60 y=3 w=20 h=1
+          line  x=60 y=3 w=20 h=1
+            #text "c"  x=60 y=3 w=1 h=1
+    <div.row.around> flex row  x=0 y=4 w=80 h=1
+      <div>  x=4 y=4 w=20 h=1
+        anonymous  x=4 y=4 w=20 h=1
+          line  x=4 y=4 w=20 h=1
+            #text "a"  x=4 y=4 w=1 h=1
+      <div>  x=31 y=4 w=20 h=1
+        anonymous  x=31 y=4 w=20 h=1
+          line  x=31 y=4 w=20 h=1
+            #text "b"  x=31 y=4 w=1 h=1
+      <div>  x=57 y=4 w=20 h=1
+        anonymous  x=57 y=4 w=20 h=1
+          line  x=57 y=4 w=20 h=1
+            #text "c"  x=57 y=4 w=1 h=1
+    <div.row.evenly> flex row  x=0 y=5 w=80 h=1
+      <div>  x=5 y=5 w=20 h=1
+        anonymous  x=5 y=5 w=20 h=1
+          line  x=5 y=5 w=20 h=1
+            #text "a"  x=5 y=5 w=1 h=1
+      <div>  x=30 y=5 w=20 h=1
+        anonymous  x=30 y=5 w=20 h=1
+          line  x=30 y=5 w=20 h=1
+            #text "b"  x=30 y=5 w=1 h=1
+      <div>  x=55 y=5 w=20 h=1
+        anonymous  x=55 y=5 w=20 h=1
+          line  x=55 y=5 w=20 h=1
+            #text "c"  x=55 y=5 w=1 h=1
