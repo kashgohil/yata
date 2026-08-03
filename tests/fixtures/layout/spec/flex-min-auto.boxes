@@ -1,0 +1,41 @@
+# SPEC GOLDEN — hand-written from css-flexbox-1 §4.5 (automatic minimum size)
+# and §9.7, before the code existed, never regenerated.
+#
+# `min-width` is `auto` on both items, and on a flex item that does not mean
+# zero: it means the item's own min-content size — the longest thing that
+# cannot be broken. That is the rule that stops a flex row from shredding a
+# word one cell at a time as the terminal narrows.
+#
+# In cells: flex-basis 160px = 20, container inner main size = 30.
+# .a's text is one 20-cell word, so its min-content — and therefore its
+# automatic minimum size — is 20. .b's is 1.
+#
+# §9.7 step 1: hypothetical sizes 20 + 20 = 40 > 30, a *shrink* pass.
+#
+# First iteration
+#   remaining free space = 30 - 40 = -10
+#   scaled shrink factors 1 × 20 = 20 each, summing to 40
+#   each target = 20 - 10 × (20/40) = 15
+#   .a violates its automatic minimum of 20 by 5; the total violation is
+#   positive, so .a freezes at 20 and the loop repeats.
+#
+# Second iteration
+#   remaining free space = 30 - (20 frozen + 20) = -10
+#   .b's scaled factor is 20, the only one, so it absorbs all of it:
+#   20 - 10 × (20/20) = 10, which is well above its own minimum of 1.
+#
+# Final: 20 / 10 = 30 exactly. The word fits its box on one line and does not
+# wrap — which is the whole point of the automatic minimum size.
+#
+# x: 0, then 0 + 20 = 20.
+<html>  x=0 y=0 w=30 h=1
+  <body>  x=0 y=0 w=30 h=1
+    <div.row> flex row  x=0 y=0 w=30 h=1
+      <div.a>  x=0 y=0 w=20 h=1
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "supercalifragilistic"  x=0 y=0 w=20 h=1
+      <div.b>  x=20 y=0 w=10 h=1
+        anonymous  x=20 y=0 w=10 h=1
+          line  x=20 y=0 w=10 h=1
+            #text "x"  x=20 y=0 w=1 h=1

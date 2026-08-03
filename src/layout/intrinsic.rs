@@ -27,7 +27,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
-use crate::layout::engine::{Axis, Hidden, LIST_MARKER, edge_h, is_block_level, is_html_space};
+use crate::layout::engine::{
+    Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_block_level, is_html_space,
+    lays_out_as_flex,
+};
 use crate::style::Styles;
 use crate::style::values::{Display, Length};
 
@@ -89,8 +92,9 @@ pub struct IntrinsicSizer<'a> {
     images: &'a ImageContext,
     /// The pass's `display:none` mode, carried for one reason: the engine's
     /// reveal pass lays hidden subtrees out anyway (M4's never-blank rescue),
-    /// and a sizer that always treated them as nothing would measure a page
-    /// rescued that way as empty while the engine builds real boxes for it.
+    /// and a sizer that always treated them as nothing would hand flex base
+    /// sizes that disagree with the boxes the engine actually builds on every
+    /// page rescued that way.
     hidden: Hidden,
     memo: HashMap<NodeId, Sizes>,
     /// Instrumentation, not surface: how many nodes this pass has actually
@@ -129,6 +133,27 @@ impl<'a> IntrinsicSizer<'a> {
     /// cells.
     pub fn max_content_width(&mut self, node: NodeId) -> i32 {
         self.sizes(node).max
+    }
+
+    /// The two widths of one *run* of sibling nodes measured as a single
+    /// inline formatting context — `(min, max)`, content-box cells.
+    ///
+    /// This is what an anonymous flex item is (M9.6, §4): a contiguous
+    /// sequence of text between two element siblings, which shares one line
+    /// box and therefore one measurement. Measuring the nodes separately and
+    /// summing would be wrong in both directions — max-content must count the
+    /// space that joins them, and min-content must not be the sum at all.
+    ///
+    /// Not memoized: the key is the run, not a node, and a run is measured
+    /// once per layout.
+    pub fn run_widths(&mut self, nodes: &[NodeId]) -> (i32, i32) {
+        let pre = nodes.first().is_some_and(|&n| self.in_pre(n));
+        let mut run = Run::new(pre);
+        for &node in nodes {
+            self.push_pieces(node, &mut run);
+        }
+        let sizes = run.finish();
+        (sizes.min, sizes.max)
     }
 
     /// How many nodes this pass has actually measured — the memo's promise
@@ -187,17 +212,16 @@ impl<'a> IntrinsicSizer<'a> {
             box_sizing: computed.box_sizing,
         };
 
-        let base = if tag == "img" {
-            // Replaced: the image box's own cell width (M8.2's resolution
-            // order), which is the size the engine gives it too — a CSS
-            // `width` on an `<img>` is not something layout honours yet. An
-            // image the context does not know generates no box, so it asks for
-            // no width.
-            Sizes::both(self.image_width(node).unwrap_or(0))
-        } else if let Some(specified) = definite_h(computed.width) {
+        let base = if tag != "img"
+            && let Some(specified) = definite_h(computed.width)
+        {
+            // A box told how wide to be is that wide, whatever is inside it.
+            // (`<img>` is the exception this engine already had: a CSS `width`
+            // on one is not something layout honours yet, so measuring it as
+            // though it were would disagree with the box that gets built.)
             Sizes::both(axis.content_from(specified))
         } else {
-            self.children_sizes(node)
+            self.content_sizes(node, tag, &computed)
         };
 
         // M9.2's clamp, called rather than restated: `max` first, then `min`,
@@ -208,6 +232,99 @@ impl<'a> IntrinsicSizer<'a> {
             min: axis.clamp(base.min, min, max),
             max: axis.clamp(base.max, min, max),
         }
+    }
+
+    /// What this element's **content** wants, ignoring any `width` the page
+    /// put on the element itself — `(min, max)` content-box cells. Its
+    /// descendants keep their own widths; only this box's is set aside.
+    ///
+    /// Two callers in M9.6, and both need exactly this rather than
+    /// [`max_content_width`](Self::max_content_width): `flex-basis: content`
+    /// exists to override the main size property (an item that answered "240px,
+    /// because that is my `width`" would make the keyword mean nothing), and
+    /// §4.5's *content size suggestion* is one half of an automatic minimum
+    /// size whose other half is the specified size — the spec takes the smaller
+    /// of the two, which it cannot do if the sizer has already folded them
+    /// together.
+    pub fn content_widths(&mut self, node: NodeId) -> (i32, i32) {
+        let sizes = match &self.dom.node(node).data {
+            NodeData::Element { tag, .. } => {
+                let tag = tag.clone();
+                let computed = *self.styles.get(node);
+                if self.is_hidden(node) {
+                    Sizes::ZERO
+                } else {
+                    self.content_sizes(node, &tag, &computed)
+                }
+            }
+            // Anything that is not an element has no `width` to set aside.
+            _ => self.sizes(node),
+        };
+        (sizes.min, sizes.max)
+    }
+
+    /// The content-based half of [`element_sizes`](Self::element_sizes): what
+    /// is inside the box, by whichever rule its formatting context uses.
+    fn content_sizes(
+        &mut self,
+        node: NodeId,
+        tag: &str,
+        computed: &crate::style::ComputedStyle,
+    ) -> Sizes {
+        if tag == "img" {
+            // Replaced: the image box's own cell width (M8.2's resolution
+            // order), which is the size the engine gives it too. An image the
+            // context has never heard of generates no box, so it asks for no
+            // width.
+            Sizes::both(self.image_width(node).unwrap_or(0))
+        } else if lays_out_as_flex(computed) {
+            self.flex_sizes(node, computed)
+        } else {
+            self.children_sizes(node)
+        }
+    }
+
+    /// A flex row's sizes (§9.9): its items sit **side by side**, so both
+    /// widths are sums where a block container's are maxima. That difference is
+    /// the whole reason this function exists — measuring a flex row like a
+    /// block reports the width of its widest item, which is what a two-item
+    /// row would be if it were allowed to wrap, and it is not (M9.6 is
+    /// `nowrap`).
+    ///
+    /// Simplification, stated rather than hidden: the spec sizes a flex
+    /// container from its items' *contributions*, which scale each item by its
+    /// flex fraction (§9.9.1). Here max-content sums the items' max-content
+    /// sizes and min-content sums their min-content sizes, which is exact for
+    /// the case that matters — at a container width equal to either sum, §9.7
+    /// has zero free space to distribute and hands every item exactly the size
+    /// that went into the sum.
+    fn flex_sizes(&mut self, node: NodeId, computed: &crate::style::ComputedStyle) -> Sizes {
+        let pre = self.in_pre(node);
+        let sources = flex_sources(self.dom, node, &|n| self.is_hidden(n), pre);
+        if sources.is_empty() {
+            return Sizes::ZERO;
+        }
+        // Gaps are part of what the row asks for: a row of three items with a
+        // one-cell gap needs two cells nothing will ever draw in. Zero
+        // containing width, per this module's percentage rule.
+        let gap = edge_h(computed.gap.column, 0).max(0) * (sources.len() as i32 - 1);
+        let mut out = Sizes { min: gap, max: gap };
+        for source in sources {
+            let sizes = match source {
+                FlexItemSource::Element(child) => {
+                    self.sizes(child).grown_by(self.outer_edges(child))
+                }
+                FlexItemSource::Text(nodes) => {
+                    let (min, max) = self.run_widths(&nodes);
+                    Sizes { min, max }
+                }
+            };
+            out = Sizes {
+                min: out.min + sizes.min,
+                max: out.max + sizes.max,
+            };
+        }
+        out
     }
 
     /// A block container's sizes: the max over what each child asks for.
@@ -222,7 +339,8 @@ impl<'a> IntrinsicSizer<'a> {
         // block, as a line of its own — so seeding the run reproduces both:
         // it joins the first inline run here too, and if a block child closes
         // the run first, it is flushed as a marker-wide segment. Without this
-        // an `<li>` measures two cells narrower than it lays out.
+        // an `<li>` measures two cells narrower than it lays out, and as a
+        // flex item that means text the algorithm believed would fit wraps.
         if matches!(&self.dom.node(node).data, NodeData::Element { tag, .. } if tag == "li") {
             run.piece(LIST_MARKER.width() as i32);
         }
@@ -886,7 +1004,12 @@ mod tests {
         fn box_of(tree: &LayoutTree, node: NodeId) -> Option<BoxId> {
             let mut found = None;
             tree.walk(tree.root, &mut |id, b| {
-                if found.is_none() && b.node == Some(node) && b.kind == BoxKind::Block {
+                // A flex container's box is a `Flex`, not a `Block` (M9.6),
+                // and it is still the box this element generated.
+                if found.is_none()
+                    && b.node == Some(node)
+                    && matches!(b.kind, BoxKind::Block | BoxKind::Flex)
+                {
                     found = Some(id);
                 }
             });
@@ -987,10 +1110,10 @@ mod tests {
                     if !has_text {
                         continue;
                     }
-                    // List items are *in* now: the marker they lay out with is
-                    // the marker they measure with, so the third of danluu.com
-                    // this filter used to cost is back under the three
-                    // assertions below.
+                    // List items are *in* now (M9.6): the marker they lay out
+                    // with is the marker they measure with, so the third of
+                    // danluu.com this filter used to cost is back under the
+                    // three assertions below.
                     let sized = subtree_any(dom, node, &|n| {
                         let c = styles.get(n);
                         !c.width.is_auto() || !c.min_width.is_auto() || !c.max_width.is_auto()
@@ -1049,6 +1172,14 @@ mod tests {
                     subtree_any(self.dom, c, &|n| is_block_element(self.dom, self.styles, n))
                 });
                 if has_block_child {
+                    return false;
+                }
+                // A flex container is not one inline formatting context either
+                // (M9.6): its items are blockified and sit side by side, so the
+                // width it wants is a sum *across* boxes and no single line box
+                // ever holds it. The narrowed framing below still measures
+                // these — and on danluu.com it is the only thing that does.
+                if lays_out_as_flex(self.styles.get(node)) {
                     return false;
                 }
                 let tree = self.lay_out(max + 200);

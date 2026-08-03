@@ -8,8 +8,9 @@ mod boxes;
 mod clip;
 mod dimensions;
 mod engine;
+mod flex;
 mod hit;
-mod intrinsic;
+pub(crate) mod intrinsic;
 mod lines;
 
 pub use boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
@@ -228,31 +229,426 @@ mod tests {
             .collect()
     }
 
+    /// Every flex item's content box under the container with id `r`, as
+    /// `(x, width)` in layout order — which for a flex container is
+    /// order-modified document order.
+    fn items(html_src: &str, css: &str, width: u16) -> Vec<(i32, i32)> {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        let mut out = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                out = b
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let d = tree.get(c).dimensions;
+                        (d.margin_box().x, d.content.width)
+                    })
+                    .collect();
+            }
+        });
+        out
+    }
+
     #[test]
-    fn a_flex_container_lays_out_as_a_block_until_m9_6() {
-        // M9.5 landed flexbox's *vocabulary*, not its algorithm: `display:
-        // flex` cascades as itself and shows up in F2, but layout still gives
-        // it a block container (`engine::is_block_level`). So every box must
-        // land where `display:block` puts it, down to the cell — which is what
-        // lets a milestone that touches the cascade move no snapshot at all.
-        let markup = "<div>one two three</div><div>four</div>";
-        let block = geometry(markup, "div { display: block }", 20);
+    fn flex_items_sit_side_by_side_at_their_own_widths() {
+        // The row basics: three items 10 cells wide in an 80-cell container.
+        // `flex-grow` is 0 initially, so nobody takes the 50 cells left over —
+        // where that room goes is M9.7's question, not this task's.
+        let row = "<div id=r><div class=i>a</div><div class=i>b</div><div class=i>c</div></div>";
+        let css = "#r { display: flex } .i { flex-basis: 80px }";
+        assert_eq!(items(row, css, 80), [(0, 10), (10, 10), (20, 10)]);
+
+        // Same row, same y: side-by-side is the whole point.
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 80, Hidden::Respect);
+        let mut ys = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text {
+                ys.push(b.dimensions.content.y);
+            }
+        });
+        assert_eq!(ys, [0, 0, 0], "items share the line's rows");
+    }
+
+    #[test]
+    fn a_row_is_as_tall_as_its_tallest_item() {
+        // Cross sizing is M9.8's, but a container has to be tall enough to
+        // hold what is in it or the page scrolls past its own content.
+        let row = "<div id=r><div>one</div><div>two words here that wrap</div></div>";
+        let (dom, styles) = styled_dom(row, "#r { display: flex } #r div { flex-basis: 100% }");
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let mut flex_h = 0;
+        let mut tallest_item = 0;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                flex_h = b.dimensions.content.height;
+                tallest_item = b
+                    .children
+                    .iter()
+                    .map(|&c| tree.get(c).dimensions.margin_box().height)
+                    .max()
+                    .unwrap_or(0);
+            }
+        });
+        assert!(tallest_item > 1, "the second item must have wrapped");
+        assert_eq!(flex_h, tallest_item);
+    }
+
+    #[test]
+    fn flex_basis_reads_every_spelling_the_page_can_write() {
+        let row = "<div id=r><div class=a>aa</div><div class=b>bb</div></div>";
+        // A length, and a percentage of the container's definite inner size.
+        assert_eq!(
+            items(
+                row,
+                "#r{display:flex} .a{flex-basis:160px} .b{flex-basis:25%}",
+                80
+            ),
+            [(0, 20), (20, 20)]
+        );
+        // `auto` defers to the main-axis size property...
+        assert_eq!(
+            items(row, "#r{display:flex} .a{width:240px} .b{width:80px}", 80),
+            [(0, 30), (30, 10)]
+        );
+        // ...and to max-content when there is no width either, which is the
+        // case that needs M9.4. Both items are two cells of text.
+        assert_eq!(items(row, "#r{display:flex}", 80), [(0, 2), (2, 2)]);
+        // `content` is max-content outright, whatever `width` says.
+        assert_eq!(
+            items(
+                row,
+                "#r{display:flex} div{width:240px;flex-basis:content}",
+                80
+            ),
+            [(0, 2), (2, 2)]
+        );
+    }
+
+    #[test]
+    fn gaps_take_their_cells_before_the_items_do() {
+        // Two growing items and a 2-cell gap in 20 cells: 18 to divide, 9 each,
+        // and the second item starts one gap past the first.
+        let row = "<div id=r><div>a</div><div>b</div></div>";
+        assert_eq!(
+            items(row, "#r { display: flex; gap: 1em } #r div { flex: 1 }", 20),
+            [(0, 9), (11, 9)]
+        );
+    }
+
+    #[test]
+    fn order_moves_an_item_visually_and_leaves_the_document_alone() {
+        let row = "<div id=r><a href=/1>one</a><a class=second href=/2>two</a></div>";
+        let css = "#r { display: flex } a { flex-basis: 25% }";
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        // Document order, no `order`: /1 is on the left.
+        assert_eq!(
+            hit::link_at(&tree, &dom, 1, 0).map(|(_, u)| u),
+            Some("/1".into())
+        );
+
+        let css = "#r { display: flex } a { flex-basis: 25% } .second { order: -1 }";
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        // ...and with `order: -1` the second link is the one on the left.
+        assert_eq!(
+            hit::link_at(&tree, &dom, 1, 0).map(|(_, u)| u),
+            Some("/2".into())
+        );
+        // The DOM never moved: `order` is a layout instruction, not an edit.
+        assert_eq!(
+            hit::dom_links(&dom)
+                .iter()
+                .map(|(_, u)| u.as_str())
+                .collect::<Vec<_>>(),
+            ["/1", "/2"]
+        );
+        // ...and hit-testing still finds each link where it was drawn, which is
+        // what `/` search, link hints and the focus ring all walk.
+        assert_eq!(
+            hit::link_at(&tree, &dom, 11, 0).map(|(_, u)| u),
+            Some("/1".into())
+        );
+    }
+
+    #[test]
+    fn a_flex_item_can_itself_be_a_flex_container() {
+        // The recursion the algorithm needs: an item is laid out at its
+        // resolved width by whatever formatting context its own `display` says,
+        // so a nested row divides *its* width the same way.
+        let markup = "<div id=r><div id=n><div>a</div><div>b</div></div><div>c</div></div>";
+        let css = "#r { display: flex } #n { display: flex } #r > div { flex: 1 }
+                   #n > div { flex: 1 }";
+        let (dom, styles) = styled_dom(markup, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut rows = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                rows.push((
+                    b.dimensions.content.width,
+                    b.children
+                        .iter()
+                        .map(|&c| tree.get(c).dimensions.content.width)
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        });
+        // The outer row splits 40 into 20/20; the nested one splits its own 20
+        // into 10/10.
+        assert_eq!(rows, [(40, vec![20, 20]), (20, vec![10, 10])]);
+    }
+
+    /// Every flex item in `tree`, with the width of its box and how far the
+    /// text inside it actually reaches. The two agreeing is what it means for
+    /// a measurement to have predicted the boxes it produced.
+    fn item_text_extents(tree: &LayoutTree) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind != BoxKind::Flex {
+                return;
+            }
+            for &item in &b.children {
+                let box_width = tree.get(item).dimensions.content.width;
+                let left = tree.get(item).dimensions.content.x;
+                let mut reach = 0;
+                tree.walk(item, &mut |_, t| {
+                    if t.kind == BoxKind::Text {
+                        reach = reach.max(t.dimensions.content.right() - left);
+                    }
+                });
+                out.push((box_width, reach));
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn a_list_item_flex_item_is_sized_with_the_marker_it_lays_out_with() {
+        // M9.4's first known divergence, closed here. An `<li>` inside a flex
+        // *container* is a flex item that is still a list item inside, so the
+        // engine injects the two-cell marker while building its boxes. If the
+        // measurement behind its flex base size did not count those two cells,
+        // the box would come out two cells short and the item's last word would
+        // drop to a second line. Nothing here is compared against a number from
+        // the implementation: the box is compared against the text in it.
+        let markup = "<ul id=r><li>alpha beta</li><li>gamma delta</li></ul>";
+        let (dom, styles) = styled_dom(markup, "#r { display: flex }");
+        let tree = layout_document(&dom, &styles, 60, Hidden::Respect);
+        let extents = item_text_extents(&tree);
+        assert_eq!(extents.len(), 2, "two items: {extents:?}");
+        for (width, reach) in extents {
+            assert!(
+                reach <= width,
+                "text reaches {reach} in a {width}-cell item"
+            );
+        }
+        // ...and the marker really is there, so the test above is measuring the
+        // case it claims to (a flex *item* keeps its marker; a flex *container*
+        // that is itself an `<li>` does not — see the test below).
+        let rows = plain(&lines_styled(markup, "#r { display: flex }", 60));
+        assert!(rows[0].contains("• alpha beta"), "{rows:?}");
+        assert_eq!(rows.len(), 2, "nothing wrapped: {rows:?}");
+    }
+
+    #[test]
+    fn a_revealed_page_measures_the_flex_items_it_lays_out() {
+        // M9.4's second known divergence, closed here. A page that hides
+        // itself gets laid out again with `display:none` ignored (M4's
+        // never-blank rescue). Intrinsic sizing has to be told, or every flex
+        // item on such a page is measured as nothing while the engine builds a
+        // real box for it — items would collapse to zero and their text would
+        // spill across the row.
+        let markup = "<body style='display:none'>\
+                      <div id=r><div>alpha</div><div>beta</div></div></body>";
+        let (dom, styles) = styled_dom(markup, "#r { display: flex }");
+        let (tree, revealed) =
+            layout_document_readable(&dom, &styles, 40, &ImageContext::default());
+        assert!(revealed, "the fixture must be rescued by the reveal pass");
+        let extents = item_text_extents(&tree);
+        assert_eq!(extents.len(), 2, "two items: {extents:?}");
+        for (width, reach) in &extents {
+            assert!(*width > 0, "a revealed item collapsed to nothing");
+            assert!(
+                reach <= width,
+                "text reaches {reach} in a {width}-cell item"
+            );
+        }
+        // Both words are on the row, side by side, with the second past the
+        // first — which is only true if the first item was sized from content
+        // the sizer was willing to look at.
+        assert_eq!(plain(&lines_from_tree(&tree))[0].trim_end(), "alphabeta");
+    }
+
+    #[test]
+    fn a_flex_list_item_loses_its_marker_the_way_a_browser_drops_it() {
+        // `display: flex` replaces `display: list-item`, so the marker a list
+        // item would have generated is not generated — which is what a browser
+        // shows for danluu.com's `li{display:flex}` link list, and what this
+        // engine now shows too. The bullet is emitted by the block path only.
+        assert_eq!(
+            plain(&lines_styled(
+                "<ul><li>first</li></ul>",
+                "li{display:block}",
+                40
+            )),
+            ["    • first", ""]
+        );
+        assert_eq!(
+            plain(&lines_styled(
+                "<ul><li>first</li></ul>",
+                "li{display:flex}",
+                40
+            )),
+            ["    first", ""]
+        );
+    }
+
+    #[test]
+    fn text_between_items_becomes_one_anonymous_item_and_whitespace_none() {
+        // §4: element children are items; contiguous text between them is one
+        // anonymous item; whitespace-only runs generate nothing, which is why
+        // the newlines in the markup below do not become items of their own.
+        let markup = "<div id=r>\n  lead text\n  <b>bee</b>\n  tail\n</div>";
+        let (dom, styles) = styled_dom(markup, "#r { display: flex }");
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut kinds = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                kinds = b.children.iter().map(|&c| tree.get(c).kind).collect();
+            }
+        });
+        assert_eq!(
+            kinds,
+            [
+                BoxKind::AnonymousBlock,
+                BoxKind::Block,
+                BoxKind::AnonymousBlock
+            ],
+            "lead text, <b>, tail — and nothing for the newlines between them"
+        );
+        // The `<b>` was blockified: it is an item with a box, not a word on a
+        // line shared with the text either side of it. So the whitespace
+        // *between* items is gone — each anonymous item is its own inline
+        // formatting context and trims its own edges, and the items are then
+        // packed against each other. That is the flexbox gotcha every page
+        // author meets: spaces between inline-blocks show, spaces between flex
+        // items do not.
+        let text: Vec<String> = plain(&lines_styled(markup, "#r { display: flex }", 40));
+        assert_eq!(text[0].trim_end(), "lead textbeetail");
+    }
+
+    #[test]
+    fn an_items_own_edges_come_out_of_the_line_before_it_is_divided() {
+        // Free space is measured against *outer* sizes: an item's margin,
+        // border and padding are not room the algorithm may hand to anyone,
+        // including itself. In 40 cells with one item carrying 4 cells of
+        // margin and 2 of padding, the 34 that are left split 17/17 — and the
+        // second item starts past all six of the first item's edge cells.
+        let row = "<div id=r><div class=a>a</div><div class=b>b</div></div>";
+        let css = "#r { display: flex } #r div { flex: 1 }
+                   .a { margin: 0 1em; padding: 0 8px }";
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut boxes = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                boxes = b
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let d = tree.get(c).dimensions;
+                        (
+                            d.margin_box().x,
+                            d.content.x,
+                            d.content.width,
+                            d.margin_box().width,
+                        )
+                    })
+                    .collect();
+            }
+        });
+        assert_eq!(boxes, [(0, 3, 17, 23), (23, 23, 17, 17)]);
+        // ...and the row is still filled exactly: 23 + 17 = 40.
+        assert_eq!(boxes.iter().map(|b| b.3).sum::<i32>(), 40);
+    }
+
+    #[test]
+    fn a_border_box_basis_counts_the_edges_it_says_it_does() {
+        // `box-sizing` applies to `flex-basis` the same way it applies to
+        // `width` (M9.2's arithmetic, called rather than restated): a 20-cell
+        // border-box basis on an item with 2 cells of padding is 18 cells of
+        // content, and a content-box one is 20.
+        let row = "<div id=r><div class=a>a</div></div>";
+        let css = "#r { display: flex } .a { flex-basis: 160px; padding: 0 8px }";
+        assert_eq!(items(row, css, 40), [(0, 20)]);
+        let css = format!("{css} .a {{ box-sizing: border-box }}");
+        assert_eq!(items(row, &css, 40), [(0, 18)]);
+    }
+
+    #[test]
+    fn a_grown_row_fills_its_container_exactly_at_every_width() {
+        // The integer-cell invariant, swept over the whole stage rather than
+        // over `flex::resolve` alone: whatever the terminal width, the items
+        // plus their gaps are exactly the container's inner size, no item is
+        // negative, and no item is lost. Rounding that leaked a cell would show
+        // up here as a one-cell hole at the end of the row on some widths and
+        // not others — the kind of bug a single fixture never catches.
+        let markup = "<div id=r><div class=a>alpha</div><div class=b>b</div>\
+                      <div class=c>gamma</div></div>";
+        let css = "#r { display: flex; gap: 1em } .a { flex: 1 } .b { flex: 2 }
+                   .c { flex: 1 }";
+        for width in 20..=120u16 {
+            let (dom, styles) = styled_dom(markup, css);
+            let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+            let mut checked = false;
+            tree.walk(tree.root, &mut |_, b| {
+                if b.kind != BoxKind::Flex {
+                    return;
+                }
+                checked = true;
+                let widths: Vec<i32> = b
+                    .children
+                    .iter()
+                    .map(|&c| tree.get(c).dimensions.margin_box().width)
+                    .collect();
+                assert_eq!(widths.len(), 3, "width {width}: an item went missing");
+                assert!(
+                    widths.iter().all(|&w| w >= 0),
+                    "width {width}: negative item {widths:?}"
+                );
+                // Two gaps of 2 cells between three items.
+                assert_eq!(
+                    widths.iter().sum::<i32>() + 4,
+                    b.dimensions.content.width,
+                    "width {width}: items {widths:?} do not fill the row"
+                );
+            });
+            assert!(checked, "width {width}: no flex container in the tree");
+        }
+    }
+
+    #[test]
+    fn a_column_flex_container_still_stacks_until_m9_9() {
+        // M9.6 implements the *row* direction. A column container keeps the
+        // block layout it had before flex existed, which is far closer to what
+        // a column means than laying it out sideways would be — and the same
+        // for the reversals. `engine::lays_out_as_flex` is the one predicate,
+        // and intrinsic sizing asks it too.
+        let markup = "<div id=r><div>one</div><div>two</div></div>";
+        let block = geometry(markup, "#r { display: block }", 20);
         for css in [
-            "div { display: flex }",
-            // Block-level here until M9.11 gives inline-level boxes a line to
-            // sit on; `inline` would collapse these two divs onto one row.
-            "div { display: inline-flex }",
-            // The rest of the vocabulary cascades and is ignored, so it must
-            // not move a cell either.
-            "div { display: flex; flex-direction: column-reverse; flex-wrap: wrap;
-                   gap: 2em; justify-content: space-between; align-items: center;
-                   align-content: center; flex: 1 0 30%; order: -1 }",
+            "#r { display: flex; flex-direction: column }",
+            "#r { display: flex; flex-direction: column-reverse }",
+            "#r { display: flex; flex-direction: row-reverse }",
         ] {
             assert_eq!(geometry(markup, css, 20), block, "css: {css}");
         }
-        // ...and the text really did wrap in there, so the comparison above is
-        // over boxes that exist rather than over two empty documents.
-        assert!(block.len() > 4, "{block:?}");
+        // ...and the row direction really does something different, so the
+        // comparison above is not vacuous.
+        assert_ne!(geometry(markup, "#r { display: flex }", 20), block);
     }
 
     #[test]

@@ -334,6 +334,19 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
     let skip_label = b.kind == BoxKind::Block && b.node == Some(dom.root);
     if !skip_label {
         let label = match b.kind {
+            // A flex container says so, and says which way it flexes: F3's
+            // job is explaining a layout, and "these boxes are side by side
+            // because their parent is a flex row" is the explanation.
+            BoxKind::Flex => {
+                let name = match b.node {
+                    Some(nid) => match &dom.node(nid).data {
+                        NodeData::Element { tag, attrs } => element_summary(tag, attrs),
+                        _ => "flex".into(),
+                    },
+                    None => "flex".into(),
+                };
+                format!("{name} flex {}", b.computed.flex_direction.name())
+            }
             BoxKind::Block | BoxKind::Inline => {
                 if let Some(nid) = b.node {
                     match &dom.node(nid).data {

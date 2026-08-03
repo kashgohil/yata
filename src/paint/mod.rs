@@ -74,7 +74,9 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
 /// them (see [`Clip::inside`]).
 fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: Clip) {
     match b.kind {
-        BoxKind::Block => {
+        // A flex container paints exactly like a block: a background fills its
+        // padding box and a border outlines it, whoever placed what is inside.
+        BoxKind::Block | BoxKind::Flex => {
             // Background fills the padding box (CSS).
             if let ColorValue::Rgb(r, g, bcol) = b.computed.background_color {
                 let rect = clip.apply(b.dimensions.padding_box());

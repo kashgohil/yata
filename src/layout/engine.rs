@@ -8,7 +8,11 @@ use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
 use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
-use crate::style::values::{BoxSizing, Display, FontStyle, FontWeight, Length, TextAlign};
+use crate::layout::flex;
+use crate::layout::intrinsic::IntrinsicSizer;
+use crate::style::values::{
+    BoxSizing, Display, FlexBasis, FlexDirection, FontStyle, FontWeight, Length, TextAlign,
+};
 use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -51,6 +55,7 @@ pub fn layout_tree_with(
         hidden,
         images,
         boxes: Vec::new(),
+        sizer: IntrinsicSizer::new(dom, styles, images, hidden),
     };
     // Synthetic root: full column width, no margins of its own. Children of
     // the document (html) are laid out into it.
@@ -124,6 +129,13 @@ struct Engine<'a> {
     hidden: Hidden,
     images: &'a ImageContext,
     boxes: Vec<LayoutBox>,
+    /// How wide subtrees *want* to be (M9.4), memoized for this pass.
+    ///
+    /// Flex base sizes and automatic minimum sizes are the only callers, and
+    /// they ask about items whose subtrees nest — the memo is what keeps that
+    /// linear. It measures without allocating a box, which is why an item's
+    /// contents are laid out exactly once per pass and not twice.
+    sizer: IntrinsicSizer<'a>,
 }
 
 impl<'a> Engine<'a> {
@@ -288,10 +300,11 @@ impl<'a> Engine<'a> {
     /// already decided and whose position is already chosen, fill it with its
     /// contents, and give it its used height (CSS 2.1 §10.5–10.7).
     ///
-    /// Split out from `layout_block` because "how wide, and where" is the only
-    /// part of block layout a flex item (M9.6) needs to answer differently:
-    /// its width comes from the flex algorithm and its position from the flex
-    /// line, and everything after that is what any block-level box does.
+    /// Two callers, which is the point: a block child, whose width came from
+    /// filling its containing block and whose position came from margin
+    /// collapse, and a flex item (M9.6), whose width came from §9.7 and whose
+    /// position came from the flex line. Everything after "how wide, and
+    /// where" is the same for both, so it is written once.
     fn layout_box_at(
         &mut self,
         id: NodeId,
@@ -302,7 +315,11 @@ impl<'a> Engine<'a> {
         pre: bool,
     ) -> BoxId {
         let box_id = self.alloc(LayoutBox {
-            kind: BoxKind::Block,
+            kind: if lays_out_as_flex(&computed) {
+                BoxKind::Flex
+            } else {
+                BoxKind::Block
+            },
             node: Some(id),
             dimensions: dims,
             children: Vec::new(),
@@ -345,6 +362,13 @@ impl<'a> Engine<'a> {
 
     /// Lay this element's children into its (already positioned) box, and
     /// return the content height they used.
+    ///
+    /// **The formatting-context fork.** A block container stacks its children
+    /// and wraps runs of inlines in anonymous blocks; a flex container runs
+    /// css-flexbox-1 §9 over them. Which one an element is, is the only thing
+    /// `display: flex` decides — everything outside this function treats the
+    /// two identically, which is why a flex item can be a block, a block child
+    /// can be a flex container, and neither case needed a second code path.
     fn layout_contents(
         &mut self,
         id: NodeId,
@@ -354,6 +378,9 @@ impl<'a> Engine<'a> {
         specified_height: Option<i32>,
         pre: bool,
     ) -> i32 {
+        if lays_out_as_flex(&computed) {
+            return self.layout_flex_contents(id, computed, box_id, specified_height, pre);
+        }
         let dims = self.boxes[box_id.0 as usize].dimensions;
 
         // List marker / tag-driven extras before children.
@@ -487,6 +514,311 @@ impl<'a> Engine<'a> {
 
         self.boxes[box_id.0 as usize].children = children;
         (content_y - dims.content.y).max(0)
+    }
+
+    /// A flex container's contents: css-flexbox-1 §4 (what the items are),
+    /// §9.2 (how big each one wants to be), §9.7 (how the line's space is
+    /// divided) and §9.5 (where they go). Returns the container's used content
+    /// height, which for a single row is its tallest item.
+    ///
+    /// Scope, M9.6: `flex-direction: row`, `flex-wrap: nowrap`, main axis only.
+    /// Items sit at main-start and keep their natural heights — M9.7 places
+    /// leftover main-axis space, M9.8 sizes and aligns the cross axis, M9.9
+    /// brings the column directions and M9.10 wrapping.
+    fn layout_flex_contents(
+        &mut self,
+        id: NodeId,
+        computed: ComputedStyle,
+        box_id: BoxId,
+        specified_height: Option<i32>,
+        pre: bool,
+    ) -> i32 {
+        let content = self.boxes[box_id.0 as usize].dimensions.content;
+        // §9.2 step 2: the container's inner main size. For a row that is the
+        // content width it already has — resolved as any block's is, clamps
+        // and `box-sizing` included (M9.2), because a flex container is a
+        // perfectly ordinary block-level box from the outside.
+        let inner_main = content.width;
+
+        let mut items = self.flex_items(id, inner_main, pre);
+        if items.is_empty() {
+            return 0;
+        }
+        // Order-modified document order (§5.4). Stable, so items that share an
+        // `order` keep the order the document gave them. Only the layout tree
+        // is reordered: the DOM is untouched, so F1, `/` search and hit-testing
+        // still see the document as written — which is what CSS says too.
+        items.sort_by_key(|item| item.order);
+
+        // §8.3: the gap between two items on the main axis. A percentage
+        // resolves against the container's own inner size on that axis.
+        let gap = computed.gap.column.to_cells_h(inner_main).max(0);
+        // Saturating: a page is free to write `gap: 99999em`, and a layout
+        // stage that panicked on one would be a browser a page can crash.
+        // The row comes out empty instead, which is what such a gap means.
+        let total_gap = gap.saturating_mul(items.len() as i32 - 1);
+
+        // §9.3 line collection: `nowrap`, so every item is on one line
+        // whatever it costs. M9.10 is where that stops being true.
+        let sizes = flex::resolve(
+            &items.iter().map(|i| i.metrics).collect::<Vec<_>>(),
+            inner_main,
+            total_gap,
+        );
+
+        // §9.5: place the items along the main axis, one after the next from
+        // main-start. Whatever room is left over stays at the end of the line
+        // until M9.7 has an opinion about where it should go.
+        let mut cursor = content.x;
+        let mut children = Vec::with_capacity(items.len());
+        let mut tallest = 0;
+        for (item, &main_size) in items.iter().zip(&sizes) {
+            let (child, outer_main) = self.layout_flex_item(
+                item,
+                main_size,
+                cursor,
+                content,
+                computed.text_align,
+                specified_height,
+                pre,
+            );
+            let mb = self.boxes[child.0 as usize].dimensions.margin_box();
+            tallest = tallest.max(mb.bottom() - content.y);
+            children.push(child);
+            cursor += outer_main + gap;
+        }
+        self.boxes[box_id.0 as usize].children = children;
+        // A row's cross size is its tallest item (§9.4, single line). The
+        // container's own specified height is not consulted here:
+        // `layout_box_at` applies it and the min/max clamps afterwards, exactly
+        // as it does for a block.
+        tallest.max(0)
+    }
+
+    /// Build one item's box at `main_start` with the main size §9.7 resolved
+    /// for it, and report the outer main size the cursor must advance by.
+    #[allow(clippy::too_many_arguments)]
+    fn layout_flex_item(
+        &mut self,
+        item: &FlexItem,
+        main_size: i32,
+        main_start: i32,
+        container: Rect,
+        align: TextAlign,
+        containing_height: Option<i32>,
+        pre: bool,
+    ) -> (BoxId, i32) {
+        match item.source {
+            FlexItemSource::Element(node) => {
+                let tag = match &self.dom.node(node).data {
+                    NodeData::Element { tag, .. } => tag.clone(),
+                    _ => String::new(),
+                };
+                // Replaced and atomic children keep their own sizing paths
+                // rather than being re-derived here: an `<img>` item is its
+                // image, not a block container that happens to be `main_size`
+                // wide. They are laid out into the room the algorithm gave
+                // them, which is what `layout_node` already does with a
+                // containing width.
+                if matches!(tag.as_str(), "img" | "br" | "hr") {
+                    let outer = main_size + item.metrics.outer_edges;
+                    let mut prev_mb = 0;
+                    if let Some(child) = self.layout_node(
+                        node,
+                        main_start,
+                        outer,
+                        containing_height,
+                        container.y,
+                        &mut prev_mb,
+                        pre,
+                    ) {
+                        let width = self.boxes[child.0 as usize].dimensions.margin_box().width;
+                        return (child, width);
+                    }
+                    // One that generates no box at all (an `<img>` the image
+                    // context never heard of) falls through and gets an empty
+                    // one: every item owes the tree a box, or F3 and
+                    // hit-testing would stop matching the DOM.
+                }
+                let mut dims = resolve_block_dims(&item.computed, container.width);
+                // An `auto` margin on a flex item absorbs free space rather
+                // than centring the box in its containing block (§9.5 step 1),
+                // and free space is M9.7's to place. Until then an auto margin
+                // on the main axis is zero, which is what `resolve_block_dims`
+                // starts from before it centres.
+                if item.computed.margin.left.is_auto() {
+                    dims.margin.left = 0;
+                }
+                if item.computed.margin.right.is_auto() {
+                    dims.margin.right = 0;
+                }
+                // The flexed size *is* the used main size: it already went
+                // through this item's own min/max clamps inside §9.7, so the
+                // width `resolve_block_dims` computed from `width`/`auto` is
+                // replaced rather than clamped again.
+                dims.content.width = main_size;
+                dims.content.x =
+                    main_start + dims.margin.left + dims.border.left + dims.padding.left;
+                dims.content.y = container.y + dims.margin.top + dims.border.top + dims.padding.top;
+                dims.content.height = 0;
+                let child =
+                    self.layout_box_at(node, &tag, item.computed, dims, containing_height, pre);
+                (child, main_size + item.metrics.outer_edges)
+            }
+            FlexItemSource::Text(ref nodes) => {
+                // An anonymous flex item: one inline formatting context over a
+                // contiguous run of text, with no styles of its own (§4).
+                let mut run = Vec::new();
+                for &node in nodes {
+                    self.push_inline(node, pre, main_size, &mut run);
+                }
+                let mut prev_mb = 0;
+                let child = self
+                    .layout_anonymous_block(
+                        main_start,
+                        main_size,
+                        container.y,
+                        &mut prev_mb,
+                        &run,
+                        // An anonymous box has no style of its own, so the
+                        // alignment it uses is the container's.
+                        align,
+                        pre,
+                    )
+                    .expect("an anonymous flex item always has inline content");
+                (child, main_size)
+            }
+        }
+    }
+
+    /// §4: turn the container's children into flex items, and measure each one
+    /// enough to hand §9.7 its inputs.
+    fn flex_items(&mut self, container: NodeId, inner_main: i32, pre: bool) -> Vec<FlexItem> {
+        flex_sources(self.dom, container, &|n| self.is_hidden(n), pre)
+            .into_iter()
+            .map(|source| match source {
+                FlexItemSource::Element(node) => self.element_item(node, inner_main),
+                FlexItemSource::Text(nodes) => {
+                    // An anonymous item has no style, so every flex property is
+                    // at its initial value: `flex: 0 1 auto`, and a basis of
+                    // `auto` on a box with no `width` is its max-content size
+                    // (§9.2 step 3 B/E).
+                    let (min, max) = self.sizer.run_widths(&nodes);
+                    FlexItem {
+                        source: FlexItemSource::Text(nodes),
+                        computed: ComputedStyle::default(),
+                        order: 0,
+                        metrics: flex::Item {
+                            base: max,
+                            hypothetical: max,
+                            min,
+                            max: None,
+                            grow: 0.0,
+                            shrink: 1.0,
+                            outer_edges: 0,
+                        },
+                    }
+                }
+            })
+            .collect()
+    }
+
+    /// One element child as a flex item, with §9.2's base and hypothetical
+    /// main sizes and §4.5's automatic minimum size.
+    fn element_item(&mut self, node: NodeId, inner_main: i32) -> FlexItem {
+        let c = *self.styles.get(node);
+        let axis = Axis {
+            edges: edge_h(c.padding.left, inner_main)
+                + edge_h(c.padding.right, inner_main)
+                + edge_h(c.border.left, inner_main)
+                + edge_h(c.border.right, inner_main),
+            box_sizing: c.box_sizing,
+        };
+        let outer_edges =
+            axis.edges + edge_h(c.margin.left, inner_main) + edge_h(c.margin.right, inner_main);
+
+        // Both §9.2's base size and §4.5's automatic minimum can need the same
+        // answer — how wide this item's *content* is — and measuring an inline
+        // subtree is the expensive thing this task added to the layout path.
+        // So it is asked at most once per item, and only when one of the two
+        // actually wants it.
+        let sizes_from_content = matches!(c.flex.basis, FlexBasis::Content)
+            || (matches!(c.flex.basis, FlexBasis::Auto) && c.width.is_auto())
+            || (c.min_width.is_auto() && !c.overflow_x.clips());
+        let content = if sizes_from_content {
+            self.sizer.content_widths(node)
+        } else {
+            (0, 0)
+        };
+
+        // §9.2 step 3: the flex base size.
+        //
+        // `content` is the max-content size outright; a length or percentage
+        // resolves on the main axis (the container's inner main size is always
+        // definite here — it is a width); `auto` defers to the main-axis size
+        // property, and to max-content when that is `auto` too. This is the
+        // step that needs M9.4: the engine can fill an available width, but
+        // only intrinsic sizing can say how wide content *wants* to be.
+        let base = match c.flex.basis {
+            FlexBasis::Content => content.1,
+            FlexBasis::Size(len) => axis.content_from(len.to_cells_h(inner_main)),
+            FlexBasis::Auto if !c.width.is_auto() => {
+                axis.content_from(c.width.to_cells_h(inner_main))
+            }
+            FlexBasis::Auto => content.1,
+        };
+
+        let max =
+            (!c.max_width.is_auto()).then(|| axis.content_from(c.max_width.to_cells_h(inner_main)));
+        let min = if c.min_width.is_auto() {
+            // §4.5, the automatic minimum size — the rule that stops a flex row
+            // from shredding a word one cell at a time. A scroll container opts
+            // out of it (a clipped box is allowed to be smaller than its
+            // content; that is what clipping is for).
+            if c.overflow_x.clips() {
+                0
+            } else {
+                let content_min = content.0;
+                let specified =
+                    (!c.width.is_auto()).then(|| axis.content_from(c.width.to_cells_h(inner_main)));
+                // Never larger than the size the item was explicitly given, or
+                // than its own maximum: an automatic minimum that outgrew
+                // either would be inventing a size the page never asked for.
+                let mut min = content_min;
+                if let Some(specified) = specified {
+                    min = min.min(specified);
+                }
+                if let Some(max) = max {
+                    min = min.min(max);
+                }
+                min
+            }
+        } else {
+            axis.content_from(c.min_width.to_cells_h(inner_main))
+        };
+
+        // §9.2 step 4: the hypothetical main size is the base size clamped by
+        // the item's own min/max — max first, then min, the order M9.2 pinned.
+        let mut hypothetical = base;
+        if let Some(max) = max {
+            hypothetical = hypothetical.min(max);
+        }
+        hypothetical = hypothetical.max(min).max(0);
+
+        FlexItem {
+            source: FlexItemSource::Element(node),
+            computed: c,
+            order: c.order,
+            metrics: flex::Item {
+                base,
+                hypothetical,
+                min,
+                max,
+                grow: c.flex.grow,
+                shrink: c.flex.shrink,
+                outer_edges,
+            },
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1296,6 +1628,96 @@ enum ChildMode {
     Skip,
     Block,
     Inline,
+}
+
+/// One flex item while it is being sized and placed (M9.6).
+///
+/// `metrics` is everything §9.7 needs and nothing it does not — the algorithm
+/// never sees a DOM node — while `source` is how the item becomes boxes once
+/// its size is known.
+struct FlexItem {
+    source: FlexItemSource,
+    /// The item's own computed style, or the initial values for an anonymous
+    /// item (which has no element to have a style).
+    computed: ComputedStyle,
+    /// `order`, lifted out so the sort does not have to reach through a style.
+    order: i32,
+    metrics: flex::Item,
+}
+
+pub(super) enum FlexItemSource {
+    Element(NodeId),
+    /// A contiguous run of text between two element children: one anonymous
+    /// item wrapping one inline formatting context (§4).
+    Text(Vec<NodeId>),
+}
+
+/// Does this box lay its children out by css-flexbox-1 §9, here and now?
+///
+/// `display: flex` is necessary and not sufficient: M9.6 implements the *row*
+/// direction, so a column container keeps stacking its children as a block
+/// until M9.9 — which is what it did before flex layout existed, and much
+/// closer to what a column means than laying it out sideways would be. The
+/// reversals go the same way.
+///
+/// Both the engine and intrinsic sizing ask this. They must agree, or a flex
+/// container's measured width and its laid-out width would come from different
+/// algorithms.
+pub(super) fn lays_out_as_flex(computed: &ComputedStyle) -> bool {
+    computed.display == Display::Flex && computed.flex_direction == FlexDirection::Row
+}
+
+/// §4 item generation: which of a flex container's children become items, and
+/// which text becomes an anonymous one.
+///
+/// Every in-flow element child is one item, blockified — an inline child
+/// becomes a block-level item, which is why a `<span>` in a flex row gets a box
+/// of its own instead of joining a line. Each contiguous run of text between
+/// elements becomes one anonymous item; a run that is only whitespace generates
+/// nothing, which is what keeps the newlines between two `<div>`s from becoming
+/// a third item.
+///
+/// Shared with intrinsic sizing (M9.4's lesson, applied): a measurement that
+/// disagreed with the engine about *what the items are* would be wrong before
+/// any arithmetic started.
+pub(super) fn flex_sources(
+    dom: &Dom,
+    container: NodeId,
+    hidden: &dyn Fn(NodeId) -> bool,
+    pre: bool,
+) -> Vec<FlexItemSource> {
+    let mut out = Vec::new();
+    let mut run: Vec<NodeId> = Vec::new();
+    let flush = |run: &mut Vec<NodeId>, out: &mut Vec<FlexItemSource>| {
+        let nodes = std::mem::take(run);
+        let has_content = nodes.iter().any(|&n| match &dom.node(n).data {
+            NodeData::Text(t) => pre || !t.chars().all(is_html_space),
+            _ => false,
+        });
+        if has_content {
+            out.push(FlexItemSource::Text(nodes));
+        }
+    };
+    for child in dom.children(container) {
+        match &dom.node(child).data {
+            // Comments and doctypes are not boxes and not text: they do not
+            // interrupt a run either.
+            NodeData::Comment(_) | NodeData::Doctype(_) | NodeData::Document => {}
+            NodeData::Text(_) => run.push(child),
+            NodeData::Element { .. } => {
+                // A hidden child generates nothing, so it cannot be an item —
+                // and it does not split the text on either side of it into two,
+                // because there is no box between them to do the splitting.
+                if hidden(child) {
+                    continue;
+                }
+                flush(&mut run, &mut out);
+                out.push(FlexItemSource::Element(child));
+            }
+        }
+    }
+    flush(&mut run, &mut out);
+    out
 }
 
 #[derive(Clone)]

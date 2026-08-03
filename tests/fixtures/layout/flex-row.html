@@ -1,0 +1,21 @@
+<!-- width: 40 -->
+<!doctype html>
+<html><head><style>
+body { margin: 0 }
+.row { display: flex; gap: 1em }
+.grow { flex: 1 }
+.fixed { flex-basis: 80px; flex-shrink: 0 }
+.first { order: -1 }
+.nested { display: flex; flex: 1 }
+</style></head>
+<body>
+<div class="row">
+<div class="grow">left</div>
+<div class="fixed">fixed</div>
+<div class="grow first">moved to the front</div>
+</div>
+<div class="row">
+<div class="nested"><span>a</span><span>b</span></div>
+<div class="grow">tail</div>
+</div>
+</body></html>

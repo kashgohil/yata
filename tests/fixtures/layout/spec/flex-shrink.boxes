@@ -1,0 +1,49 @@
+# SPEC GOLDEN — hand-written from css-flexbox-1 §9.7 before the code existed,
+# never regenerated. This is the case a single pass gets wrong: an item that
+# hits its `min-width` must freeze there and the *others* must absorb what it
+# refused to give up.
+#
+# In cells: flex-basis 320px = 40, min-width 240px = 30, container inner main
+# size = 80. Every item keeps the initial `flex-shrink: 1` and `flex-grow: 0`.
+#
+# §9.7 step 1: hypothetical outer main sizes are 40 + 40 + 40 = 120 > 80, so
+#   this is a *shrink* pass. (.c's hypothetical is clamp(40, min 30) = 40 —
+#   the clamp does not bind until the item shrinks.)
+# §9.7 step 2: nothing is frozen; no shrink factor is zero and no base size
+#   differs from its hypothetical main size.
+#
+# First iteration
+#   remaining free space = 80 - 120 = -40
+#   scaled shrink factor = shrink × *inner base size* = 1 × 40 = 40 each,
+#   summing to 120 — the scaling is what makes a wide item give up more than
+#   a narrow one at the same `flex-shrink`.
+#   each target = 40 - 40 × (40/120) = 40 - 13.333… = 26.666…
+#   §9.7 step 5: .c violates its 30-cell minimum by 3.333…, total violation is
+#   positive, so .c freezes at 30 and the loop repeats.
+#
+# Second iteration
+#   remaining free space = 80 - (30 frozen + 40 + 40) = -30
+#   scaled factors 40 and 40, summing to 80
+#   each target = 40 - 30 × (40/80) = 40 - 15 = 25
+#   no violations (the automatic minimum of a text item is its longest word,
+#   1 cell here), so both freeze and the loop ends.
+#
+# Final: 25 / 25 / 30 = 80 exactly. A single pass would have left
+# 26.666… + 26.666… + 30 = 83.333… and overflowed the container by 3 cells.
+#
+# x: 0, 0 + 25 = 25, 25 + 25 = 50.
+<html>  x=0 y=0 w=80 h=1
+  <body>  x=0 y=0 w=80 h=1
+    <div.row> flex row  x=0 y=0 w=80 h=1
+      <div.a>  x=0 y=0 w=25 h=1
+        anonymous  x=0 y=0 w=25 h=1
+          line  x=0 y=0 w=25 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div.b>  x=25 y=0 w=25 h=1
+        anonymous  x=25 y=0 w=25 h=1
+          line  x=25 y=0 w=25 h=1
+            #text "b"  x=25 y=0 w=1 h=1
+      <div.c>  x=50 y=0 w=30 h=1
+        anonymous  x=50 y=0 w=30 h=1
+          line  x=50 y=0 w=30 h=1
+            #text "c"  x=50 y=0 w=1 h=1

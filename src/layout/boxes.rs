@@ -20,6 +20,11 @@ pub struct BoxId(pub u32);
 pub enum BoxKind {
     /// A block-level element box.
     Block,
+    /// A flex container (M9.6). Block-level and painted exactly like `Block` —
+    /// backgrounds, borders and clipping know nothing about flex. The kind
+    /// exists because what is *inside* it was placed by a different algorithm,
+    /// and F3 has to be able to say so.
+    Flex,
     /// Anonymous block wrapping consecutive inlines inside a block container.
     AnonymousBlock,
     /// One line box inside an inline formatting context.

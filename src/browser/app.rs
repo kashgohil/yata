@@ -734,7 +734,9 @@ impl App {
             match b.kind {
                 // Deeper text fragments overwrite shallower ones (walk order).
                 BoxKind::Text => best_text = Some((node, y)),
-                BoxKind::Block => best_block = Some((node, y)),
+                // A flex container is as good a scroll anchor as any other
+                // block-level box (M9.6).
+                BoxKind::Block | BoxKind::Flex => best_block = Some((node, y)),
                 _ => {}
             }
         });
