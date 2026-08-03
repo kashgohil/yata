@@ -15,7 +15,8 @@ use crate::dom::{Dom, NodeData, NodeId};
 use crate::layout::{BoxId, BoxKind, LayoutTree};
 use crate::style::Styles;
 use crate::style::values::{
-    BoxSizing, ColorValue, Display, Edges, FontStyle, FontWeight, Length, TextAlign,
+    AlignContent, AlignItems, AlignSelf, BoxSizing, ColorValue, Display, Edges, Flex, FlexBasis,
+    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, TextAlign,
 };
 
 /// Cell caps for the variable-length parts of a line. Text gets the most room
@@ -106,17 +107,24 @@ fn push_styled(dom: &Dom, id: NodeId, depth: usize, styles: &Styles, out: &mut V
 /// Computed values as one compact clause list: `block · #5c5cff · bold
 /// underline`. Initial values are left out (see `style_lines`).
 fn summarize(computed: &crate::style::ComputedStyle) -> String {
-    let mut parts = vec![
-        match computed.display {
-            Display::Block => "block",
-            Display::Inline => "inline",
-            // The axis and the rest of the vocabulary arrive with M9.5's
-            // computed values; the keyword is what there is to print today.
-            Display::Flex => "flex",
-            Display::None => "none",
+    let mut parts = vec![match computed.display {
+        Display::Block => "block".to_string(),
+        Display::Inline => "inline".to_string(),
+        Display::None => "none".to_string(),
+        // A flex container prints its axis with the display keyword — `flex
+        // row`, and `flex row wrap` when it wraps — because "which way does
+        // this stack, and does it wrap" is the first thing to know about a
+        // flex box, and `flex-flow` is how CSS spells the pair. The rest of
+        // the flex properties follow the usual "interesting only" rule below.
+        Display::Flex => {
+            let mut s = format!("flex {}", computed.flex_direction.name());
+            if computed.flex_wrap != FlexWrap::default() {
+                s.push(' ');
+                s.push_str(computed.flex_wrap.name());
+            }
+            s
         }
-        .to_string(),
-    ];
+    }];
     if let ColorValue::Rgb(r, g, b) = computed.color {
         parts.push(format!("#{r:02x}{g:02x}{b:02x}"));
     }
@@ -179,7 +187,83 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
     if let Some(o) = overflow_summary(computed) {
         parts.push(format!("overflow {o}"));
     }
+    parts.extend(flex_summary(computed));
     parts.join(" · ")
+}
+
+/// The flex clauses (M9.5), in the order a page would write them: container
+/// first, then what this box asks of the container above it. Same
+/// "interesting only" rule as everything else — a document with no flex in it
+/// gets not one extra character.
+///
+/// The direction and wrap of a box that is *not* a flex container still print
+/// when a page set them. They do nothing there, and that is exactly why they
+/// are worth seeing: `flex-direction: column` on a box whose `display` never
+/// became `flex` is a page bug F2 should be able to show.
+fn flex_summary(computed: &crate::style::ComputedStyle) -> Vec<String> {
+    let mut parts = Vec::new();
+    if computed.display != Display::Flex {
+        // Named in full here, unlike the `flex row wrap` clause above: on a box
+        // that is not a flex container a bare `column` would read like any
+        // other one-word clause, and the point of printing it is that it is
+        // out of place.
+        if computed.flex_direction != FlexDirection::default() {
+            parts.push(format!("flex-direction {}", computed.flex_direction.name()));
+        }
+        if computed.flex_wrap != FlexWrap::default() {
+            parts.push(format!("flex-wrap {}", computed.flex_wrap.name()));
+        }
+    }
+    if computed.justify_content != JustifyContent::default() {
+        parts.push(format!("justify {}", computed.justify_content.name()));
+    }
+    if computed.align_items != AlignItems::default() {
+        parts.push(format!("align-items {}", computed.align_items.name()));
+    }
+    if computed.align_content != AlignContent::default() {
+        parts.push(format!("align-content {}", computed.align_content.name()));
+    }
+    if let Some(g) = gap_summary(&computed.gap) {
+        parts.push(g);
+    }
+    if computed.align_self != AlignSelf::Auto {
+        parts.push(format!("align-self {}", computed.align_self.name()));
+    }
+    // Compared against the initial values rather than against 0/1 literals, so
+    // the two spellings of "initial" cannot drift apart.
+    let initial = Flex::default();
+    if computed.flex.grow != initial.grow {
+        parts.push(format!("grow {}", computed.flex.grow));
+    }
+    if computed.flex.shrink != initial.shrink {
+        parts.push(format!("shrink {}", computed.flex.shrink));
+    }
+    match computed.flex.basis {
+        FlexBasis::Auto => {}
+        FlexBasis::Content => parts.push("basis content".into()),
+        FlexBasis::Size(len) => parts.push(format!("basis {}", length_summary(len))),
+    }
+    if computed.order != 0 {
+        parts.push(format!("order {}", computed.order));
+    }
+    parts
+}
+
+/// `gap 1em`, or `gap 1em 2em` when the two axes differ — row first, like the
+/// shorthand. `None` when both are the initial zero.
+fn gap_summary(gap: &Gaps) -> Option<String> {
+    if *gap == Gaps::default() {
+        return None;
+    }
+    Some(if gap.row == gap.column {
+        format!("gap {}", length_summary(gap.row))
+    } else {
+        format!(
+            "gap {} {}",
+            length_summary(gap.row),
+            length_summary(gap.column)
+        )
+    })
 }
 
 fn length_summary(len: Length) -> String {
@@ -575,6 +659,51 @@ mod tests {
         let p = lines.iter().find(|l| l.contains("<p>")).unwrap();
         assert!(!p.contains("h "), "{p}");
         assert!(!p.contains("border-box"), "{p}");
+    }
+
+    #[test]
+    fn flex_values_show_when_set() {
+        let lines = styled(
+            "<div><p>x</p></div><span>y</span>",
+            "div { display: flex; gap: 1em; justify-content: space-between;
+                   align-items: center }
+             p { flex: 1; order: -1; align-self: flex-end }",
+        );
+        // The axis rides with the display keyword: a flex container's first
+        // fact is which way it stacks.
+        let div = lines.iter().find(|l| l.contains("<div>")).unwrap();
+        assert!(div.contains("flex row"), "{div}");
+        assert!(div.contains("gap 1em"), "{div}");
+        assert!(div.contains("justify space-between"), "{div}");
+        assert!(div.contains("align-items center"), "{div}");
+
+        // `flex: 1` is 1/1/0, so all three parts show.
+        let p = lines.iter().find(|l| l.contains("<p>")).unwrap();
+        assert!(p.contains("grow 1"), "{p}");
+        assert!(p.contains("basis 0"), "{p}");
+        assert!(p.contains("order -1"), "{p}");
+        assert!(p.contains("align-self flex-end"), "{p}");
+        assert!(!p.contains("shrink"), "shrink 1 is initial: {p}");
+
+        // Nothing flex-related was said about the span, so nothing is shown —
+        // the same reason F2 stays readable on Wikipedia.
+        let span = lines.iter().find(|l| l.contains("<span>")).unwrap();
+        assert_eq!(span.trim(), "<span> inline");
+
+        // Wrap joins the axis, the way `flex-flow` writes the pair.
+        let lines = styled(
+            "<div>x</div>",
+            "div { display: flex; flex-direction: column; flex-wrap: wrap; gap: 1em 2em }",
+        );
+        let div = lines.iter().find(|l| l.contains("<div>")).unwrap();
+        assert!(div.contains("flex column wrap"), "{div}");
+        assert!(div.contains("gap 1em 2em"), "{div}");
+
+        // Flex properties on a box that never became a flex container still
+        // show: that combination is a page bug, and F2 exists to explain it.
+        let lines = styled("<div>x</div>", "div { flex-direction: column }");
+        let div = lines.iter().find(|l| l.contains("<div>")).unwrap();
+        assert_eq!(div.trim(), "<div> block · flex-direction column");
     }
 
     #[test]
