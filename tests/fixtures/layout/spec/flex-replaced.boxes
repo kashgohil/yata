@@ -1,0 +1,43 @@
+# SPEC GOLDEN — hand-written from css-flexbox-1 §9.7 before the code did this,
+# never regenerated.
+#
+# A replaced element is a flex item like any other: §9.7 resolves a main size
+# for it, and that flexed size *is* its used main size. Its intrinsic width
+# only reaches the algorithm twice — as the flex base size when `flex-basis`
+# is `auto`, and as §4.5's content size suggestion — and neither of those is
+# the used size. So an `<img>` under `flex: 1` stretches, exactly as a `<div>`
+# does.
+#
+# `width="80"` is 80px = 10 cells (PLAN.md's 8px per cell), `height="16"` is
+# 16px = 1 line.
+#
+# §9.2: `flex: 1` is `1 1 0`, so both items have a flex base size of 0. Their
+#   hypothetical main sizes are that clamped by §4.5's automatic minimum: the
+#   image's content size suggestion is its intrinsic 10 cells, the div's is
+#   min-content = 1 cell.
+# §9.7 step 1: sum of hypothetical outer main sizes = 10 + 1 = 11 < 80, so
+#   this is a grow pass.
+# §9.7 step 2: neither item is frozen — both grow factors are 1, and each
+#   base size (0) is under its hypothetical main size.
+# §9.7 step 4: free space = 80 - 0 - 0 = 80, split by grow factor 1:1, so each
+#   item's target is 0 + 40 = 40. Neither violates its minimum (40 >= 10 and
+#   40 >= 1), so both freeze and the loop ends.
+#
+# Whole cells: both targets are integral, so nothing is left over.
+#
+# The line is therefore filled exactly — 40 + 40 = 80 — which is the property
+# that matters beyond this fixture. An image that kept its intrinsic 10 cells
+# and advanced the cursor by 10 would leave the row holding 30 cells of free
+# space that §9.7 had already given away, and M9.7's `justify-content` would
+# then distribute a free space of zero across a row that visibly has room.
+#
+# The image's height is untouched: stretching on the main axis is what §9.7
+# resolved, and the cross axis is M9.8's.
+<html>  x=0 y=0 w=80 h=1
+  <body>  x=0 y=0 w=80 h=1
+    <div.row> flex row  x=0 y=0 w=80 h=1
+      img "logo" https://fixture.test/logo.png  x=0 y=0 w=40 h=1
+      <div.item>  x=40 y=0 w=40 h=1
+        anonymous  x=40 y=0 w=40 h=1
+          line  x=40 y=0 w=40 h=1
+            #text "b"  x=40 y=0 w=1 h=1

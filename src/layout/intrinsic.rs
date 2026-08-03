@@ -32,7 +32,7 @@ use crate::layout::engine::{
     lays_out_as_flex,
 };
 use crate::style::Styles;
-use crate::style::values::{Display, Length};
+use crate::style::values::{Display, FlexBasis, Length};
 
 /// The containing width handed to image sizing, and to nothing else.
 ///
@@ -201,16 +201,7 @@ impl<'a> IntrinsicSizer<'a> {
             return Sizes::ZERO;
         }
 
-        // Padding and border on this axis, which is what `border-box` counts
-        // as part of a specified width. Zero containing width: see the
-        // percentage rule on `definite_h`.
-        let axis = Axis {
-            edges: edge_h(computed.padding.left, 0)
-                + edge_h(computed.padding.right, 0)
-                + edge_h(computed.border.left, 0)
-                + edge_h(computed.border.right, 0),
-            box_sizing: computed.box_sizing,
-        };
+        let axis = axis_h(&computed);
 
         let base = if tag != "img"
             && let Some(specified) = definite_h(computed.width)
@@ -312,7 +303,7 @@ impl<'a> IntrinsicSizer<'a> {
         for source in sources {
             let sizes = match source {
                 FlexItemSource::Element(child) => {
-                    self.sizes(child).grown_by(self.outer_edges(child))
+                    self.item_sizes(child).grown_by(self.outer_edges(child))
                 }
                 FlexItemSource::Text(nodes) => {
                     let (min, max) = self.run_widths(&nodes);
@@ -325,6 +316,47 @@ impl<'a> IntrinsicSizer<'a> {
             };
         }
         out
+    }
+
+    /// What one element item asks the row for, in place of what
+    /// [`sizes`](Self::sizes) would say about it as a plain box.
+    ///
+    /// The difference is `flex-basis`. §9.2 step 3 makes an item's *flex base
+    /// size* what the row is built from, and a definite `flex-basis` overrides
+    /// `width` there — so an item with `flex: 0 0 20em` and one word in it asks
+    /// for 40 cells, while `sizes` (which only knows about `width`) says one.
+    /// Left that way, a nested row measures as wide as its text and then lays
+    /// its items out past its own edge and over its next sibling.
+    ///
+    /// Which of the two sizes the basis decides depends on which way the item
+    /// can flex, and that is exact rather than approximate in both directions:
+    /// an item that cannot grow can never exceed its basis, and one that cannot
+    /// shrink can never go under it. The other side keeps asking what its
+    /// content wants — a growable item's real contribution scales by the row's
+    /// flex fraction (§9.9.1), which this module states plainly that it does
+    /// not model.
+    fn item_sizes(&mut self, child: NodeId) -> Sizes {
+        let computed = *self.styles.get(child);
+        let content = self.sizes(child);
+        let Some(basis) = definite_basis(&computed) else {
+            return content;
+        };
+        Sizes {
+            // `.max()` rather than the basis outright: a growable item is at
+            // least its basis, and how much more is the part not modelled here.
+            max: if computed.flex.grow == 0.0 {
+                basis
+            } else {
+                basis.max(content.max)
+            },
+            // A shrinkable item bottoms out at §4.5's automatic minimum, which
+            // is the min-content width `sizes` already reports.
+            min: if computed.flex.shrink == 0.0 {
+                basis
+            } else {
+                content.min
+            },
+        }
     }
 
     /// A block container's sizes: the max over what each child asks for.
@@ -564,6 +596,39 @@ enum ChildMode {
 /// claim that the box is empty. CSS resolves the size case properly with a
 /// second pass once the containing block is known; in a cell grid that is not
 /// worth its complexity.
+/// Padding and border on the inline axis, which is what `border-box` counts as
+/// part of a specified width. Zero containing width: see the percentage rule
+/// on [`definite_h`].
+fn axis_h(computed: &crate::style::ComputedStyle) -> Axis {
+    Axis {
+        edges: edge_h(computed.padding.left, 0)
+            + edge_h(computed.padding.right, 0)
+            + edge_h(computed.border.left, 0)
+            + edge_h(computed.border.right, 0),
+        box_sizing: computed.box_sizing,
+    }
+}
+
+/// A flex item's hypothetical main size (§9.2 steps 3–4) when `flex-basis`
+/// alone decides it — the case [`Sizer::sizes`] cannot see, because it reads
+/// `width` and `flex-basis` overrides `width`.
+///
+/// `None` means "no definite basis of its own": `auto`, `content`, or a
+/// percentage, which needs the container's inner main size — the one thing an
+/// intrinsic measurement has by definition not got.
+fn definite_basis(computed: &crate::style::ComputedStyle) -> Option<i32> {
+    let FlexBasis::Size(len) = computed.flex.basis else {
+        return None;
+    };
+    let basis = definite_h(len)?;
+    let axis = axis_h(computed);
+    Some(axis.clamp(
+        axis.content_from(basis),
+        definite_h(computed.min_width),
+        definite_h(computed.max_width),
+    ))
+}
+
 fn definite_h(len: Length) -> Option<i32> {
     match len {
         Length::Auto | Length::Percent(_) => None,
@@ -788,6 +853,36 @@ mod tests {
             (24, 24),
             "min-width beats a smaller max-width (M9.2's clamp order)"
         );
+    }
+
+    #[test]
+    fn a_rows_width_comes_from_its_items_flex_basis_not_their_text() {
+        // §9.2 step 3: `flex-basis` is what an item's flex base size comes
+        // from, and it overrides the main size property. Measuring a row by
+        // its items' text instead reports 2 cells for a row that lays out 20,
+        // and the items then draw past their own parent and over its sibling.
+        let row = "<div id=r><div class=i>a</div><div class=i>b</div></div>";
+        let rigid = "#r { display: flex } .i { flex: 0 0 80px }";
+        assert_eq!(sizes_of(row, rigid, "div"), (20, 20));
+
+        // Which of the two sizes the basis decides is not a guess: an item
+        // that cannot grow can never be wider than its basis, and one that
+        // cannot shrink can never be narrower. Free one direction and only
+        // that direction goes back to asking the content.
+        let can_shrink = "#r { display: flex } .i { flex: 0 1 80px }";
+        assert_eq!(
+            sizes_of(row, can_shrink, "div"),
+            (2, 20),
+            "shrinkable items bottom out at §4.5's automatic minimum"
+        );
+
+        // `flex: 1` is `1 1 0`, and a growable item's real contribution scales
+        // by the row's flex fraction (§9.9.1) — which this module says plainly
+        // that it does not model. It must therefore keep asking what its
+        // content wants rather than reporting a basis of zero, or every
+        // `flex: 1` row in the wild would measure as nothing.
+        let growable = "#r { display: flex } .i { flex: 1 }";
+        assert_eq!(sizes_of(row, growable, "div"), (2, 2));
     }
 
     #[test]

@@ -67,14 +67,7 @@ impl Length {
             // Same rounding rule as every other length: nonzero rounds up to
             // at least one line, so `height: 5%` of a 12-line block is a row
             // the reader can see rather than a box that vanished.
-            Length::Percent(p) => {
-                let raw = (p / 100.0) * containing_height as f32;
-                if raw <= 0.0 {
-                    0
-                } else {
-                    raw.round().max(1.0) as i32
-                }
-            }
+            Length::Percent(p) => cells((p / 100.0) * containing_height as f32),
             other => resolve(other, 0, Axis::Vertical),
         }
     }
@@ -105,11 +98,32 @@ fn resolve(len: Length, containing_width: i32, axis: Axis) -> i32 {
         },
         Length::Percent(p) => (p / 100.0) * containing_width as f32,
     };
+    cells(raw)
+}
+
+/// The largest number of cells any one length may resolve to.
+///
+/// A page is free to write `width: 1e11em`, and `f32 as i32` saturates that to
+/// `i32::MAX` — a number layout cannot do arithmetic with. Every stage after
+/// this one *adds* these values (a box's `x + width`, a flex cursor's
+/// `+ gap`, an inline run's `cx + cells`), and one addition on `i32::MAX`
+/// overflows, which in a debug build is a panic a single CSS declaration can
+/// trigger. Capping here rather than at each of those additions keeps one
+/// source of truth for what a cell count may be.
+///
+/// 2²⁰ cells is ~16× the widest terminal a `u16` column count can describe, so
+/// nothing that renders is affected; it also leaves room for a few thousand of
+/// them to be summed before an `i32` is in any danger.
+const MAX_CELLS: f32 = (1 << 20) as f32;
+
+/// Round a raw cell count to a usable integer: nonzero rounds up to at least
+/// one cell so thin borders and small margins still show, and nothing exceeds
+/// [`MAX_CELLS`].
+fn cells(raw: f32) -> i32 {
     if raw <= 0.0 {
         0
     } else {
-        // Nonzero → at least one cell so thin borders and small margins show.
-        raw.round().max(1.0) as i32
+        raw.round().clamp(1.0, MAX_CELLS) as i32
     }
 }
 
@@ -957,6 +971,29 @@ mod tests {
         assert_eq!(parse_display("table-cell"), Some(Display::Block));
         assert_eq!(parse_display("inline-block"), Some(Display::Inline));
         assert_eq!(parse_display("bananas"), None);
+    }
+
+    #[test]
+    fn a_length_no_layout_can_hold_is_capped_rather_than_saturated() {
+        // `f32 as i32` saturates, so without a cap these resolve to
+        // `i32::MAX` — a number every later stage then *adds* to (a box's
+        // `x + width`, a flex cursor's `+ gap`, an inline run's `cx + cells`),
+        // and one addition on `i32::MAX` overflows. In a debug build that is a
+        // panic one CSS declaration can trigger, which principle §1.5 does not
+        // allow: errors reach the reader as pages, never as crashes.
+        let cap = MAX_CELLS as i32;
+        assert_eq!(Length::Px(1e11).to_cells_h(80), cap);
+        assert_eq!(Length::Em(1e11).to_cells_h(80), cap);
+        assert_eq!(Length::Em(1e11).to_cells_v(80), cap);
+        assert_eq!(Length::Px(1e11).to_lines(24), cap);
+        assert_eq!(Length::Percent(1e11).to_cells_h(80), cap);
+        assert_eq!(Length::Percent(1e11).to_lines(24), cap);
+        // The cap is far past anything that renders — a `u16` column count
+        // cannot describe a terminal a sixteenth this wide — so no length a
+        // page means literally is touched by it.
+        assert!(cap > 16 * u16::MAX as i32);
+        assert_eq!(Length::Px(8000.0).to_cells_h(80), 1000);
+        assert_eq!(Length::Percent(100.0).to_cells_h(80), 80);
     }
 
     #[test]

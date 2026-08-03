@@ -585,7 +585,12 @@ impl<'a> Engine<'a> {
             let mb = self.boxes[child.0 as usize].dimensions.margin_box();
             tallest = tallest.max(mb.bottom() - content.y);
             children.push(child);
-            cursor += outer_main + gap;
+            // Saturating for the same reason `total_gap` is: `gap: 1e11em`
+            // saturates the cast to cells at `i32::MAX`, and a cursor that
+            // added it would overflow — a panic a stylesheet can trigger, so a
+            // page could crash the browser. The item lands off the right edge
+            // instead, which is what such a gap asks for.
+            cursor = cursor.saturating_add(outer_main).saturating_add(gap);
         }
         self.boxes[box_id.0 as usize].children = children;
         // A row's cross size is its tallest item (§9.4, single line). The
@@ -614,32 +619,6 @@ impl<'a> Engine<'a> {
                     NodeData::Element { tag, .. } => tag.clone(),
                     _ => String::new(),
                 };
-                // Replaced and atomic children keep their own sizing paths
-                // rather than being re-derived here: an `<img>` item is its
-                // image, not a block container that happens to be `main_size`
-                // wide. They are laid out into the room the algorithm gave
-                // them, which is what `layout_node` already does with a
-                // containing width.
-                if matches!(tag.as_str(), "img" | "br" | "hr") {
-                    let outer = main_size + item.metrics.outer_edges;
-                    let mut prev_mb = 0;
-                    if let Some(child) = self.layout_node(
-                        node,
-                        main_start,
-                        outer,
-                        containing_height,
-                        container.y,
-                        &mut prev_mb,
-                        pre,
-                    ) {
-                        let width = self.boxes[child.0 as usize].dimensions.margin_box().width;
-                        return (child, width);
-                    }
-                    // One that generates no box at all (an `<img>` the image
-                    // context never heard of) falls through and gets an empty
-                    // one: every item owes the tree a box, or F3 and
-                    // hit-testing would stop matching the DOM.
-                }
                 let mut dims = resolve_block_dims(&item.computed, container.width);
                 // An `auto` margin on a flex item absorbs free space rather
                 // than centring the box in its containing block (§9.5 step 1),
@@ -652,18 +631,62 @@ impl<'a> Engine<'a> {
                 if item.computed.margin.right.is_auto() {
                     dims.margin.right = 0;
                 }
+                // What the cursor owes this item, whichever path builds its
+                // box. `outer_edges` is the same six lengths `dims` resolved,
+                // summed against the same containing width, so every item
+                // advances the line by exactly the outer size §9.7 divided it
+                // into — the invariant the whole line's arithmetic rests on.
+                let lead = dims.margin.left + dims.border.left + dims.padding.left;
+                let outer_main = main_size + item.metrics.outer_edges;
+
+                // Replaced and line-generating children keep their own layout
+                // paths rather than being re-derived here: an `<img>` item is
+                // its image, not a block container that happens to be
+                // `main_size` wide. `<br>` and `<hr>` size themselves from the
+                // width they are handed and take their own edges back out of
+                // it, so the outer size is what they should be given.
+                if matches!(tag.as_str(), "img" | "br" | "hr") {
+                    let mut prev_mb = 0;
+                    if let Some(child) = self.layout_node(
+                        node,
+                        main_start,
+                        outer_main,
+                        containing_height,
+                        container.y,
+                        &mut prev_mb,
+                        pre,
+                    ) {
+                        if tag == "img" {
+                            // `layout_img_block` floors an image at its
+                            // intrinsic width and ignores its margins: right
+                            // for a block, wrong for a flex item, whose used
+                            // main size *is* the size §9.7 resolved for it,
+                            // stretched or squeezed. Left alone, the item
+                            // advanced the cursor by its intrinsic width and
+                            // the line silently kept free space the algorithm
+                            // had already given away.
+                            let dims = &mut self.boxes[child.0 as usize].dimensions;
+                            dims.content.x = main_start + lead;
+                            dims.content.width = main_size;
+                        }
+                        return (child, outer_main);
+                    }
+                    // One that generates no box at all (an `<img>` the image
+                    // context never heard of) falls through and gets an empty
+                    // one: every item owes the tree a box, or F3 and
+                    // hit-testing would stop matching the DOM.
+                }
                 // The flexed size *is* the used main size: it already went
                 // through this item's own min/max clamps inside §9.7, so the
                 // width `resolve_block_dims` computed from `width`/`auto` is
                 // replaced rather than clamped again.
                 dims.content.width = main_size;
-                dims.content.x =
-                    main_start + dims.margin.left + dims.border.left + dims.padding.left;
+                dims.content.x = main_start + lead;
                 dims.content.y = container.y + dims.margin.top + dims.border.top + dims.padding.top;
                 dims.content.height = 0;
                 let child =
                     self.layout_box_at(node, &tag, item.computed, dims, containing_height, pre);
-                (child, main_size + item.metrics.outer_edges)
+                (child, outer_main)
             }
             FlexItemSource::Text(ref nodes) => {
                 // An anonymous flex item: one inline formatting context over a

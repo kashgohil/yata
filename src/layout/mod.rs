@@ -631,6 +631,35 @@ mod tests {
     }
 
     #[test]
+    fn a_length_no_layout_can_hold_lays_out_instead_of_crashing() {
+        // A stylesheet is untrusted input, and `gap: 1e11em` is a legal thing
+        // for one to say. Layout has to answer it with boxes — principle §1.5:
+        // what reaches the reader is a page, and a panic is not one. The
+        // answer here is "everything after the first item is off the right
+        // edge", which is what such a gap asks for.
+        //
+        // The cap that makes it safe lives in `Length::to_cells_*`, so the
+        // same declaration on a plain block is covered by the same fix: these
+        // three used to overflow at the same `+` inside inline layout.
+        let row = "<div id=r><div>a</div><div>b</div></div>";
+        let items = items(row, "#r { display: flex; gap: 1e11em }", 80);
+        assert_eq!(items.len(), 2, "both items still got boxes");
+        assert!(
+            items[1].0 > 80,
+            "the second item is off the line: {items:?}"
+        );
+
+        for css in [
+            "p { margin-left: 1e11em }",
+            "p { padding-left: 1e11em }",
+            "p { width: 1e11em }",
+        ] {
+            let rows = lines_styled("<p>hello</p>", css, 80);
+            assert!(!rows.is_empty(), "css: {css}");
+        }
+    }
+
+    #[test]
     fn a_column_flex_container_still_stacks_until_m9_9() {
         // M9.6 implements the *row* direction. A column container keeps the
         // block layout it had before flex existed, which is far closer to what

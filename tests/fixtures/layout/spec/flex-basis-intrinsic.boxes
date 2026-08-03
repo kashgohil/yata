@@ -1,0 +1,53 @@
+# SPEC GOLDEN — hand-written from css-flexbox-1 §9.2 and §9.9 before the code
+# did this, never regenerated.
+#
+# A row nested inside a row has to be *measured* before it can be laid out,
+# and §9.2 step 3 says what it is measured from: an item's flex base size
+# comes from `flex-basis`, which overrides the main size property. An item
+# with `flex: 0 0 80px` asks for 10 cells whatever its text says, so the row
+# holding two of them asks for 20 — not for the 2 cells its two letters
+# occupy.
+#
+# `flex: 0 0 80px` is grow 0, shrink 0, basis 80px = 10 cells.
+#
+# Measuring `.inner` (§9.9, as this engine models it — the items sit side by
+# side on one line, so the row's own width is their sum):
+#   each `.fixed` item cannot grow, so it can never exceed its basis, and
+#   cannot shrink, so it can never go under it. Its contribution is 10 cells
+#   in both directions, exactly. Two items, no gap: `.inner` measures 20.
+#
+# `.outer`, inner main size 60:
+#   §9.2: `.inner` and `.tail` are both at the initial `flex: 0 1 auto` with
+#     `width: auto`, so each flex base size is the item's max-content width —
+#     20 for `.inner` (above) and 4 for `tail`.
+#   §9.7 step 1: 20 + 4 = 24 < 60, a grow pass.
+#   §9.7 step 2: every grow factor is 0, so both items are inflexible and
+#     freeze at their hypothetical main sizes. The 36 cells left over stay at
+#     the end of the line until M9.7 has an opinion about them.
+#   Placement: `.inner` at x=0 with 20 cells, `tail` at x=0+20=20.
+#
+# Inside `.inner`, inner main size 20:
+#   §9.7 step 1: 10 + 10 = 20, which is not *less* than 20, so this is a
+#     shrink pass — and both shrink factors are 0, so both items are
+#     inflexible and freeze at 10. x = 0 and x = 10.
+#
+# What this pins beyond the numbers: measuring `.inner` by its text would make
+# it 2 cells wide while its items still laid out 10 cells each, so they would
+# run 18 cells past their own parent's box and paint over `tail` at x=2.
+# A measurement and the layout it predicts have to agree.
+<html>  x=0 y=0 w=60 h=1
+  <body>  x=0 y=0 w=60 h=1
+    <div.outer> flex row  x=0 y=0 w=60 h=1
+      <div.inner> flex row  x=0 y=0 w=20 h=1
+        <div.fixed>  x=0 y=0 w=10 h=1
+          anonymous  x=0 y=0 w=10 h=1
+            line  x=0 y=0 w=10 h=1
+              #text "a"  x=0 y=0 w=1 h=1
+        <div.fixed>  x=10 y=0 w=10 h=1
+          anonymous  x=10 y=0 w=10 h=1
+            line  x=10 y=0 w=10 h=1
+              #text "b"  x=10 y=0 w=1 h=1
+      <div.tail>  x=20 y=0 w=4 h=1
+        anonymous  x=20 y=0 w=4 h=1
+          line  x=20 y=0 w=4 h=1
+            #text "tail"  x=20 y=0 w=4 h=1
