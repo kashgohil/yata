@@ -27,7 +27,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
-use crate::layout::engine::{Axis, edge_h, is_block_level, is_html_space};
+use crate::layout::engine::{Axis, Hidden, LIST_MARKER, edge_h, is_block_level, is_html_space};
 use crate::style::Styles;
 use crate::style::values::{Display, Length};
 
@@ -87,6 +87,11 @@ pub struct IntrinsicSizer<'a> {
     dom: &'a Dom,
     styles: &'a Styles,
     images: &'a ImageContext,
+    /// The pass's `display:none` mode, carried for one reason: the engine's
+    /// reveal pass lays hidden subtrees out anyway (M4's never-blank rescue),
+    /// and a sizer that always treated them as nothing would measure a page
+    /// rescued that way as empty while the engine builds real boxes for it.
+    hidden: Hidden,
     memo: HashMap<NodeId, Sizes>,
     /// Instrumentation, not surface: how many nodes this pass has actually
     /// measured. It exists so the memo's promise can be pinned by a test and
@@ -97,11 +102,17 @@ pub struct IntrinsicSizer<'a> {
 }
 
 impl<'a> IntrinsicSizer<'a> {
-    pub fn new(dom: &'a Dom, styles: &'a Styles, images: &'a ImageContext) -> IntrinsicSizer<'a> {
+    pub fn new(
+        dom: &'a Dom,
+        styles: &'a Styles,
+        images: &'a ImageContext,
+        hidden: Hidden,
+    ) -> IntrinsicSizer<'a> {
         IntrinsicSizer {
             dom,
             styles,
             images,
+            hidden,
             memo: HashMap::new(),
             #[cfg(test)]
             measured: 0,
@@ -160,11 +171,8 @@ impl<'a> IntrinsicSizer<'a> {
 
     fn element_sizes(&mut self, node: NodeId, tag: &str) -> Sizes {
         let computed = *self.styles.get(node);
-        if computed.display == Display::None {
-            // Generates no box, so it asks its parent for no width. (The
-            // engine's `Hidden::Reveal` pass is a rescue for pages that hide
-            // themselves entirely, not a sizing mode; sizing follows the
-            // cascade.)
+        if self.is_hidden(node) {
+            // Generates no box, so it asks its parent for no width.
             return Sizes::ZERO;
         }
 
@@ -209,6 +217,15 @@ impl<'a> IntrinsicSizer<'a> {
         let pre = self.in_pre(node);
         let mut out = Sizes::ZERO;
         let mut run = Run::new(pre);
+        // The list marker (M9.6). The engine injects `LIST_MARKER` as the
+        // first inline piece of an `<li>` — or, when the item starts with a
+        // block, as a line of its own — so seeding the run reproduces both:
+        // it joins the first inline run here too, and if a block child closes
+        // the run first, it is flushed as a marker-wide segment. Without this
+        // an `<li>` measures two cells narrower than it lays out.
+        if matches!(&self.dom.node(node).data, NodeData::Element { tag, .. } if tag == "li") {
+            run.piece(LIST_MARKER.width() as i32);
+        }
         let children: Vec<NodeId> = self.dom.children(node).collect();
         for child in children {
             match self.child_mode(child) {
@@ -280,7 +297,7 @@ impl<'a> IntrinsicSizer<'a> {
                 }
             }
             NodeData::Element { tag, .. } => {
-                if self.styles.get(node).display == Display::None {
+                if self.is_hidden(node) {
                     return;
                 }
                 if tag == "br" {
@@ -323,15 +340,16 @@ impl<'a> IntrinsicSizer<'a> {
     }
 
     /// Which formatting context a child of a block container joins. Mirrors
-    /// the engine's `child_mode`, except that `display: none` contributes
-    /// nothing here rather than being walked for the reveal pass.
+    /// the engine's `child_mode`, `Hidden` mode included — under reveal a
+    /// page-hidden child is walked as a block there, so it is measured as one
+    /// here.
     fn child_mode(&self, node: NodeId) -> ChildMode {
         match &self.dom.node(node).data {
             NodeData::Comment(_) | NodeData::Doctype(_) | NodeData::Document => ChildMode::Skip,
             NodeData::Text(_) => ChildMode::Inline,
             NodeData::Element { tag, .. } => {
                 let display = self.styles.get(node).display;
-                if display == Display::None {
+                if self.is_hidden(node) {
                     return ChildMode::Skip;
                 }
                 if tag == "br" || tag == "hr" {
@@ -346,8 +364,8 @@ impl<'a> IntrinsicSizer<'a> {
                 }
                 match display {
                     Display::Inline => ChildMode::Inline,
-                    // `None` left above; block-level is what remains — flex
-                    // included, until M9.6 (`engine::is_block_level`).
+                    // Block-level is what remains, and so is a revealed
+                    // `display:none` — the engine walks one as a block.
                     _ => ChildMode::Block,
                 }
             }
@@ -372,6 +390,17 @@ impl<'a> IntrinsicSizer<'a> {
     fn image_width(&self, node: NodeId) -> Option<i32> {
         let img = self.images.by_node.get(&node)?;
         Some(self.images.size_for(img, UNCONSTRAINED).0)
+    }
+
+    /// Generates no box at all — the same question `Engine::is_hidden` asks,
+    /// and answered from the same two facts, so a measurement and the layout it
+    /// predicts cannot disagree about what is on the page. Under
+    /// `Hidden::Reveal` a page's own `display:none` is measured (the engine
+    /// lays it out as a block); the user-agent sheet's `!important` hiding is
+    /// still nothing, because the engine still skips it.
+    fn is_hidden(&self, node: NodeId) -> bool {
+        let c = self.styles.get(node);
+        c.display == Display::None && (self.hidden == Hidden::Respect || c.hidden_by_ua)
     }
 
     /// Is this node inside a `<pre>`? The engine threads a `pre` flag down
@@ -534,7 +563,7 @@ mod tests {
         let (dom, styles) = styled(html_src, css);
         let node = find_tag(&dom, tag);
         let images = ImageContext::default();
-        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images);
+        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images, Hidden::Respect);
         (sizer.min_content_width(node), sizer.max_content_width(node))
     }
 
@@ -602,7 +631,7 @@ mod tests {
         let (dom, styles) = styled(src, css);
         let outer = find_tag(&dom, "div");
         let images = ImageContext::default();
-        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images);
+        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images, Hidden::Respect);
         assert_eq!(sizer.max_content_width(outer), 7);
         // min-content likewise: the padded child's word (5) plus its padding.
         assert_eq!(sizer.min_content_width(outer), 7);
@@ -679,7 +708,7 @@ mod tests {
         let imgs = crate::image::discover(&dom, Some("https://ex/"));
         let mut cache = crate::image::ImageCache::default();
         let images = crate::image::ImageContext::from_discovery(&imgs, &mut cache);
-        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images);
+        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images, Hidden::Respect);
 
         let img = find_tag(&dom, "img");
         assert_eq!(sizer.min_content_width(img), 10);
@@ -717,7 +746,7 @@ mod tests {
         }
         let (dom, styles) = styled(&src, "div { margin: 0 }");
         let images = ImageContext::default();
-        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images);
+        let mut sizer = IntrinsicSizer::new(&dom, &styles, &images, Hidden::Respect);
 
         // Measuring the outermost div measures the whole chain, once each.
         let outer = find_tag(&dom, "div");
@@ -931,15 +960,10 @@ mod tests {
         impl Page<'_> {
             /// The elements of this page the three assertions can be asked of.
             ///
-            /// Three exclusions, each because the assertion would be meaningless
+            /// Two exclusions, each because the assertion would be meaningless
             /// rather than because it would be inconvenient:
             ///
             /// - nothing to wrap: no text anywhere inside.
-            /// - a `<li>` inside: the engine injects a `"• "` marker into a list
-            ///   item's first line that intrinsic sizing deliberately does not
-            ///   count, so every ancestor of an `li` is two cells adrift by
-            ///   design. That divergence is real and is being tracked for M9.6;
-            ///   this test is not the place to relitigate it.
             /// - a specified `width` / `min-width` / `max-width` inside: such a box
             ///   is the width it was told to be no matter how much room there is,
             ///   so no page width narrows it and "one cell narrower and it wraps"
@@ -963,12 +987,15 @@ mod tests {
                     if !has_text {
                         continue;
                     }
-                    let is_list_item = subtree_any(dom, node, &|n| tag_of(dom, n) == "li");
+                    // List items are *in* now: the marker they lay out with is
+                    // the marker they measure with, so the third of danluu.com
+                    // this filter used to cost is back under the three
+                    // assertions below.
                     let sized = subtree_any(dom, node, &|n| {
                         let c = styles.get(n);
                         !c.width.is_auto() || !c.min_width.is_auto() || !c.max_width.is_auto()
                     });
-                    if is_list_item || sized {
+                    if sized {
                         continue;
                     }
                     out.push(node);
@@ -980,7 +1007,8 @@ mod tests {
             /// Put a sample of this page's blocks through both framings, and
             /// refuse to pass if the filters left nothing to measure.
             fn check(&self) {
-                let mut sizer = IntrinsicSizer::new(self.dom, self.styles, self.images);
+                let mut sizer =
+                    IntrinsicSizer::new(self.dom, self.styles, self.images, Hidden::Respect);
                 let candidates = self.measurable_blocks();
                 let step = (candidates.len() / SAMPLE).max(1);
                 let mut checked = 0;

@@ -13,6 +13,15 @@ use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// The bullet the engine puts before a list item's content, and the two cells
+/// it takes.
+///
+/// Shared with intrinsic sizing (M9.6) rather than spelled twice: an `<li>`
+/// that measures two cells narrower than it lays out is a flex item whose base
+/// size is too small and whose automatic minimum size is too small, so text the
+/// algorithm believed would fit wraps instead. One `const` is the whole fix.
+pub(super) const LIST_MARKER: &str = "• ";
+
 /// Whether `display:none` is honoured on this pass (M4 review never-blank).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Hidden {
@@ -355,7 +364,7 @@ impl<'a> Engine<'a> {
                             content_y,
                             &mut child_prev_mb,
                             &[InlineItem::Marker {
-                                text: "• ".into(),
+                                text: LIST_MARKER.into(),
                                 style: Style::default(),
                             }],
                             computed.text_align,
@@ -386,7 +395,7 @@ impl<'a> Engine<'a> {
                 ChildMode::Inline => {
                     if marker_pending {
                         inline_run.push(InlineItem::Marker {
-                            text: "• ".into(),
+                            text: LIST_MARKER.into(),
                             style: Style::default(),
                         });
                         marker_pending = false;
@@ -411,7 +420,7 @@ impl<'a> Engine<'a> {
                 content_y,
                 &mut child_prev_mb,
                 &[InlineItem::Marker {
-                    text: "• ".into(),
+                    text: LIST_MARKER.into(),
                     style: Style::default(),
                 }],
                 computed.text_align,
