@@ -1,7 +1,7 @@
-//! Flexbox's core arithmetic: css-flexbox-1 §9.7, *resolve the flexible
-//! lengths* (M9.6), §9.5, *main-axis alignment* (M9.7), and §9.4/§9.6, *cross
-//! sizing and cross-axis alignment* (M9.8), in whole terminal cells
-//! (PLAN.md M9).
+//! Flexbox's core arithmetic: css-flexbox-1 §9.3, *line collection* and §9.6
+//! step 15, *`align-content`* (M9.10), §9.7, *resolve the flexible lengths*
+//! (M9.6), §9.5, *main-axis alignment* (M9.7), and §9.4/§9.6, *cross sizing and
+//! cross-axis alignment* (M9.8), in whole terminal cells (PLAN.md M9).
 //!
 //! Kept out of `engine` deliberately. This is the part of flex layout that is
 //! pure arithmetic over numbers — no DOM, no styles, no boxes — so it can be
@@ -13,9 +13,11 @@
 //! never in `x`. That is what makes a reversed direction a mapping in the
 //! engine — main-start is the far edge, so the same offsets are subtracted
 //! instead of added — rather than a second copy of the placement rules with the
-//! signs changed. [`cross_place`] is written the same way, in distances from
-//! *cross-start*, and between them they serve all four directions: nothing in
-//! this file knows which physical axis is which.
+//! signs changed. [`cross_place`] and [`align_lines`] are written the same way,
+//! in distances from *cross-start*, so `wrap-reverse` is the same mapping on
+//! the other axis. Between them they serve all four directions and both wrap
+//! orders: nothing in this file knows which physical axis is which, or which
+//! way either of them points.
 //!
 //! **One axis has to be measured from built boxes, and which one depends on the
 //! direction.** A size this file can be handed as a number is one the engine
@@ -36,7 +38,9 @@
 //! items that grow to fill a line leave no hole at its end, and no item is
 //! ever a fraction of a cell narrower than its neighbour for no reason.
 
-use crate::style::values::{AlignItems, JustifyContent};
+use std::ops::Range;
+
+use crate::style::values::{AlignContent, AlignItems, JustifyContent};
 
 /// One flex item's inputs to §9.7, all in cells and all on the main axis.
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +71,68 @@ impl Item {
         }
         size.max(self.min as f64).max(0.0)
     }
+}
+
+/// §9.3 step 5: cut the items into flex lines, as ranges over the order the
+/// caller gave them.
+///
+/// Walk the items in order, adding each to the current line while it still
+/// fits the container's inner main size — the item's own outer size plus the
+/// gap that would precede it — and starting a new line the first time one does
+/// not. A `nowrap` container skips all of that: one line, whatever it costs,
+/// which is what every flex container in this engine was until M9.10.
+///
+/// **The sizes read here are the *hypothetical* ones**, from before §9.7 flexed
+/// anything, and that is the spec's rule rather than an approximation. Wrapping
+/// decides which items share a line; §9.7 then decides how each line's items
+/// divide it. Collect on post-grow sizes instead and a row of `flex: 1` items
+/// wraps by sizes it only has *because* of where it wrapped, which is circular:
+/// three items with a 20-cell basis in 80 cells belong on one line, and the
+/// fact that they then grow to 26 cells each cannot be allowed to break them
+/// into two.
+///
+/// **A line always holds at least one item**, even one wider than the whole
+/// container — there is nowhere else to put it, and an item dropped or given a
+/// line of its own *and* a second empty line would both be worse than the
+/// overflow.
+pub(super) fn collect_lines(
+    items: &[Item],
+    inner_main: i32,
+    gap: i32,
+    wrap: bool,
+) -> Vec<Range<usize>> {
+    let mut lines = Vec::new();
+    if items.is_empty() {
+        return lines;
+    }
+    if !wrap {
+        lines.push(0..items.len());
+        return lines;
+    }
+    let mut start = 0;
+    let mut used = 0;
+    for (idx, item) in items.iter().enumerate() {
+        // Saturating: these are stylesheet numbers, and `flex-basis: 99999em`
+        // is a legal thing to write. Such an item overflows its own line, which
+        // is what it asks for; an overflowing add would be a panic a page could
+        // trigger (PLAN.md §1.5).
+        let outer = item.hypothetical.saturating_add(item.outer_edges);
+        if idx == start {
+            // The first item on a line is never asked whether it fits.
+            used = outer;
+            continue;
+        }
+        let extended = used.saturating_add(gap).saturating_add(outer);
+        if extended > inner_main {
+            lines.push(start..idx);
+            start = idx;
+            used = outer;
+        } else {
+            used = extended;
+        }
+    }
+    lines.push(start..items.len());
+    lines
 }
 
 /// Resolve every item's used main size (content-box cells), in the order given
@@ -537,6 +603,89 @@ fn baseline_extents(items: &[CrossItem]) -> (i32, i32) {
         })
 }
 
+/// Where §9.6 step 15 put one flex line on the cross axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct FlexLine {
+    /// The line's used cross size — the one `cross_size` computed, plus
+    /// whatever share of the container's leftover cross space `stretch` gave
+    /// it.
+    pub(super) cross: i32,
+    /// Cells from the container's cross-start content edge to this line's
+    /// cross-start edge.
+    pub(super) cross_start: i32,
+}
+
+/// §9.6 step 15, *`align-content`*: stack the lines and hand out whatever cross
+/// space the container has left over.
+///
+/// **This is [`place`] again, one axis over.** css-align gives
+/// `justify-content` and `align-content` the same value list because they are
+/// the same operation — pack some boxes into a larger box and divide what is
+/// left — and here they are literally the same code: the lines are the slots,
+/// the cross gap is the gap, and only `stretch` needs a rule of its own. Which
+/// is worth more than the twenty lines it saves: `align-content: space-between`
+/// rounds its leftover cells exactly the way `justify-content: space-between`
+/// does, without either having to be re-checked against the other.
+///
+/// `stretch` — the initial value — grows every line by an equal share of the
+/// leftover instead of moving it, cells that rounding dropped going to the
+/// earliest lines, and then has nothing left to distribute. A container whose
+/// cross size came from its own contents has no leftover in the first place, so
+/// every value of `align-content` does nothing there, which is what a browser
+/// shows and the reason the property looks broken on single-line containers.
+pub(super) fn align_lines(
+    lines: &[i32],
+    gap: i32,
+    inner_cross: i32,
+    align: AlignContent,
+) -> Vec<FlexLine> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    let mut cross = lines.to_vec();
+    if align == AlignContent::Stretch {
+        let free = inner_cross.saturating_sub(used_cross(&cross, gap)).max(0);
+        let weights = vec![1; cross.len()];
+        for (line, share) in cross.iter_mut().zip(split(free, &weights)) {
+            *line += share;
+        }
+    }
+    let slots: Vec<Slot> = cross
+        .iter()
+        .map(|&outer| Slot {
+            outer,
+            auto_start: false,
+            auto_end: false,
+        })
+        .collect();
+    // A stretched line took the free space already, so what is left to pack is
+    // nothing and `flex-start` is the cheapest way to say "in order, from
+    // cross-start". Auto margins have no counterpart here — a *line* has no
+    // margins — which is why `place`'s step-1 branch never fires for lines.
+    let justify = match align {
+        AlignContent::FlexStart | AlignContent::Stretch => JustifyContent::FlexStart,
+        AlignContent::FlexEnd => JustifyContent::FlexEnd,
+        AlignContent::Center => JustifyContent::Center,
+        AlignContent::SpaceBetween => JustifyContent::SpaceBetween,
+        AlignContent::SpaceAround => JustifyContent::SpaceAround,
+    };
+    place(&slots, gap, inner_cross, justify)
+        .iter()
+        .zip(cross)
+        .map(|(p, cross)| FlexLine {
+            cross,
+            cross_start: p.main_start,
+        })
+        .collect()
+}
+
+/// What a stack of lines costs the cross axis: their own sizes plus the gap
+/// between each adjacent pair.
+pub(super) fn used_cross(lines: &[i32], gap: i32) -> i32 {
+    let gaps = gap.saturating_mul(lines.len() as i32 - 1).max(0);
+    lines.iter().fold(gaps, |acc, &c| acc.saturating_add(c))
+}
+
 /// §9.6 *cross-axis alignment*: where each item's cross-start margin edge sits
 /// inside a line of `line_cross` cells.
 ///
@@ -758,6 +907,208 @@ mod tests {
             let used: i32 = sizes.iter().sum::<i32>() + 2;
             assert_eq!(used, width, "width {width}: {sizes:?}");
             assert_eq!(sizes.len(), 3, "no item was lost");
+        }
+    }
+
+    // §9.3 step 5, line collection (M9.10).
+
+    /// How many items `collect_lines` put on each line. The ranges themselves
+    /// are an indexing detail; the cut is the behaviour.
+    fn lines(items: &[Item], inner_main: i32, gap: i32) -> Vec<usize> {
+        collect_lines(items, inner_main, gap, true)
+            .iter()
+            .map(|line| line.len())
+            .collect()
+    }
+
+    #[test]
+    fn nowrap_keeps_every_item_on_one_line_however_little_room_there_is() {
+        // The initial value, and every flex container in this engine before
+        // M9.10: three items that need 150 cells stay on one 80-cell line and
+        // overflow it.
+        let items = [item(50), item(50), item(50)];
+        let single = collect_lines(&items, 80, 0, false);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0], 0..3);
+        assert!(collect_lines(&[], 80, 0, true).is_empty());
+    }
+
+    #[test]
+    fn a_line_takes_items_until_the_next_one_does_not_fit() {
+        // Six 20-cell items in 80 cells: the fourth fits exactly, the fifth
+        // would make 100.
+        let items = [item(20); 6];
+        assert_eq!(lines(&items, 80, 0), [4, 2]);
+        // One cell narrower and the fourth is the one that no longer fits.
+        assert_eq!(lines(&items, 79, 0), [3, 3]);
+    }
+
+    #[test]
+    fn the_gap_before_an_item_is_part_of_whether_it_fits() {
+        // Four 20-cell items fill 80 cells exactly; add a 4-cell gap between
+        // each pair and the fourth needs 92, so three share the line.
+        let items = [item(20); 4];
+        assert_eq!(lines(&items, 80, 0), [4]);
+        assert_eq!(lines(&items, 80, 4), [3, 1]);
+    }
+
+    #[test]
+    fn an_items_own_edges_count_towards_the_line_it_asks_for() {
+        // Free space is measured against *outer* sizes here as everywhere
+        // else: three items of 20 cells with 10 cells of edges each need 90.
+        let padded = Item {
+            outer_edges: 10,
+            ..item(20)
+        };
+        assert_eq!(lines(&[padded; 3], 90, 0), [3]);
+        assert_eq!(lines(&[padded; 3], 89, 0), [2, 1]);
+    }
+
+    #[test]
+    fn the_size_that_decides_a_line_is_the_hypothetical_one() {
+        // §9.2 step 4 has already run, so an item with a 40-cell basis and a
+        // 20-cell maximum takes 20 cells of the line rather than 40 — and four
+        // of them share a line that two of their base sizes would have filled.
+        let clamped = Item {
+            base: 40,
+            hypothetical: 20,
+            max: Some(20),
+            ..item(40)
+        };
+        assert_eq!(lines(&[clamped; 4], 80, 0), [4]);
+    }
+
+    #[test]
+    fn a_line_always_holds_at_least_one_item() {
+        // An item wider than the whole container gets a line to overflow on
+        // its own. Dropping it, or leaving an empty line in front of it, would
+        // both be worse than the overflow.
+        assert_eq!(lines(&[item(200); 2], 80, 0), [1, 1]);
+        // ...and a gap wider than the container never empties a line either.
+        assert_eq!(lines(&[item(1); 2], 10, 400), [1, 1]);
+    }
+
+    #[test]
+    fn every_item_lands_on_exactly_one_line_at_every_width() {
+        // The structural invariant, swept: whatever the container's width, the
+        // lines partition the items in order — none lost, none duplicated, and
+        // no line empty. A `0` width is included because a terminal can be
+        // dragged to nothing and a flex container must still produce boxes.
+        let items = [item(7), item(13), item(5), item(21), item(1)];
+        let all: Vec<usize> = (0..items.len()).collect();
+        for width in 0..=120 {
+            let lines = collect_lines(&items, width, 2, true);
+            assert!(
+                lines.iter().all(|line| !line.is_empty()),
+                "width {width}: an empty line {lines:?}"
+            );
+            let covered: Vec<usize> = lines.iter().flat_map(|line| line.clone()).collect();
+            assert_eq!(covered, all, "width {width}: {lines:?}");
+        }
+    }
+
+    // §9.6 step 15, `align-content` (M9.10). Cross-axis coordinates again:
+    // `cross_start` counts from cross-start, whichever edge that is.
+
+    const ALL_CONTENT: [AlignContent; 6] = [
+        AlignContent::FlexStart,
+        AlignContent::FlexEnd,
+        AlignContent::Center,
+        AlignContent::SpaceBetween,
+        AlignContent::SpaceAround,
+        AlignContent::Stretch,
+    ];
+
+    fn line_starts(lines: &[i32], gap: i32, inner: i32, align: AlignContent) -> Vec<i32> {
+        align_lines(lines, gap, inner, align)
+            .iter()
+            .map(|line| line.cross_start)
+            .collect()
+    }
+
+    fn line_sizes(lines: &[i32], gap: i32, inner: i32, align: AlignContent) -> Vec<i32> {
+        align_lines(lines, gap, inner, align)
+            .iter()
+            .map(|line| line.cross)
+            .collect()
+    }
+
+    #[test]
+    fn align_content_distributes_the_leftover_cross_space_six_ways() {
+        // Two 1-row lines in a 6-row container: 4 rows to place, and the same
+        // six answers `justify-content` gives on the main axis.
+        let lines = [1, 1];
+        assert_eq!(line_starts(&lines, 0, 6, AlignContent::FlexStart), [0, 1]);
+        assert_eq!(line_starts(&lines, 0, 6, AlignContent::FlexEnd), [4, 5]);
+        assert_eq!(line_starts(&lines, 0, 6, AlignContent::Center), [2, 3]);
+        assert_eq!(
+            line_starts(&lines, 0, 6, AlignContent::SpaceBetween),
+            [0, 5]
+        );
+        // Half a share at each end and a whole one between: 1 : 2 : 1 over 4
+        // rows divides exactly.
+        assert_eq!(line_starts(&lines, 0, 6, AlignContent::SpaceAround), [1, 4]);
+        // `stretch` is the odd one out: it grows the lines instead of moving
+        // them, and then has nothing left to hand out.
+        assert_eq!(line_starts(&lines, 0, 6, AlignContent::Stretch), [0, 3]);
+        assert_eq!(line_sizes(&lines, 0, 6, AlignContent::Stretch), [3, 3]);
+    }
+
+    #[test]
+    fn stretch_hands_the_odd_row_to_the_earliest_line() {
+        // 5 rows over 2 lines is 2.5 each: the odd row goes to the first line,
+        // which is `split`'s rule everywhere in this file.
+        assert_eq!(line_sizes(&[1, 1], 0, 7, AlignContent::Stretch), [4, 3]);
+        // The gap comes off first, exactly as it does on the main axis: 7 rows
+        // less a 1-row gap leaves 6 to divide.
+        assert_eq!(line_sizes(&[1, 1], 1, 7, AlignContent::Stretch), [3, 3]);
+    }
+
+    #[test]
+    fn a_content_sized_cross_axis_leaves_align_content_nothing_to_do() {
+        // A container as big as its own lines has no leftover space, so every
+        // value — `stretch` included — stacks them from cross-start. This is
+        // why `align-content` looks broken on most pages that reach for it.
+        for align in ALL_CONTENT {
+            assert_eq!(line_starts(&[2, 3], 1, 6, align), [0, 3], "{align:?}");
+            assert_eq!(line_sizes(&[2, 3], 1, 6, align), [2, 3], "{align:?}");
+        }
+    }
+
+    #[test]
+    fn lines_neither_overlap_nor_overflow_at_any_cross_size() {
+        // The integer-cell invariant on the cross axis, swept the way the main
+        // axis's is: lines stay in order, keep their gap, and the values that
+        // claim both edges land exactly on the far one.
+        let lines = [2, 3, 1];
+        let gap = 1;
+        let content = used_cross(&lines, gap);
+        for inner in 0..=40 {
+            for align in ALL_CONTENT {
+                let placed = align_lines(&lines, gap, inner, align);
+                let label = format!("inner {inner}, {align:?}: {placed:?}");
+                assert!(placed[0].cross_start >= 0, "{label}");
+                for pair in placed.windows(2) {
+                    assert!(
+                        pair[1].cross_start - (pair[0].cross_start + pair[0].cross) >= gap,
+                        "{label}: lines overlap or ate the gap"
+                    );
+                }
+                let end = placed[2].cross_start + placed[2].cross;
+                if inner < content {
+                    // Overflow: nothing to hand out, and nothing handed out.
+                    assert_eq!(placed[0].cross_start, 0, "{label}");
+                    assert_eq!(end, content, "{label}");
+                    continue;
+                }
+                assert!(end <= inner, "{label}: overflowed by rounding");
+                // `stretch` grows the lines into every spare cell and
+                // `space-between` pushes the last one onto the far edge, so
+                // both have to end exactly there.
+                if matches!(align, AlignContent::Stretch | AlignContent::SpaceBetween) {
+                    assert_eq!(end, inner, "{label}: left a hole");
+                }
+            }
         }
     }
 

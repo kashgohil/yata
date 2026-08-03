@@ -1,0 +1,82 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.3 and §9.4 with main and
+# cross swapped (M9.9), before the code existed. Never regenerated.
+#
+# A column wraps into further *columns*: its main axis is the block axis, so a
+# line is a stack of items and the lines sit side by side. Every main-axis
+# number here is a height in lines and every cross-axis one a width in cells.
+#
+# Container 1 — `height: 3em` is the edge to wrap at. Each item is one line
+#   tall, so three fit and the fourth starts a second column: "aaa" "bb" "c" at
+#   y = 0, 1, 2 and "dddd" "e" at y = 0, 1 again.
+#
+#   The cross axis is what wrapping took back from M9.9. A `nowrap` column's
+#   one line is always the container's whole content box, so M9.9 could size
+#   and place each item across the moment it built it; here a line is only as
+#   wide as the items *on* it — 3 cells for the first ("aaa"), 4 for the second
+#   ("dddd") — and which items those are is not known until every item has been
+#   built and measured. So the items are built at the container's cross-start
+#   edge and moved: the second column starts at x = 3.
+#
+#   `align-content: flex-start` is what makes those numbers visible. The
+#   container's cross size is its content width — 40 cells, always definite —
+#   so the initial `stretch` would have grown each column by half of the 33
+#   cells left over and hidden the sizing behind the distribution.
+#
+#   `align-items` is `stretch` by default, so each item fills its own column:
+#   "c" is a 3-cell box holding a 1-cell word. Its inner boxes keep the width
+#   they were laid out at, exactly as a stretched *row* item's contents keep
+#   their heights — stretching moves the edge a background and border reach to,
+#   it does not re-wrap the text. That is safe because an item narrower than
+#   its column was laid out at its own text's width, so no line inside it was
+#   ever going to reach the extra cells.
+#
+# Container 2 — the same items with `height: auto`, which is the case worth
+#   writing a fixture for: it does **not** wrap, however `flex-wrap` is set. A
+#   column that is as tall as its own items has no height to overflow, so
+#   there is nothing to wrap at, and all five items stay in one column that
+#   fills the container's 40 cells — ordinary block flow, which is what
+#   `flex-direction: column` looks like and should keep looking like.
+<html>  x=0 y=0 w=40 h=8
+  <body>  x=0 y=0 w=40 h=8
+    <div.col.short> flex column wrap  x=0 y=0 w=40 h=3
+      <div>  x=0 y=0 w=3 h=1
+        anonymous  x=0 y=0 w=3 h=1
+          line  x=0 y=0 w=3 h=1
+            #text "aaa"  x=0 y=0 w=3 h=1
+      <div>  x=0 y=1 w=3 h=1
+        anonymous  x=0 y=1 w=2 h=1
+          line  x=0 y=1 w=2 h=1
+            #text "bb"  x=0 y=1 w=2 h=1
+      <div>  x=0 y=2 w=3 h=1
+        anonymous  x=0 y=2 w=1 h=1
+          line  x=0 y=2 w=1 h=1
+            #text "c"  x=0 y=2 w=1 h=1
+      <div>  x=3 y=0 w=4 h=1
+        anonymous  x=3 y=0 w=4 h=1
+          line  x=3 y=0 w=4 h=1
+            #text "dddd"  x=3 y=0 w=4 h=1
+      <div>  x=3 y=1 w=4 h=1
+        anonymous  x=3 y=1 w=1 h=1
+          line  x=3 y=1 w=1 h=1
+            #text "e"  x=3 y=1 w=1 h=1
+    <div.col> flex column wrap  x=0 y=3 w=40 h=5
+      <div>  x=0 y=3 w=40 h=1
+        anonymous  x=0 y=3 w=40 h=1
+          line  x=0 y=3 w=40 h=1
+            #text "aaa"  x=0 y=3 w=3 h=1
+      <div>  x=0 y=4 w=40 h=1
+        anonymous  x=0 y=4 w=40 h=1
+          line  x=0 y=4 w=40 h=1
+            #text "bb"  x=0 y=4 w=2 h=1
+      <div>  x=0 y=5 w=40 h=1
+        anonymous  x=0 y=5 w=40 h=1
+          line  x=0 y=5 w=40 h=1
+            #text "c"  x=0 y=5 w=1 h=1
+      <div>  x=0 y=6 w=40 h=1
+        anonymous  x=0 y=6 w=40 h=1
+          line  x=0 y=6 w=40 h=1
+            #text "dddd"  x=0 y=6 w=4 h=1
+      <div>  x=0 y=7 w=40 h=1
+        anonymous  x=0 y=7 w=40 h=1
+          line  x=0 y=7 w=40 h=1
+            #text "e"  x=0 y=7 w=1 h=1

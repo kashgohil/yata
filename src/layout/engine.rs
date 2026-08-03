@@ -7,12 +7,14 @@
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
+use std::ops::Range;
+
 use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
 use crate::layout::flex;
 use crate::layout::intrinsic::IntrinsicSizer;
 use crate::style::values::{
-    AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FontStyle, FontWeight, Gaps, Length,
-    TextAlign,
+    AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FlexWrap, FontStyle, FontWeight,
+    Gaps, Length, TextAlign,
 };
 use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
@@ -546,13 +548,13 @@ impl<'a> Engine<'a> {
     }
 
     /// A flex container's contents: css-flexbox-1 §4 (what the items are),
-    /// §9.2 (how big each one wants to be), §9.7 (how the line's space is
-    /// divided) and §9.5 (where they go). Returns the container's used content
-    /// height — for a row its line's cross size, for a column its inner main
-    /// size.
+    /// §9.2 (how big each one wants to be), §9.3 (which of them share a line),
+    /// §9.7 (how each line's space is divided) and §9.5 (where they go).
+    /// Returns the container's used content height — for a row the cross size
+    /// its lines used, for a column its inner main size.
     ///
-    /// Scope, M9.9: all four `flex-direction`s, `flex-wrap: nowrap`, both axes.
-    /// M9.10 brings wrapping.
+    /// Scope, M9.10: all four `flex-direction`s, all three `flex-wrap`s, both
+    /// axes.
     ///
     /// **The two directions run their passes in opposite orders, and that is
     /// forced rather than chosen.** A row's main size is a *width*, and
@@ -563,13 +565,24 @@ impl<'a> Engine<'a> {
     /// items exist, so that runs last in [`align_cross`](Self::align_cross) and
     /// does move boxes.
     ///
-    /// A column inverts both halves. Its main size is a height and there is no
-    /// height sizer, so an item has to be *built to be measured*: item
+    /// A column inverts the main half. Its main size is a height and there is
+    /// no height sizer, so an item has to be *built to be measured*: item
     /// generation builds each box, §9.7 and §9.5 run on the heights that came
     /// back, and [`place_column_item`](Self::place_column_item) moves each
-    /// subtree to where the line put it. Its cross axis is a width, and the
-    /// container's content width is definite, so cross sizes and cross
-    /// positions are settled before anything is built and never move at all.
+    /// subtree to where the line put it.
+    ///
+    /// **What wrapping took back (M9.10).** A `nowrap` column's cross axis was
+    /// the easy one: its single line is exactly as wide as the container's
+    /// content box, so no item's cross placement depended on any other's and
+    /// M9.9 settled both while building each item. A wrapping line is only as
+    /// wide as the items *on it*, and which line an item lands on is not known
+    /// until line collection has run — which for a column needs the items built
+    /// first, because their main sizes are heights. So the shortcut is gone and
+    /// both directions now run the same order: build, collect, flex and place
+    /// the main axis line by line, then size and place the cross axis in
+    /// [`align_cross`](Self::align_cross). Every item still gets built exactly
+    /// once; what a column pays is that its boxes move on both axes instead of
+    /// one.
     fn layout_flex_contents(
         &mut self,
         id: NodeId,
@@ -579,7 +592,12 @@ impl<'a> Engine<'a> {
         pre: bool,
     ) -> i32 {
         let content = self.boxes[box_id.0 as usize].dimensions.content;
-        let axis = FlexAxis::of(computed.flex_direction, content.width, heights.specified);
+        let axis = FlexAxis::of(
+            computed.flex_direction,
+            computed.flex_wrap,
+            content.width,
+            heights,
+        );
 
         let mut items = self.flex_items(id, &axis, &computed, content, heights.specified, pre);
         if items.is_empty() {
@@ -603,8 +621,8 @@ impl<'a> Engine<'a> {
         // The row comes out empty instead, which is what such a gap means.
         let total_gap = gap.saturating_mul(items.len() as i32 - 1);
 
-        // §9.2 step 2: the container's inner main size, the number §9.7
-        // divides.
+        // §9.2 step 2: the container's inner main size, the number §9.3 wraps
+        // against and §9.7 divides.
         //
         // A **row**'s is the content width it already has — resolved as any
         // block's is, clamps and `box-sizing` included (M9.2), because a flex
@@ -622,6 +640,11 @@ impl<'a> Engine<'a> {
         // free space depends on them. That later clamp then re-applies to an
         // already-clamped value and is a no-op, which keeps the rule at one
         // site rather than splitting it across two.
+        //
+        // It is also what leaves a `max-height` in the number §9.3 wraps
+        // against, which is §9.2 step 2's rule for a container whose main size
+        // is indefinite — see [`FlexAxis::of`], where the decision not to wrap
+        // an auto-height column is written down.
         let inner_main = if axis.vertical {
             let dims = self.boxes[box_id.0 as usize].dimensions;
             let v_axis = Axis {
@@ -644,112 +667,126 @@ impl<'a> Engine<'a> {
             content.width
         };
 
-        // §9.3 line collection: `nowrap`, so every item is on one line
-        // whatever it costs. M9.10 is where that stops being true.
-        let sizes = flex::resolve(
-            &items.iter().map(|i| i.metrics).collect::<Vec<_>>(),
-            inner_main,
-            total_gap,
-        );
-
-        // The axis flip, and the whole of what a `-reverse` direction costs.
-        // Main-start is the container's far edge — its right for `row-reverse`,
-        // its bottom for `column-reverse` — so an offset from main-start is
-        // subtracted instead of added, and an item's main-start margin is the
-        // one on the other side. Everything else — §9.7 above, §9.5 below — is
-        // written in main-axis terms and does not know which way the axis
-        // points, or even which axis it is.
-        let slots: Vec<flex::Slot> = items
-            .iter()
-            .zip(&sizes)
-            .map(|(item, &main_size)| {
-                let (start, end) = axis.main_margins(&item.computed);
-                flex::Slot {
-                    outer: main_size + item.metrics.outer_edges,
-                    auto_start: start.is_auto(),
-                    auto_end: end.is_auto(),
-                }
-            })
-            .collect();
-
-        // §9.5: hand out what §9.7 could not give away — auto margins first,
-        // then `justify-content`.
-        let placed = flex::place(&slots, gap, inner_main, computed.justify_content);
+        // §9.3 step 5: which items share a line. A `nowrap` container gets the
+        // one line it always got; a wrapping one is cut at the last item that
+        // fits, by the *hypothetical* sizes measured above — before §9.7 has
+        // grown or shrunk anything, because where the items wrap is what
+        // decides how much room each has to grow into.
+        let metrics: Vec<flex::Item> = items.iter().map(|i| i.metrics).collect();
+        let lines = flex::collect_lines(&metrics, inner_main, gap, axis.wraps);
 
         // The container's main-start content edge in tree coordinates, and the
         // far edge a reversed direction counts back from.
         let main_origin = if axis.vertical { content.y } else { content.x };
         let main_far = main_origin.saturating_add(inner_main);
 
+        // §9.7 and §9.5, once per line. Every line divides the container's
+        // whole inner main size — lines do not share it, they take turns at it
+        // — so nothing here needs to know how many other lines there are.
         let mut children = Vec::with_capacity(items.len());
-        for (idx, (item, &main_size)) in items.iter().zip(&sizes).enumerate() {
-            let p = placed[idx];
-            let outer_main = slots[idx]
-                .outer
-                .saturating_add(p.auto_start)
-                .saturating_add(p.auto_end);
-            // Main-axis offset → the physical near edge of the item's margin
-            // box: added to the container's near edge, or subtracted from its
-            // far one when the axis is reversed. Saturating, because an offset
-            // can be enormous — `gap: 1e11em` is a legal thing for a stylesheet
-            // to say, and an item shoved off the page is what it asks for,
-            // where an overflowing add would be a panic a page could trigger.
-            let near = if axis.reverse {
-                main_far
-                    .saturating_sub(p.main_start)
-                    .saturating_sub(outer_main)
-            } else {
-                main_origin.saturating_add(p.main_start)
-            };
-            // The auto-margin shares, named for the sides they are painted on
-            // rather than for the ends of the main axis.
-            let (auto_near, auto_far) = if axis.reverse {
-                (p.auto_end, p.auto_start)
-            } else {
-                (p.auto_start, p.auto_end)
-            };
-            let place = ItemPlacement {
-                near,
-                main_size,
-                auto_near,
-                auto_far,
-            };
-            // The one fork the pass inversion costs. A column's box already
-            // exists — building it is how its main size was measured — so it
-            // moves to its place; a row's is built there in the first place.
-            let child = match item.built {
-                Some(b) => {
-                    self.place_column_item(b, item, &axis, place);
-                    b
-                }
-                None => self.layout_flex_item(
-                    item,
-                    place,
-                    content,
-                    computed.text_align,
-                    heights.specified,
-                    pre,
-                ),
-            };
-            children.push(child);
+        for line in &lines {
+            let line_items = &items[line.clone()];
+            let sizes = flex::resolve(
+                &metrics[line.clone()],
+                inner_main,
+                gap.saturating_mul(line.len() as i32 - 1),
+            );
+
+            // The axis flip, and the whole of what a `-reverse` direction
+            // costs. Main-start is the container's far edge — its right for
+            // `row-reverse`, its bottom for `column-reverse` — so an offset
+            // from main-start is subtracted instead of added, and an item's
+            // main-start margin is the one on the other side. Everything else —
+            // §9.7 above, §9.5 below — is written in main-axis terms and does
+            // not know which way the axis points, or even which axis it is.
+            let slots: Vec<flex::Slot> = line_items
+                .iter()
+                .zip(&sizes)
+                .map(|(item, &main_size)| {
+                    let (start, end) = axis.main_margins(&item.computed);
+                    flex::Slot {
+                        outer: main_size + item.metrics.outer_edges,
+                        auto_start: start.is_auto(),
+                        auto_end: end.is_auto(),
+                    }
+                })
+                .collect();
+
+            // §9.5: hand out what §9.7 could not give away — auto margins
+            // first, then `justify-content`.
+            let placed = flex::place(&slots, gap, inner_main, computed.justify_content);
+
+            for (idx, (item, &main_size)) in line_items.iter().zip(&sizes).enumerate() {
+                let p = placed[idx];
+                let outer_main = slots[idx]
+                    .outer
+                    .saturating_add(p.auto_start)
+                    .saturating_add(p.auto_end);
+                // Main-axis offset → the physical near edge of the item's
+                // margin box: added to the container's near edge, or subtracted
+                // from its far one when the axis is reversed. Saturating,
+                // because an offset can be enormous — `gap: 1e11em` is a legal
+                // thing for a stylesheet to say, and an item shoved off the
+                // page is what it asks for, where an overflowing add would be a
+                // panic a page could trigger.
+                let near = if axis.reverse {
+                    main_far
+                        .saturating_sub(p.main_start)
+                        .saturating_sub(outer_main)
+                } else {
+                    main_origin.saturating_add(p.main_start)
+                };
+                // The auto-margin shares, named for the sides they are painted
+                // on rather than for the ends of the main axis.
+                let (auto_near, auto_far) = if axis.reverse {
+                    (p.auto_end, p.auto_start)
+                } else {
+                    (p.auto_start, p.auto_end)
+                };
+                let place = ItemPlacement {
+                    near,
+                    main_size,
+                    auto_near,
+                    auto_far,
+                };
+                // The one fork the pass inversion costs. A column's box already
+                // exists — building it is how its main size was measured — so
+                // it moves to its place; a row's is built there in the first
+                // place.
+                let child = match item.built {
+                    Some(b) => {
+                        self.place_column_item(b, item, &axis, place);
+                        b
+                    }
+                    None => self.layout_flex_item(
+                        item,
+                        place,
+                        content,
+                        computed.text_align,
+                        heights.specified,
+                        pre,
+                    ),
+                };
+                children.push(child);
+            }
         }
 
-        // The container's used content height, whichever axis produced it.
-        //
-        // A row's is its line's cross size (§9.4/§9.6), which can only be asked
-        // now: an item's main size is a number the algorithm computes, but its
-        // cross size is *its content's* height, which nothing knows until the
-        // content has been laid out. A column's is the inner main size it has
-        // just divided — its cross axis was settled before any box existed.
+        // §9.4 and §9.6: size every line on the cross axis and stack them.
+        // This can only be asked now, whichever direction the container runs:
+        // for a row an item's cross size is *its content's* height, which
+        // nothing knows until the content has been laid out, and for a column a
+        // line's cross size is the widest item on it, which nothing knows until
+        // line collection has said which items those are.
+        let cross = self.align_cross(&items, &children, &lines, &axis, &computed, content);
+
+        // The container's used content height, whichever axis produced it: a
+        // row's lines stack down the page, while a column's cross axis runs
+        // across it and the height is the inner main size §9.7 just divided.
         //
         // Either way the container's own `height` is not consulted here:
         // `layout_box_at` applies it and the min/max clamps afterwards, exactly
         // as it does for a block.
-        let height = if axis.vertical {
-            inner_main
-        } else {
-            self.align_cross(&items, &children, &computed, content.y, heights.specified)
-        };
+        let height = if axis.vertical { inner_main } else { cross };
         self.boxes[box_id.0 as usize].children = children;
         height
     }
@@ -791,7 +828,7 @@ impl<'a> Engine<'a> {
             .saturating_add(edge_v(c.border.top, axis.width))
             .saturating_add(edge_v(c.padding.top, axis.width));
         let dy = content_y - self.boxes[b.0 as usize].dimensions.content.y;
-        self.shift_subtree(b, dy);
+        self.shift_subtree(b, 0, dy);
         let dims = &mut self.boxes[b.0 as usize].dimensions;
         // An `auto` main-axis margin's share is part of the item's margin box,
         // not just of the line's arithmetic — the same rule the row path
@@ -805,155 +842,303 @@ impl<'a> Engine<'a> {
         dims.content.height = place.main_size;
     }
 
-    /// §9.4 (*cross sizing*) and §9.6 (*cross-axis alignment*) for the one line
-    /// a `nowrap` container has: size the line, then move each item into its
-    /// place on it.
+    /// §9.4 (*cross sizing*), §9.6 step 15 (*`align-content`*) and §9.6
+    /// (*cross-axis alignment*): size every line, stack the lines, and move
+    /// each item into its place on its own line.
     ///
-    /// Returns the line's cross size.
+    /// Returns the cross size the lines used, which for a row is the
+    /// container's used content height.
     ///
-    /// **Row containers only.** A row's cross axis is the vertical one, and a
-    /// line's height is not known until its tallest item has been laid out —
-    /// by which time the shortest one already has a box. So an item is built at
-    /// the line's cross-start edge and then moved down, *with everything inside
-    /// it*, which is the whole content of the promise M9.6 made about text
-    /// never being left behind, and the reason
+    /// **Both directions, since M9.10.** The cross axis is where the two
+    /// directions stopped differing: whichever it is, a line's cross size
+    /// depends on every item on it, so no item's cross placement can be settled
+    /// while the items are still being built. An item is therefore built at the
+    /// container's cross-start content edge and moved afterwards, *with
+    /// everything inside it* — which is the whole content of the promise M9.6
+    /// made about text never being left behind, and the reason
     /// [`shift_subtree`](Self::shift_subtree) exists.
     ///
-    /// A column's cross axis is the horizontal one and needs none of this: its
-    /// cross size is the container's content width, which is definite before
-    /// anything is laid out, so its items are sized and placed on the cross
-    /// axis at the moment they are built (M9.9). Nothing here would be right
-    /// for one — `definite_cross` would always be `Some`, the "line as tall as
-    /// its contents" branch would never run, and `stretch_item` would be
-    /// growing the wrong dimension.
+    /// What still differs is what "cross size" means. A row's is a height, and
+    /// growing one is a field write. A column's is a width, and growing one
+    /// would leave the text inside wrapped at the old width, so a column item
+    /// is *built* at the size it will keep and only ever widened into space its
+    /// text was never going to reach — see
+    /// [`stretch_item`](Self::stretch_item).
     fn align_cross(
         &mut self,
         items: &[FlexItem],
         boxes: &[BoxId],
+        lines: &[Range<usize>],
+        axis: &FlexAxis,
         container: &ComputedStyle,
-        // The container's cross-start *content* edge: items are positioned
-        // inside its padding and border, never against its border box.
-        content_y: i32,
-        definite_cross: Option<i32>,
+        // The container's *content* box: items are positioned inside its
+        // padding and border, never against its border box.
+        content: Rect,
     ) -> i32 {
         let cross_items: Vec<flex::CrossItem> = items
             .iter()
             .zip(boxes)
             .map(|(item, &b)| {
                 let c = &item.computed;
-                let align = c.align_self.resolve(container.align_items);
+                let align = cross_align(c, axis, container);
                 let dims = self.boxes[b.0 as usize].dimensions;
+                let outer = if axis.vertical {
+                    dims.margin_box().width
+                } else {
+                    dims.margin_box().height
+                };
+                let (start, end) = axis.cross_margins(c);
                 flex::CrossItem {
-                    outer: dims.margin_box().height,
+                    outer,
                     // Measured only for the items that will be aligned by it:
                     // finding a baseline means walking the item's subtree for
                     // its first line box, and a row of `align-items: stretch`
                     // cards has no use for the answer.
+                    //
+                    // A baseline is a distance from the item's *cross-start*
+                    // edge, so under `wrap-reverse` — where cross-start is the
+                    // bottom — it is measured from the bottom. That keeps the
+                    // baselines coincident after the flip, which is the one
+                    // property the value exists for: reflecting each item
+                    // individually would align them by their heights instead.
                     baseline: if align == AlignItems::Baseline {
-                        self.item_baseline(b)
+                        let from_top = self.item_baseline(b);
+                        if axis.cross_reverse {
+                            outer - from_top
+                        } else {
+                            from_top
+                        }
                     } else {
                         0
                     },
                     align,
-                    auto_start: c.margin.top.is_auto(),
-                    auto_end: c.margin.bottom.is_auto(),
+                    auto_start: start.is_auto(),
+                    auto_end: end.is_auto(),
                 }
             })
             .collect();
 
-        // §9.4 step 7: a container with a definite inner cross size hands it to
-        // its line, whatever is on it — that is what makes `align-items:
-        // center` inside a `height: 10em` container centre in ten rows rather
-        // than in the tallest item. Otherwise the line is as tall as its
-        // contents (step 8).
-        let line_cross = definite_cross.unwrap_or_else(|| flex::cross_size(&cross_items));
-        let placed = flex::cross_place(&cross_items, line_cross);
+        let gap = axis.cross_distance(axis.cross_gap(container.gap));
 
-        for ((item, &b), (p, ci)) in items.iter().zip(boxes).zip(placed.iter().zip(&cross_items)) {
-            let c = &item.computed;
-            if ci.align == AlignItems::Stretch {
-                self.stretch_item(b, c, line_cross, definite_cross);
-            }
-            let dims = self.boxes[b.0 as usize].dimensions;
-            // An `auto` cross margin's share is part of the item's margin box,
-            // not just of the line's arithmetic — the same rule §9.5's auto
-            // margins follow on the main axis, so that the boxes on a line
-            // still tile it exactly.
-            let margin_top = if c.margin.top.is_auto() {
-                p.auto_start
+        // §9.4 step 8: every line is as big as the items on it.
+        let mut line_cross: Vec<i32> = lines
+            .iter()
+            .map(|line| flex::cross_size(&cross_items[line.clone()]))
+            .collect();
+
+        // §9.4 step 7: a **single-line** container — `nowrap`, and the spec
+        // means the property rather than "happened to fit on one line" — hands
+        // its definite inner cross size to its one line, which is what makes
+        // `align-items: center` inside a `height: 10em` container centre in ten
+        // rows rather than in the tallest item. Every other line keeps the size
+        // its own items gave it, and `align-content` below is what decides
+        // where the container's leftover cross space goes instead.
+        let definite_cross = axis.cross_base;
+        if let (Some(cross), false) = (definite_cross, axis.wraps) {
+            line_cross[0] = cross;
+        }
+        let inner_cross = definite_cross.unwrap_or_else(|| flex::used_cross(&line_cross, gap));
+        let placed_lines =
+            flex::align_lines(&line_cross, gap, inner_cross, container.align_content);
+
+        // The container's cross-start content edge, and the far edge
+        // `wrap-reverse` counts back from — the same mapping the main axis
+        // makes for a `-reverse` direction, on the other axis.
+        let cross_origin = if axis.vertical { content.x } else { content.y };
+        let cross_far = cross_origin.saturating_add(inner_cross);
+
+        for (line, placed_line) in lines.iter().zip(&placed_lines) {
+            let placed = flex::cross_place(&cross_items[line.clone()], placed_line.cross);
+            // This line's *near* edge in tree coordinates — its top for a row,
+            // its left for a column, whichever end of the cross axis
+            // cross-start turns out to be.
+            let line_near = if axis.cross_reverse {
+                cross_far
+                    .saturating_sub(placed_line.cross_start)
+                    .saturating_sub(placed_line.cross)
             } else {
-                dims.margin.top
+                cross_origin.saturating_add(placed_line.cross_start)
             };
-            let top = content_y + p.cross_start + margin_top + dims.border.top + dims.padding.top;
-            self.shift_subtree(b, top - dims.content.y);
-            let dims = &mut self.boxes[b.0 as usize].dimensions;
-            if c.margin.top.is_auto() {
-                dims.margin.top = p.auto_start;
-            }
-            if c.margin.bottom.is_auto() {
-                dims.margin.bottom = p.auto_end;
+            for (idx, item) in line.clone().enumerate() {
+                let (b, p, ci) = (boxes[item], placed[idx], cross_items[item]);
+                let c = &items[item].computed;
+                if ci.align == AlignItems::Stretch {
+                    self.stretch_item(b, c, axis, placed_line.cross, definite_cross);
+                }
+                // Read the box back: `stretch_item` may just have changed the
+                // very size the offsets below are measured against, and a
+                // stretched item that kept its old outer size would sit a
+                // reversed line's worth of cells off the bottom.
+                let dims = self.boxes[b.0 as usize].dimensions;
+                let outer = if axis.vertical {
+                    dims.margin_box().width
+                } else {
+                    dims.margin_box().height
+                };
+                let span = outer
+                    .saturating_add(p.auto_start)
+                    .saturating_add(p.auto_end);
+                // Cross-axis offset → the physical near edge of the item's
+                // margin box, and the auto-margin shares named for the sides
+                // they are painted on. The same arithmetic §9.5 does on the
+                // main axis, and for the same reason: an offset from
+                // cross-start is subtracted when cross-start is the far edge.
+                let near = if axis.cross_reverse {
+                    line_near
+                        .saturating_add(placed_line.cross)
+                        .saturating_sub(p.cross_start)
+                        .saturating_sub(span)
+                } else {
+                    line_near.saturating_add(p.cross_start)
+                };
+                let (auto_near, auto_far) = if axis.cross_reverse {
+                    (p.auto_end, p.auto_start)
+                } else {
+                    (p.auto_start, p.auto_end)
+                };
+                // The item's own near-side edges, the ones between its margin
+                // box and its content box on this axis.
+                let (near_margin, far_margin, near_edges, used_margin) = if axis.vertical {
+                    (
+                        c.margin.left,
+                        c.margin.right,
+                        dims.border.left + dims.padding.left,
+                        dims.margin.left,
+                    )
+                } else {
+                    (
+                        c.margin.top,
+                        c.margin.bottom,
+                        dims.border.top + dims.padding.top,
+                        dims.margin.top,
+                    )
+                };
+                let used_margin = if near_margin.is_auto() {
+                    auto_near
+                } else {
+                    used_margin
+                };
+                let start = near + used_margin + near_edges;
+                if axis.vertical {
+                    self.shift_subtree(b, start - dims.content.x, 0);
+                } else {
+                    self.shift_subtree(b, 0, start - dims.content.y);
+                }
+                // An `auto` cross margin's share is part of the item's margin
+                // box, not just of the line's arithmetic — the same rule §9.5's
+                // auto margins follow on the main axis, so that the boxes on a
+                // line still tile it exactly.
+                let dims = &mut self.boxes[b.0 as usize].dimensions;
+                let (near_slot, far_slot) = if axis.vertical {
+                    (&mut dims.margin.left, &mut dims.margin.right)
+                } else {
+                    (&mut dims.margin.top, &mut dims.margin.bottom)
+                };
+                if near_margin.is_auto() {
+                    *near_slot = auto_near;
+                }
+                if far_margin.is_auto() {
+                    *far_slot = auto_far;
+                }
             }
         }
-        line_cross
+        inner_cross
     }
 
     /// §9.4 step 11: an item with `align-self: stretch` fills its line's cross
     /// size — *if* its own cross size is `auto` and neither cross margin is,
-    /// since an item that stated a height or claimed the free space with an
-    /// auto margin has already answered the question.
+    /// since an item that stated a size or claimed the free space with an auto
+    /// margin has already answered the question.
     ///
-    /// **Row containers only**, and not for want of generalising: a row item's
-    /// cross size is a height, and growing a box's height is a field write —
-    /// its contents keep the positions they were given, and what changes is how
-    /// far its background and borders reach, which is what pages use `stretch`
-    /// for (equal-height cards). A *column* item's cross size is a width, and
-    /// widening a built box would leave its text wrapped at the old width, so a
-    /// stretched column item is built at its stretched width instead
-    /// ([`column_cross_size`](Self::column_cross_size), M9.9).
+    /// **A field write on both axes, but they are not the same bargain.** A row
+    /// item's cross size is a height, and growing a box's height changes
+    /// nothing inside it: its contents keep the positions they were given, and
+    /// what changes is how far its background and borders reach, which is what
+    /// pages use `stretch` for (equal-height cards). A column item's cross size
+    /// is a width, and widening a box does *not* re-wrap the text inside it —
+    /// so a column item is built at the width it will keep, and this only ever
+    /// widens it into space that text was never going to reach.
     ///
-    /// Content that genuinely wants the new height — a nested `height: 100%` —
-    /// still does not get it, here or in a column. M9.9's note on that, since
-    /// this doc used to promise otherwise: an item's used main size in a column
-    /// is only known *after* the item was built to measure it, so a percentage
-    /// height inside it resolved against nothing and stays indefinite. Making
-    /// it definite means a second layout pass over the item, which is the one
-    /// thing the column path is written to avoid.
+    /// That is safe rather than lucky, and the reason is worth stating: a
+    /// column item that stretches is one whose `width` is `auto`, which
+    /// [`column_cross_size`](Self::column_cross_size) built at its fit-content
+    /// width — its text's own width, unwrapped — whenever that fits the
+    /// container. An item whose text *did* have to wrap was built at the
+    /// container's full content width, which no line can exceed, so it is never
+    /// the one being widened here.
+    ///
+    /// Content that genuinely wants the new size — a nested `height: 100%` —
+    /// still does not get it, on either axis. M9.9's note on that: an item's
+    /// used main size in a column is only known *after* the item was built to
+    /// measure it, so a percentage height inside it resolved against nothing
+    /// and stays indefinite. Making it definite means a second layout pass over
+    /// the item, which is the one thing this path is written to avoid.
     fn stretch_item(
         &mut self,
         b: BoxId,
         c: &ComputedStyle,
+        axis: &FlexAxis,
         line_cross: i32,
         definite_cross: Option<i32>,
     ) {
-        // A replaced box's cross size came from the image, not from `height:
-        // auto`, so it is not the `auto` the spec's condition is about.
-        // Stretching one would rescale the picture to fill the row.
+        let (size, min, max) = if axis.vertical {
+            (c.width, c.min_width, c.max_width)
+        } else {
+            (c.height, c.min_height, c.max_height)
+        };
+        let (near_margin, far_margin) = axis.cross_margins(c);
+        // A replaced box's cross size came from the image, not from an `auto`
+        // size, so it is not the `auto` the spec's condition is about.
+        // Stretching one would rescale the picture to fill the line.
         if self.boxes[b.0 as usize].kind == BoxKind::Image
-            || !c.height.is_auto()
-            || c.margin.top.is_auto()
-            || c.margin.bottom.is_auto()
+            || !size.is_auto()
+            || near_margin.is_auto()
+            || far_margin.is_auto()
         {
             return;
         }
         let dims = self.boxes[b.0 as usize].dimensions;
-        let v_axis = Axis {
-            edges: dims.padding.top + dims.padding.bottom + dims.border.top + dims.border.bottom,
+        let (edges, margins, content_size) = if axis.vertical {
+            (
+                dims.padding.left + dims.padding.right + dims.border.left + dims.border.right,
+                dims.margin.left + dims.margin.right,
+                dims.content.width,
+            )
+        } else {
+            (
+                dims.padding.top + dims.padding.bottom + dims.border.top + dims.border.bottom,
+                dims.margin.top + dims.margin.bottom,
+                dims.content.height,
+            )
+        };
+        let box_axis = Axis {
+            edges,
             box_sizing: c.box_sizing,
         };
-        let target = line_cross - (v_axis.edges + dims.margin.top + dims.margin.bottom);
-        // §4.5 on the cross axis: `min-height: auto` on a flex item is its
-        // *content* height, so an item stretched into a line shorter than its
-        // own text is never squeezed until it clips. That content height is
-        // exactly the height the box has right now — `height` is `auto` here,
-        // so it is what the contents used.
-        let auto_min = dims.content.height;
-        let min =
-            definite_v(c.min_height, definite_cross).map_or(auto_min, |h| v_axis.content_from(h));
-        let max = definite_v(c.max_height, definite_cross).map(|h| v_axis.content_from(h));
+        let target = line_cross - (edges + margins);
+        // §4.5 on the cross axis: an `auto` minimum on a flex item is its
+        // *content* size, so an item stretched into a line shorter than its own
+        // text is never squeezed until it clips. That content size is exactly
+        // the size the box has right now — the cross size is `auto` here, so it
+        // is what the contents used.
+        let resolve = |len: Length| {
+            if axis.vertical {
+                (!len.is_auto()).then(|| len.to_cells_h(axis.width))
+            } else {
+                definite_v(len, definite_cross)
+            }
+        };
+        let min = resolve(min).map_or(content_size, |v| box_axis.content_from(v));
+        let max = resolve(max).map(|v| box_axis.content_from(v));
         // M9.2's clamp order, max before min, so a minimum bigger than the
         // maximum wins — the automatic one included.
         let used = max.map_or(target, |m| target.min(m)).max(min).max(0);
-        self.boxes[b.0 as usize].dimensions.content.height = used;
+        let dims = &mut self.boxes[b.0 as usize].dimensions;
+        if axis.vertical {
+            dims.content.width = used;
+        } else {
+            dims.content.height = used;
+        }
     }
 
     /// The row this item's baseline sits on, as a distance from its cross-start
@@ -987,22 +1172,29 @@ impl<'a> Engine<'a> {
         bx.children.iter().find_map(|&c| self.first_line_row(c))
     }
 
-    /// Move a box and everything under it `dy` rows down the page.
+    /// Move a box and everything under it `dx` cells across the page and `dy`
+    /// rows down it.
     ///
     /// Every rectangle in the tree is absolute, so a subtree moves by adding
     /// the same offset to every box in it — no relative coordinates to keep in
     /// step, and nothing outside the subtree to update. Edges are unaffected:
     /// a margin is a width, not a position.
-    fn shift_subtree(&mut self, b: BoxId, dy: i32) {
-        if dy == 0 {
+    ///
+    /// Both axes since M9.10: a wrapping column's items are placed on the cross
+    /// axis after they are built, so they move sideways for the same reason a
+    /// row's move down.
+    fn shift_subtree(&mut self, b: BoxId, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
             return;
         }
-        self.boxes[b.0 as usize].dimensions.content.y += dy;
+        let content = &mut self.boxes[b.0 as usize].dimensions.content;
+        content.x += dx;
+        content.y += dy;
         // By index, not by iterator: the loop needs `&mut self` for the
         // recursion, and the child list cannot be borrowed across it.
         for i in 0..self.boxes[b.0 as usize].children.len() {
             let child = self.boxes[b.0 as usize].children[i];
-            self.shift_subtree(child, dy);
+            self.shift_subtree(child, dx, dy);
         }
     }
 
@@ -1212,20 +1404,24 @@ impl<'a> Engine<'a> {
         }
     }
 
-    /// One item of a **column**: resolve its cross size, place it on the cross
-    /// axis, build it there, and read back the main size it used.
+    /// One item of a **column**: resolve its cross size, build it at the
+    /// container's cross-start edge, and read back the main size it used.
     ///
     /// This is the pass inversion `flex-direction: column` forces. A column's
-    /// main size is a height, `intrinsic` measures widths only, and this task
-    /// does not add a height sizer — so a `height: auto` item's flex base size
-    /// can only be learned by building the item and asking how tall it came
-    /// out. The item is built exactly once: §9.7's answer is applied afterwards
-    /// as a field write, never as a rebuild.
+    /// main size is a height, `intrinsic` measures widths only, and there is no
+    /// height sizer — so a `height: auto` item's flex base size can only be
+    /// learned by building the item and asking how tall it came out. The item
+    /// is built exactly once: §9.7's answer is applied afterwards as a field
+    /// write, never as a rebuild.
     ///
-    /// The cross axis is the easy one in exchange. It is a width, and the
-    /// container's content width is definite before anything is laid out, so
-    /// each item's cross size and cross position are decided *here* — and no
-    /// column item ever has to be moved sideways afterwards.
+    /// Its cross **size** is settled here, because it is a width and a box has
+    /// to be built at the width it will keep. Its cross **position** is not:
+    /// under `flex-wrap: wrap` a line is only as wide as the items on it, and
+    /// which items those are is not known until every item has been built. So
+    /// the box is built against the container's cross-start content edge and
+    /// [`align_cross`](Self::align_cross) moves it — which is what M9.10 took
+    /// back from M9.9, where a column's single line was always the full content
+    /// box and no item ever moved sideways.
     fn column_item(
         &mut self,
         source: FlexItemSource,
@@ -1242,14 +1438,16 @@ impl<'a> Engine<'a> {
                     NodeData::Element { tag, .. } => tag.clone(),
                     _ => String::new(),
                 };
-                let align = column_cross_align(c.align_self.resolve(style.align_items));
+                let align = cross_align(&c, axis, style);
 
                 let mut dims = resolve_block_dims(&c, content.width);
                 // `resolve_block_dims` centres an `auto` cross margin in the
                 // containing block; a flex item's takes the *line's* free space
                 // instead (§9.6 step 1), a different rule with a different
                 // answer. Zero them first, so the item's outer cross size is
-                // measured the way §9.6 measures it.
+                // measured the way §9.6 measures it — and leave them zero:
+                // `align_cross` is what hands out the shares, once it knows
+                // which line the item is on.
                 if c.margin.left.is_auto() {
                     dims.margin.left = 0;
                 }
@@ -1273,39 +1471,18 @@ impl<'a> Engine<'a> {
                     // they were handed: no content to shrink-wrap and nothing
                     // to stretch.
                     "br" | "hr" => avail,
-                    _ => self.column_cross_size(node, &c, align, avail, h_edges, content.width),
+                    _ => self.column_cross_size(node, &c, align, axis, avail, h_edges),
                 };
                 dims.content.width = cross;
 
-                // §9.6 on the cross axis, one item at a time: a column's line
-                // is as wide as the container's content box whatever is on it,
-                // so no item's cross placement depends on another's and the
-                // whole-line pass `align_cross` runs for a row is unnecessary.
-                let placed = flex::cross_place(
-                    &[flex::CrossItem {
-                        outer: cross + h_edges + fixed_margins,
-                        // A column has no shared baseline row to stitch to;
-                        // see `column_cross_align`.
-                        baseline: 0,
-                        align,
-                        auto_start: c.margin.left.is_auto(),
-                        auto_end: c.margin.right.is_auto(),
-                    }],
-                    content.width,
-                )[0];
-                let (auto_left, auto_right) = (placed.auto_start, placed.auto_end);
-                if c.margin.left.is_auto() {
-                    dims.margin.left = auto_left;
-                }
-                if c.margin.right.is_auto() {
-                    dims.margin.right = auto_right;
-                }
-                let margin_left = content.x + placed.cross_start;
+                // Both axes are provisional: §9.5 cannot run until every item's
+                // height is known and §9.6 cannot run until line collection has
+                // said which items share a line, so the box is built against
+                // the container's two content-start edges and moved from there
+                // — `place_column_item` on the main axis, `align_cross` on the
+                // cross one.
                 dims.content.x =
-                    margin_left + dims.margin.left + dims.border.left + dims.padding.left;
-                // Main axis: provisional. §9.5 cannot run until every item's
-                // height is known, so the box is built against the container's
-                // main-start content edge and `place_column_item` moves it.
+                    content.x + dims.margin.left + dims.border.left + dims.padding.left;
                 dims.content.y = content.y + dims.margin.top + dims.border.top + dims.padding.top;
                 dims.content.height = 0;
 
@@ -1314,14 +1491,13 @@ impl<'a> Engine<'a> {
                     // re-derived as block containers, exactly as they do on a
                     // row: they size themselves from the width they are handed
                     // and take their own edges back out of it, so what they are
-                    // given is their own outer cross size — starting *past* any
-                    // auto margin, never across it.
+                    // given is their own outer cross size.
                     let mut prev_mb = 0;
                     let own_outer = cross + h_edges + fixed_margins;
                     let content_x = dims.content.x;
                     self.layout_node(
                         node,
-                        margin_left + auto_left,
+                        content.x,
                         own_outer,
                         definite_height,
                         content.y,
@@ -1329,12 +1505,7 @@ impl<'a> Engine<'a> {
                         pre,
                     )
                     .map(|b| {
-                        // The cells §9.6 granted this item's auto margins are
-                        // part of its margin box, not just of the line's
-                        // arithmetic — the inner layout could not know them.
                         let d = &mut self.boxes[b.0 as usize].dimensions;
-                        d.margin.left += auto_left;
-                        d.margin.right += auto_right;
                         if tag == "img" {
                             // `layout_img_block` ignores an image's own margins
                             // and floors it at its intrinsic width: right for a
@@ -1374,21 +1545,11 @@ impl<'a> Engine<'a> {
                 // alignment and its text alignment are the container's.
                 let align = column_cross_align(style.align_items);
                 let (min_content, max_content) = self.sizer.run_widths(&nodes);
-                let cross = if align == AlignItems::Stretch {
+                let cross = if align == AlignItems::Stretch && !axis.wraps {
                     content.width
                 } else {
                     shrink_to_fit(min_content, max_content, content.width)
                 };
-                let placed = flex::cross_place(
-                    &[flex::CrossItem {
-                        outer: cross,
-                        baseline: 0,
-                        align,
-                        auto_start: false,
-                        auto_end: false,
-                    }],
-                    content.width,
-                )[0];
                 let mut run = Vec::new();
                 for &node in &nodes {
                     self.push_inline(node, pre, cross, &mut run);
@@ -1396,7 +1557,7 @@ impl<'a> Engine<'a> {
                 let mut prev_mb = 0;
                 let b = self
                     .layout_anonymous_block(
-                        content.x + placed.cross_start,
+                        content.x,
                         cross,
                         content.y,
                         &mut prev_mb,
@@ -1422,30 +1583,39 @@ impl<'a> Engine<'a> {
     ///
     /// A stated `width` wins. Otherwise `stretch` — the initial `align-items`,
     /// and the reason `flex-direction: column` looks like ordinary block flow —
-    /// fills the container's content width, and every other alignment
-    /// shrink-wraps the item around its content. Either way the item's own
-    /// `min-width`/`max-width` clamp the result, in M9.2's order.
+    /// fills the line, and every other alignment shrink-wraps the item around
+    /// its content. Either way the item's own `min-width`/`max-width` clamp the
+    /// result, in M9.2's order.
     ///
-    /// **This has to happen before the box is built**, which is why
-    /// [`stretch_item`](Self::stretch_item) was left alone rather than
-    /// generalised: stretching a height is a field write, but stretching a
-    /// width re-runs the line breaker over everything inside the item.
+    /// **This has to happen before the box is built**: a box laid out at one
+    /// width and then given another has its text wrapped at the wrong one, and
+    /// re-wrapping means building the item twice.
+    ///
+    /// Which is why a **wrapping** column stretches nothing here. Its line is
+    /// only as wide as the items on it, and that is not known until every item
+    /// has been built, so a stretching item is built at the same fit-content
+    /// width `flex-start` would have given it — §9.4 step 8's *hypothetical
+    /// cross size*, which is exactly what the line is then sized from — and
+    /// [`stretch_item`](Self::stretch_item) widens the box into its line
+    /// afterwards. That widening cannot change any wrapping: an item built
+    /// narrower than its line was built at its own text's width.
     fn column_cross_size(
         &mut self,
         node: NodeId,
         c: &ComputedStyle,
         align: AlignItems,
+        axis: &FlexAxis,
         avail: i32,
         h_edges: i32,
-        containing_width: i32,
     ) -> i32 {
         let h_axis = Axis {
             edges: h_edges,
             box_sizing: c.box_sizing,
         };
         let tentative = if !c.width.is_auto() {
-            h_axis.content_from(c.width.to_cells_h(containing_width))
+            h_axis.content_from(c.width.to_cells_h(axis.width))
         } else if align == AlignItems::Stretch
+            && !axis.wraps
             && !c.margin.left.is_auto()
             && !c.margin.right.is_auto()
         {
@@ -1457,7 +1627,7 @@ impl<'a> Engine<'a> {
             let (min_content, max_content) = self.sizer.content_widths(node);
             shrink_to_fit(min_content, max_content, avail)
         };
-        let resolve = |len: Length| (!len.is_auto()).then(|| len.to_cells_h(containing_width));
+        let resolve = |len: Length| (!len.is_auto()).then(|| len.to_cells_h(axis.width));
         h_axis.clamp(tentative, resolve(c.min_width), resolve(c.max_width))
     }
 
@@ -2287,6 +2457,17 @@ fn shrink_to_fit(min_content: i32, max_content: i32, available: i32) -> i32 {
         .max(0)
 }
 
+/// `align-self` resolved against the container's `align-items`, and then
+/// against what this container's cross axis can actually honour.
+fn cross_align(c: &ComputedStyle, axis: &FlexAxis, container: &ComputedStyle) -> AlignItems {
+    let align = c.align_self.resolve(container.align_items);
+    if axis.vertical {
+        column_cross_align(align)
+    } else {
+        align
+    }
+}
+
 /// `align-items` as a **column**'s cross axis can honour it.
 ///
 /// Five of the six values are the same question turned sideways. `baseline` is
@@ -2423,6 +2604,14 @@ struct FlexAxis {
     /// Main-start is the container's far edge — its right for `row-reverse`,
     /// its bottom for `column-reverse`.
     reverse: bool,
+    /// Items that do not fit start a new line: `flex-wrap: wrap` or
+    /// `wrap-reverse` (M9.10).
+    wraps: bool,
+    /// Cross-start is the container's far edge — its bottom for a row,
+    /// its right for a column: `flex-wrap: wrap-reverse`. Lines stack back
+    /// towards the near edge and every cross-axis offset is subtracted rather
+    /// than added, which is the same mapping `reverse` is on the main axis.
+    cross_reverse: bool,
     /// The container's inner **width**. Percentage padding and margins resolve
     /// against it on *both* axes (CSS 2.1 §8.1), and for a column it is the
     /// inner cross size outright.
@@ -2433,10 +2622,14 @@ struct FlexAxis {
     /// a `height: auto` column has no number for a percentage to be a
     /// percentage of, so every such length behaves as `auto` (M9.2).
     main_base: Option<i32>,
+    /// The same question on the cross axis, and the same asymmetry seen from
+    /// the other side: a column's cross size is a width and always definite, a
+    /// row's is its `height` and often is not.
+    cross_base: Option<i32>,
 }
 
 impl FlexAxis {
-    fn of(direction: FlexDirection, width: i32, definite_height: Option<i32>) -> Self {
+    fn of(direction: FlexDirection, wrap: FlexWrap, width: i32, heights: BlockHeight) -> Self {
         let vertical = matches!(
             direction,
             FlexDirection::Column | FlexDirection::ColumnReverse
@@ -2447,11 +2640,29 @@ impl FlexAxis {
                 direction,
                 FlexDirection::RowReverse | FlexDirection::ColumnReverse
             ),
+            // **An auto-height column does not wrap, whatever `flex-wrap`
+            // says**, and it is the question every reader of the wrapping code
+            // asks. Wrapping needs an edge to wrap at: a row always has one,
+            // because its main size is the width it was given, but a column's
+            // is its height, and a column that is as tall as its own items has
+            // no height it could overflow. A browser does the same. `height`
+            // puts the edge there, and so does `max-height` — §9.2 step 2 says
+            // to measure against the max main size when the main size itself is
+            // indefinite, which is exactly what the clamp in
+            // `layout_flex_contents` leaves in the inner main size.
+            wraps: wrap != FlexWrap::NoWrap
+                && (!vertical || heights.specified.is_some() || heights.max.is_some()),
+            cross_reverse: wrap == FlexWrap::WrapReverse,
             width,
             main_base: if vertical {
-                definite_height
+                heights.specified
             } else {
                 Some(width)
+            },
+            cross_base: if vertical {
+                Some(width)
+            } else {
+                heights.specified
             },
         }
     }
@@ -2486,6 +2697,23 @@ impl FlexAxis {
             (c.margin.left, c.margin.right)
         };
         if self.reverse {
+            (end, start)
+        } else {
+            (start, end)
+        }
+    }
+
+    /// The cross-axis margins in `(cross-start, cross-end)` order, already
+    /// through `wrap-reverse`'s flip — under which a row item's cross-start
+    /// margin is its `margin-bottom`, so `margin-bottom: auto` is what pushes
+    /// it to the top of its line.
+    fn cross_margins(self, c: &ComputedStyle) -> (Length, Length) {
+        let (start, end) = if self.vertical {
+            (c.margin.left, c.margin.right)
+        } else {
+            (c.margin.top, c.margin.bottom)
+        };
+        if self.cross_reverse {
             (end, start)
         } else {
             (start, end)
@@ -2545,11 +2773,29 @@ impl FlexAxis {
 
     /// The gap that falls *between the items on a line*. A gap is named for
     /// what it sits between, so `column-gap` — the gutter between columns — is
-    /// a row's main-axis gap and `row-gap` is a column's. The other one is the
-    /// gap between flex lines, and a `nowrap` container has one line, so it
-    /// falls between nothing until M9.10.
+    /// a row's main-axis gap and `row-gap` is a column's.
     fn main_gap(self, gaps: Gaps) -> Length {
         if self.vertical { gaps.row } else { gaps.column }
+    }
+
+    /// The other one: the gap *between flex lines*, which a `nowrap` container
+    /// has nothing to put between and a wrapping one does (M9.10).
+    fn cross_gap(self, gaps: Gaps) -> Length {
+        if self.vertical { gaps.column } else { gaps.row }
+    }
+
+    /// A cross-axis distance that is never `auto`. The mirror of
+    /// [`main_distance`](Self::main_distance), unit rule included: a cross axis
+    /// that is a width is 8px to the cell and takes its percentage from the
+    /// container's width, one that is a height is 16px to the line and takes
+    /// its percentage from a definite `height` — or is zero when there is none.
+    fn cross_distance(self, len: Length) -> i32 {
+        if self.vertical {
+            edge_h(len, self.width)
+        } else {
+            definite_v(len, self.cross_base).unwrap_or(0)
+        }
+        .max(0)
     }
 
     /// Whether this item opts out of §4.5's automatic minimum size by clipping

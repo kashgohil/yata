@@ -1,0 +1,83 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §5.2 and §9.6 before the code
+# existed, never regenerated.
+#
+# `wrap-reverse` does one thing: it swaps cross-start and cross-end. For a row
+# that means **cross-start is the bottom**, and everything else follows from
+# that one sentence rather than from a second set of rules — lines stack from
+# the bottom up, and every value that packs at cross-start packs downwards.
+# Items are 160px = 20 cells; each is one line of text.
+#
+# Row 1 — six items, four to a line as in `spec/flex-wrap`. The *lines* are
+#   what reversed, not the items: a b c d is still the first line and still
+#   reads left to right, but it is now the lower of the two rows (y = 1) and
+#   e f sits above it (y = 0). Reversing the items as well would need
+#   `row-reverse`, which is a different property answering a different
+#   question.
+#
+# Row 2 — `align-items: flex-start` **puts the items at the bottom of their
+#   line**, which is the whole of what the flip means for alignment and reads
+#   as a bug to anyone who has not met it. Both items fit on one line, the
+#   container states 4 rows, and `align-content: stretch` (the initial value)
+#   grows that one line to fill all 4 — so the line is the container's content
+#   box and its cross-start edge is the container's bottom row, y = 5.
+#
+# Row 3 — `align-items: flex-end` is the same sentence from the other end: it
+#   packs at cross-end, which is now the top, y = 6.
+#
+# Row 4 — `stretch`, the initial value, is the one alignment the flip cannot
+#   move: an item that fills its line fills it from either end. The items are
+#   4 rows tall and start at the line's top row, y = 10.
+<html>  x=0 y=0 w=80 h=14
+  <body>  x=0 y=0 w=80 h=14
+    <div.rev> flex row wrap-reverse  x=0 y=0 w=80 h=2
+      <div>  x=0 y=1 w=20 h=1
+        anonymous  x=0 y=1 w=20 h=1
+          line  x=0 y=1 w=20 h=1
+            #text "a"  x=0 y=1 w=1 h=1
+      <div>  x=20 y=1 w=20 h=1
+        anonymous  x=20 y=1 w=20 h=1
+          line  x=20 y=1 w=20 h=1
+            #text "b"  x=20 y=1 w=1 h=1
+      <div>  x=40 y=1 w=20 h=1
+        anonymous  x=40 y=1 w=20 h=1
+          line  x=40 y=1 w=20 h=1
+            #text "c"  x=40 y=1 w=1 h=1
+      <div>  x=60 y=1 w=20 h=1
+        anonymous  x=60 y=1 w=20 h=1
+          line  x=60 y=1 w=20 h=1
+            #text "d"  x=60 y=1 w=1 h=1
+      <div>  x=0 y=0 w=20 h=1
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "e"  x=0 y=0 w=1 h=1
+      <div>  x=20 y=0 w=20 h=1
+        anonymous  x=20 y=0 w=20 h=1
+          line  x=20 y=0 w=20 h=1
+            #text "f"  x=20 y=0 w=1 h=1
+    <div.rev.tall.top> flex row wrap-reverse  x=0 y=2 w=80 h=4
+      <div>  x=0 y=5 w=20 h=1
+        anonymous  x=0 y=5 w=20 h=1
+          line  x=0 y=5 w=20 h=1
+            #text "a"  x=0 y=5 w=1 h=1
+      <div>  x=20 y=5 w=20 h=1
+        anonymous  x=20 y=5 w=20 h=1
+          line  x=20 y=5 w=20 h=1
+            #text "b"  x=20 y=5 w=1 h=1
+    <div.rev.tall.bottom> flex row wrap-reverse  x=0 y=6 w=80 h=4
+      <div>  x=0 y=6 w=20 h=1
+        anonymous  x=0 y=6 w=20 h=1
+          line  x=0 y=6 w=20 h=1
+            #text "a"  x=0 y=6 w=1 h=1
+      <div>  x=20 y=6 w=20 h=1
+        anonymous  x=20 y=6 w=20 h=1
+          line  x=20 y=6 w=20 h=1
+            #text "b"  x=20 y=6 w=1 h=1
+    <div.rev.tall> flex row wrap-reverse  x=0 y=10 w=80 h=4
+      <div>  x=0 y=10 w=20 h=4
+        anonymous  x=0 y=10 w=20 h=1
+          line  x=0 y=10 w=20 h=1
+            #text "a"  x=0 y=10 w=1 h=1
+      <div>  x=20 y=10 w=20 h=4
+        anonymous  x=20 y=10 w=20 h=1
+          line  x=20 y=10 w=20 h=1
+            #text "b"  x=20 y=10 w=1 h=1

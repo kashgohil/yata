@@ -1,0 +1,16 @@
+<!-- width: 80 -->
+<!doctype html>
+<html><head><style>
+body { margin: 0 }
+.row { display: flex; flex-wrap: wrap }
+.row div { flex: 0 0 160px }
+.gapped { gap: 2em }
+.grow div { flex: 1 1 192px }
+.wide div { flex: 0 0 800px }
+</style></head>
+<body>
+<div class="row"><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div><div>f</div></div>
+<div class="row gapped"><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div><div>f</div></div>
+<div class="row grow"><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div></div>
+<div class="row wide"><div>a</div><div>b</div></div>
+</body></html>

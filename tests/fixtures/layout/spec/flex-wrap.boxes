@@ -1,0 +1,118 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.3 step 5 (line collection)
+# before the code existed, never regenerated.
+#
+# Every item here is `flex-basis` in disguise: 160px = 20 cells, 192px = 24,
+# 800px = 100 (PLAN.md's unit table, 8px per cell), and every item's content is
+# one letter on one line, so the cross axis stays out of the way.
+#
+# Row 1 — the basic cut. Six 20-cell items in 80 cells: the fourth still fits
+#   (4 x 20 = 80 exactly), the fifth would make 100, so the line ends after
+#   four. x = 0, 20, 40, 60 on the first line and 0, 20 on the second; the
+#   second line sits at y = 1 because the first is one row tall, and the
+#   container is 2.
+#
+# Row 2 — the gap is part of the question. `gap: 2em` is both gaps at once, and
+#   they land on different axes with different units: the main-axis one is
+#   `column-gap`, 2em = 32px = 4 cells, and the cross-axis one is `row-gap`,
+#   2em = 32px = 2 *lines*. Collecting now asks whether `used + gap + item`
+#   fits: 20, 44, 68, and a fourth item would be 92 — so three per line, at
+#   x = 0, 24, 48. Without the gap in the test this row would have taken four
+#   items and overflowed by 12 cells. The two lines are one row each with two
+#   rows of `row-gap` between them, so the second is at y = 5 and the container
+#   is 4 rows tall.
+#
+# Row 3 — **hypothetical sizes, not post-grow ones**, which is the rule this
+#   fixture exists to pin. Five `flex: 1 1 192px` items: the basis is 24 cells,
+#   so three fit (72) and a fourth would be 96. Only *then* does §9.7 run, on
+#   each line separately: line one divides 80 between three items — 26.666…
+#   each, floored to 26 with the two leftover cells going to the earliest items
+#   — so 27, 27, 26 at x = 0, 27, 54, and line two gives its two items 40 each.
+#   Collect on those grown sizes instead and the answer is circular: the items
+#   are 27 wide *because* three of them shared a line.
+#
+# Row 4 — an item wider than the whole container. §9.3 step 5 collects the
+#   first item of a line without asking whether it fits, so each 100-cell item
+#   gets a line of its own and overflows it. The alternative readings are both
+#   worse: dropped items, or an empty line before every oversized one.
+<html>  x=0 y=0 w=80 h=10
+  <body>  x=0 y=0 w=80 h=10
+    <div.row> flex row wrap  x=0 y=0 w=80 h=2
+      <div>  x=0 y=0 w=20 h=1
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div>  x=20 y=0 w=20 h=1
+        anonymous  x=20 y=0 w=20 h=1
+          line  x=20 y=0 w=20 h=1
+            #text "b"  x=20 y=0 w=1 h=1
+      <div>  x=40 y=0 w=20 h=1
+        anonymous  x=40 y=0 w=20 h=1
+          line  x=40 y=0 w=20 h=1
+            #text "c"  x=40 y=0 w=1 h=1
+      <div>  x=60 y=0 w=20 h=1
+        anonymous  x=60 y=0 w=20 h=1
+          line  x=60 y=0 w=20 h=1
+            #text "d"  x=60 y=0 w=1 h=1
+      <div>  x=0 y=1 w=20 h=1
+        anonymous  x=0 y=1 w=20 h=1
+          line  x=0 y=1 w=20 h=1
+            #text "e"  x=0 y=1 w=1 h=1
+      <div>  x=20 y=1 w=20 h=1
+        anonymous  x=20 y=1 w=20 h=1
+          line  x=20 y=1 w=20 h=1
+            #text "f"  x=20 y=1 w=1 h=1
+    <div.row.gapped> flex row wrap  x=0 y=2 w=80 h=4
+      <div>  x=0 y=2 w=20 h=1
+        anonymous  x=0 y=2 w=20 h=1
+          line  x=0 y=2 w=20 h=1
+            #text "a"  x=0 y=2 w=1 h=1
+      <div>  x=24 y=2 w=20 h=1
+        anonymous  x=24 y=2 w=20 h=1
+          line  x=24 y=2 w=20 h=1
+            #text "b"  x=24 y=2 w=1 h=1
+      <div>  x=48 y=2 w=20 h=1
+        anonymous  x=48 y=2 w=20 h=1
+          line  x=48 y=2 w=20 h=1
+            #text "c"  x=48 y=2 w=1 h=1
+      <div>  x=0 y=5 w=20 h=1
+        anonymous  x=0 y=5 w=20 h=1
+          line  x=0 y=5 w=20 h=1
+            #text "d"  x=0 y=5 w=1 h=1
+      <div>  x=24 y=5 w=20 h=1
+        anonymous  x=24 y=5 w=20 h=1
+          line  x=24 y=5 w=20 h=1
+            #text "e"  x=24 y=5 w=1 h=1
+      <div>  x=48 y=5 w=20 h=1
+        anonymous  x=48 y=5 w=20 h=1
+          line  x=48 y=5 w=20 h=1
+            #text "f"  x=48 y=5 w=1 h=1
+    <div.row.grow> flex row wrap  x=0 y=6 w=80 h=2
+      <div>  x=0 y=6 w=27 h=1
+        anonymous  x=0 y=6 w=27 h=1
+          line  x=0 y=6 w=27 h=1
+            #text "a"  x=0 y=6 w=1 h=1
+      <div>  x=27 y=6 w=27 h=1
+        anonymous  x=27 y=6 w=27 h=1
+          line  x=27 y=6 w=27 h=1
+            #text "b"  x=27 y=6 w=1 h=1
+      <div>  x=54 y=6 w=26 h=1
+        anonymous  x=54 y=6 w=26 h=1
+          line  x=54 y=6 w=26 h=1
+            #text "c"  x=54 y=6 w=1 h=1
+      <div>  x=0 y=7 w=40 h=1
+        anonymous  x=0 y=7 w=40 h=1
+          line  x=0 y=7 w=40 h=1
+            #text "d"  x=0 y=7 w=1 h=1
+      <div>  x=40 y=7 w=40 h=1
+        anonymous  x=40 y=7 w=40 h=1
+          line  x=40 y=7 w=40 h=1
+            #text "e"  x=40 y=7 w=1 h=1
+    <div.row.wide> flex row wrap  x=0 y=8 w=80 h=2
+      <div>  x=0 y=8 w=100 h=1
+        anonymous  x=0 y=8 w=100 h=1
+          line  x=0 y=8 w=100 h=1
+            #text "a"  x=0 y=8 w=1 h=1
+      <div>  x=0 y=9 w=100 h=1
+        anonymous  x=0 y=9 w=100 h=1
+          line  x=0 y=9 w=100 h=1
+            #text "b"  x=0 y=9 w=1 h=1

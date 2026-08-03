@@ -1,0 +1,16 @@
+<!-- width: 80 -->
+<!doctype html>
+<html><head><style>
+body { margin: 0 }
+.rev { display: flex; flex-wrap: wrap-reverse }
+.rev div { flex: 0 0 160px }
+.tall { height: 4em }
+.top { align-items: flex-start }
+.bottom { align-items: flex-end }
+</style></head>
+<body>
+<div class="rev"><div>a</div><div>b</div><div>c</div><div>d</div><div>e</div><div>f</div></div>
+<div class="rev tall top"><div>a</div><div>b</div></div>
+<div class="rev tall bottom"><div>a</div><div>b</div></div>
+<div class="rev tall"><div>a</div><div>b</div></div>
+</body></html>

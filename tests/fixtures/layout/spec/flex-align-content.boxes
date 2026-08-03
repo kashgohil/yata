@@ -1,0 +1,86 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.6 step 15 and css-align-3 §8
+# before the code existed, never regenerated.
+#
+# Every container here is the same shape, so only the property changes. Two
+# items of 400px = 50 cells cannot share an 80-cell line, so each gets one, and
+# each line is one row tall because each item is one line of text. The
+# container states `height: 6em` = 6 rows, so its inner cross size is definite
+# and there are 6 - 2 = **4 leftover rows** for `align-content` to place. That
+# definite height is the whole precondition: a container as tall as its own
+# content has nothing left over and every value below would do the same
+# nothing, which is why `align-content` looks broken on most pages that reach
+# for it.
+#
+# `align-content` is `justify-content` on the other axis — same value list,
+# same rounding — so the four rows are handed out the same six ways, with the
+# lines standing in for the items:
+#
+#   flex-start      lines at 0 and 1, the 4 rows left at the end
+#   flex-end        4 rows first: lines at 4 and 5
+#   center          2 rows each end: lines at 2 and 3
+#   space-between   everything in the one gap between them: 0 and 5
+#   space-around    half a share at each end, a whole one between: weights
+#                   1 : 2 : 1 over 4 rows divide exactly, so lines at 1 and 4
+#   stretch         the odd one out, and the initial value: it grows the lines
+#                   instead of moving them. 4 rows over 2 lines is 2 each, so
+#                   both lines are 3 rows tall, at 0 and 3 — and the items,
+#                   which are `align-items: stretch` by default, fill them.
+#
+# The rows a container leaves empty are still its own: every container is 6
+# rows tall whatever its lines did, so they start at y = 0, 6, 12, 18, 24, 30.
+<html>  x=0 y=0 w=80 h=36
+  <body>  x=0 y=0 w=80 h=36
+    <div.wrap.start> flex row wrap  x=0 y=0 w=80 h=6
+      <div>  x=0 y=0 w=50 h=1
+        anonymous  x=0 y=0 w=50 h=1
+          line  x=0 y=0 w=50 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div>  x=0 y=1 w=50 h=1
+        anonymous  x=0 y=1 w=50 h=1
+          line  x=0 y=1 w=50 h=1
+            #text "b"  x=0 y=1 w=1 h=1
+    <div.wrap.end> flex row wrap  x=0 y=6 w=80 h=6
+      <div>  x=0 y=10 w=50 h=1
+        anonymous  x=0 y=10 w=50 h=1
+          line  x=0 y=10 w=50 h=1
+            #text "a"  x=0 y=10 w=1 h=1
+      <div>  x=0 y=11 w=50 h=1
+        anonymous  x=0 y=11 w=50 h=1
+          line  x=0 y=11 w=50 h=1
+            #text "b"  x=0 y=11 w=1 h=1
+    <div.wrap.mid> flex row wrap  x=0 y=12 w=80 h=6
+      <div>  x=0 y=14 w=50 h=1
+        anonymous  x=0 y=14 w=50 h=1
+          line  x=0 y=14 w=50 h=1
+            #text "a"  x=0 y=14 w=1 h=1
+      <div>  x=0 y=15 w=50 h=1
+        anonymous  x=0 y=15 w=50 h=1
+          line  x=0 y=15 w=50 h=1
+            #text "b"  x=0 y=15 w=1 h=1
+    <div.wrap.between> flex row wrap  x=0 y=18 w=80 h=6
+      <div>  x=0 y=18 w=50 h=1
+        anonymous  x=0 y=18 w=50 h=1
+          line  x=0 y=18 w=50 h=1
+            #text "a"  x=0 y=18 w=1 h=1
+      <div>  x=0 y=23 w=50 h=1
+        anonymous  x=0 y=23 w=50 h=1
+          line  x=0 y=23 w=50 h=1
+            #text "b"  x=0 y=23 w=1 h=1
+    <div.wrap.around> flex row wrap  x=0 y=24 w=80 h=6
+      <div>  x=0 y=25 w=50 h=1
+        anonymous  x=0 y=25 w=50 h=1
+          line  x=0 y=25 w=50 h=1
+            #text "a"  x=0 y=25 w=1 h=1
+      <div>  x=0 y=28 w=50 h=1
+        anonymous  x=0 y=28 w=50 h=1
+          line  x=0 y=28 w=50 h=1
+            #text "b"  x=0 y=28 w=1 h=1
+    <div.wrap.stretch> flex row wrap  x=0 y=30 w=80 h=6
+      <div>  x=0 y=30 w=50 h=3
+        anonymous  x=0 y=30 w=50 h=1
+          line  x=0 y=30 w=50 h=1
+            #text "a"  x=0 y=30 w=1 h=1
+      <div>  x=0 y=33 w=50 h=3
+        anonymous  x=0 y=33 w=50 h=1
+          line  x=0 y=33 w=50 h=1
+            #text "b"  x=0 y=33 w=1 h=1

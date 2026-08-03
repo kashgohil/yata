@@ -379,7 +379,10 @@ mod tests {
     fn row_gap_is_the_cross_axis_gap_and_a_row_has_one_line() {
         // `gap: <row> <column>`: the row gap goes *between lines*, and a
         // `nowrap` row has a single line, so it must not reach the main axis or
-        // the container's height. M9.10 is where it starts doing something.
+        // the container's height. M9.10 gave it something to sit between —
+        // `a_wrapping_row_keeps_every_item_and_tiles_its_lines_at_every_width`
+        // is where it does — and this row still has one line, so nothing here
+        // moved.
         let row = "<div id=r><div>a</div><div>b</div></div>";
         let sizing = "#r div { flex: 0 0 80px }";
         let both = format!("#r {{ display: flex; gap: 4em 1em }} {sizing}");
@@ -1304,6 +1307,167 @@ mod tests {
             Some(&1),
             "the `height: 100%` child is still its content's 1 line"
         );
+    }
+
+    // ---- M9.10 wrapping and `align-content` ---------------------------------
+
+    #[test]
+    fn a_wrapping_row_keeps_every_item_and_tiles_its_lines_at_every_width() {
+        // The invariant sweep for wrapping, over the whole stage. Whatever the
+        // terminal width: every item still has a box, no line is empty, items
+        // on a line keep their order and their gap, and the container is
+        // exactly as tall as its lines and the gaps between them — a cross axis
+        // that leaked a row would show up here as a container an inch taller
+        // than its own content on some widths and not others.
+        let markup = "<div id=r><div>alpha</div><div>beta</div><div>gamma</div>\
+                      <div>delta</div><div>epsilon</div><div>zeta</div></div>";
+        let css = "#r { display: flex; flex-wrap: wrap; gap: 1em }
+                   #r div { flex: 0 0 160px }";
+        for width in 20..=120u16 {
+            let (dom, styles) = styled_dom(markup, css);
+            let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+            let mut container = 0;
+            let mut boxes = Vec::new();
+            tree.walk(tree.root, &mut |_, b| {
+                if b.kind == BoxKind::Flex {
+                    container = b.dimensions.content.height;
+                    boxes = b
+                        .children
+                        .iter()
+                        .map(|&c| tree.get(c).dimensions.margin_box())
+                        .collect();
+                }
+            });
+            let label = format!("width {width}: {boxes:?}");
+            assert_eq!(boxes.len(), 6, "{label}: an item went missing");
+            // Group the items into lines by the row they were placed on, in
+            // layout order — which is the order the algorithm collected them.
+            let mut rows: Vec<Vec<Rect>> = Vec::new();
+            for b in &boxes {
+                match rows.last_mut() {
+                    Some(row) if row[0].y == b.y => row.push(*b),
+                    _ => rows.push(vec![*b]),
+                }
+            }
+            let mut expected_y = 0;
+            for (idx, row) in rows.iter().enumerate() {
+                // `gap: 1em` is both gaps: 2 cells between items on a line, and
+                // one *row* between the lines themselves.
+                if idx > 0 {
+                    expected_y += 1;
+                }
+                assert_eq!(row[0].y, expected_y, "{label}: line {idx} is misplaced");
+                for pair in row.windows(2) {
+                    assert!(pair[1].x - pair[0].right() >= 2, "{label}");
+                }
+                expected_y += row.iter().map(|b| b.height).max().unwrap_or(0);
+            }
+            // No line is empty (every group came from an item), and the
+            // container is exactly the lines it holds.
+            assert_eq!(container, expected_y, "{label}: lines do not tile");
+        }
+    }
+
+    #[test]
+    fn wrapping_moves_everything_inside_the_item_it_moves() {
+        // The wrapping counterpart of
+        // `moving_a_column_item_moves_everything_inside_it`, and the case M9.10
+        // added: a wrapping column places its items *across* after building
+        // them, so a subtree now moves sideways as well as down. The classic
+        // flex bug — a box that moved and left its text behind — would live
+        // here if it lived anywhere.
+        let col = "<div id=r><div>one</div><div>two</div><div><b>hi</b> there</div></div>";
+        let css = "#r { display: flex; flex-direction: column; flex-wrap: wrap;
+                   height: 32px; align-content: flex-start }";
+        // Two 1-line items fill the 2-line container, so the third starts a
+        // second column at x = 3 — the width of the first column, which is the
+        // widest item on it ("one" and "two" are 3 cells each).
+        assert_eq!(
+            item_boxes(col, css, 40),
+            [(0, 0, 3, 1), (0, 1, 3, 1), (3, 0, 8, 1)]
+        );
+
+        let (dom, styles) = styled_dom(col, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut texts = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text {
+                texts.push((
+                    b.text.clone().unwrap_or_default(),
+                    b.dimensions.content.x,
+                    b.dimensions.content.y,
+                ));
+            }
+        });
+        // "hi" and "there" are inside the item that moved, and both went with
+        // it: they are on the second column's row 0, not back at x = 0.
+        let moved: Vec<_> = texts.iter().filter(|(_, x, _)| *x >= 3).collect();
+        assert_eq!(moved.len(), 2, "the second column's text: {texts:?}");
+        for (text, x, y) in moved {
+            assert!(*x >= 3 && *y == 0, "{text:?} left behind at {x},{y}");
+        }
+        // ...and it is really on screen there: row 0 reads across both columns.
+        assert_eq!(
+            plain(&lines_styled(col, css, 40))[0].trim_end(),
+            "onehi there"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_link_hit_tests_where_it_was_drawn() {
+        // The rest of the browser has to agree with the wrap. Two 20-cell links
+        // in a 30-cell container: the second one wraps to row 1, and `/2` must
+        // answer there rather than where an unwrapped row would have put it.
+        let row = "<div id=r><a href=/1>one</a><a href=/2>two</a></div>";
+        let css = "#r { display: flex; flex-wrap: wrap } a { flex: 0 0 160px }";
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 30, Hidden::Respect);
+        assert_eq!(
+            hit::link_at(&tree, &dom, 1, 0).map(|(_, u)| u),
+            Some("/1".into())
+        );
+        assert_eq!(
+            hit::link_at(&tree, &dom, 1, 1).map(|(_, u)| u),
+            Some("/2".into())
+        );
+        // The DOM is untouched, as it is for `order` and the reversed
+        // directions: wrapping is a layout instruction, not an edit.
+        assert_eq!(
+            hit::dom_links(&dom)
+                .iter()
+                .map(|(_, u)| u.as_str())
+                .collect::<Vec<_>>(),
+            ["/1", "/2"]
+        );
+    }
+
+    #[test]
+    fn baseline_items_still_share_a_row_under_wrap_reverse() {
+        // `wrap-reverse` swaps cross-start and cross-end, and the one value
+        // that cannot simply be reflected is `baseline`: reflecting each item
+        // inside its line would align them by their heights instead of by their
+        // text, which is the one thing the value exists to prevent. So a
+        // baseline is measured from the item's *cross-start* edge — the bottom,
+        // here — and the group ends up flush with the bottom of the line with
+        // its baselines still on one row.
+        let row = "<div id=r><div class=pad>a</div><div>b</div></div>";
+        let css = "#r { display: flex; flex-wrap: wrap-reverse; align-items: baseline }
+                   #r div { flex: 0 0 80px } .pad { padding-top: 16px }";
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut rows = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text {
+                rows.push((b.text.clone().unwrap_or_default(), b.dimensions.content.y));
+            }
+        });
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].1, rows[1].1, "the baselines split up: {rows:?}");
+        // ...and the same fixture the other way up puts them on the same row
+        // too, one row higher, because the padded item is the taller one and a
+        // reversed line hangs from its far edge.
+        let upright = css.replace("wrap-reverse", "wrap");
+        assert_eq!(cross(row, &upright, 40), cross(row, css, 40));
     }
 
     #[test]
