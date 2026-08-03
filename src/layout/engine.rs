@@ -695,26 +695,42 @@ impl<'a> Engine<'a> {
                 // against the same containing width, so an item occupies
                 // exactly the outer size §9.7 divided the line into and §9.5
                 // placed — the invariant the whole line's arithmetic rests on.
+                // The auto-margin share is deliberately *not* in it: that is
+                // the line's space, sitting beside the box rather than in it.
                 let lead = dims.margin.left + dims.border.left + dims.padding.left;
-                let outer_main = main_size + item.metrics.outer_edges + auto_left + auto_right;
+                let own_outer = main_size + item.metrics.outer_edges;
 
                 // Replaced and line-generating children keep their own layout
                 // paths rather than being re-derived here: an `<img>` item is
                 // its image, not a block container that happens to be
                 // `main_size` wide. `<br>` and `<hr>` size themselves from the
                 // width they are handed and take their own edges back out of
-                // it, so the outer size is what they should be given.
+                // it, so their own outer size is what they should be given —
+                // starting past the auto margin, never across it. Hand one the
+                // auto share as well and it fills the very cells §9.5 reserved
+                // to push it along.
                 if matches!(tag.as_str(), "img" | "br" | "hr") {
                     let mut prev_mb = 0;
                     if let Some(child) = self.layout_node(
                         node,
-                        left,
-                        outer_main,
+                        left + auto_left,
+                        own_outer,
                         containing_height,
                         container.y,
                         &mut prev_mb,
                         pre,
                     ) {
+                        // The cells §9.5 granted this item's auto margins are
+                        // part of its margin box, not just of the line's
+                        // arithmetic: an item whose box did not record them
+                        // would sit correctly and still leave the row's boxes
+                        // failing to tile it, which is the invariant M9.8's
+                        // cross-axis work will be read against. They are the
+                        // one thing the inner layout could not know — it was
+                        // handed this item's own outer size and nothing else.
+                        let built = &mut self.boxes[child.0 as usize].dimensions;
+                        built.margin.left += auto_left;
+                        built.margin.right += auto_right;
                         if tag == "img" {
                             // `layout_img_block` floors an image at its
                             // intrinsic width and ignores its margins: right
@@ -724,9 +740,8 @@ impl<'a> Engine<'a> {
                             // advanced the cursor by its intrinsic width and
                             // the line silently kept free space the algorithm
                             // had already given away.
-                            let dims = &mut self.boxes[child.0 as usize].dimensions;
-                            dims.content.x = left + lead;
-                            dims.content.width = main_size;
+                            built.content.x = left + lead;
+                            built.content.width = main_size;
                         }
                         return child;
                     }

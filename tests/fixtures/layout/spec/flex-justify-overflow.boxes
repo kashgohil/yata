@@ -8,10 +8,16 @@
 #
 # Negative free space is not distributed. §9.5 step 1 only fires "if the
 # remaining free space is positive", so auto margins are zero, and every
-# packing value falls back to `flex-start` — a browser's "safe" behaviour.
-# Centring an overflowing row would push its first item 20 cells off the
-# main-start edge, where nothing can bring it back: a terminal scrolls
-# vertically, and there is no negative column to scroll to.
+# packing value here falls back to `flex-start`.
+#
+# That last part is a deliberate departure, and this golden is where it is
+# written down. css-align-3 §9.3 only specifies the `flex-start` fallback for
+# `space-between`; `space-around` and `space-evenly` fall back to `center`, and
+# `center` is *unsafe* by default — a browser lets an overflowing row hang off
+# both ends. This engine does what `safe center` does instead. The reason is
+# the medium: a browser's start-edge overflow is recoverable, because the
+# reader can scroll left to it, and a terminal has no negative column. The
+# first item would not be clipped, it would be gone.
 #
 # Row 1 — `justify-content: center`, packed from main-start anyway:
 #   x = 0, 40, 80. The third item is entirely past the right edge, which is

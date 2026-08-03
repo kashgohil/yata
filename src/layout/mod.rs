@@ -692,6 +692,58 @@ mod tests {
     }
 
     #[test]
+    fn an_hr_item_is_pushed_by_its_auto_margin_instead_of_filling_it() {
+        // M9.7 review. `<hr>` and `<br>` are handed a width and size themselves
+        // from it, taking their own edges back out — which is why they are not
+        // re-derived like a block. The auto-margin share is not one of their
+        // edges: it is the line's space, sitting *beside* the box. Handed it as
+        // well, an `<hr>` stretched across the very cells §9.5 had reserved to
+        // push it right, and the row silently lost the margin it had granted.
+        let row = "<div id=r><hr></div>";
+        let pushed = "#r { display: flex } hr { flex: 0 0 80px; margin: 0; margin-left: auto }";
+        // Nothing here is compared against a number from the implementation:
+        // the same intent said the other way — `justify-content: flex-end` on a
+        // row with one item — has to produce the same boxes, and the two ways
+        // of pushing an item to main-end agreeing is the assertion.
+        let by_alignment =
+            "#r { display: flex; justify-content: flex-end } hr { flex: 0 0 80px; margin: 0 }";
+        assert_eq!(geometry(row, pushed, 40), geometry(row, by_alignment, 40));
+        // ...and it really is 10 cells at 30, not 40 cells at 0. The margin box
+        // starts at 0 and spans the whole 40, because the granted cells land on
+        // the *box* as well as on the line: a row whose items do not tile it is
+        // a row that has lost track of its own free space.
+        assert_eq!(items(row, pushed, 40), [(0, 10)]);
+        let (dom, styles) = styled_dom(row, pushed);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut tiled = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                tiled = b
+                    .children
+                    .iter()
+                    .map(|&c| tree.get(c).dimensions.margin_box().width)
+                    .collect();
+            }
+        });
+        assert_eq!(tiled, [40]);
+
+        // The same for a replaced item, which reaches the line by the same path
+        // and was already correct — pinned so the two stay together.
+        let img = "<div id=r><img src=logo.png width=80 height=16></div>";
+        let (dom, styles) = styled_dom(img, "#r { display: flex } img { margin-left: auto }");
+        let imgs = crate::image::discover(&dom, Some("https://fixture.test/page"));
+        let ctx = ImageContext::from_discovery(&imgs, &mut crate::image::ImageCache::default());
+        let tree = layout_document_with(&dom, &styles, 40, Hidden::Respect, &ctx);
+        let mut boxes = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Image {
+                boxes.push((b.dimensions.content.x, b.dimensions.content.width));
+            }
+        });
+        assert_eq!(boxes, [(30, 10)], "the image is pushed, not stretched");
+    }
+
+    #[test]
     fn row_reverse_starts_at_the_right_edge_and_hit_tests_where_it_drew() {
         // Main-start is the container's right edge, so the *first* item in
         // document order is the rightmost one and `flex-start` leaves its free

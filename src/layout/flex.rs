@@ -303,9 +303,16 @@ pub(super) fn place(
     // Negative free space is *overflow*, and there is nothing to distribute:
     // auto margins are treated as zero (§9.5 step 1 only fires "if the
     // remaining free space is positive") and every `justify-content` value
-    // falls back to packing at main-start, which is what a browser's "safe"
-    // behaviour does. Centring an overflowing row would push its first item
-    // off the main-start edge, where nothing can scroll it back into view.
+    // packs at main-start.
+    //
+    // **A deliberate departure, stated rather than hidden.** css-align-3 §9.3
+    // only falls back this way for `space-between`; `space-around` and
+    // `space-evenly` fall back to `center`, and `center` is *unsafe* by
+    // default, so a browser lets an overflowing row hang off both ends. That
+    // is the behaviour of `safe center` instead, chosen here because the
+    // overflow a browser hides at the start edge is recoverable — the reader
+    // scrolls left — and in a terminal it is not: there is no negative column,
+    // and the first item would simply be gone.
     let free = inner_main.saturating_sub(used).max(0);
 
     let mut placed = vec![Placed::default(); n];
