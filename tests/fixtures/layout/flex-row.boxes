@@ -7,11 +7,11 @@
             #text "moved to the"  x=0 y=0 w=12 h=1
           line  x=0 y=1 w=13 h=1
             #text "front"  x=0 y=1 w=5 h=1
-      <div.grow>  x=15 y=0 w=13 h=1
+      <div.grow>  x=15 y=0 w=13 h=2
         anonymous  x=15 y=0 w=13 h=1
           line  x=15 y=0 w=13 h=1
             #text "left"  x=15 y=0 w=4 h=1
-      <div.fixed>  x=30 y=0 w=10 h=1
+      <div.fixed>  x=30 y=0 w=10 h=2
         anonymous  x=30 y=0 w=10 h=1
           line  x=30 y=0 w=10 h=1
             #text "fixed"  x=30 y=0 w=5 h=1

@@ -655,10 +655,12 @@ mod tests {
     #[test]
     fn alignment_moves_everything_inside_the_item_it_moves() {
         // The classic flex bug is a centred item whose text stayed at the old
-        // x. It cannot happen in this engine's shape — an item is *placed*
-        // before its contents are laid out, so there is no second position to
-        // forget to update — and this is the test that says so rather than
-        // leaving it to a reader of the code.
+        // x. On the main axis it cannot happen in this engine's shape — an item
+        // is *placed* before its contents are laid out, so there is no second
+        // position to forget to update — and this is the test that says so
+        // rather than leaving it to a reader of the code. The cross axis does
+        // move built boxes and is pinned separately, in
+        // `cross_alignment_moves_everything_inside_the_item_it_moves`.
         let row = "<div id=r><div class=i><b>hi</b> there</div></div>";
         let css = "#r { display: flex; justify-content: center } .i { flex: 0 0 160px }";
         // One 20-cell item in 80 cells: 60 free, 30 of it before the item.
@@ -829,6 +831,134 @@ mod tests {
                     assert_eq!(boxes[0].0, 0, "{label}: overflow must pack at 0");
                 }
             }
+        }
+    }
+
+    // ---- M9.8 cross sizing and alignment -----------------------------------
+
+    /// Every flex item's `(margin-box y, content height)` under the container
+    /// with id `r`, in layout order — the cross-axis counterpart of [`items`].
+    fn cross(html_src: &str, css: &str, width: u16) -> Vec<(i32, i32)> {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        let mut out = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                out = b
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let d = tree.get(c).dimensions;
+                        (d.margin_box().y, d.content.height)
+                    })
+                    .collect();
+            }
+        });
+        out
+    }
+
+    #[test]
+    fn a_definite_container_height_is_the_lines_cross_size() {
+        // §9.4 step 7, and the case no golden built out of content can show:
+        // when the container states a height, *that* is the line the items are
+        // aligned in — not the tallest item's height. A 10-row container
+        // centres a 1-row item at 5 and a 3-row item at 4, and both would sit
+        // at 0 and 0 if the line were only as tall as its contents.
+        let row = "<div id=r><div class=a>one</div><div class=b>two words here</div></div>";
+        let css = "#r { display: flex; height: 10em; align-items: center }
+                   #r div { flex: 0 0 32px }";
+        assert_eq!(cross(row, css, 40), [(5, 1), (4, 3)]);
+        // The container really is 10 rows: `layout_box_at` applies the
+        // specified height exactly as it does for a block, and the flex code
+        // does not get a second say in it.
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut container = 0;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                container = b.dimensions.content.height;
+            }
+        });
+        assert_eq!(container, 10);
+    }
+
+    #[test]
+    fn stretching_never_squeezes_an_item_below_its_own_text() {
+        // §4.5 on the cross axis: `min-height: auto` on a flex item is its
+        // content height. A container 2 rows tall stretches its items to 2 —
+        // and an item with 5 rows of text in it keeps all 5 and overflows,
+        // rather than having its box end three rows above its own last line.
+        let row = "<div id=r><div>a b c d e</div></div>";
+        let css = "#r { display: flex; height: 2em } #r div { flex: 0 0 16px }";
+        assert_eq!(cross(row, css, 40), [(0, 5)]);
+        // An explicit `min-height` replaces the automatic one, and a page that
+        // states a floor of 1 row has said the text may be clipped: the item
+        // stretches to the line's 2 rows and stops there, three rows short of
+        // its own last line.
+        let with_min = format!("{css} #r div {{ min-height: 1em }}");
+        assert_eq!(cross(row, &with_min, 40), [(0, 2)]);
+    }
+
+    #[test]
+    fn cross_alignment_moves_everything_inside_the_item_it_moves() {
+        // The cross axis is the one place this stage moves a box *after*
+        // building it: a line's height is not known until its tallest item has
+        // been laid out, so a short item is built at the line's top edge and
+        // dropped into place afterwards. That is the shape the main axis was
+        // written to avoid, so the thing it risks — a box that moved and left
+        // its text behind — is pinned here instead.
+        let row = "<div id=r><div class=a><b>hi</b> there</div><div class=b>x y z w v</div></div>";
+        let css = "#r { display: flex; align-items: flex-end }
+                   .a { flex: 0 0 160px } .b { flex: 0 0 16px }";
+        // The second item is five 1-cell words in a 2-cell box, so the line is
+        // 5 rows and the one-row first item drops 4.
+        assert_eq!(cross(row, css, 40), [(4, 1), (0, 5)]);
+
+        let (dom, styles) = styled_dom(row, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let mut texts = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text {
+                texts.push((b.text.clone().unwrap_or_default(), b.dimensions.content.y));
+            }
+        });
+        assert_eq!(
+            texts,
+            [
+                ("hi".into(), 4),
+                (" there".into(), 4),
+                ("x".into(), 0),
+                ("y".into(), 1),
+                ("z".into(), 2),
+                ("w".into(), 3),
+                ("v".into(), 4),
+            ]
+        );
+        // ...and it is on screen where the boxes say: the moved item's text is
+        // on the row the alignment put it on, not on the row it was built at.
+        assert_eq!(
+            plain(&lines_styled(row, css, 40))[4],
+            "hi there            v"
+        );
+    }
+
+    #[test]
+    fn a_cross_axis_length_no_layout_can_hold_lays_out_instead_of_crashing() {
+        // The cross-axis half of the rule below, because this task added
+        // arithmetic on a new axis: a line's cross size, an item's free space
+        // in it, an auto margin's share of that. Every one of these
+        // declarations is legal CSS a page may serve, and every one of them
+        // has to come out as boxes rather than as an overflow panic.
+        for css in [
+            "#r { display: flex; height: 1e11em; align-items: flex-end }",
+            "#r { display: flex; align-items: center } #r div { height: 1e11em }",
+            "#r { display: flex; align-items: baseline } #r div { padding-top: 1e11em }",
+            "#r { display: flex } #r div { margin-top: auto; margin-bottom: 1e11em }",
+            "#r { display: flex; height: 1e11em } #r div { max-height: 1e11em }",
+        ] {
+            let (dom, styles) = styled_dom("<div id=r><div>a</div><div>b</div></div>", css);
+            let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+            assert!(tree.height >= 0, "css: {css}");
         }
     }
 

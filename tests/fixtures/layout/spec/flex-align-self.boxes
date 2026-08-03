@@ -1,0 +1,85 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.4 and §9.6, and css-align-3
+# §6.2 (`align-self`), before the code existed. Never regenerated.
+#
+# Both rows are three 6-cell items (`flex: 0 0 48px`) of 6-cell words, packed at
+# x = 0, 6, 12; the last item of each is 5 rows of content and so fixes the
+# line's cross size at 5. Both rows are therefore 5 rows tall and stack at
+# y = 0 and y = 5.
+#
+# Row 1 — `align-items: center`, one item disagreeing.
+#
+#   `align-self: auto` is the initial value and means "whatever the container
+#   said", so items b and c centre: b has 4 free rows and drops 2, c fills the
+#   line and does not move. Item a says `align-self: flex-end` and takes all 4
+#   of its free rows instead — one item can leave the container's alignment
+#   without the other two noticing.
+#
+#   a: y = 0 + 4 = 4     b: y = 0 + 2 = 2     c: y = 0
+#
+# Row 2 — `align-items` unset, so `stretch`, and the two ways an item refuses.
+#
+#   `stretch` only applies to an item whose cross size property is `auto`
+#   (§9.4 step 11), so item a — `height: 2em` — keeps the 2 rows it asked for,
+#   even though it is sitting in a 5-row line and even though 2 rows is more
+#   than the 1 row of text inside it. A page that states a height has already
+#   answered the question `stretch` is asking.
+#
+#   Item b has no height, so it stretches — up to `max-height: 3em`. The clamps
+#   are M9.2's, in M9.2's order: the stretch target (5) is clamped by the
+#   maximum (3) and then by the minimum, which for `min-height: auto` on a flex
+#   item is the item's own content height (1). 5 → 3 → 3.
+#
+#   Every item in this row sits at the line's cross-start edge: `stretch` grows
+#   boxes, it does not move them, and an item that could not grow is left where
+#   `flex-start` would have put it.
+#
+#   a: y = 5, h = 2      b: y = 5, h = 3      c: y = 5, h = 5
+#
+# In both rows the text inside an item stays on the item's own rows — the
+# anonymous block inside b is 1 row at y = 5 while the box around it is 3 —
+# because stretching is a change to the box, not a second layout of what is in
+# it.
+<html>  x=0 y=0 w=40 h=10
+  <body>  x=0 y=0 w=40 h=10
+    <div.row.mid> flex row  x=0 y=0 w=40 h=5
+      <div.self>  x=0 y=4 w=6 h=1
+        anonymous  x=0 y=4 w=6 h=1
+          line  x=0 y=4 w=6 h=1
+            #text "aaaaaa"  x=0 y=4 w=6 h=1
+      <div>  x=6 y=2 w=6 h=1
+        anonymous  x=6 y=2 w=6 h=1
+          line  x=6 y=2 w=6 h=1
+            #text "bbbbbb"  x=6 y=2 w=6 h=1
+      <div>  x=12 y=0 w=6 h=5
+        anonymous  x=12 y=0 w=6 h=5
+          line  x=12 y=0 w=6 h=1
+            #text "cccccc"  x=12 y=0 w=6 h=1
+          line  x=12 y=1 w=6 h=1
+            #text "dddddd"  x=12 y=1 w=6 h=1
+          line  x=12 y=2 w=6 h=1
+            #text "eeeeee"  x=12 y=2 w=6 h=1
+          line  x=12 y=3 w=6 h=1
+            #text "ffffff"  x=12 y=3 w=6 h=1
+          line  x=12 y=4 w=6 h=1
+            #text "gggggg"  x=12 y=4 w=6 h=1
+    <div.row> flex row  x=0 y=5 w=40 h=5
+      <div.fixed>  x=0 y=5 w=6 h=2
+        anonymous  x=0 y=5 w=6 h=1
+          line  x=0 y=5 w=6 h=1
+            #text "hhhhhh"  x=0 y=5 w=6 h=1
+      <div.capped>  x=6 y=5 w=6 h=3
+        anonymous  x=6 y=5 w=6 h=1
+          line  x=6 y=5 w=6 h=1
+            #text "iiiiii"  x=6 y=5 w=6 h=1
+      <div>  x=12 y=5 w=6 h=5
+        anonymous  x=12 y=5 w=6 h=5
+          line  x=12 y=5 w=6 h=1
+            #text "jjjjjj"  x=12 y=5 w=6 h=1
+          line  x=12 y=6 w=6 h=1
+            #text "kkkkkk"  x=12 y=6 w=6 h=1
+          line  x=12 y=7 w=6 h=1
+            #text "llllll"  x=12 y=7 w=6 h=1
+          line  x=12 y=8 w=6 h=1
+            #text "mmmmmm"  x=12 y=8 w=6 h=1
+          line  x=12 y=9 w=6 h=1
+            #text "nnnnnn"  x=12 y=9 w=6 h=1

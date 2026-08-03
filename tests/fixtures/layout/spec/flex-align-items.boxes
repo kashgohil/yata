@@ -1,0 +1,135 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.4 (cross sizing) and §9.6
+# (cross-axis alignment) before the code existed, never regenerated.
+#
+# Four rows, one per `align-items` value, each with the same three items.
+# `flex: 0 0 48px` is grow 0, shrink 0, basis 48px = 6 cells, so every item is
+# 6 cells wide and they pack at x = 0, 6, 12 — the main axis is M9.7's and does
+# not move here. Each word is exactly 6 cells, so no two words share a line and
+# the items are 1, 3 and 5 rows tall by their content alone. No item has a
+# `height`, which is what makes `stretch` apply to all three.
+#
+# §9.4 step 8: the line's cross size is its tallest item's outer cross size —
+# max(1, 3, 5) = 5. The container has no definite height of its own, so that
+# is also every row's content height, and the four rows stack at y = 0, 5, 10
+# and 15.
+#
+# §9.6, the free space each item has inside the 5-row line (5 - its own height,
+# so 4 / 2 / 0), and where its cross-start edge lands in each row:
+#
+#   value        item a (1 row)   item b (3 rows)   item c (5 rows)
+#   flex-start   +0               +0                +0
+#   center       +2               +1                +0
+#   flex-end     +4               +2                +0
+#   stretch      +0, grown to 5   +0, grown to 5    +0 (already 5)
+#
+# `center` splits an odd free space with the extra cell *above* the item — the
+# same "earliest slot first" rule M9.6's `quantize` and M9.7's `split` use — but
+# neither 4 nor 2 is odd here, so both halves are exact.
+#
+# `stretch` is the initial value of `align-items`, and the only one that changes
+# a box's *size*: items a and b become 5 rows tall. Their contents do not move
+# and are not laid out again — the anonymous block inside item a is still 1 row
+# at the row's first line, which is exactly what "only the box grows" means and
+# is what lets a background reach the full height of a card.
+<html>  x=0 y=0 w=40 h=20
+  <body>  x=0 y=0 w=40 h=20
+    <div.row.start> flex row  x=0 y=0 w=40 h=5
+      <div>  x=0 y=0 w=6 h=1
+        anonymous  x=0 y=0 w=6 h=1
+          line  x=0 y=0 w=6 h=1
+            #text "aaaaaa"  x=0 y=0 w=6 h=1
+      <div>  x=6 y=0 w=6 h=3
+        anonymous  x=6 y=0 w=6 h=3
+          line  x=6 y=0 w=6 h=1
+            #text "bbbbbb"  x=6 y=0 w=6 h=1
+          line  x=6 y=1 w=6 h=1
+            #text "cccccc"  x=6 y=1 w=6 h=1
+          line  x=6 y=2 w=6 h=1
+            #text "dddddd"  x=6 y=2 w=6 h=1
+      <div>  x=12 y=0 w=6 h=5
+        anonymous  x=12 y=0 w=6 h=5
+          line  x=12 y=0 w=6 h=1
+            #text "eeeeee"  x=12 y=0 w=6 h=1
+          line  x=12 y=1 w=6 h=1
+            #text "ffffff"  x=12 y=1 w=6 h=1
+          line  x=12 y=2 w=6 h=1
+            #text "gggggg"  x=12 y=2 w=6 h=1
+          line  x=12 y=3 w=6 h=1
+            #text "hhhhhh"  x=12 y=3 w=6 h=1
+          line  x=12 y=4 w=6 h=1
+            #text "iiiiii"  x=12 y=4 w=6 h=1
+    <div.row.mid> flex row  x=0 y=5 w=40 h=5
+      <div>  x=0 y=7 w=6 h=1
+        anonymous  x=0 y=7 w=6 h=1
+          line  x=0 y=7 w=6 h=1
+            #text "aaaaaa"  x=0 y=7 w=6 h=1
+      <div>  x=6 y=6 w=6 h=3
+        anonymous  x=6 y=6 w=6 h=3
+          line  x=6 y=6 w=6 h=1
+            #text "bbbbbb"  x=6 y=6 w=6 h=1
+          line  x=6 y=7 w=6 h=1
+            #text "cccccc"  x=6 y=7 w=6 h=1
+          line  x=6 y=8 w=6 h=1
+            #text "dddddd"  x=6 y=8 w=6 h=1
+      <div>  x=12 y=5 w=6 h=5
+        anonymous  x=12 y=5 w=6 h=5
+          line  x=12 y=5 w=6 h=1
+            #text "eeeeee"  x=12 y=5 w=6 h=1
+          line  x=12 y=6 w=6 h=1
+            #text "ffffff"  x=12 y=6 w=6 h=1
+          line  x=12 y=7 w=6 h=1
+            #text "gggggg"  x=12 y=7 w=6 h=1
+          line  x=12 y=8 w=6 h=1
+            #text "hhhhhh"  x=12 y=8 w=6 h=1
+          line  x=12 y=9 w=6 h=1
+            #text "iiiiii"  x=12 y=9 w=6 h=1
+    <div.row.end> flex row  x=0 y=10 w=40 h=5
+      <div>  x=0 y=14 w=6 h=1
+        anonymous  x=0 y=14 w=6 h=1
+          line  x=0 y=14 w=6 h=1
+            #text "aaaaaa"  x=0 y=14 w=6 h=1
+      <div>  x=6 y=12 w=6 h=3
+        anonymous  x=6 y=12 w=6 h=3
+          line  x=6 y=12 w=6 h=1
+            #text "bbbbbb"  x=6 y=12 w=6 h=1
+          line  x=6 y=13 w=6 h=1
+            #text "cccccc"  x=6 y=13 w=6 h=1
+          line  x=6 y=14 w=6 h=1
+            #text "dddddd"  x=6 y=14 w=6 h=1
+      <div>  x=12 y=10 w=6 h=5
+        anonymous  x=12 y=10 w=6 h=5
+          line  x=12 y=10 w=6 h=1
+            #text "eeeeee"  x=12 y=10 w=6 h=1
+          line  x=12 y=11 w=6 h=1
+            #text "ffffff"  x=12 y=11 w=6 h=1
+          line  x=12 y=12 w=6 h=1
+            #text "gggggg"  x=12 y=12 w=6 h=1
+          line  x=12 y=13 w=6 h=1
+            #text "hhhhhh"  x=12 y=13 w=6 h=1
+          line  x=12 y=14 w=6 h=1
+            #text "iiiiii"  x=12 y=14 w=6 h=1
+    <div.row.fill> flex row  x=0 y=15 w=40 h=5
+      <div>  x=0 y=15 w=6 h=5
+        anonymous  x=0 y=15 w=6 h=1
+          line  x=0 y=15 w=6 h=1
+            #text "aaaaaa"  x=0 y=15 w=6 h=1
+      <div>  x=6 y=15 w=6 h=5
+        anonymous  x=6 y=15 w=6 h=3
+          line  x=6 y=15 w=6 h=1
+            #text "bbbbbb"  x=6 y=15 w=6 h=1
+          line  x=6 y=16 w=6 h=1
+            #text "cccccc"  x=6 y=16 w=6 h=1
+          line  x=6 y=17 w=6 h=1
+            #text "dddddd"  x=6 y=17 w=6 h=1
+      <div>  x=12 y=15 w=6 h=5
+        anonymous  x=12 y=15 w=6 h=5
+          line  x=12 y=15 w=6 h=1
+            #text "eeeeee"  x=12 y=15 w=6 h=1
+          line  x=12 y=16 w=6 h=1
+            #text "ffffff"  x=12 y=16 w=6 h=1
+          line  x=12 y=17 w=6 h=1
+            #text "gggggg"  x=12 y=17 w=6 h=1
+          line  x=12 y=18 w=6 h=1
+            #text "hhhhhh"  x=12 y=18 w=6 h=1
+          line  x=12 y=19 w=6 h=1
+            #text "iiiiii"  x=12 y=19 w=6 h=1

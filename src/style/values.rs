@@ -458,6 +458,17 @@ impl AlignSelf {
             AlignSelf::Items(a) => a.name(),
         }
     }
+
+    /// The alignment this item actually gets, given its container's
+    /// `align-items` (css-align-3 §6.2). `align-self` is not inherited, so
+    /// this is a lookup at the container, not up the tree — an item three
+    /// levels down inside another flex item takes *its* container's value.
+    pub fn resolve(self, items: AlignItems) -> AlignItems {
+        match self {
+            AlignSelf::Auto => items,
+            AlignSelf::Items(a) => a,
+        }
+    }
 }
 
 pub fn parse_align_self(value: &str) -> Option<AlignSelf> {
@@ -1156,6 +1167,17 @@ mod tests {
             Some(AlignSelf::Items(AlignItems::FlexEnd))
         );
         assert_eq!(parse_align_self("space-between"), None);
+
+        // `auto` defers to the container's `align-items`, anything else wins
+        // over it — the one rule M9.8 needs from these two properties.
+        assert_eq!(
+            AlignSelf::Auto.resolve(AlignItems::Center),
+            AlignItems::Center
+        );
+        assert_eq!(
+            AlignSelf::Items(AlignItems::FlexEnd).resolve(AlignItems::Center),
+            AlignItems::FlexEnd
+        );
 
         assert_eq!(
             parse_align_content("space-around"),

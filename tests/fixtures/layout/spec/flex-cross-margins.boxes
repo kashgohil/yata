@@ -1,0 +1,62 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.6 step 1 (auto cross
+# margins) and §9.4 (positions are inside the container's content box) before
+# the code existed. Never regenerated.
+#
+# One row with `padding: 1em 2em` — 1 row above and below, 4 cells left and
+# right — so its content box is x = 4, y = 1, w = 32. Every item is placed
+# from *that* corner, not from the border box: a container's padding is space
+# no item may be in, on either axis.
+#
+# Four 6-cell items (`flex: 0 0 48px`) of 6-cell words, at x = 4, 10, 16, 22.
+# Item c is 5 rows of content, so the line's cross size is 5 and the row's
+# border box is 1 + 5 + 1 = 7 rows.
+#
+# The container asks for `align-items: center`. Then:
+#
+#   a  `align-self: flex-start` overrides the container — and `margin-top` and
+#      `margin-bottom: auto` override *that*, because §9.6 hands the free space
+#      to auto margins before the alignment property is ever read. 4 free rows
+#      split two and two, so the item is centred after all, by a different rule
+#      than the container's and with its margin box filling the line:
+#      y = 1 + 2 = 3.
+#
+#   b  one auto margin takes all 4 rows, which is how an item pins itself to
+#      the cross-end edge of a row: y = 1 + 4 = 5.
+#
+#   c  fills the line, so `center` has nothing to give it: y = 1.
+#
+#   d  3 rows in a 5-row line, centred: y = 1 + 1 = 2.
+#
+# Nothing here is stretched: `align-items: center` is not `stretch`, so every
+# item keeps the height its own content gave it.
+<html>  x=0 y=0 w=40 h=7
+  <body>  x=0 y=0 w=40 h=7
+    <div.row> flex row  x=4 y=1 w=32 h=5
+      <div.both>  x=4 y=3 w=6 h=1
+        anonymous  x=4 y=3 w=6 h=1
+          line  x=4 y=3 w=6 h=1
+            #text "aaaaaa"  x=4 y=3 w=6 h=1
+      <div.push>  x=10 y=5 w=6 h=1
+        anonymous  x=10 y=5 w=6 h=1
+          line  x=10 y=5 w=6 h=1
+            #text "bbbbbb"  x=10 y=5 w=6 h=1
+      <div>  x=16 y=1 w=6 h=5
+        anonymous  x=16 y=1 w=6 h=5
+          line  x=16 y=1 w=6 h=1
+            #text "cccccc"  x=16 y=1 w=6 h=1
+          line  x=16 y=2 w=6 h=1
+            #text "dddddd"  x=16 y=2 w=6 h=1
+          line  x=16 y=3 w=6 h=1
+            #text "eeeeee"  x=16 y=3 w=6 h=1
+          line  x=16 y=4 w=6 h=1
+            #text "ffffff"  x=16 y=4 w=6 h=1
+          line  x=16 y=5 w=6 h=1
+            #text "gggggg"  x=16 y=5 w=6 h=1
+      <div>  x=22 y=2 w=6 h=3
+        anonymous  x=22 y=2 w=6 h=3
+          line  x=22 y=2 w=6 h=1
+            #text "hhhhhh"  x=22 y=2 w=6 h=1
+          line  x=22 y=3 w=6 h=1
+            #text "iiiiii"  x=22 y=3 w=6 h=1
+          line  x=22 y=4 w=6 h=1
+            #text "jjjjjj"  x=22 y=4 w=6 h=1

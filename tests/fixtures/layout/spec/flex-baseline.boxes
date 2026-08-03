@@ -1,0 +1,76 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.4 step 8 and §8.3 (baseline
+# alignment and baseline synthesis) before the code existed. Never regenerated.
+#
+# A cell grid makes baseline alignment the *easy* case rather than the hard
+# one: every line box is exactly one row tall, so an item's baseline is simply
+# the row its first line of text sits on. Measured from the item's cross-start
+# margin edge, that is margin + border + padding + wherever the line landed
+# inside the content box.
+#
+# Row 1 — a label, a block with a rule and a row of padding above its text, and
+# a five-row label. All three are 6 cells wide (`flex: 0 0 48px`) with 6-cell
+# words, at x = 0, 6, 12.
+#
+#   item   outer cross   baseline   above   below
+#   a      1             0          0       1
+#   b      5             1 + 1 = 2  2       3
+#   c      5             0          0       5
+#
+# The line has to hold the deepest thing above the shared row and the deepest
+# thing below it: 2 + 5 = 7 rows — two more than the tallest item on it, which
+# is what "the line's cross size grows" means. Nothing else on the page is 7
+# rows tall; the alignment made it so.
+#
+# Each item then drops by (deepest baseline − its own): a and c by 2, b by 0.
+# So b's border sits on row 0, its padding on row 1, and all three items' first
+# text rows land on row 2 — which is the whole point of asking for `baseline`.
+#
+# Row 2 — the items with no text at all, at y = 7.
+#
+#   §8.3: an item with no line box synthesises its baseline from its cross-end
+#   *border* edge, so it hangs off the shared row the way a letter sits on a
+#   rule. The empty div is 1 row of border and nothing else, so its baseline is
+#   1; the image is 2 rows tall (16 × 32 px is 2 × 2 cells), so its baseline is
+#   2; the label's is 0.
+#
+#   above = max(1, 2, 0) = 2, below = max(0, 0, 1) = 1, so the line is 3 rows.
+#   The empty div drops 1 row, the image 0, the label 2 — putting the div's
+#   border, the image's bottom row and the label's text all on row 9.
+#
+#   The image keeps its own width: `.row div` does not match it, so its main
+#   size is its intrinsic 2 cells rather than the 6 the divs asked for, and the
+#   label starts at x = 8.
+<html>  x=0 y=0 w=40 h=10
+  <body>  x=0 y=0 w=40 h=10
+    <div.row> flex row  x=0 y=0 w=40 h=7
+      <div>  x=0 y=2 w=6 h=1
+        anonymous  x=0 y=2 w=6 h=1
+          line  x=0 y=2 w=6 h=1
+            #text "aaaaaa"  x=0 y=2 w=6 h=1
+      <div.pad>  x=6 y=2 w=6 h=3
+        anonymous  x=6 y=2 w=6 h=3
+          line  x=6 y=2 w=6 h=1
+            #text "bbbbbb"  x=6 y=2 w=6 h=1
+          line  x=6 y=3 w=6 h=1
+            #text "cccccc"  x=6 y=3 w=6 h=1
+          line  x=6 y=4 w=6 h=1
+            #text "dddddd"  x=6 y=4 w=6 h=1
+      <div>  x=12 y=2 w=6 h=5
+        anonymous  x=12 y=2 w=6 h=5
+          line  x=12 y=2 w=6 h=1
+            #text "eeeeee"  x=12 y=2 w=6 h=1
+          line  x=12 y=3 w=6 h=1
+            #text "ffffff"  x=12 y=3 w=6 h=1
+          line  x=12 y=4 w=6 h=1
+            #text "gggggg"  x=12 y=4 w=6 h=1
+          line  x=12 y=5 w=6 h=1
+            #text "hhhhhh"  x=12 y=5 w=6 h=1
+          line  x=12 y=6 w=6 h=1
+            #text "iiiiii"  x=12 y=6 w=6 h=1
+    <div.row> flex row  x=0 y=7 w=40 h=3
+      <div.edge>  x=0 y=9 w=6 h=0
+      img "pic" https://fixture.test/p.png  x=6 y=7 w=2 h=2
+      <div>  x=8 y=9 w=6 h=1
+        anonymous  x=8 y=9 w=6 h=1
+          line  x=8 y=9 w=6 h=1
+            #text "xxxxxx"  x=8 y=9 w=6 h=1

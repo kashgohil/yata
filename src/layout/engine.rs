@@ -11,7 +11,8 @@ use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
 use crate::layout::flex;
 use crate::layout::intrinsic::IntrinsicSizer;
 use crate::style::values::{
-    BoxSizing, Display, FlexBasis, FlexDirection, FontStyle, FontWeight, Length, TextAlign,
+    AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FontStyle, FontWeight, Length,
+    TextAlign,
 };
 use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
@@ -521,17 +522,20 @@ impl<'a> Engine<'a> {
     /// divided) and §9.5 (where they go). Returns the container's used content
     /// height, which for a single row is its tallest item.
     ///
-    /// Scope, M9.7: `flex-direction: row` and `row-reverse`, `flex-wrap:
-    /// nowrap`, main axis only. Items keep their natural heights — M9.8 sizes
-    /// and aligns the cross axis, M9.9 brings the column directions and M9.10
+    /// Scope, M9.8: `flex-direction: row` and `row-reverse`, `flex-wrap:
+    /// nowrap`, both axes. M9.9 brings the column directions and M9.10
     /// wrapping.
     ///
-    /// **Alignment places, it never moves.** Every item is positioned before
-    /// its contents are laid out, so a centred item's text is built at the
-    /// centred `x` and no subtree ever has to be translated afterwards. The
-    /// classic flex bug — a box that moved and left its text behind — is not
-    /// possible in this shape, which is why the order here is: size the whole
-    /// line, place the whole line, *then* build the boxes.
+    /// **On the main axis, alignment places and never moves.** Every item is
+    /// positioned before its contents are laid out, so a centred item's text is
+    /// built at the centred `x` and no subtree has to be translated afterwards:
+    /// size the whole line, place the whole line, *then* build the boxes.
+    ///
+    /// The cross axis cannot be written that way, because a line's height is
+    /// not known until its tallest item has been laid out. So it runs last, in
+    /// [`align_cross`](Self::align_cross), and it does move boxes — with their
+    /// whole subtrees, which is where the classic flex bug (a box that moved
+    /// and left its text behind) would live if it lived anywhere here.
     fn layout_flex_contents(
         &mut self,
         id: NodeId,
@@ -604,7 +608,6 @@ impl<'a> Engine<'a> {
         let placed = flex::place(&slots, gap, inner_main, computed.justify_content);
 
         let mut children = Vec::with_capacity(items.len());
-        let mut tallest = 0;
         for (idx, (item, &main_size)) in items.iter().zip(&sizes).enumerate() {
             let p = placed[idx];
             let outer_main = slots[idx]
@@ -643,16 +646,205 @@ impl<'a> Engine<'a> {
                 specified_height,
                 pre,
             );
-            let mb = self.boxes[child.0 as usize].dimensions.margin_box();
-            tallest = tallest.max(mb.bottom() - content.y);
             children.push(child);
         }
+
+        // §9.4 and §9.6: the cross axis, once every item's box exists. It has
+        // to be last, and that is a fact about the axis rather than a choice:
+        // an item's main size is a number the algorithm computes, but its
+        // cross size is *its content's* height, which nothing knows until the
+        // content has been laid out.
+        let line_cross =
+            self.align_cross(&items, &children, &computed, content.y, specified_height);
         self.boxes[box_id.0 as usize].children = children;
-        // A row's cross size is its tallest item (§9.4, single line). The
+        // A single line's cross size is the row's content height. The
         // container's own specified height is not consulted here:
         // `layout_box_at` applies it and the min/max clamps afterwards, exactly
         // as it does for a block.
-        tallest.max(0)
+        line_cross
+    }
+
+    /// §9.4 (*cross sizing*) and §9.6 (*cross-axis alignment*) for the one line
+    /// M9.8 has: size the line, then move each item into its place on it.
+    ///
+    /// Returns the line's cross size.
+    ///
+    /// **This is the one stage that moves boxes after building them**, and it
+    /// is the reason [`shift_subtree`](Self::shift_subtree) exists. The main
+    /// axis can place before it builds because it knows every item's width
+    /// first; the cross axis cannot know the line's height until the tallest
+    /// item has been laid out, and by then the shortest one already has a box.
+    /// So an item is built at the line's cross-start edge and then moved down —
+    /// *with everything inside it*, which is the whole content of the promise
+    /// M9.6 made about text never being left behind.
+    fn align_cross(
+        &mut self,
+        items: &[FlexItem],
+        boxes: &[BoxId],
+        container: &ComputedStyle,
+        // The container's cross-start *content* edge: items are positioned
+        // inside its padding and border, never against its border box.
+        content_y: i32,
+        definite_cross: Option<i32>,
+    ) -> i32 {
+        let cross_items: Vec<flex::CrossItem> = items
+            .iter()
+            .zip(boxes)
+            .map(|(item, &b)| {
+                let c = &item.computed;
+                let align = c.align_self.resolve(container.align_items);
+                let dims = self.boxes[b.0 as usize].dimensions;
+                flex::CrossItem {
+                    outer: dims.margin_box().height,
+                    // Measured only for the items that will be aligned by it:
+                    // finding a baseline means walking the item's subtree for
+                    // its first line box, and a row of `align-items: stretch`
+                    // cards has no use for the answer.
+                    baseline: if align == AlignItems::Baseline {
+                        self.item_baseline(b)
+                    } else {
+                        0
+                    },
+                    align,
+                    auto_start: c.margin.top.is_auto(),
+                    auto_end: c.margin.bottom.is_auto(),
+                }
+            })
+            .collect();
+
+        // §9.4 step 7: a container with a definite inner cross size hands it to
+        // its line, whatever is on it — that is what makes `align-items:
+        // center` inside a `height: 10em` container centre in ten rows rather
+        // than in the tallest item. Otherwise the line is as tall as its
+        // contents (step 8).
+        let line_cross = definite_cross.unwrap_or_else(|| flex::cross_size(&cross_items));
+        let placed = flex::cross_place(&cross_items, line_cross);
+
+        for ((item, &b), (p, ci)) in items.iter().zip(boxes).zip(placed.iter().zip(&cross_items)) {
+            let c = &item.computed;
+            if ci.align == AlignItems::Stretch {
+                self.stretch_item(b, c, line_cross, definite_cross);
+            }
+            let dims = self.boxes[b.0 as usize].dimensions;
+            // An `auto` cross margin's share is part of the item's margin box,
+            // not just of the line's arithmetic — the same rule §9.5's auto
+            // margins follow on the main axis, so that the boxes on a line
+            // still tile it exactly.
+            let margin_top = if c.margin.top.is_auto() {
+                p.auto_start
+            } else {
+                dims.margin.top
+            };
+            let top = content_y + p.cross_start + margin_top + dims.border.top + dims.padding.top;
+            self.shift_subtree(b, top - dims.content.y);
+            let dims = &mut self.boxes[b.0 as usize].dimensions;
+            if c.margin.top.is_auto() {
+                dims.margin.top = p.auto_start;
+            }
+            if c.margin.bottom.is_auto() {
+                dims.margin.bottom = p.auto_end;
+            }
+        }
+        line_cross
+    }
+
+    /// §9.4 step 11: an item with `align-self: stretch` fills its line's cross
+    /// size — *if* its own cross size is `auto` and neither cross margin is,
+    /// since an item that stated a height or claimed the free space with an
+    /// auto margin has already answered the question.
+    ///
+    /// Only the box grows. Its contents are not laid out again, so this is a
+    /// field write rather than a second layout pass: what changes is how far
+    /// the item's background and borders reach, which is what pages use
+    /// `stretch` for (equal-height cards). Content that genuinely wants the new
+    /// height — a nested `height: 100%` — needs the definite-size plumbing
+    /// M9.9 brings, and is left to it.
+    fn stretch_item(
+        &mut self,
+        b: BoxId,
+        c: &ComputedStyle,
+        line_cross: i32,
+        definite_cross: Option<i32>,
+    ) {
+        // A replaced box's cross size came from the image, not from `height:
+        // auto`, so it is not the `auto` the spec's condition is about.
+        // Stretching one would rescale the picture to fill the row.
+        if self.boxes[b.0 as usize].kind == BoxKind::Image
+            || !c.height.is_auto()
+            || c.margin.top.is_auto()
+            || c.margin.bottom.is_auto()
+        {
+            return;
+        }
+        let dims = self.boxes[b.0 as usize].dimensions;
+        let v_axis = Axis {
+            edges: dims.padding.top + dims.padding.bottom + dims.border.top + dims.border.bottom,
+            box_sizing: c.box_sizing,
+        };
+        let target = line_cross - (v_axis.edges + dims.margin.top + dims.margin.bottom);
+        // §4.5 on the cross axis: `min-height: auto` on a flex item is its
+        // *content* height, so an item stretched into a line shorter than its
+        // own text is never squeezed until it clips. That content height is
+        // exactly the height the box has right now — `height` is `auto` here,
+        // so it is what the contents used.
+        let auto_min = dims.content.height;
+        let min =
+            definite_v(c.min_height, definite_cross).map_or(auto_min, |h| v_axis.content_from(h));
+        let max = definite_v(c.max_height, definite_cross).map(|h| v_axis.content_from(h));
+        // M9.2's clamp order, max before min, so a minimum bigger than the
+        // maximum wins — the automatic one included.
+        let used = max.map_or(target, |m| target.min(m)).max(min).max(0);
+        self.boxes[b.0 as usize].dimensions.content.height = used;
+    }
+
+    /// The row this item's baseline sits on, as a distance from its cross-start
+    /// margin edge.
+    ///
+    /// A cell grid makes this the easy part of flex rather than the hard one:
+    /// every line box is exactly one row tall, so an item's baseline *is* the
+    /// row of its first line box — margin + border + padding, plus wherever
+    /// that line ended up inside the content box.
+    ///
+    /// An item with no line box at all (an empty div, an image) has nothing to
+    /// align to, so it synthesises one from its cross-end **border** edge, as
+    /// css-flexbox-1 §8.3 says: the box hangs off the baseline the way a
+    /// letter sits on a rule.
+    fn item_baseline(&self, b: BoxId) -> i32 {
+        let dims = self.boxes[b.0 as usize].dimensions;
+        let margin_edge = dims.margin_box().y;
+        match self.first_line_row(b) {
+            Some(row) => row - margin_edge,
+            None => dims.border_box().bottom() - margin_edge,
+        }
+    }
+
+    /// The row of the first line box in this subtree, in paint order — which
+    /// for a box that contains text is the row its first line of text is on.
+    fn first_line_row(&self, b: BoxId) -> Option<i32> {
+        let bx = &self.boxes[b.0 as usize];
+        if bx.kind == BoxKind::Line {
+            return Some(bx.dimensions.content.y);
+        }
+        bx.children.iter().find_map(|&c| self.first_line_row(c))
+    }
+
+    /// Move a box and everything under it `dy` rows down the page.
+    ///
+    /// Every rectangle in the tree is absolute, so a subtree moves by adding
+    /// the same offset to every box in it — no relative coordinates to keep in
+    /// step, and nothing outside the subtree to update. Edges are unaffected:
+    /// a margin is a width, not a position.
+    fn shift_subtree(&mut self, b: BoxId, dy: i32) {
+        if dy == 0 {
+            return;
+        }
+        self.boxes[b.0 as usize].dimensions.content.y += dy;
+        // By index, not by iterator: the loop needs `&mut self` for the
+        // recursion, and the child list cannot be borrowed across it.
+        for i in 0..self.boxes[b.0 as usize].children.len() {
+            let child = self.boxes[b.0 as usize].children[i];
+            self.shift_subtree(child, dy);
+        }
     }
 
     /// Build one item's box where §9.5 placed it, at the main size §9.7

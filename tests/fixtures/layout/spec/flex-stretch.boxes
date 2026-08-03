@@ -1,0 +1,40 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.4 step 11 (`stretch`)
+# before the code existed. Never regenerated. The paint half of this fixture is
+# `snapshots::flex_stretch_backgrounds_reach_the_full_line`: this file says how
+# tall the boxes are, that one says which cells their backgrounds fill, which
+# is the only place `stretch` is visible to a reader.
+#
+# Three 5-cell items (`flex: 0 0 40px`) of 5-cell words at x = 0, 5, 10. The
+# last is three rows of content, so the line's cross size is 3.
+#
+#   a  `align-items` is unset, so `stretch` — the CSS initial value, which is
+#      why this is the case that changes existing goldens. The item's own cross
+#      size is `auto` and neither cross margin is, so the box grows from the 1
+#      row its text needs to the 3 the line has. Its contents do not move: the
+#      anonymous block inside it is still 1 row at y = 0. Only the box grew,
+#      and with it how far its background reaches.
+#
+#   b  the same background, but `align-self: flex-start` opts out of
+#      stretching. It stays 1 row tall — the contrast that makes the first
+#      item's extra rows attributable to `stretch` and not to the text.
+#
+#   c  already fills the line, so `stretch` finds nothing to do.
+<html>  x=0 y=0 w=20 h=3
+  <body>  x=0 y=0 w=20 h=3
+    <div.row> flex row  x=0 y=0 w=20 h=3
+      <div.card>  x=0 y=0 w=5 h=3
+        anonymous  x=0 y=0 w=5 h=1
+          line  x=0 y=0 w=5 h=1
+            #text "one"  x=0 y=0 w=3 h=1
+      <div.short.card>  x=5 y=0 w=5 h=1
+        anonymous  x=5 y=0 w=5 h=1
+          line  x=5 y=0 w=5 h=1
+            #text "two"  x=5 y=0 w=3 h=1
+      <div>  x=10 y=0 w=5 h=3
+        anonymous  x=10 y=0 w=5 h=3
+          line  x=10 y=0 w=5 h=1
+            #text "aaaaa"  x=10 y=0 w=5 h=1
+          line  x=10 y=1 w=5 h=1
+            #text "bbbbb"  x=10 y=1 w=5 h=1
+          line  x=10 y=2 w=5 h=1
+            #text "ccccc"  x=10 y=2 w=5 h=1

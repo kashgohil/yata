@@ -1,6 +1,7 @@
 //! Flexbox's core arithmetic: css-flexbox-1 §9.7, *resolve the flexible
-//! lengths* (M9.6), and §9.5, *main-axis alignment* (M9.7), in whole terminal
-//! cells (PLAN.md M9).
+//! lengths* (M9.6), §9.5, *main-axis alignment* (M9.7), and §9.4/§9.6, *cross
+//! sizing and cross-axis alignment* (M9.8), in whole terminal cells
+//! (PLAN.md M9).
 //!
 //! Kept out of `engine` deliberately. This is the part of flex layout that is
 //! pure arithmetic over numbers — no DOM, no styles, no boxes — so it can be
@@ -12,7 +13,15 @@
 //! never in `x`. That is what makes `row-reverse` a mapping in the engine —
 //! main-start is the right edge, so the same offsets are subtracted instead of
 //! added — rather than a second copy of the placement rules with the signs
-//! changed.
+//! changed. [`cross_place`] is written the same way, in distances from
+//! *cross-start*, which is what M9.9's column directions will need.
+//!
+//! **The two axes are not symmetric, and the asymmetry is real.** Main-axis
+//! sizes are computed from numbers the algorithm already has, so the engine can
+//! place an item before building it. A cross size is *the item's content's*
+//! height, so nothing here can be asked until the items exist — which is why
+//! the cross-axis functions take an item's outer size as an input rather than
+//! producing it.
 //!
 //! **Whole cells.** The spec distributes fractions of a pixel and lets the
 //! rasteriser sort it out; a terminal has no such luxury, so the fractions are
@@ -22,7 +31,7 @@
 //! items that grow to fill a line leave no hole at its end, and no item is
 //! ever a fraction of a cell narrower than its neighbour for no reason.
 
-use crate::style::values::JustifyContent;
+use crate::style::values::{AlignItems, JustifyContent};
 
 /// One flex item's inputs to §9.7, all in cells and all on the main axis.
 #[derive(Clone, Copy, Debug)]
@@ -435,6 +444,132 @@ fn split(total: i32, weights: &[i32]) -> Vec<i32> {
     out
 }
 
+/// One item as §9.4 (*cross sizing*) and §9.6 (*cross-axis alignment*) see it,
+/// all in cells and all on the cross axis.
+///
+/// The item has already been laid out when this struct is built: `outer` is
+/// what it turned out to be, not what it asked for. Cross alignment is the one
+/// part of flex that cannot be decided before the items exist — an item's
+/// height is its content's, and its content's height is only known once it has
+/// been laid out.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CrossItem {
+    /// Outer cross size: the item's margin box on the cross axis.
+    pub(super) outer: i32,
+    /// Distance from the item's cross-start margin edge to its baseline — the
+    /// row its first line box sits on, or, for an item with no line box at
+    /// all, its cross-end border edge (§8.3's synthesis rule). Only read when
+    /// `align` is `Baseline`.
+    pub(super) baseline: i32,
+    /// `align-self` already resolved against the container's `align-items`.
+    pub(super) align: AlignItems,
+    /// Whether the cross-start / cross-end margin is `auto`, which on this
+    /// axis too means "give me the free space" — and overrides `align`.
+    pub(super) auto_start: bool,
+    pub(super) auto_end: bool,
+}
+
+/// Where §9.6 put one item on the cross axis.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct CrossPlaced {
+    /// Cells from the line's cross-start edge to this item's cross-start
+    /// *margin* edge.
+    pub(super) cross_start: i32,
+    /// Cells this item's `auto` cross margins absorbed. Zero unless the item
+    /// asked for one and the line had room to give it.
+    pub(super) auto_start: i32,
+    pub(super) auto_end: i32,
+}
+
+/// §9.4 step 8: the line's cross size, from the items on it.
+///
+/// Two groups, and the larger wins. Items aligned any way but `baseline` need
+/// room for themselves, so they ask for their own outer cross size.
+/// Baseline-aligned items are stitched together at one row, so what they need
+/// is the deepest anything reaches *above* that row plus the deepest anything
+/// reaches below it — which can be more than any single item's height, and is
+/// the reason a label next to a bordered heading makes its row taller than
+/// either of them alone.
+pub(super) fn cross_size(items: &[CrossItem]) -> i32 {
+    let (above, below) = baseline_extents(items);
+    let tallest = items
+        .iter()
+        .filter(|i| i.align != AlignItems::Baseline)
+        .map(|i| i.outer)
+        .max()
+        .unwrap_or(0);
+    tallest.max(above.saturating_add(below))
+}
+
+/// How far the baseline-aligned items reach above and below their shared row.
+fn baseline_extents(items: &[CrossItem]) -> (i32, i32) {
+    items
+        .iter()
+        .filter(|i| i.align == AlignItems::Baseline)
+        .fold((0, 0), |(above, below), i| {
+            (
+                above.max(i.baseline.max(0)),
+                below.max((i.outer - i.baseline).max(0)),
+            )
+        })
+}
+
+/// §9.6 *cross-axis alignment*: where each item's cross-start margin edge sits
+/// inside a line of `line_cross` cells.
+///
+/// The order of business mirrors §9.5's on the main axis, for the same reason:
+/// **auto margins take the free space first**, and only an item that claimed
+/// none of it is aligned by `align-self`. An item with `margin: auto 0` is
+/// centred whatever its `align-self` says, which is the rule that lets one item
+/// in a row centre itself without the container agreeing to centre all of them.
+///
+/// `stretch` places at cross-start here and grows the box elsewhere: an item
+/// that cannot stretch (a specified cross size, an auto margin) is left exactly
+/// where `flex-start` would have put it, which is what the spec says it falls
+/// back to.
+pub(super) fn cross_place(items: &[CrossItem], line_cross: i32) -> Vec<CrossPlaced> {
+    let (max_above, _) = baseline_extents(items);
+    items
+        .iter()
+        .map(|item| {
+            // Negative free space is overflow, and there is nothing to hand
+            // out. The same deliberate *safe* fallback as §9.5's: an item
+            // centred out of an overflowing line would hang off the top of the
+            // page, and unlike a browser a terminal has no rows above row 0 to
+            // scroll back to.
+            let free = line_cross.saturating_sub(item.outer).max(0);
+            if free > 0 && (item.auto_start || item.auto_end) {
+                let shares = split(
+                    free,
+                    &[i32::from(item.auto_start), i32::from(item.auto_end)],
+                );
+                return CrossPlaced {
+                    cross_start: 0,
+                    auto_start: shares[0],
+                    auto_end: shares[1],
+                };
+            }
+            let cross_start = match item.align {
+                AlignItems::FlexStart | AlignItems::Stretch => 0,
+                AlignItems::FlexEnd => free,
+                // The odd cell goes above the item, the same "earliest slot
+                // first" rule `split` uses everywhere else in this file.
+                AlignItems::Center => split(free, &[1, 1])[0],
+                // Every baseline-aligned item drops by the difference between
+                // the line's deepest baseline and its own, so the offset is
+                // never negative: an item that would have sat above the line's
+                // cross-start edge is what *pushed the edge down* in
+                // `cross_size`, rather than escaping the line.
+                AlignItems::Baseline => (max_above - item.baseline).max(0),
+            };
+            CrossPlaced {
+                cross_start,
+                ..CrossPlaced::default()
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +959,201 @@ mod tests {
                     let lo = spaces.iter().min().copied().unwrap();
                     let hi = spaces.iter().max().copied().unwrap();
                     assert!(hi - lo <= 1, "{label}: uneven spaces {spaces:?}");
+                }
+            }
+        }
+    }
+
+    // §9.4 and §9.6, the cross axis (M9.8). `cross_start` counts down from the
+    // line's cross-start edge for a row, which is its top.
+
+    /// An item of `outer` cells with no auto margins and no baseline of its
+    /// own — the shape almost every item on a real page has.
+    fn cross(outer: i32, align: AlignItems) -> CrossItem {
+        CrossItem {
+            outer,
+            baseline: 0,
+            align,
+            auto_start: false,
+            auto_end: false,
+        }
+    }
+
+    /// Where each item's cross-start margin edge lands in a line of
+    /// `line_cross` cells.
+    fn cross_starts(items: &[CrossItem], line_cross: i32) -> Vec<i32> {
+        cross_place(items, line_cross)
+            .iter()
+            .map(|p| p.cross_start)
+            .collect()
+    }
+
+    #[test]
+    fn the_line_is_as_tall_as_its_tallest_item() {
+        let items = [
+            cross(1, AlignItems::Stretch),
+            cross(5, AlignItems::FlexStart),
+            cross(3, AlignItems::Center),
+        ];
+        assert_eq!(cross_size(&items), 5);
+        assert_eq!(cross_size(&[]), 0, "an empty line has no cross size");
+    }
+
+    #[test]
+    fn align_items_places_an_item_inside_the_line_four_ways() {
+        // One 1-cell item in a 5-cell line: 4 cells to place.
+        for (align, start) in [
+            (AlignItems::FlexStart, 0),
+            (AlignItems::Center, 2),
+            (AlignItems::FlexEnd, 4),
+            // `stretch` sits at cross-start; the growing is the caller's job,
+            // because an item that *cannot* stretch must still land here.
+            (AlignItems::Stretch, 0),
+        ] {
+            assert_eq!(cross_starts(&[cross(1, align)], 5), [start], "{align:?}");
+        }
+    }
+
+    #[test]
+    fn an_odd_cell_lands_above_the_item_rather_than_below_it() {
+        // 3 cells to centre 2 cells of item. The extra one goes to the
+        // earliest slot — above — which is `split`'s rule everywhere else too.
+        assert_eq!(cross_starts(&[cross(2, AlignItems::Center)], 5), [2]);
+    }
+
+    #[test]
+    fn baseline_alignment_shares_a_row_and_grows_the_line() {
+        // A three-row label whose text starts at its own top row, and a box
+        // with a cell of border+padding above its single row of text. Their
+        // baselines are 0 and 1, so the label drops a row to meet the box.
+        let label = CrossItem {
+            outer: 3,
+            baseline: 0,
+            ..cross(3, AlignItems::Baseline)
+        };
+        let boxed = CrossItem {
+            outer: 2,
+            baseline: 1,
+            ..cross(2, AlignItems::Baseline)
+        };
+        let line = cross_size(&[label, boxed]);
+        // Deepest above the shared row (1, the box's padding) plus deepest
+        // below it (3, the label's rows) — one cell more than the tallest item
+        // on the line, because the label now hangs a row lower than it did.
+        assert_eq!(line, 4);
+        assert_eq!(cross_starts(&[label, boxed], line), [1, 0]);
+    }
+
+    #[test]
+    fn a_baseline_item_pushes_the_line_down_instead_of_escaping_it() {
+        // The deepest baseline decides the shared row, so no offset is ever
+        // negative — the item with the shallow baseline is the one that moves.
+        let deep = CrossItem {
+            outer: 4,
+            baseline: 3,
+            ..cross(4, AlignItems::Baseline)
+        };
+        let shallow = CrossItem {
+            outer: 1,
+            baseline: 0,
+            ..cross(1, AlignItems::Baseline)
+        };
+        let line = cross_size(&[shallow, deep]);
+        let starts = cross_starts(&[shallow, deep], line);
+        assert_eq!(starts, [3, 0]);
+        assert!(starts.iter().all(|&s| s >= 0));
+        // Both baselines really do land on the same row.
+        assert_eq!(starts[0] + shallow.baseline, starts[1] + deep.baseline);
+    }
+
+    #[test]
+    fn a_baseline_item_shares_the_line_with_items_aligned_other_ways() {
+        // The line has to be tall enough for both groups: a 6-cell
+        // `flex-start` item beats the baseline group's 1 + 2.
+        let plain = cross(6, AlignItems::FlexStart);
+        let text = CrossItem {
+            outer: 2,
+            baseline: 1,
+            ..cross(2, AlignItems::Baseline)
+        };
+        assert_eq!(cross_size(&[plain, text]), 6);
+        // …and the baseline item still aligns to the baseline group's row, not
+        // to the tall item's top or bottom.
+        assert_eq!(cross_starts(&[plain, text], 6), [0, 0]);
+    }
+
+    #[test]
+    fn auto_cross_margins_take_the_free_space_and_override_align_self() {
+        // `margin: auto 0` centres the item even though it asked for
+        // `flex-start`: §9.6 step 1 runs before the alignment property is read.
+        let item = CrossItem {
+            auto_start: true,
+            auto_end: true,
+            ..cross(2, AlignItems::FlexStart)
+        };
+        let placed = cross_place(&[item], 8);
+        assert_eq!(placed[0].cross_start, 0, "the margin box fills the line");
+        assert_eq!((placed[0].auto_start, placed[0].auto_end), (3, 3));
+
+        // One auto margin takes all of it: `margin-top: auto` is how an item
+        // pins itself to the bottom of a row.
+        let item = CrossItem {
+            auto_start: true,
+            ..cross(2, AlignItems::FlexStart)
+        };
+        let placed = cross_place(&[item], 8);
+        assert_eq!((placed[0].auto_start, placed[0].auto_end), (6, 0));
+    }
+
+    #[test]
+    fn an_overflowing_item_packs_at_cross_start_however_it_asked_to_align() {
+        // Negative free space is not distributed — the same safe fallback the
+        // main axis makes, and for a sharper reason: there is no row above the
+        // top of the page to scroll back to.
+        for align in [
+            AlignItems::FlexStart,
+            AlignItems::FlexEnd,
+            AlignItems::Center,
+            AlignItems::Stretch,
+            AlignItems::Baseline,
+        ] {
+            assert_eq!(cross_starts(&[cross(9, align)], 4), [0], "{align:?}");
+        }
+        let item = CrossItem {
+            auto_start: true,
+            auto_end: true,
+            ..cross(9, AlignItems::FlexStart)
+        };
+        let placed = cross_place(&[item], 4);
+        assert_eq!((placed[0].auto_start, placed[0].auto_end), (0, 0));
+    }
+
+    #[test]
+    fn no_item_ever_lands_outside_the_line_at_any_size() {
+        // The cross-axis counterpart of the main axis's exactness sweep: every
+        // item sits inside the line whenever it fits, and never above its
+        // cross-start edge even when it does not.
+        let items = [
+            cross(1, AlignItems::FlexStart),
+            cross(3, AlignItems::Center),
+            cross(2, AlignItems::FlexEnd),
+            CrossItem {
+                outer: 4,
+                baseline: 2,
+                ..cross(4, AlignItems::Baseline)
+            },
+            CrossItem {
+                auto_start: true,
+                ..cross(2, AlignItems::Center)
+            },
+        ];
+        for line in 0..=20 {
+            for (item, placed) in items.iter().zip(cross_place(&items, line)) {
+                let label = format!("line {line}, {item:?} -> {placed:?}");
+                assert!(placed.cross_start >= 0, "{label}");
+                let outer = item.outer + placed.auto_start + placed.auto_end;
+                if outer <= line {
+                    assert!(placed.cross_start + outer <= line, "{label}");
                 }
             }
         }
