@@ -937,10 +937,13 @@ mod ladder {
         let a = styles.get(find(&dom, "a"));
         assert!(a.underline);
         assert_eq!(a.color, ColorValue::Rgb(0x5c, 0x5c, 0xff));
-        // `li{display:flex}` from the page's own sheet: flex is not a mode M4
-        // implements, and mapping it to Block is what keeps the list stacked
-        // instead of collapsing onto one line.
-        assert_eq!(styles.get(find(&dom, "li")).display, Display::Block);
+        // `li{display:flex}` from the page's own sheet. Until M9.5 this
+        // cascaded to `Block`, because that was the nearest mode that stacked;
+        // now it cascades to what the page actually wrote, and layout is the
+        // stage that treats it as a block container (`engine::is_block_level`)
+        // until M9.6. The list stays stacked either way — that is what makes
+        // this a vocabulary change and not a rendering one.
+        assert_eq!(styles.get(find(&dom, "li")).display, Display::Flex);
     }
 
     #[test]

@@ -214,6 +214,68 @@ mod tests {
         lines.iter().map(text).collect()
     }
 
+    /// Every box's kind and content-box geometry, in allocation order — what
+    /// two documents must share to be laying out identically.
+    fn geometry(html_src: &str, css: &str, width: u16) -> Vec<(BoxKind, i32, i32, i32, i32)> {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        tree.boxes
+            .iter()
+            .map(|b| {
+                let d = b.dimensions.content;
+                (b.kind, d.x, d.y, d.width, d.height)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_flex_container_lays_out_as_a_block_until_m9_6() {
+        // M9.5 landed flexbox's *vocabulary*, not its algorithm: `display:
+        // flex` cascades as itself and shows up in F2, but layout still gives
+        // it a block container (`engine::is_block_level`). So every box must
+        // land where `display:block` puts it, down to the cell — which is what
+        // lets a milestone that touches the cascade move no snapshot at all.
+        let markup = "<div>one two three</div><div>four</div>";
+        let block = geometry(markup, "div { display: block }", 20);
+        for css in [
+            "div { display: flex }",
+            // Block-level here until M9.11 gives inline-level boxes a line to
+            // sit on; `inline` would collapse these two divs onto one row.
+            "div { display: inline-flex }",
+            // The rest of the vocabulary cascades and is ignored, so it must
+            // not move a cell either.
+            "div { display: flex; flex-direction: column-reverse; flex-wrap: wrap;
+                   gap: 2em; justify-content: space-between; align-items: center;
+                   align-content: center; flex: 1 0 30%; order: -1 }",
+        ] {
+            assert_eq!(geometry(markup, css, 20), block, "css: {css}");
+        }
+        // ...and the text really did wrap in there, so the comparison above is
+        // over boxes that exist rather than over two empty documents.
+        assert!(block.len() > 4, "{block:?}");
+    }
+
+    #[test]
+    fn an_inline_flex_span_breaks_its_line_until_m9_11() {
+        // The one place M9.5 does change what a page looks like, pinned so
+        // M9.11 has to come here and say so. `inline-flex` is an inline-level
+        // box with a flex inner mode; this engine takes the inner half and
+        // makes the box block-level, so a `<span>` that a browser leaves on
+        // the line gets a row of its own. No ladder fixture uses `inline-flex`,
+        // which is exactly why this test exists rather than a snapshot.
+        let src = "<p>before <span class=b>btn</span> after</p>";
+        assert_eq!(
+            plain(&lines_styled(src, "span.b { display: inline-block }", 40)),
+            ["before btn after", ""]
+        );
+        assert_eq!(
+            plain(&lines_styled(src, "span.b { display: inline-flex }", 40)),
+            ["before", "btn", "after", ""],
+            "when M9.11 gives inline-level boxes a line to sit on, this becomes \
+             one row again"
+        );
+    }
+
     #[test]
     fn paragraphs_stack_with_a_blank_line_from_margins() {
         // UA margin 1em top+bottom on p → adjacent collapse to one blank row.

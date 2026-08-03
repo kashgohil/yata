@@ -195,20 +195,22 @@ impl<'a> Engine<'a> {
                         y,
                         prev_margin_bottom,
                     ),
-                    _ => match computed.display {
-                        Display::None => None,
-                        Display::Block => self.layout_block(
-                            id,
-                            tag,
-                            computed,
-                            x,
-                            containing_width,
-                            containing_height,
-                            y,
-                            prev_margin_bottom,
-                            pre || tag == "pre",
-                        ),
-                        Display::Inline => {
+                    _ => {
+                        if computed.display == Display::None {
+                            None
+                        } else if is_block_level(computed.display) {
+                            self.layout_block(
+                                id,
+                                tag,
+                                computed,
+                                x,
+                                containing_width,
+                                containing_height,
+                                y,
+                                prev_margin_bottom,
+                                pre || tag == "pre",
+                            )
+                        } else {
                             // Inline element as a block-container child: wrap.
                             let items =
                                 self.collect_inline(id, pre || tag == "pre", containing_width);
@@ -225,7 +227,7 @@ impl<'a> Engine<'a> {
                                 pre || tag == "pre",
                             )
                         }
-                    },
+                    }
                 }
             }
         }
@@ -1154,17 +1156,18 @@ impl<'a> Engine<'a> {
                 // Block-level `display:block` img goes through layout_node;
                 // default inline img stays in the IFC as an atomic replaced box.
                 if tag == "img" {
-                    return match self.styles.get(id).display {
-                        Display::Block => ChildMode::Block,
-                        _ => ChildMode::Inline,
+                    return if is_block_level(self.styles.get(id).display) {
+                        ChildMode::Block
+                    } else {
+                        ChildMode::Inline
                     };
                 }
                 match self.styles.get(id).display {
+                    Display::Inline => ChildMode::Inline,
                     // Reveal: a page-hidden box is walked as block so its
                     // subtree can surface. UA-important none never gets here.
-                    Display::None => ChildMode::Block,
-                    Display::Block => ChildMode::Block,
-                    Display::Inline => ChildMode::Inline,
+                    // Everything left is block-level.
+                    _ => ChildMode::Block,
                 }
             }
         }
@@ -1489,6 +1492,22 @@ pub fn term_color(color: crate::style::values::ColorValue) -> Color {
             }
         }
     }
+}
+
+/// Does this `display` generate a block-level box — one that stacks, rather
+/// than joining the line beside it?
+///
+/// **This is the whole of what `display: flex` means to layout today (M9.5).**
+/// The vocabulary — direction, wrap, gaps, the flex factors — cascades and
+/// shows up in `F2`, but no box reads it yet, so a flex container is laid out
+/// exactly as a block container: children stacked, in document order,
+/// `order` ignored. That is what `flex` already did when M4 parsed it straight
+/// to `Block`, which is why landing the vocabulary moves no snapshot.
+///
+/// M9.6 replaces this: `Display::Flex` gets its own arm in `layout_node`, and
+/// what remains here is the block/inline question.
+pub(super) fn is_block_level(display: Display) -> bool {
+    matches!(display, Display::Block | Display::Flex)
 }
 
 /// Where a line may be broken: HTML whitespace, and nothing else.

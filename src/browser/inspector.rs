@@ -110,6 +110,9 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
         match computed.display {
             Display::Block => "block",
             Display::Inline => "inline",
+            // The axis and the rest of the vocabulary arrive with M9.5's
+            // computed values; the keyword is what there is to print today.
+            Display::Flex => "flex",
             Display::None => "none",
         }
         .to_string(),

@@ -27,7 +27,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
-use crate::layout::engine::{Axis, edge_h, is_html_space};
+use crate::layout::engine::{Axis, edge_h, is_block_level, is_html_space};
 use crate::style::Styles;
 use crate::style::values::{Display, Length};
 
@@ -338,15 +338,17 @@ impl<'a> IntrinsicSizer<'a> {
                     return ChildMode::Block;
                 }
                 if tag == "img" {
-                    return match display {
-                        Display::Block => ChildMode::Block,
-                        _ => ChildMode::Inline,
+                    return if is_block_level(display) {
+                        ChildMode::Block
+                    } else {
+                        ChildMode::Inline
                     };
                 }
                 match display {
                     Display::Inline => ChildMode::Inline,
-                    // `None` left above; block-level is what remains.
-                    Display::Block | Display::None => ChildMode::Block,
+                    // `None` left above; block-level is what remains — flex
+                    // included, until M9.6 (`engine::is_block_level`).
+                    _ => ChildMode::Block,
                 }
             }
         }
@@ -950,7 +952,7 @@ mod tests {
                 while let Some(node) = stack.pop() {
                     stack.extend(dom.children(node));
                     if !matches!(&dom.node(node).data, NodeData::Element { .. })
-                        || styles.get(node).display != Display::Block
+                        || !is_block_level(styles.get(node).display)
                     {
                         continue;
                     }
@@ -1089,9 +1091,14 @@ mod tests {
             }
         }
 
+        /// Block-*level*, not `display:block` — a flex container is still one
+        /// of these, and until M9.6 it is laid out as a block container too
+        /// (`engine::is_block_level`). Asking the narrower question here would
+        /// quietly drop danluu.com's `li{display:flex}` and `.np` from the
+        /// suite the moment M9.5 gave `flex` its own value.
         fn is_block_element(dom: &Dom, styles: &Styles, node: NodeId) -> bool {
             matches!(&dom.node(node).data, NodeData::Element { .. })
-                && styles.get(node).display == Display::Block
+                && is_block_level(styles.get(node).display)
         }
 
         fn check(name: &str, extra_css: Option<&str>) {

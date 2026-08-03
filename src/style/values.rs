@@ -8,13 +8,17 @@
 //! This is where M4.1's deliberate ignorance ends — the parser handed over raw
 //! source text, and this module is the first code that knows `red` is a colour.
 
-/// The three display modes M4 implements. PLAN.md M5 brings the box model;
-/// until then a box is either a line-breaking block, inline text, or gone.
+/// The display modes this engine implements. M4 had three — a line-breaking
+/// block, inline text, or gone — and M9.5 adds the fourth: a flex container,
+/// which is block-level and lays its children out along an axis. Until M9.6
+/// implements that axis, layout treats it as a block (`engine::is_block_level`,
+/// the one place that decision is made).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Display {
     Block,
     #[default]
     Inline,
+    Flex,
     None,
 }
 
@@ -251,20 +255,23 @@ pub fn parse_overflow(value: &str) -> Option<Overflow> {
     }
 }
 
-/// `display`. Values M4 cannot honour are mapped to the nearest of the three
-/// rather than dropped: danluu.com's list items are `display:flex`, and
-/// dropping that declaration is harmless while treating it as *invalid* would
-/// be too — but treating `flex` as `inline` would collapse the page. Every
-/// box-generating mode that stacks becomes `Block`; M9 brings real flex.
+/// `display`. Values this engine cannot honour are mapped to the nearest one it
+/// can rather than dropped: dropping the declaration would leave a page's
+/// `display:grid` container as an inline, which collapses it. Every
+/// box-generating mode that stacks becomes `Block`.
 pub fn parse_display(value: &str) -> Option<Display> {
     match lower(value).as_str() {
         "none" => Some(Display::None),
-        "inline" | "inline-block" | "inline-flex" | "inline-grid" | "contents" => {
-            Some(Display::Inline)
-        }
-        "block" | "flow-root" | "list-item" | "flex" | "grid" | "table" | "table-row"
-        | "table-cell" | "table-row-group" | "table-header-group" | "table-footer-group"
-        | "table-caption" | "inline-table" => Some(Display::Block),
+        // `inline-flex` is an inline-*level* box with a flex *inner* mode. The
+        // inner mode is the half that matters for the children, and it is the
+        // half M9.6 implements, so it wins for now: an inline-flex box is
+        // block-level here. M9.11 (atomic inlines) is where it becomes a real
+        // inline-level box that sits on a line with its siblings.
+        "flex" | "inline-flex" => Some(Display::Flex),
+        "inline" | "inline-block" | "inline-grid" | "contents" => Some(Display::Inline),
+        "block" | "flow-root" | "list-item" | "grid" | "table" | "table-row" | "table-cell"
+        | "table-row-group" | "table-header-group" | "table-footer-group" | "table-caption"
+        | "inline-table" => Some(Display::Block),
         _ => None,
     }
 }
@@ -529,8 +536,11 @@ mod tests {
         assert_eq!(parse_display("block"), Some(Display::Block));
         assert_eq!(parse_display("INLINE"), Some(Display::Inline));
         assert_eq!(parse_display("none"), Some(Display::None));
-        // danluu.com's list items; must stack, not collapse into a line.
-        assert_eq!(parse_display("flex"), Some(Display::Block));
+        // M9.5: `flex` is its own mode now — it stopped being spelled `Block`
+        // the moment there was a `Flex` to spell it. `inline-flex` joins it
+        // until M9.11 makes inline-level boxes real.
+        assert_eq!(parse_display("flex"), Some(Display::Flex));
+        assert_eq!(parse_display("INLINE-FLEX"), Some(Display::Flex));
         assert_eq!(parse_display("table-cell"), Some(Display::Block));
         assert_eq!(parse_display("inline-block"), Some(Display::Inline));
         assert_eq!(parse_display("bananas"), None);
