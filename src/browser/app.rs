@@ -4366,4 +4366,223 @@ mod tests {
             "identical view must not retransmit"
         );
     }
+
+    /// M9.12: every interaction surface, over a flex layout.
+    ///
+    /// Each of these worked before this module existed, and that is the point:
+    /// they worked because hit-testing, hints and search all read the layout
+    /// tree rather than the source order, and nothing in M9 was allowed to
+    /// make them read something else. Before flex, a link's document `x` was
+    /// its indentation and every test could get away with x=0 — a link two
+    /// columns to the right is the first thing that tells the two apart.
+    ///
+    /// The clipped half is the one that has already broken once: M9.3's review
+    /// found `Tab` parking on links inside a collapsed menu, from a list that
+    /// was built out of the DOM instead of out of the boxes.
+    mod flex_interaction {
+        use super::*;
+
+        /// A sidebar beside a content column, plus a clipped box whose second
+        /// link is cut away. Every length is a whole number of cells.
+        const PAGE: &str = r#"<style>
+body { margin: 0 } div, p { margin: 0 }
+.row { display: flex }
+.side { flex: 0 0 96px }
+.content { flex: 1 }
+.clip { max-height: 16px; overflow: hidden }
+</style>
+<div class="row">
+  <div class="side"><a href="/one">one</a></div>
+  <div class="content"><a href="/two">two</a> tail words that carry on far enough to wrap onto a second line</div>
+</div>
+<div class="clip"><p><a href="/shown">shown</a></p><p><a href="/gone">gone</a></p></div>"#;
+
+        /// The links the layout tree says are on the page, by href.
+        fn links(app: &App) -> Vec<(String, i32, i32)> {
+            let dom = app.dom.as_ref().unwrap();
+            let tree = app.layout_tree.as_ref().unwrap();
+            layout::collect_links(tree, dom)
+                .into_iter()
+                .map(|l| (l.href, l.x, l.y))
+                .collect()
+        }
+
+        #[test]
+        fn a_link_in_the_second_flex_item_is_where_the_layout_says() {
+            let app = page(60, 12, PAGE);
+            let found = links(&app);
+            let two = found
+                .iter()
+                .find(|(h, _, _)| h == "/two")
+                .expect("content link missing");
+            // `flex: 0 0 96px` is 12 cells of sidebar, so the content column
+            // starts at 12 — the value a pre-flex engine would have called 0.
+            assert_eq!((two.1, two.2), (12, 0), "{found:?}");
+        }
+
+        #[test]
+        fn clicking_a_link_beside_another_flex_item_follows_it() {
+            let mut app = page(60, 12, PAGE);
+            let found = links(&app);
+            let (_, x, y) = found.iter().find(|(h, _, _)| h == "/two").unwrap();
+            let left = column(app.size.0).left;
+            let effect = app.update(mouse_down((left as i32 + x) as u16, *y as u16));
+            assert_eq!(
+                effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+                Some("http://final/two"),
+                "click at ({x}, {y}) missed the content column's link"
+            );
+        }
+
+        #[test]
+        fn hints_reach_both_columns_and_skip_the_clipped_link() {
+            let mut app = page(60, 12, PAGE);
+            assert!(app.update(ch('f')).dirty);
+            let session = app.hint.as_ref().expect("hints must open");
+            let hrefs: Vec<&str> = session
+                .labels
+                .iter()
+                .map(|(_, l)| l.href.as_str())
+                .collect();
+            assert!(hrefs.contains(&"/one"), "{hrefs:?}");
+            assert!(hrefs.contains(&"/two"), "{hrefs:?}");
+            assert!(hrefs.contains(&"/shown"), "{hrefs:?}");
+            assert!(
+                !hrefs.contains(&"/gone"),
+                "a clipped-away link got a hint label: {hrefs:?}"
+            );
+        }
+
+        #[test]
+        fn a_clipped_away_link_is_not_clickable() {
+            let mut app = page(60, 12, PAGE);
+            // The second paragraph of the clip is at the row `max-height`
+            // cut off; clicking where it would have been must hit nothing.
+            let dom = app.dom.as_ref().unwrap();
+            let tree = app.layout_tree.as_ref().unwrap();
+            let hidden_row = layout::collect_links(tree, dom)
+                .iter()
+                .find(|l| l.href == "/shown")
+                .unwrap()
+                .y
+                + 1;
+            let left = column(app.size.0).left;
+            let effect = app.update(mouse_down(left, hidden_row as u16));
+            assert!(
+                effect.fetch.is_none(),
+                "a click reached a link the clip removed"
+            );
+        }
+
+        #[test]
+        fn hover_inside_a_flex_item_restyles_without_relayout() {
+            let mut app = page(60, 12, PAGE);
+            let layouts_before = app.layouts;
+            let found = links(&app);
+            let (_, x, y) = found.iter().find(|(h, _, _)| h == "/two").unwrap();
+            let left = column(app.size.0).left;
+            let effect = app.update(mouse_move((left as i32 + x) as u16, *y as u16));
+            assert!(effect.dirty, "hover over a flex item did nothing");
+            assert!(app.hover.is_some());
+            assert_eq!(app.layouts, layouts_before, "hover must not relayout");
+        }
+
+        #[test]
+        fn search_finds_a_word_on_a_wrapped_flex_items_second_line() {
+            let mut app = page(60, 12, PAGE);
+            let layouts_before = app.layouts;
+            app.update(ch('/'));
+            for c in "second".chars() {
+                app.update(ch(c));
+            }
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            let session = app.search.as_ref().expect("search session");
+            assert_eq!(session.matches.len(), 1, "{:?}", session.matches);
+            // The match is on the content column's second line, which only
+            // exists at all because the sidebar narrowed it to 48 cells.
+            let m = &session.matches[0];
+            assert!(m.x >= 12, "match at x={} is not in the content column", m.x);
+            assert!(m.y >= 1, "match at y={} is not on a wrapped line", m.y);
+            assert_eq!(app.layouts, layouts_before, "search must not relayout");
+        }
+
+        #[test]
+        fn resize_keeps_a_flex_page_anchored() {
+            let mut app = page(60, 12, PAGE);
+            let layouts_before = app.layouts;
+            app.update(Msg::Resize(40, 12));
+            assert_eq!(app.layouts, layouts_before + 1, "resize must relayout");
+            let mut frame = Frame::new(40, 12);
+            app.draw(&mut frame);
+            // Narrower terminal, same sidebar: the content column shrinks and
+            // the page still starts where it did.
+            assert!(
+                row_text(&frame, 0).contains("one"),
+                "{:?}",
+                row_text(&frame, 0)
+            );
+        }
+
+        /// F3 has to explain a flex layout, which means saying that a box *is*
+        /// a flex container, which way it runs, and which box swallowed the
+        /// content that is missing.
+        #[test]
+        fn f3_labels_the_flex_container_and_the_clip() {
+            let mut app = page(60, 12, PAGE);
+            assert_eq!(app.update(f3()), redraw());
+            let dom = app.dom.as_ref().unwrap();
+            let tree = app.layout_tree.as_ref().unwrap();
+            let lines = crate::browser::inspector::box_lines(dom, tree).join("\n");
+            assert!(lines.contains("flex row"), "no flex label in F3:\n{lines}");
+            assert!(lines.contains("overflow=hidden"), "no clip in F3:\n{lines}");
+        }
+
+        /// F1 and F4 are in the same gate and had no reason to change, so this
+        /// is the test that says they did not: the DOM surface still lists the
+        /// page's elements, and the timing table still has a row per stage that
+        /// ran, with `layout` among them on a page whose layout is the point.
+        #[test]
+        fn f1_and_f4_still_work_on_a_flex_page() {
+            let mut app = page(60, 12, PAGE);
+            assert_eq!(app.update(f1()), redraw());
+            let mut frame = Frame::new(60, 12);
+            app.draw(&mut frame);
+            let dom_view = (0..11)
+                .map(|y| row_text(&frame, y))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(dom_view.contains("div"), "F1 lost the tree:\n{dom_view}");
+
+            let rows = app.timings().rows();
+            assert!(
+                rows.iter().any(|r| r.starts_with("layout ")),
+                "no layout row in F4: {rows:?}"
+            );
+            assert!(
+                rows.iter().all(|r| r.ends_with(" ms")),
+                "F4 row is not a duration: {rows:?}"
+            );
+        }
+
+        /// F2 has to show the properties M9.5 added, or a page that flexes
+        /// unexpectedly has no surface that says why.
+        #[test]
+        fn f2_shows_the_flex_properties() {
+            let mut app = page(60, 12, PAGE);
+            assert_eq!(app.update(f2()), redraw());
+            let dom = app.dom.as_ref().unwrap();
+            let styles = app.styles.as_ref().unwrap();
+            let lines = crate::browser::inspector::style_lines(dom, styles).join("\n");
+            // The container's axis rides along with the display keyword, and
+            // the item properties print only where they differ from initial:
+            // `flex: 0 0 96px` is a shrink and a basis, `flex: 1` is a grow.
+            assert!(
+                lines.contains("flex row"),
+                "no flex container in F2:\n{lines}"
+            );
+            assert!(lines.contains("shrink 0"), "{lines}");
+            assert!(lines.contains("basis 96px"), "{lines}");
+            assert!(lines.contains("grow 1"), "{lines}");
+        }
+    }
 }
