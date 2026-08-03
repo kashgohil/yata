@@ -276,6 +276,419 @@ pub fn parse_display(value: &str) -> Option<Display> {
     }
 }
 
+// ---- Flexbox vocabulary (M9.5, css-flexbox-1) -----------------------------
+//
+// Parsing, cascade and initial values only: nothing below is read by layout
+// until M9.6. The point of landing it first is that every later flex task has
+// its inputs already computed, and that F2 can show a page's flex properties
+// before the engine can honour them.
+
+/// `flex-direction`: which axis is the main axis, and which end items start
+/// from. `Row` is the initial value, and the only one M9.6 implements — the
+/// column directions arrive in M9.9 and the reversals with them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FlexDirection {
+    #[default]
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+}
+
+impl FlexDirection {
+    /// The keyword, for `F2`.
+    pub fn name(self) -> &'static str {
+        match self {
+            FlexDirection::Row => "row",
+            FlexDirection::RowReverse => "row-reverse",
+            FlexDirection::Column => "column",
+            FlexDirection::ColumnReverse => "column-reverse",
+        }
+    }
+}
+
+pub fn parse_flex_direction(value: &str) -> Option<FlexDirection> {
+    match lower(value).as_str() {
+        "row" => Some(FlexDirection::Row),
+        "row-reverse" => Some(FlexDirection::RowReverse),
+        "column" => Some(FlexDirection::Column),
+        "column-reverse" => Some(FlexDirection::ColumnReverse),
+        _ => None,
+    }
+}
+
+/// `flex-wrap`: whether items that do not fit start a new line (M9.10).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum FlexWrap {
+    #[default]
+    NoWrap,
+    Wrap,
+    WrapReverse,
+}
+
+impl FlexWrap {
+    pub fn name(self) -> &'static str {
+        match self {
+            FlexWrap::NoWrap => "nowrap",
+            FlexWrap::Wrap => "wrap",
+            FlexWrap::WrapReverse => "wrap-reverse",
+        }
+    }
+}
+
+pub fn parse_flex_wrap(value: &str) -> Option<FlexWrap> {
+    match lower(value).as_str() {
+        "nowrap" => Some(FlexWrap::NoWrap),
+        "wrap" => Some(FlexWrap::Wrap),
+        "wrap-reverse" => Some(FlexWrap::WrapReverse),
+        _ => None,
+    }
+}
+
+/// `justify-content`: how leftover main-axis space is distributed (M9.7).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum JustifyContent {
+    #[default]
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+}
+
+impl JustifyContent {
+    pub fn name(self) -> &'static str {
+        match self {
+            JustifyContent::FlexStart => "flex-start",
+            JustifyContent::FlexEnd => "flex-end",
+            JustifyContent::Center => "center",
+            JustifyContent::SpaceBetween => "space-between",
+            JustifyContent::SpaceAround => "space-around",
+            JustifyContent::SpaceEvenly => "space-evenly",
+        }
+    }
+}
+
+pub fn parse_justify_content(value: &str) -> Option<JustifyContent> {
+    match lower(value).as_str() {
+        // `start`/`left` and `end`/`right` are the box-alignment spellings of
+        // the two flex keywords. In a left-to-right row they mean the same
+        // thing, and pages write them, so they are taken rather than dropped.
+        // `normal` is this property's own CSS initial value, which on a flex
+        // container behaves as `flex-start`.
+        "flex-start" | "start" | "left" | "normal" => Some(JustifyContent::FlexStart),
+        "flex-end" | "end" | "right" => Some(JustifyContent::FlexEnd),
+        "center" => Some(JustifyContent::Center),
+        "space-between" => Some(JustifyContent::SpaceBetween),
+        "space-around" => Some(JustifyContent::SpaceAround),
+        "space-evenly" => Some(JustifyContent::SpaceEvenly),
+        _ => None,
+    }
+}
+
+/// `align-items`: how items are placed on the cross axis of their line (M9.8).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AlignItems {
+    FlexStart,
+    FlexEnd,
+    Center,
+    #[default]
+    Stretch,
+    Baseline,
+}
+
+impl AlignItems {
+    pub fn name(self) -> &'static str {
+        match self {
+            AlignItems::FlexStart => "flex-start",
+            AlignItems::FlexEnd => "flex-end",
+            AlignItems::Center => "center",
+            AlignItems::Stretch => "stretch",
+            AlignItems::Baseline => "baseline",
+        }
+    }
+}
+
+pub fn parse_align_items(value: &str) -> Option<AlignItems> {
+    match lower_words(value).as_str() {
+        "flex-start" | "start" | "self-start" | "left" => Some(AlignItems::FlexStart),
+        "flex-end" | "end" | "self-end" | "right" => Some(AlignItems::FlexEnd),
+        "center" => Some(AlignItems::Center),
+        // `normal` behaves as `stretch` on a flex container (css-align-3 §6.2).
+        "stretch" | "normal" => Some(AlignItems::Stretch),
+        // A cell grid has one baseline per line — the line itself — so the
+        // first/last distinction has nothing to distinguish. Both spellings
+        // become the one notion M9.8 implements.
+        "baseline" | "first baseline" | "last baseline" => Some(AlignItems::Baseline),
+        _ => None,
+    }
+}
+
+/// `align-self`: one item overriding its container's `align-items`. `Auto`
+/// (the initial value) means "whatever the container said"; M9.8 resolves it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AlignSelf {
+    #[default]
+    Auto,
+    /// Carries the `align-items` values rather than restating them: the two
+    /// properties take the same keywords, and M9.8 resolves `Auto` into
+    /// exactly this.
+    Items(AlignItems),
+}
+
+impl AlignSelf {
+    pub fn name(self) -> &'static str {
+        match self {
+            AlignSelf::Auto => "auto",
+            AlignSelf::Items(a) => a.name(),
+        }
+    }
+}
+
+pub fn parse_align_self(value: &str) -> Option<AlignSelf> {
+    if lower(value) == "auto" {
+        return Some(AlignSelf::Auto);
+    }
+    parse_align_items(value).map(AlignSelf::Items)
+}
+
+/// `align-content`: how leftover cross-axis space is distributed between the
+/// lines of a wrapped container (M9.10). Has no effect on a single-line
+/// container, which is why it is the last of the alignment properties to
+/// matter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AlignContent {
+    FlexStart,
+    FlexEnd,
+    Center,
+    SpaceBetween,
+    SpaceAround,
+    #[default]
+    Stretch,
+}
+
+impl AlignContent {
+    pub fn name(self) -> &'static str {
+        match self {
+            AlignContent::FlexStart => "flex-start",
+            AlignContent::FlexEnd => "flex-end",
+            AlignContent::Center => "center",
+            AlignContent::SpaceBetween => "space-between",
+            AlignContent::SpaceAround => "space-around",
+            AlignContent::Stretch => "stretch",
+        }
+    }
+}
+
+pub fn parse_align_content(value: &str) -> Option<AlignContent> {
+    match lower(value).as_str() {
+        "flex-start" | "start" => Some(AlignContent::FlexStart),
+        "flex-end" | "end" => Some(AlignContent::FlexEnd),
+        "center" => Some(AlignContent::Center),
+        "space-between" => Some(AlignContent::SpaceBetween),
+        "space-around" => Some(AlignContent::SpaceAround),
+        "stretch" | "normal" => Some(AlignContent::Stretch),
+        _ => None,
+    }
+}
+
+/// `row-gap` / `column-gap`: the gutters between flex lines and between the
+/// items on a line. Their initial value is zero where every other `Length`
+/// field's is `auto`, which is why they live in a type with its own `Default`
+/// — the same reason [`Edges`] has one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Gaps {
+    pub row: Length,
+    pub column: Length,
+}
+
+impl Default for Gaps {
+    fn default() -> Self {
+        Gaps {
+            row: Length::Zero,
+            column: Length::Zero,
+        }
+    }
+}
+
+/// One gap length. `normal` — the CSS initial value, which pages do write to
+/// reset a gap — is zero here: it only means something other than zero in
+/// multi-column layout, which this engine does not have.
+///
+/// Negative gaps are invalid (css-align-3 §8.1), like negative widths and
+/// unlike negative margins. A percentage is legal and M9.7 resolves it against
+/// the container's own inner size on that axis.
+pub fn parse_gap(value: &str) -> Option<Length> {
+    if value.trim().eq_ignore_ascii_case("normal") {
+        return Some(Length::Zero);
+    }
+    match parse_length(value)? {
+        // `gap: auto` is not CSS, and `Auto` is not a distance.
+        Length::Auto => None,
+        Length::Px(n) | Length::Em(n) | Length::Percent(n) if n < 0.0 => None,
+        len => Some(len),
+    }
+}
+
+/// `gap: <row> [<column>]` — one value sets both axes.
+pub fn parse_gaps(value: &str) -> Option<Gaps> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    match parts.len() {
+        1 => {
+            let both = parse_gap(parts[0])?;
+            Some(Gaps {
+                row: both,
+                column: both,
+            })
+        }
+        2 => Some(Gaps {
+            row: parse_gap(parts[0])?,
+            column: parse_gap(parts[1])?,
+        }),
+        _ => None,
+    }
+}
+
+/// `flex-basis`: the main size an item starts from, before growing or
+/// shrinking. `Auto` defers to the main-axis size property (`width` in a row),
+/// and `Content` sizes from the content — which is also what `Auto` falls back
+/// to when that property is itself `auto` (css-flexbox-1 §7.2.3).
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum FlexBasis {
+    #[default]
+    Auto,
+    Content,
+    Size(Length),
+}
+
+pub fn parse_flex_basis(value: &str) -> Option<FlexBasis> {
+    match lower(value).as_str() {
+        "auto" => return Some(FlexBasis::Auto),
+        // `max-content` and `fit-content` are distinct sizes in CSS; both
+        // collapse to `content` here, which M9.4 measures as the max-content
+        // width. `fit-content` is the approximation of the two — it should
+        // also be clamped by the available space, and is not.
+        "content" | "max-content" | "fit-content" => return Some(FlexBasis::Content),
+        _ => {}
+    }
+    match parse_length(value)? {
+        // `auto` is handled above; a bare `Length::Auto` cannot reach here.
+        Length::Auto => None,
+        Length::Px(n) | Length::Em(n) | Length::Percent(n) if n < 0.0 => None,
+        len => Some(FlexBasis::Size(len)),
+    }
+}
+
+/// `flex-grow` / `flex-shrink` / `flex-basis`, kept together because the `flex`
+/// shorthand always writes all three and because their initial values are not
+/// each other's: `0 1 auto`, which no derived `Default` would produce.
+///
+/// The grammar's asymmetry is the thing to remember: a page that writes
+/// `flex: 1` gets `1 1 0`, not `1 1 auto` — omitting the basis from the
+/// shorthand sets it to zero, while never writing the shorthand at all leaves
+/// it `auto`. That difference is most of what makes `flex: 1` behave the way
+/// pages expect.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Flex {
+    pub grow: f32,
+    pub shrink: f32,
+    pub basis: FlexBasis,
+}
+
+impl Default for Flex {
+    fn default() -> Self {
+        Flex {
+            grow: 0.0,
+            shrink: 1.0,
+            basis: FlexBasis::Auto,
+        }
+    }
+}
+
+/// `flex-grow` / `flex-shrink`: a non-negative number. Negative is invalid, and
+/// so are the infinities `f32::from_str` would otherwise hand back for
+/// `flex-grow: infinity` — a factor that is not a finite number would make
+/// M9.6's distribution arithmetic produce `NaN` widths.
+pub fn parse_flex_factor(value: &str) -> Option<f32> {
+    let n: f32 = lower(value).parse().ok()?;
+    (n.is_finite() && n >= 0.0).then_some(n)
+}
+
+/// `flex: <grow> [<shrink>] [<basis>]`, the shorthand pages actually write.
+///
+/// `auto` and `content` need no special case — they fall out of the grammar as
+/// a lone basis, which defaults the two factors to `1 1`. `none` and `initial`
+/// do, because neither is a basis.
+pub fn parse_flex(value: &str) -> Option<Flex> {
+    match lower(value).as_str() {
+        "none" => {
+            return Some(Flex {
+                grow: 0.0,
+                shrink: 0.0,
+                basis: FlexBasis::Auto,
+            });
+        }
+        "initial" => return Some(Flex::default()),
+        _ => {}
+    }
+    let (mut grow, mut shrink, mut basis) = (None, None, None);
+    // Where the grow factor was, so the shrink factor can be required to sit
+    // directly after it: the grammar is `<grow> <shrink>? || <basis>`, so the
+    // two factors are one component and cannot be split by the basis.
+    // `flex: 20px 1 2` is a page writing the components out of order and is
+    // valid; `flex: 1 20px 2` splits the pair and is not.
+    let mut grow_at = None;
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return None;
+    }
+    for (i, part) in parts.iter().enumerate() {
+        // Order matters within a token too: `0` is both a number and a length,
+        // and the grammar reads the leading numbers as the factors.
+        if let Some(n) = parse_flex_factor(part) {
+            if grow.is_none() {
+                grow = Some(n);
+                grow_at = Some(i);
+                continue;
+            }
+            if shrink.is_none() && grow_at.is_some_and(|at| at + 1 == i) {
+                shrink = Some(n);
+                continue;
+            }
+        }
+        if basis.is_none() {
+            basis = Some(parse_flex_basis(part)?);
+            continue;
+        }
+        return None;
+    }
+    Some(Flex {
+        // An omitted factor is 1 in the shorthand, whatever the longhand's own
+        // initial value is (`flex-grow`'s is 0).
+        grow: grow.unwrap_or(1.0),
+        shrink: shrink.unwrap_or(1.0),
+        basis: basis.unwrap_or(FlexBasis::Size(Length::Zero)),
+    })
+}
+
+/// `order`: an integer, and only an integer — `order: 1.5` is invalid CSS, so
+/// the declaration drops and the previous winner stands. M9.6 sorts items by
+/// it before placing them.
+pub fn parse_order(value: &str) -> Option<i32> {
+    lower(value).parse().ok()
+}
+
+/// Lowercase, trimmed, and internal whitespace runs collapsed to one space —
+/// what a two-word keyword (`first baseline`) needs before a table lookup.
+fn lower_words(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|w| w.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// `color` / `background-color`. Accepts `#rgb`, `#rgba`, `#rrggbb`,
 /// `#rrggbbaa`, `rgb()`/`rgba()`, and a small keyword table. Alpha is parsed
 /// and discarded — a cell grid has no compositing, so a translucent colour is
@@ -663,6 +1076,266 @@ mod tests {
         ] {
             assert!(v.clips(), "{v:?} must clip");
         }
+    }
+
+    // ---- Flexbox vocabulary (M9.5) ----------------------------------------
+
+    #[test]
+    fn the_flex_keyword_properties_take_their_css_values() {
+        assert_eq!(parse_flex_direction("row"), Some(FlexDirection::Row));
+        assert_eq!(
+            parse_flex_direction("COLUMN-REVERSE"),
+            Some(FlexDirection::ColumnReverse)
+        );
+        assert_eq!(
+            parse_flex_direction(" column "),
+            Some(FlexDirection::Column)
+        );
+        assert_eq!(parse_flex_direction("sideways"), None);
+        // `column reverse` is two keywords, not the hyphenated one.
+        assert_eq!(parse_flex_direction("column reverse"), None);
+
+        assert_eq!(parse_flex_wrap("nowrap"), Some(FlexWrap::NoWrap));
+        assert_eq!(parse_flex_wrap("Wrap-Reverse"), Some(FlexWrap::WrapReverse));
+        assert_eq!(parse_flex_wrap("no-wrap"), None);
+
+        assert_eq!(
+            parse_justify_content("space-between"),
+            Some(JustifyContent::SpaceBetween)
+        );
+        assert_eq!(
+            parse_justify_content("SPACE-EVENLY"),
+            Some(JustifyContent::SpaceEvenly)
+        );
+        assert_eq!(parse_justify_content("space-arround"), None);
+
+        assert_eq!(parse_align_items("stretch"), Some(AlignItems::Stretch));
+        assert_eq!(parse_align_items("Center"), Some(AlignItems::Center));
+        assert_eq!(parse_align_items("middle"), None);
+
+        assert_eq!(parse_align_self("auto"), Some(AlignSelf::Auto));
+        assert_eq!(
+            parse_align_self("flex-end"),
+            Some(AlignSelf::Items(AlignItems::FlexEnd))
+        );
+        assert_eq!(parse_align_self("space-between"), None);
+
+        assert_eq!(
+            parse_align_content("space-around"),
+            Some(AlignContent::SpaceAround)
+        );
+        assert_eq!(parse_align_content("stretch"), Some(AlignContent::Stretch));
+        // Not in `align-content`'s value list (css-align-3 gives it
+        // `space-evenly`, this engine does not — M9.10 has no use for it):
+        // invalid, so the previous winner stands.
+        assert_eq!(parse_align_content("space-evenly"), None);
+    }
+
+    #[test]
+    fn the_alignment_aliases_pages_actually_write() {
+        // `start`/`end` are the box-alignment spellings; `left`/`right` are
+        // what pages write when they mean the same thing in a row.
+        assert_eq!(
+            parse_justify_content("start"),
+            Some(JustifyContent::FlexStart)
+        );
+        assert_eq!(
+            parse_justify_content("left"),
+            Some(JustifyContent::FlexStart)
+        );
+        assert_eq!(parse_justify_content("end"), Some(JustifyContent::FlexEnd));
+        assert_eq!(
+            parse_justify_content("right"),
+            Some(JustifyContent::FlexEnd)
+        );
+        assert_eq!(parse_align_items("self-start"), Some(AlignItems::FlexStart));
+        // `normal` is the CSS initial value of both, and behaves as stretch on
+        // a flex container.
+        assert_eq!(parse_align_items("normal"), Some(AlignItems::Stretch));
+        assert_eq!(parse_align_content("normal"), Some(AlignContent::Stretch));
+        // A terminal line has one baseline, so both spellings land on it.
+        assert_eq!(parse_align_items("baseline"), Some(AlignItems::Baseline));
+        assert_eq!(
+            parse_align_items("first baseline"),
+            Some(AlignItems::Baseline)
+        );
+        assert_eq!(
+            parse_align_items("LAST   baseline"),
+            Some(AlignItems::Baseline),
+            "case and inner whitespace must not matter"
+        );
+        assert_eq!(parse_align_items("baseline last"), None);
+    }
+
+    #[test]
+    fn gaps_are_lengths_that_start_at_zero() {
+        assert_eq!(parse_gap("1em"), Some(Length::Em(1.0)));
+        assert_eq!(parse_gap("0"), Some(Length::Zero));
+        assert_eq!(parse_gap("10%"), Some(Length::Percent(10.0)));
+        // `normal` is how a page resets a gap; it means zero here.
+        assert_eq!(parse_gap("NORMAL"), Some(Length::Zero));
+        // Negative gaps are invalid, unlike negative margins.
+        assert_eq!(parse_gap("-1em"), None);
+        assert_eq!(parse_gap("auto"), None);
+        assert_eq!(parse_gap("2rem"), None);
+
+        assert_eq!(
+            parse_gaps("1em 2em"),
+            Some(Gaps {
+                row: Length::Em(1.0),
+                column: Length::Em(2.0),
+            })
+        );
+        assert_eq!(
+            parse_gaps("8px"),
+            Some(Gaps {
+                row: Length::Px(8.0),
+                column: Length::Px(8.0),
+            })
+        );
+        // One bad component drops the whole shorthand rather than gapping one
+        // axis the page never asked to gap.
+        assert_eq!(parse_gaps("1em bananas"), None);
+        assert_eq!(parse_gaps("1em 2em 3em"), None);
+        assert_eq!(parse_gaps(""), None);
+        // The initial value is zero on both axes — not `auto`, which is what a
+        // derived `Default` on `Length` would have given.
+        assert_eq!(
+            Gaps::default(),
+            Gaps {
+                row: Length::Zero,
+                column: Length::Zero
+            }
+        );
+    }
+
+    #[test]
+    fn flex_factors_are_non_negative_finite_numbers() {
+        assert_eq!(parse_flex_factor("0"), Some(0.0));
+        assert_eq!(parse_flex_factor("2.5"), Some(2.5));
+        assert_eq!(parse_flex_factor(" 3 "), Some(3.0));
+        assert_eq!(parse_flex_factor("-1"), None);
+        assert_eq!(parse_flex_factor("1px"), None);
+        assert_eq!(parse_flex_factor(""), None);
+        // `f32::from_str` takes these; a distribution weight of infinity would
+        // hand M9.6 a `NaN` width.
+        assert_eq!(parse_flex_factor("inf"), None);
+        assert_eq!(parse_flex_factor("infinity"), None);
+        assert_eq!(parse_flex_factor("NaN"), None);
+    }
+
+    #[test]
+    fn flex_basis_is_a_length_or_one_of_two_keywords() {
+        assert_eq!(parse_flex_basis("auto"), Some(FlexBasis::Auto));
+        assert_eq!(parse_flex_basis("Content"), Some(FlexBasis::Content));
+        assert_eq!(
+            parse_flex_basis("20px"),
+            Some(FlexBasis::Size(Length::Px(20.0)))
+        );
+        assert_eq!(parse_flex_basis("0"), Some(FlexBasis::Size(Length::Zero)));
+        assert_eq!(
+            parse_flex_basis("50%"),
+            Some(FlexBasis::Size(Length::Percent(50.0)))
+        );
+        assert_eq!(parse_flex_basis("-1px"), None);
+        // `none` is `max-width`'s way of saying "no clamp" and is not a basis.
+        assert_eq!(parse_flex_basis("none"), None);
+    }
+
+    #[test]
+    fn the_flex_shorthand_fills_in_what_the_page_left_out() {
+        let flex = |s: &str| parse_flex(s).unwrap();
+        // The one every page writes, and the asymmetry worth remembering: a
+        // bare number leaves the basis at *zero*, not at the longhand's `auto`.
+        assert_eq!(
+            flex("1"),
+            Flex {
+                grow: 1.0,
+                shrink: 1.0,
+                basis: FlexBasis::Size(Length::Zero)
+            }
+        );
+        assert_eq!(
+            flex("none"),
+            Flex {
+                grow: 0.0,
+                shrink: 0.0,
+                basis: FlexBasis::Auto
+            }
+        );
+        assert_eq!(
+            flex("auto"),
+            Flex {
+                grow: 1.0,
+                shrink: 1.0,
+                basis: FlexBasis::Auto
+            }
+        );
+        assert_eq!(flex("initial"), Flex::default());
+        assert_eq!(Flex::default().grow, 0.0);
+        assert_eq!(Flex::default().shrink, 1.0);
+        assert_eq!(
+            flex("2 3 20px"),
+            Flex {
+                grow: 2.0,
+                shrink: 3.0,
+                basis: FlexBasis::Size(Length::Px(20.0))
+            }
+        );
+        // Two numbers are the two factors; a number and a length are grow and
+        // basis, whichever order they come in.
+        assert_eq!(
+            flex("2 0"),
+            Flex {
+                grow: 2.0,
+                shrink: 0.0,
+                basis: FlexBasis::Size(Length::Zero)
+            }
+        );
+        assert_eq!(
+            flex("1 30%"),
+            Flex {
+                grow: 1.0,
+                shrink: 1.0,
+                basis: FlexBasis::Size(Length::Percent(30.0))
+            }
+        );
+        // A lone length: both factors default to 1, which is not either
+        // longhand's own initial value.
+        assert_eq!(
+            flex("30em"),
+            Flex {
+                grow: 1.0,
+                shrink: 1.0,
+                basis: FlexBasis::Size(Length::Em(30.0))
+            }
+        );
+        // The components may come in either order, but the two factors are one
+        // component: the basis cannot be written between them.
+        assert_eq!(
+            flex("20px 1 2"),
+            Flex {
+                grow: 1.0,
+                shrink: 2.0,
+                basis: FlexBasis::Size(Length::Px(20.0))
+            }
+        );
+        assert_eq!(parse_flex("1 20px 2"), None);
+        assert_eq!(parse_flex("1 2 3 4"), None);
+        assert_eq!(parse_flex("bananas"), None);
+        assert_eq!(parse_flex("1 auto auto"), None);
+        assert_eq!(parse_flex(""), None);
+        assert_eq!(parse_flex("-1"), None);
+    }
+
+    #[test]
+    fn order_is_an_integer_and_may_be_negative() {
+        assert_eq!(parse_order("0"), Some(0));
+        assert_eq!(parse_order("-1"), Some(-1));
+        assert_eq!(parse_order(" 12 "), Some(12));
+        // CSS says integer; `1.5` is invalid, so the previous winner stands.
+        assert_eq!(parse_order("1.5"), None);
+        assert_eq!(parse_order("first"), None);
     }
 
     #[test]
