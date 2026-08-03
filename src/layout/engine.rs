@@ -11,7 +11,7 @@ use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
 use crate::layout::flex;
 use crate::layout::intrinsic::IntrinsicSizer;
 use crate::style::values::{
-    AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FontStyle, FontWeight, Length,
+    AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FontStyle, FontWeight, Gaps, Length,
     TextAlign,
 };
 use crate::style::{ComputedStyle, Styles};
@@ -522,9 +522,10 @@ impl<'a> Engine<'a> {
     /// divided) and §9.5 (where they go). Returns the container's used content
     /// height, which for a single row is its tallest item.
     ///
-    /// Scope, M9.8: `flex-direction: row` and `row-reverse`, `flex-wrap:
-    /// nowrap`, both axes. M9.9 brings the column directions and M9.10
-    /// wrapping.
+    /// Scope, M9.9 so far: `flex-direction: row` and `row-reverse`, `flex-wrap:
+    /// nowrap`, both axes — the same directions M9.8 laid out, now expressed in
+    /// main/cross terms rather than in `x`/`y` ones. The column directions are
+    /// the rest of M9.9 and M9.10 brings wrapping.
     ///
     /// **On the main axis, alignment places and never moves.** Every item is
     /// positioned before its contents are laid out, so a centred item's text is
@@ -545,13 +546,9 @@ impl<'a> Engine<'a> {
         pre: bool,
     ) -> i32 {
         let content = self.boxes[box_id.0 as usize].dimensions.content;
-        // §9.2 step 2: the container's inner main size. For a row that is the
-        // content width it already has — resolved as any block's is, clamps
-        // and `box-sizing` included (M9.2), because a flex container is a
-        // perfectly ordinary block-level box from the outside.
-        let inner_main = content.width;
+        let axis = FlexAxis::of(computed.flex_direction, content.width, specified_height);
 
-        let mut items = self.flex_items(id, inner_main, pre);
+        let mut items = self.flex_items(id, &axis, pre);
         if items.is_empty() {
             return 0;
         }
@@ -561,13 +558,22 @@ impl<'a> Engine<'a> {
         // still see the document as written — which is what CSS says too.
         items.sort_by_key(|item| item.order);
 
-        // §8.3: the gap between two items on the main axis. A percentage
-        // resolves against the container's own inner size on that axis.
-        let gap = computed.gap.column.to_cells_h(inner_main).max(0);
+        // §8.3: the gap between two items on the main axis — `column-gap` for a
+        // row, `row-gap` for a column, because a gap is named for what it sits
+        // between. A percentage resolves against the container's own inner size
+        // on that axis.
+        let gap = axis.main_distance(axis.main_gap(computed.gap));
         // Saturating: a page is free to write `gap: 99999em`, and a layout
         // stage that panicked on one would be a browser a page can crash.
         // The row comes out empty instead, which is what such a gap means.
         let total_gap = gap.saturating_mul(items.len() as i32 - 1);
+
+        // §9.2 step 2: the container's inner main size, the number §9.7
+        // divides. For a row that is the content width it already has —
+        // resolved as any block's is, clamps and `box-sizing` included (M9.2),
+        // because a flex container is a perfectly ordinary block-level box from
+        // the outside.
+        let inner_main = content.width;
 
         // §9.3 line collection: `nowrap`, so every item is on one line
         // whatever it costs. M9.10 is where that stops being true.
@@ -577,28 +583,22 @@ impl<'a> Engine<'a> {
             total_gap,
         );
 
-        // The axis flip, and the whole of what `row-reverse` costs. Main-start
-        // is the container's right edge, so an offset from main-start counts
-        // leftwards instead of rightwards and an item's main-start margin is
-        // its `margin-right`. Everything else — §9.7 above, §9.5 below — is
+        // The axis flip, and the whole of what a `-reverse` direction costs.
+        // Main-start is the container's far edge — its right for `row-reverse`,
+        // its bottom for `column-reverse` — so an offset from main-start is
+        // subtracted instead of added, and an item's main-start margin is the
+        // one on the other side. Everything else — §9.7 above, §9.5 below — is
         // written in main-axis terms and does not know which way the axis
-        // points.
-        let reverse = computed.flex_direction == FlexDirection::RowReverse;
+        // points, or even which axis it is.
         let slots: Vec<flex::Slot> = items
             .iter()
             .zip(&sizes)
             .map(|(item, &main_size)| {
-                let left = item.computed.margin.left.is_auto();
-                let right = item.computed.margin.right.is_auto();
-                let (auto_start, auto_end) = if reverse {
-                    (right, left)
-                } else {
-                    (left, right)
-                };
+                let (start, end) = axis.main_margins(&item.computed);
                 flex::Slot {
                     outer: main_size + item.metrics.outer_edges,
-                    auto_start,
-                    auto_end,
+                    auto_start: start.is_auto(),
+                    auto_end: end.is_auto(),
                 }
             })
             .collect();
@@ -607,6 +607,11 @@ impl<'a> Engine<'a> {
         // then `justify-content`.
         let placed = flex::place(&slots, gap, inner_main, computed.justify_content);
 
+        // The container's main-start content edge in tree coordinates, and the
+        // far edge a reversed direction counts back from.
+        let main_origin = content.x;
+        let main_far = main_origin.saturating_add(inner_main);
+
         let mut children = Vec::with_capacity(items.len());
         for (idx, (item, &main_size)) in items.iter().zip(&sizes).enumerate() {
             let p = placed[idx];
@@ -614,33 +619,35 @@ impl<'a> Engine<'a> {
                 .outer
                 .saturating_add(p.auto_start)
                 .saturating_add(p.auto_end);
-            // Main-axis offset → the physical left edge of the item's margin
-            // box: added to the left edge for a row, subtracted from the right
-            // for a reversed one. Saturating, because an offset can be
-            // enormous — `gap: 1e11em` is a legal thing for a stylesheet to
-            // say, and an item shoved past the right edge is what it asks for,
+            // Main-axis offset → the physical near edge of the item's margin
+            // box: added to the container's near edge, or subtracted from its
+            // far one when the axis is reversed. Saturating, because an offset
+            // can be enormous — `gap: 1e11em` is a legal thing for a stylesheet
+            // to say, and an item shoved off the page is what it asks for,
             // where an overflowing add would be a panic a page could trigger.
-            let left = if reverse {
-                content
-                    .right()
+            let near = if axis.reverse {
+                main_far
                     .saturating_sub(p.main_start)
                     .saturating_sub(outer_main)
             } else {
-                content.x.saturating_add(p.main_start)
+                main_origin.saturating_add(p.main_start)
             };
-            let (auto_left, auto_right) = if reverse {
+            // The auto-margin shares, named for the sides they are painted on
+            // rather than for the ends of the main axis.
+            let (auto_near, auto_far) = if axis.reverse {
                 (p.auto_end, p.auto_start)
             } else {
                 (p.auto_start, p.auto_end)
             };
+            let place = ItemPlacement {
+                near,
+                main_size,
+                auto_near,
+                auto_far,
+            };
             let child = self.layout_flex_item(
                 item,
-                ItemPlacement {
-                    left,
-                    main_size,
-                    auto_left,
-                    auto_right,
-                },
+                place,
                 content,
                 computed.text_align,
                 specified_height,
@@ -665,7 +672,8 @@ impl<'a> Engine<'a> {
     }
 
     /// §9.4 (*cross sizing*) and §9.6 (*cross-axis alignment*) for the one line
-    /// M9.8 has: size the line, then move each item into its place on it.
+    /// a `nowrap` container has: size the line, then move each item into its
+    /// place on it.
     ///
     /// Returns the line's cross size.
     ///
@@ -859,10 +867,10 @@ impl<'a> Engine<'a> {
         pre: bool,
     ) -> BoxId {
         let ItemPlacement {
-            left,
+            near: left,
             main_size,
-            auto_left,
-            auto_right,
+            auto_near: auto_left,
+            auto_far: auto_right,
         } = place;
         match item.source {
             FlexItemSource::Element(node) => {
@@ -978,131 +986,51 @@ impl<'a> Engine<'a> {
 
     /// §4: turn the container's children into flex items, and measure each one
     /// enough to hand §9.7 its inputs.
-    fn flex_items(&mut self, container: NodeId, inner_main: i32, pre: bool) -> Vec<FlexItem> {
+    fn flex_items(&mut self, container: NodeId, axis: &FlexAxis, pre: bool) -> Vec<FlexItem> {
         flex_sources(self.dom, container, &|n| self.is_hidden(n), pre)
             .into_iter()
-            .map(|source| match source {
-                FlexItemSource::Element(node) => self.element_item(node, inner_main),
-                FlexItemSource::Text(nodes) => {
-                    // An anonymous item has no style, so every flex property is
-                    // at its initial value: `flex: 0 1 auto`, and a basis of
-                    // `auto` on a box with no `width` is its max-content size
-                    // (§9.2 step 3 B/E).
-                    let (min, max) = self.sizer.run_widths(&nodes);
-                    FlexItem {
-                        source: FlexItemSource::Text(nodes),
-                        computed: ComputedStyle::default(),
-                        order: 0,
-                        metrics: flex::Item {
-                            base: max,
-                            hypothetical: max,
-                            min,
-                            max: None,
-                            grow: 0.0,
-                            shrink: 1.0,
-                            outer_edges: 0,
-                        },
-                    }
-                }
-            })
+            .map(|source| self.row_item(source, axis))
             .collect()
     }
 
-    /// One element child as a flex item, with §9.2's base and hypothetical
-    /// main sizes and §4.5's automatic minimum size.
-    fn element_item(&mut self, node: NodeId, inner_main: i32) -> FlexItem {
-        let c = *self.styles.get(node);
-        let axis = Axis {
-            edges: edge_h(c.padding.left, inner_main)
-                + edge_h(c.padding.right, inner_main)
-                + edge_h(c.border.left, inner_main)
-                + edge_h(c.border.right, inner_main),
-            box_sizing: c.box_sizing,
-        };
-        let outer_edges =
-            axis.edges + edge_h(c.margin.left, inner_main) + edge_h(c.margin.right, inner_main);
-
-        // Both §9.2's base size and §4.5's automatic minimum can need the same
-        // answer — how wide this item's *content* is — and measuring an inline
-        // subtree is the expensive thing this task added to the layout path.
-        // So it is asked at most once per item, and only when one of the two
-        // actually wants it.
-        let sizes_from_content = matches!(c.flex.basis, FlexBasis::Content)
-            || (matches!(c.flex.basis, FlexBasis::Auto) && c.width.is_auto())
-            || (c.min_width.is_auto() && !c.overflow_x.clips());
-        let content = if sizes_from_content {
-            self.sizer.content_widths(node)
-        } else {
-            (0, 0)
-        };
-
-        // §9.2 step 3: the flex base size.
-        //
-        // `content` is the max-content size outright; a length or percentage
-        // resolves on the main axis (the container's inner main size is always
-        // definite here — it is a width); `auto` defers to the main-axis size
-        // property, and to max-content when that is `auto` too. This is the
-        // step that needs M9.4: the engine can fill an available width, but
-        // only intrinsic sizing can say how wide content *wants* to be.
-        let base = match c.flex.basis {
-            FlexBasis::Content => content.1,
-            FlexBasis::Size(len) => axis.content_from(len.to_cells_h(inner_main)),
-            FlexBasis::Auto if !c.width.is_auto() => {
-                axis.content_from(c.width.to_cells_h(inner_main))
-            }
-            FlexBasis::Auto => content.1,
-        };
-
-        let max =
-            (!c.max_width.is_auto()).then(|| axis.content_from(c.max_width.to_cells_h(inner_main)));
-        let min = if c.min_width.is_auto() {
-            // §4.5, the automatic minimum size — the rule that stops a flex row
-            // from shredding a word one cell at a time. A scroll container opts
-            // out of it (a clipped box is allowed to be smaller than its
-            // content; that is what clipping is for).
-            if c.overflow_x.clips() {
-                0
-            } else {
-                let content_min = content.0;
-                let specified =
-                    (!c.width.is_auto()).then(|| axis.content_from(c.width.to_cells_h(inner_main)));
-                // Never larger than the size the item was explicitly given, or
-                // than its own maximum: an automatic minimum that outgrew
-                // either would be inventing a size the page never asked for.
-                let mut min = content_min;
-                if let Some(specified) = specified {
-                    min = min.min(specified);
+    /// One item of a **row**: measured, not built. Its main size is a width, so
+    /// `intrinsic` can answer without laying anything out, and the box is built
+    /// later at the position §9.5 chose for it.
+    fn row_item(&mut self, source: FlexItemSource, axis: &FlexAxis) -> FlexItem {
+        match source {
+            FlexItemSource::Element(node) => {
+                let c = *self.styles.get(node);
+                // Measuring an inline subtree is the expensive thing flex added
+                // to the layout path, so it is asked at most once per item and
+                // only when §9.2's base size or §4.5's automatic minimum
+                // actually wants the answer.
+                let content = if wants_content_size(&c, axis) {
+                    self.sizer.content_widths(node)
+                } else {
+                    (0, 0)
+                };
+                FlexItem {
+                    source: FlexItemSource::Element(node),
+                    order: c.order,
+                    metrics: item_metrics(&c, axis, content),
+                    computed: c,
                 }
-                if let Some(max) = max {
-                    min = min.min(max);
-                }
-                min
             }
-        } else {
-            axis.content_from(c.min_width.to_cells_h(inner_main))
-        };
-
-        // §9.2 step 4: the hypothetical main size is the base size clamped by
-        // the item's own min/max — max first, then min, the order M9.2 pinned.
-        let mut hypothetical = base;
-        if let Some(max) = max {
-            hypothetical = hypothetical.min(max);
-        }
-        hypothetical = hypothetical.max(min).max(0);
-
-        FlexItem {
-            source: FlexItemSource::Element(node),
-            computed: c,
-            order: c.order,
-            metrics: flex::Item {
-                base,
-                hypothetical,
-                min,
-                max,
-                grow: c.flex.grow,
-                shrink: c.flex.shrink,
-                outer_edges,
-            },
+            FlexItemSource::Text(nodes) => {
+                // An anonymous item has no style, so every flex property is at
+                // its initial value: `flex: 0 1 auto`, and a basis of `auto` on
+                // a box with no `width` is its max-content size (§9.2 step 3
+                // B/E), which is what the initial style makes `item_metrics`
+                // compute.
+                let content = self.sizer.run_widths(&nodes);
+                let c = ComputedStyle::default();
+                FlexItem {
+                    source: FlexItemSource::Text(nodes),
+                    computed: c,
+                    order: 0,
+                    metrics: item_metrics(&c, axis, content),
+                }
+            }
         }
     }
 
@@ -1909,6 +1837,278 @@ pub(super) fn edge_h(len: crate::style::values::Length, containing_width: i32) -
     }
 }
 
+/// Vertical length → lines; `auto` is zero for margin edges.
+///
+/// A percentage still resolves against the containing block's **width** — CSS
+/// 2.1's rule for padding and margins on both axes, which is why this is
+/// `to_cells_v` and not `to_lines`. `to_lines` is for `height` and its clamps,
+/// and getting the two crossed is the likeliest bug on a vertical main axis.
+pub(super) fn edge_v(len: crate::style::values::Length, containing_width: i32) -> i32 {
+    if len.is_auto() {
+        0
+    } else {
+        len.to_cells_v(containing_width)
+    }
+}
+
+/// Does §9.2's base size or §4.5's automatic minimum need to know how big this
+/// item's *content* wants to be on the main axis?
+///
+/// Asked so the measurement happens at most once per item, and only when one of
+/// the two actually reads it — measuring an inline subtree is the expensive
+/// thing flex added to the layout path.
+fn wants_content_size(c: &ComputedStyle, axis: &FlexAxis) -> bool {
+    matches!(c.flex.basis, FlexBasis::Content)
+        || (matches!(c.flex.basis, FlexBasis::Auto)
+            && axis.main_definite(axis.main_size(c)).is_none())
+        || (axis.main_min(c).is_auto() && !axis.main_overflow_clips(c))
+}
+
+/// §9.2 steps 3 and 4 and §4.5, from the two content sizes the axis was able to
+/// supply — `(min-content, max-content)` for a row, and the height the item's
+/// content used, twice, for a column.
+///
+/// Pure arithmetic over one style, so both directions reach the same rules by
+/// the same route: the only thing that differs between them is which property
+/// each "main-axis" question resolves to, and that is [`FlexAxis`]'s job.
+fn item_metrics(c: &ComputedStyle, axis: &FlexAxis, content: (i32, i32)) -> flex::Item {
+    let box_axis = Axis {
+        edges: axis.main_box_edges(c),
+        box_sizing: c.box_sizing,
+    };
+    let (margin_start, margin_end) = axis.main_margins(c);
+    let outer_edges = box_axis.edges + axis.edge(margin_start) + axis.edge(margin_end);
+    let specified = axis
+        .main_definite(axis.main_size(c))
+        .map(|v| box_axis.content_from(v));
+
+    // §9.2 step 3: the flex base size.
+    //
+    // `content` is the max-content size outright; a length or percentage
+    // resolves on the main axis; `auto` defers to the main-axis size property,
+    // and to the content size when that is `auto` too. A percentage against an
+    // indefinite main size — a `height: auto` column — behaves as `auto` and
+    // lands in the same place. This is the step that needs M9.4 for a row: the
+    // engine can fill an available width, but only intrinsic sizing can say how
+    // wide content *wants* to be.
+    let base = match c.flex.basis {
+        FlexBasis::Content => content.1,
+        FlexBasis::Size(len) => match axis.main_definite(len) {
+            Some(cells) => box_axis.content_from(cells),
+            None => content.1,
+        },
+        FlexBasis::Auto => specified.unwrap_or(content.1),
+    };
+
+    let max = axis
+        .main_definite(axis.main_max(c))
+        .map(|v| box_axis.content_from(v));
+    let min = if axis.main_min(c).is_auto() {
+        // §4.5, the automatic minimum size — the rule that stops a flex row
+        // from shredding a word one cell at a time, and a column from squeezing
+        // an item shorter than its own text. A scroll container opts out of it
+        // (a clipped box is allowed to be smaller than its content; that is
+        // what clipping is for).
+        if axis.main_overflow_clips(c) {
+            0
+        } else {
+            // Never larger than the size the item was explicitly given, or than
+            // its own maximum: an automatic minimum that outgrew either would
+            // be inventing a size the page never asked for.
+            let mut min = content.0;
+            if let Some(specified) = specified {
+                min = min.min(specified);
+            }
+            if let Some(max) = max {
+                min = min.min(max);
+            }
+            min
+        }
+    } else {
+        axis.main_definite(axis.main_min(c))
+            .map_or(0, |v| box_axis.content_from(v))
+    };
+
+    // §9.2 step 4: the hypothetical main size is the base size clamped by the
+    // item's own min/max — max first, then min, the order M9.2 pinned.
+    let mut hypothetical = base;
+    if let Some(max) = max {
+        hypothetical = hypothetical.min(max);
+    }
+    hypothetical = hypothetical.max(min).max(0);
+
+    flex::Item {
+        base,
+        hypothetical,
+        min,
+        max,
+        grow: c.flex.grow,
+        shrink: c.flex.shrink,
+        outer_edges,
+    }
+}
+
+/// Which physical direction a flex container's main axis runs in, and what
+/// lengths on either axis resolve against (M9.9).
+///
+/// `flex-direction: column` is not a second algorithm — it is the same one with
+/// main and cross swapped — and this is the swap. Every "main axis" question
+/// the engine asks (which size property, which margins, which padding and
+/// border, which gap, which unit rule, which `overflow`) is asked here, which is
+/// what lets `layout_flex_contents` and its helpers be written once in
+/// main/cross terms instead of twice in `x`/`y` ones.
+///
+/// **Deliberately not called `Axis`.** This module already has one — a
+/// box-model axis, carrying padding+border and `box-sizing` for a single
+/// dimension — and `style::values` has a private one for a length's units. A
+/// third meaning of the same word in the same crate is a trap for a reader.
+#[derive(Clone, Copy)]
+struct FlexAxis {
+    /// The main axis runs down the page: `column` or `column-reverse`.
+    vertical: bool,
+    /// Main-start is the container's far edge — its right for `row-reverse`,
+    /// its bottom for `column-reverse`.
+    reverse: bool,
+    /// The container's inner **width**. Percentage padding and margins resolve
+    /// against it on *both* axes (CSS 2.1 §8.1), and for a column it is the
+    /// inner cross size outright.
+    width: i32,
+    /// What a percentage on the **main** axis resolves against, or `None` when
+    /// the container's main size is indefinite. A row's is always `Some` — a
+    /// main size that is a width is settled before anything is laid out — while
+    /// a `height: auto` column has no number for a percentage to be a
+    /// percentage of, so every such length behaves as `auto` (M9.2).
+    main_base: Option<i32>,
+}
+
+impl FlexAxis {
+    fn of(direction: FlexDirection, width: i32, definite_height: Option<i32>) -> Self {
+        let vertical = matches!(
+            direction,
+            FlexDirection::Column | FlexDirection::ColumnReverse
+        );
+        FlexAxis {
+            vertical,
+            reverse: matches!(
+                direction,
+                FlexDirection::RowReverse | FlexDirection::ColumnReverse
+            ),
+            width,
+            main_base: if vertical {
+                definite_height
+            } else {
+                Some(width)
+            },
+        }
+    }
+
+    fn main_size(self, c: &ComputedStyle) -> Length {
+        if self.vertical { c.height } else { c.width }
+    }
+
+    fn main_min(self, c: &ComputedStyle) -> Length {
+        if self.vertical {
+            c.min_height
+        } else {
+            c.min_width
+        }
+    }
+
+    fn main_max(self, c: &ComputedStyle) -> Length {
+        if self.vertical {
+            c.max_height
+        } else {
+            c.max_width
+        }
+    }
+
+    /// The main-axis margins in `(main-start, main-end)` order, already through
+    /// the direction's flip — a `row-reverse` item's main-start margin is its
+    /// `margin-right`, and a `column-reverse` item's is its `margin-bottom`.
+    fn main_margins(self, c: &ComputedStyle) -> (Length, Length) {
+        let (start, end) = if self.vertical {
+            (c.margin.top, c.margin.bottom)
+        } else {
+            (c.margin.left, c.margin.right)
+        };
+        if self.reverse {
+            (end, start)
+        } else {
+            (start, end)
+        }
+    }
+
+    /// Padding + border on the main axis: what `box-sizing: border-box` counts
+    /// as part of a main size.
+    fn main_box_edges(self, c: &ComputedStyle) -> i32 {
+        if self.vertical {
+            self.edge(c.padding.top)
+                + self.edge(c.padding.bottom)
+                + self.edge(c.border.top)
+                + self.edge(c.border.bottom)
+        } else {
+            self.edge(c.padding.left)
+                + self.edge(c.padding.right)
+                + self.edge(c.border.left)
+                + self.edge(c.border.right)
+        }
+    }
+
+    /// One main-axis edge — margin, border or padding — in cells; `auto` is
+    /// zero. Percentages use the container's *width* whichever axis this is,
+    /// which is CSS 2.1's rule and not a shortcut.
+    fn edge(self, len: Length) -> i32 {
+        if self.vertical {
+            edge_v(len, self.width)
+        } else {
+            edge_h(len, self.width)
+        }
+    }
+
+    /// A main-axis **size** property as cells, or `None` for "behaves as
+    /// `auto`" — which a percentage does when the container's main size is
+    /// indefinite.
+    ///
+    /// The unit rule is the thing that must not get crossed: a width is 8px to
+    /// the cell and takes its percentage from the containing width, a height is
+    /// 16px to the line and takes its percentage from the containing *height*.
+    fn main_definite(self, len: Length) -> Option<i32> {
+        if self.vertical {
+            definite_v(len, self.main_base)
+        } else if len.is_auto() {
+            None
+        } else {
+            Some(len.to_cells_h(self.width))
+        }
+    }
+
+    /// A main-axis distance that is never `auto`: a gap. An indefinite main
+    /// size makes a percentage gap zero, the same thing it does to a percentage
+    /// height.
+    fn main_distance(self, len: Length) -> i32 {
+        self.main_definite(len).unwrap_or(0).max(0)
+    }
+
+    /// The gap that falls *between the items on a line*. A gap is named for
+    /// what it sits between, so `column-gap` — the gutter between columns — is
+    /// a row's main-axis gap and `row-gap` is a column's. The other one is the
+    /// gap between flex lines, and a `nowrap` container has one line, so it
+    /// falls between nothing until M9.10.
+    fn main_gap(self, gaps: Gaps) -> Length {
+        if self.vertical { gaps.row } else { gaps.column }
+    }
+
+    /// Whether this item opts out of §4.5's automatic minimum size by clipping
+    /// on the main axis.
+    fn main_overflow_clips(self, c: &ComputedStyle) -> bool {
+        if self.vertical {
+            c.overflow_y.clips()
+        } else {
+            c.overflow_x.clips()
+        }
+    }
+}
+
 enum ChildMode {
     Skip,
     Block,
@@ -1933,19 +2133,21 @@ struct FlexItem {
 /// One item's place on the line, in the physical terms box-building needs:
 /// §9.5's main-axis offsets already mapped through the container's direction.
 ///
-/// `auto_left` / `auto_right` are the cells that item's `auto` margins
-/// absorbed, named for the sides they are painted on rather than for the ends
-/// of the main axis — under `row-reverse` the main-start one is the right.
+/// "Near" and "far" rather than start and end, because those are the ones a
+/// box's coordinates are in: the near edge is the item's left in a row and its
+/// top in a column, and under a `-reverse` direction it is the main-*end* one.
 #[derive(Clone, Copy)]
 struct ItemPlacement {
-    /// Left edge of the item's margin box, in the tree's coordinates. Not
-    /// "main-start": under `row-reverse` that is the item's *right* edge, and
-    /// this is the number box-building needs.
-    left: i32,
+    /// The item's margin box's near edge on the main axis, in the tree's
+    /// coordinates: its `x` for a row, its `y` for a column.
+    near: i32,
     /// The used main size §9.7 resolved, content-box.
     main_size: i32,
-    auto_left: i32,
-    auto_right: i32,
+    /// The cells this item's `auto` main-axis margins absorbed, on the near and
+    /// far sides — `margin-left`/`margin-right` for a row, `margin-top`/
+    /// `margin-bottom` for a column.
+    auto_near: i32,
+    auto_far: i32,
 }
 
 pub(super) enum FlexItemSource {
@@ -1957,10 +2159,11 @@ pub(super) enum FlexItemSource {
 
 /// Does this box lay its children out by css-flexbox-1 §9, here and now?
 ///
-/// `display: flex` is necessary and not sufficient: M9.7 implements the two
-/// *row* directions, so a column container keeps stacking its children as a
-/// block until M9.9 — which is what it did before flex layout existed, and much
-/// closer to what a column means than laying it out sideways would be.
+/// `display: flex` is necessary and not sufficient: the two *row* directions
+/// are laid out, so a column container keeps stacking its children as a block
+/// until the rest of M9.9 lands — which is what it did before flex layout
+/// existed, and much closer to what a column means than laying it out sideways
+/// would be.
 ///
 /// Both the engine and intrinsic sizing ask this. They must agree, or a flex
 /// container's measured width and its laid-out width would come from different
