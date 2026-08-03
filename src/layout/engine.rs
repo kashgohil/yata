@@ -2969,15 +2969,13 @@ pub fn term_color(color: crate::style::values::ColorValue) -> Color {
 /// Does this `display` generate a block-level box — one that stacks, rather
 /// than joining the line beside it?
 ///
-/// **This is the whole of what `display: flex` means to layout today (M9.5).**
-/// The vocabulary — direction, wrap, gaps, the flex factors — cascades and
-/// shows up in `F2`, but no box reads it yet, so a flex container is laid out
-/// exactly as a block container: children stacked, in document order,
-/// `order` ignored. That is what `flex` already did when M4 parsed it straight
-/// to `Block`, which is why landing the vocabulary moves no snapshot.
-///
-/// M9.6 replaces this: `Display::Flex` gets its own arm in `layout_node`, and
-/// what remains here is the block/inline question.
+/// `Display::Flex` answers yes for the same reason `Display::Block` does: a
+/// flex container is an ordinary block-level box *from the outside*, and this
+/// question is only about the outside. What it does with its children —
+/// css-flexbox-1 §9 rather than a stack of blocks — is
+/// [`lays_out_as_flex`]'s, and the two are deliberately separate: it is what
+/// lets a flex container be a block's child, and a block a flex item, with no
+/// second code path on either side.
 pub(super) fn is_block_level(display: Display) -> bool {
     matches!(display, Display::Block | Display::Flex)
 }
