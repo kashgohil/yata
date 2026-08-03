@@ -1284,6 +1284,14 @@ enum InlineItem {
 }
 
 /// Intermediate fragment while building an IFC (text pieces + atomic images).
+///
+/// The `Image` variant is the wide one: it carries a whole `ComputedStyle`
+/// (204 bytes since M9.5 put flexbox's vocabulary in there), against 48 for a
+/// text piece. Boxing it, which is what the lint asks for, would trade a
+/// transient per-IFC `Vec` — freed as soon as the block's lines are built —
+/// for a heap allocation on every inline image. Not worth it at this size;
+/// worth revisiting if `ComputedStyle` keeps growing.
+#[allow(clippy::large_enum_variant)]
 enum InlineFrag {
     Piece(Piece),
     Image {

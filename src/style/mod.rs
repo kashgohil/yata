@@ -20,7 +20,9 @@ use crate::css::{self, Declaration, Stylesheet};
 use crate::dom::{Dom, NodeData, NodeId};
 use matching::RuleIndex;
 use values::{
-    BoxSizing, ColorValue, Display, Edges, FontStyle, FontWeight, Length, Overflow, TextAlign,
+    AlignContent, AlignItems, AlignSelf, BoxSizing, ColorValue, Display, Edges, Flex,
+    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, Overflow,
+    TextAlign,
 };
 
 /// Dynamic matching inputs for the cascade (M6): which node is hovered, which
@@ -83,6 +85,28 @@ pub struct ComputedStyle {
     /// a paragraph inside a clipped menu is not itself a clipping box.
     pub overflow_x: Overflow,
     pub overflow_y: Overflow,
+    /// Flex *container* properties (M9.5): what a `display:flex` box does with
+    /// the children it flexes. None of them inherit — a `<span>` inside a flex
+    /// container is not itself a flex container, and its own children are laid
+    /// out by whatever formatting context it establishes.
+    pub flex_direction: FlexDirection,
+    pub flex_wrap: FlexWrap,
+    pub justify_content: JustifyContent,
+    pub align_items: AlignItems,
+    pub align_content: AlignContent,
+    /// `row-gap` / `column-gap`. Also the `gap` shorthand, which is why they
+    /// share a struct.
+    pub gap: Gaps,
+    /// Flex *item* properties: what this box asks of the container flexing it.
+    /// Set on the child, read by the parent — so they sit on every node, not
+    /// only on flex children, and mean nothing until a flex container reads
+    /// them (M9.6).
+    pub flex: Flex,
+    pub align_self: AlignSelf,
+    /// `order`: the sequence items are placed in, lowest first (M9.6). It does
+    /// not reorder the DOM — hit-testing, focus and the inspectors keep seeing
+    /// document order, which is what CSS says too.
+    pub order: i32,
     /// The winning `display` came from the user-agent sheet's `!important` —
     /// this element holds code, metadata or inert markup and is never prose
     /// (see `ua.css`). Layout's never-blank fallback honours this even when it
@@ -128,6 +152,19 @@ impl ComputedStyle {
             // page put it on.
             overflow_x: Overflow::default(),
             overflow_y: Overflow::default(),
+            // Nor does any of the flex vocabulary (M9.5). A container's
+            // `justify-content` describes how *it* places *its* children, and
+            // an item's `flex: 1` is a request to *its* parent; inheriting
+            // either would apply it a level too deep.
+            flex_direction: FlexDirection::default(),
+            flex_wrap: FlexWrap::default(),
+            justify_content: JustifyContent::default(),
+            align_items: AlignItems::default(),
+            align_content: AlignContent::default(),
+            gap: Gaps::default(),
+            flex: Flex::default(),
+            align_self: AlignSelf::default(),
+            order: 0,
             // Not inherited: a child of a hidden `<script>` is hidden because
             // its ancestor's subtree is skipped, not because it inherited a
             // verdict about itself.
@@ -359,6 +396,33 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
         "overflow" => apply_overflow_shorthand(computed, value),
         "overflow-x" => set(&mut computed.overflow_x, values::parse_overflow(value)),
         "overflow-y" => set(&mut computed.overflow_y, values::parse_overflow(value)),
+        // M9.5's vocabulary. The shorthands expand here rather than in the
+        // parser so a longhand later in the cascade still overrides the piece
+        // of them it names — `flex: none; flex-grow: 3` is grow 3.
+        "flex-direction" => set(
+            &mut computed.flex_direction,
+            values::parse_flex_direction(value),
+        ),
+        "flex-wrap" => set(&mut computed.flex_wrap, values::parse_flex_wrap(value)),
+        "flex-flow" => apply_flex_flow(computed, value),
+        "justify-content" => set(
+            &mut computed.justify_content,
+            values::parse_justify_content(value),
+        ),
+        "align-items" => set(&mut computed.align_items, values::parse_align_items(value)),
+        "align-self" => set(&mut computed.align_self, values::parse_align_self(value)),
+        "align-content" => set(
+            &mut computed.align_content,
+            values::parse_align_content(value),
+        ),
+        "gap" => set(&mut computed.gap, values::parse_gaps(value)),
+        "row-gap" => set(&mut computed.gap.row, values::parse_gap(value)),
+        "column-gap" => set(&mut computed.gap.column, values::parse_gap(value)),
+        "flex" => set(&mut computed.flex, values::parse_flex(value)),
+        "flex-grow" => set(&mut computed.flex.grow, values::parse_flex_factor(value)),
+        "flex-shrink" => set(&mut computed.flex.shrink, values::parse_flex_factor(value)),
+        "flex-basis" => set(&mut computed.flex.basis, values::parse_flex_basis(value)),
+        "order" => set(&mut computed.order, values::parse_order(value)),
         "text-decoration" | "text-decoration-line" => set(
             &mut computed.underline,
             values::parse_text_decoration(value),
@@ -386,6 +450,36 @@ fn apply_overflow_shorthand(computed: &mut ComputedStyle, value: &str) -> bool {
     };
     computed.overflow_x = x;
     computed.overflow_y = y;
+    true
+}
+
+/// `flex-flow: <direction> || <wrap>` — either component, in either order,
+/// with the one that is absent reset to its initial value (that is what a
+/// shorthand does, and it is why `flex-flow: wrap` un-reverses a direction an
+/// earlier rule set). A token that is neither drops the whole declaration.
+fn apply_flex_flow(computed: &mut ComputedStyle, value: &str) -> bool {
+    let (mut direction, mut wrap) = (None, None);
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.is_empty() || parts.len() > 2 {
+        return false;
+    }
+    for part in parts {
+        if direction.is_none()
+            && let Some(d) = values::parse_flex_direction(part)
+        {
+            direction = Some(d);
+            continue;
+        }
+        if wrap.is_none()
+            && let Some(w) = values::parse_flex_wrap(part)
+        {
+            wrap = Some(w);
+            continue;
+        }
+        return false;
+    }
+    computed.flex_direction = direction.unwrap_or_default();
+    computed.flex_wrap = wrap.unwrap_or_default();
     true
 }
 
@@ -705,6 +799,119 @@ mod tests {
     }
 
     #[test]
+    fn the_flex_vocabulary_cascades_and_does_not_inherit() {
+        let (dom, styles) = styled(
+            "<div><p>t</p></div>",
+            "div { display: flex; flex-direction: column; flex-wrap: wrap-reverse;
+                   justify-content: space-between; align-items: center;
+                   align-content: flex-end; gap: 1em 2em;
+                   flex: 2 3 20px; align-self: flex-start; order: -1 }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.display, Display::Flex);
+        assert_eq!(div.flex_direction, FlexDirection::Column);
+        assert_eq!(div.flex_wrap, FlexWrap::WrapReverse);
+        assert_eq!(div.justify_content, JustifyContent::SpaceBetween);
+        assert_eq!(div.align_items, AlignItems::Center);
+        assert_eq!(div.align_content, AlignContent::FlexEnd);
+        assert_eq!(div.gap.row, Length::Em(1.0));
+        assert_eq!(div.gap.column, Length::Em(2.0));
+        assert_eq!(div.flex.grow, 2.0);
+        assert_eq!(div.flex.shrink, 3.0);
+        assert_eq!(div.flex.basis, FlexBasis::Size(Length::Px(20.0)));
+        assert_eq!(div.align_self, AlignSelf::Items(AlignItems::FlexStart));
+        assert_eq!(div.order, -1);
+
+        // A child of a flex container is not itself one, and asks nothing of
+        // its own children: every one of these is back at its initial value.
+        let p = styles.get(find(&dom, "p"));
+        assert_eq!(p.display, Display::Block);
+        assert_eq!(p.flex_direction, FlexDirection::Row);
+        assert_eq!(p.flex_wrap, FlexWrap::NoWrap);
+        assert_eq!(p.justify_content, JustifyContent::FlexStart);
+        assert_eq!(p.align_items, AlignItems::Stretch);
+        assert_eq!(p.align_content, AlignContent::Stretch);
+        assert_eq!(p.gap, Gaps::default());
+        assert_eq!(p.flex, Flex::default());
+        assert_eq!(p.align_self, AlignSelf::Auto);
+        assert_eq!(p.order, 0);
+    }
+
+    #[test]
+    fn a_longhand_after_a_shorthand_still_wins() {
+        // The shorthands expand at cascade time, in cascade order, so a
+        // longhand that comes later overrides the piece of them it names —
+        // and one that comes earlier does not.
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { flex: none; flex-grow: 3 }
+             div { flex-basis: 4em; flex: 1 }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.flex.grow, 1.0, "the second `flex` reset grow");
+        assert_eq!(div.flex.shrink, 1.0);
+        assert_eq!(
+            div.flex.basis,
+            FlexBasis::Size(Length::Zero),
+            "`flex: 1` overrides the flex-basis written before it"
+        );
+
+        // The other order, on one element, for each shorthand.
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { flex: none; flex-grow: 3;
+                   flex-flow: column wrap; flex-direction: row-reverse;
+                   gap: 1em; row-gap: 3em; column-gap: 4em }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.flex.grow, 3.0);
+        assert_eq!(div.flex.shrink, 0.0, "the rest of `flex: none` survives");
+        assert_eq!(div.flex_direction, FlexDirection::RowReverse);
+        assert_eq!(div.flex_wrap, FlexWrap::Wrap, "from `flex-flow`");
+        assert_eq!(div.gap.row, Length::Em(3.0));
+        assert_eq!(div.gap.column, Length::Em(4.0));
+    }
+
+    #[test]
+    fn flex_flow_resets_the_component_it_omits() {
+        // That is what a shorthand does: `flex-flow: wrap` says nothing about
+        // the direction, so the direction goes back to its initial value
+        // rather than keeping what an earlier rule set.
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { flex-direction: column } div { flex-flow: wrap }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.flex_direction, FlexDirection::Row);
+        assert_eq!(div.flex_wrap, FlexWrap::Wrap);
+
+        // Either order of the two components, and a junk token drops the whole
+        // declaration rather than half-applying it.
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { flex-flow: wrap-reverse column-reverse }
+             div { flex-flow: row bananas }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.flex_direction, FlexDirection::ColumnReverse);
+        assert_eq!(div.flex_wrap, FlexWrap::WrapReverse);
+    }
+
+    #[test]
+    fn an_invalid_flex_value_leaves_the_previous_winner_standing() {
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { flex-grow: 2; justify-content: center; gap: 1em; order: 4 }
+             div { flex-grow: -1; justify-content: middle; gap: -1em; order: 1.5 }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.flex.grow, 2.0);
+        assert_eq!(div.justify_content, JustifyContent::Center);
+        assert_eq!(div.gap.row, Length::Em(1.0));
+        assert_eq!(div.order, 4);
+    }
+
+    #[test]
     fn box_model_properties_cascade_and_do_not_inherit() {
         let (dom, styles) = styled(
             "<div><p>t</p></div>",
@@ -944,6 +1151,20 @@ mod ladder {
         // until M9.6. The list stays stacked either way — that is what makes
         // this a vocabulary change and not a rendering one.
         assert_eq!(styles.get(find(&dom, "li")).display, Display::Flex);
+        // ...and the page's `.np` nav, which is where its flex *properties*
+        // are: `flex-direction: row; justify-content: space-between`.
+        let np = elements(&dom)
+            .into_iter()
+            .find(|&id| dom.attr(id, "class").is_some_and(|c| c == "np"))
+            .expect("danluu.com has a .np nav");
+        let np = styles.get(np);
+        assert_eq!(np.display, Display::Flex);
+        assert_eq!(np.flex_direction, values::FlexDirection::Row);
+        assert_eq!(
+            np.justify_content,
+            values::JustifyContent::SpaceBetween,
+            "the one real justify-content on the ladder"
+        );
     }
 
     #[test]
