@@ -319,3 +319,96 @@ Demo path: open a page with images (or inject via local fixture server);
 placeholders appear immediately; pixels pop in without freezing scroll;
 `j`/`k` stay instant; on Kitty, true pixels overlay the same rects.
 
+
+---
+
+## M9 — flexbox (2026-08-04)
+
+Block sizing (`height`, min/max clamps, `box-sizing`), `overflow` clipping,
+intrinsic sizing, the whole of flexbox, and atomic inlines. Machine A.
+
+**Method.** Every row is a **before/after pair measured on the same day, on the
+same machine, alternating** — `AFTER, BEFORE, AFTER, BEFORE` — because this
+machine drifts 5–10% between runs and a single before-then-after comparison
+would report the drift as the change. "Before" is the M9 parent commit
+(`6dd6b73`, M8 tip) built from a worktree, not the numbers in the M8 section
+above: those were taken on another day and are not comparable at this
+resolution. Criterion `--sample-size 20 --measurement-time 5`; two rounds each,
+both reported.
+
+### The gates
+
+| Measure | Before (M8 tip) | After (M9) | Budget |
+|---|---|---|---|
+| full pipeline danluu.com (`--timing` total, median of 7) | 2.9 ms | **3.2 ms** | < 50 ms |
+| full pipeline en.wikipedia.org (`--timing` total, median of 7) | 64.6 ms | **66.0 ms** | < 250 ms |
+| `bench layout` en.wikipedia.org 80-col | 4.25 / 4.33 ms | **5.29 / 5.58 ms** | < 100 ms |
+| `bench layout` full pipeline danluu.com | 583 / 584 µs | **772 / 783 µs** | < 50 ms |
+| `bench layout` flex deck 80-col (new) | 526 / 524 µs | **1.208 / 1.219 ms** | — |
+| `bench scroll` 120×40 | 53.9 / 54.1 µs | **52.3 / 52.3 µs** | < 5 ms |
+| `bench scroll` 200×50 | 76.0 / 75.7 µs | **74.0 / 74.1 µs** | < 5 ms |
+| Peak RSS, Wikipedia (`--dump-boxes`, full layout) | 42.5 MB | **45.3 MB** | < 100 MB |
+
+Both gated pages stay two orders of magnitude inside budget: danluu at 6% of
+50 ms, Wikipedia at 26% of 250 ms — and Wikipedia's total is still 67% *style*,
+a stage M9 never touched.
+
+### Where the time went
+
+Layout got slower everywhere, by three different amounts, and each has a
+different cause.
+
+**Wikipedia layout, +24% (4.3 → 5.4 ms).** This page is not a flex page — it
+has two flex containers in the taxobox and a portal box. The cost is the work
+M9.2 and M9.3 added to *every* box, flex or not: resolving `height`, the four
+clamps and `box-sizing` on each block, and carrying a clip rectangle down the
+walk. It is a per-box tax, and the page has 13 399 elements.
+
+**danluu pipeline, +33% (583 → 776 µs).** All of it is `li { display: flex }`
+on 196 list items: each one now generates flex items and measures its subtree's
+intrinsic widths before laying it out. M9.6 already logged this arriving
+(620 → 726 µs on that day's machine) and it has not grown since; the rest of M9
+added nothing measurable to this page.
+
+**Flex deck, +130% (525 µs → 1.21 ms).** This is the new bench, and the honest
+caveat is that the two sides are not doing the same work: before M9, the same
+DOM laid out as plain blocks, ignoring every `display: flex` on it. So the
+number is not a regression — it is the price of the feature, on a page (300
+flex columns inside a wrapping flex row, a nested header row each) built to be
+nothing but flex. Roughly 2.3× block layout for the same tree is what
+generating items, measuring each one's min/max-content width, collecting lines
+and distributing free space costs.
+
+Items are laid out **once**: measurement allocates no boxes, so there is no
+measure-then-relayout pass. The one place a box is moved after being built is
+M9.8's cross-axis shift, which moves a finished subtree rather than rebuilding
+it.
+
+### Scrolling still never relayouts
+
+The scroll step came out *faster* on both frame sizes (−3%, inside this
+machine's drift — read it as unchanged). It could hardly be otherwise: the
+scroll path is cached display list → repaint at a new offset, and M9 changed
+what goes into the list, not what happens to it afterwards. Pinned by tests
+rather than by the bench alone — the `layouts` counter stays flat across
+scroll, search, `n`/`N`, and hover, including hover on a link inside a flex
+item (`flex_interaction::hover_inside_a_flex_item_restyles_without_relayout`).
+
+Keypress→screen is the same story: the only keypress that relayouts is a
+resize, whose cost is the layout row above (5.4 ms on Wikipedia, inside the
+10 ms budget), and `flex_interaction::resize_keeps_a_flex_page_anchored`
+pins that a flex page still relayouts exactly once for it.
+
+### Memory
+
+Peak RSS on the Wikipedia fixture went 42.5 → 45.3 MB, 45% of the 100 MB
+budget.
+
+The 2.8 MB is **not attributed** — it was measured, not explained, and the two
+candidates were not separated: a denser layout tree (flex containers carry line
+structure, M9.11's line boxes carry a row count) and `IntrinsicSizer`'s memo,
+a `HashMap<NodeId, Sizes>` that can hold an entry per measured node and is live
+for the whole of `layout_document`. Both are transient — the memo is dropped
+with the `Engine` and the tree is replaced on the next layout — so this is peak
+*during* a layout, not a leak, and M9 adds nothing that outlives a navigation.
+Worth separating if the number ever approaches the budget; at 45% it is not.
