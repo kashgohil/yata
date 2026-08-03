@@ -279,6 +279,28 @@ impl<'a> Engine<'a> {
         // Content width already set by resolve; height filled below.
         dims.content.height = 0;
 
+        let box_id = self.layout_box_at(id, tag, computed, dims, containing_height, pre);
+        *prev_margin_bottom = self.boxes[box_id.0 as usize].dimensions.margin.bottom;
+        Some(box_id)
+    }
+
+    /// Build the box for an element whose edges and content **width** are
+    /// already decided and whose position is already chosen, fill it with its
+    /// contents, and give it its used height (CSS 2.1 §10.5–10.7).
+    ///
+    /// Split out from `layout_block` because "how wide, and where" is the only
+    /// part of block layout a flex item (M9.6) needs to answer differently:
+    /// its width comes from the flex algorithm and its position from the flex
+    /// line, and everything after that is what any block-level box does.
+    fn layout_box_at(
+        &mut self,
+        id: NodeId,
+        tag: &str,
+        computed: ComputedStyle,
+        dims: Dimensions,
+        containing_height: Option<i32>,
+        pre: bool,
+    ) -> BoxId {
         let box_id = self.alloc(LayoutBox {
             kind: BoxKind::Block,
             node: Some(id),
@@ -302,6 +324,37 @@ impl<'a> Engine<'a> {
         };
         let specified_height =
             definite_v(computed.height, containing_height).map(|h| v_axis.content_from(h));
+
+        let auto_height = self.layout_contents(id, tag, computed, box_id, specified_height, pre);
+
+        // Used height: the specified one if there is one, else the content's
+        // (an empty div is zero rows), then the min/max clamps. Children keep
+        // the boxes and positions they were given, so a box shorter than its
+        // content lets that content overflow and paint past the bottom edge —
+        // `overflow: visible` is the initial value, and clipping is M9.3.
+        // The flow advances by *this* height, which is what makes `height: 0`
+        // collapse a box whose children still exist.
+        let content_height = v_axis.clamp(
+            specified_height.unwrap_or(auto_height),
+            definite_v(computed.min_height, containing_height),
+            definite_v(computed.max_height, containing_height),
+        );
+        self.boxes[box_id.0 as usize].dimensions.content.height = content_height;
+        box_id
+    }
+
+    /// Lay this element's children into its (already positioned) box, and
+    /// return the content height they used.
+    fn layout_contents(
+        &mut self,
+        id: NodeId,
+        tag: &str,
+        computed: ComputedStyle,
+        box_id: BoxId,
+        specified_height: Option<i32>,
+        pre: bool,
+    ) -> i32 {
+        let dims = self.boxes[box_id.0 as usize].dimensions;
 
         // List marker / tag-driven extras before children.
         let bullet = tag == "li";
@@ -432,24 +485,8 @@ impl<'a> Engine<'a> {
             children.push(anon);
         }
 
-        // Used height: the specified one if there is one, else the content's
-        // (an empty div is zero rows), then the min/max clamps. Children keep
-        // the boxes and positions they were given, so a box shorter than its
-        // content lets that content overflow and paint past the bottom edge —
-        // `overflow: visible` is the initial value, and clipping is M9.3.
-        // The flow advances by *this* height, which is what makes `height: 0`
-        // collapse a box whose children still exist.
-        let auto_height = (content_y - dims.content.y).max(0);
-        let content_height = v_axis.clamp(
-            specified_height.unwrap_or(auto_height),
-            definite_v(computed.min_height, containing_height),
-            definite_v(computed.max_height, containing_height),
-        );
-        self.boxes[box_id.0 as usize].dimensions.content.height = content_height;
         self.boxes[box_id.0 as usize].children = children;
-
-        *prev_margin_bottom = self.boxes[box_id.0 as usize].dimensions.margin.bottom;
-        Some(box_id)
+        (content_y - dims.content.y).max(0)
     }
 
     #[allow(clippy::too_many_arguments)]
