@@ -2205,6 +2205,18 @@ impl<'a> Engine<'a> {
     /// breaker has to know how wide the box *would* be before it can decide
     /// which line it goes on — and if it goes on the next one, the answer
     /// changes, because `available` did.
+    ///
+    /// **Where this diverges from a browser, deliberately.** CSS 2.1 reads
+    /// "available width" as the *containing block's* width, so a browser sizes
+    /// an inline-block the same wherever it lands: a box that does not fit
+    /// moves to the next line at the width it already had. Here `available` is
+    /// what is left of the current line (M9.11's spec), so a box with room for
+    /// only some of its content squeezes into that room and wraps inside
+    /// itself rather than leaving the tail of a line empty — worth more on an
+    /// 80-cell terminal than the browser's rule is. The cost is that the same
+    /// box can come out two widths on two runs at different column widths.
+    /// `tests/fixtures/layout/spec/inline-block.boxes` pins both readings
+    /// apart: its third paragraph is the one that would change.
     fn atomic_dims(&mut self, node: NodeId, containing_width: i32, available: i32) -> Dimensions {
         let computed = *self.styles.get(node);
         let mut dims = resolve_block_dims(&computed, containing_width);
@@ -2267,7 +2279,7 @@ impl<'a> Engine<'a> {
         // height inside an atomic inline behaves as `auto` — M9.2's rule for
         // any box whose containing block is sized by its content.
         let box_id = self.layout_box_at(node, &tag, computed, dims, None, pre);
-        Piece::atomic(box_id, cells, node)
+        Piece::atomic(box_id, cells)
     }
 
     /// How many rows an atomic inline's margin box occupies, and which of them
@@ -2657,6 +2669,14 @@ impl<'a> Engine<'a> {
                 // margins and padding belong to its own box rather than
                 // becoming spacers, and its contents are laid out inside it
                 // rather than flowing into this line (M9.11).
+                //
+                // `<br>` and `<img>` are already gone by here, which leaves one
+                // element whose real layout lives in a function this path does
+                // not call: an `<hr>` nested inside an inline element (invalid
+                // markup the parser usually breaks up first) gets an empty
+                // atomic box instead of a rule. It still costs the line its 1em
+                // UA margins, which is what a browser does with the box too —
+                // only the rule inside it is missing.
                 if is_atomic_inline(computed.display) {
                     out.push(InlineItem::Atomic { node: id });
                     return;
@@ -3387,12 +3407,15 @@ impl Piece {
         }
     }
 
-    fn atomic(box_id: BoxId, cells: i32, node: NodeId) -> Piece {
+    /// `node` stays `None`: the box carries the DOM node, and a piece's own
+    /// node is only ever read to build a text box or to merge one, neither of
+    /// which an atomic does.
+    fn atomic(box_id: BoxId, cells: i32) -> Piece {
         Piece {
             text: String::new(),
             cells,
             style: Style::default(),
-            node: Some(node),
+            node: None,
             kind: PieceKind::Atomic(box_id),
         }
     }

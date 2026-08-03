@@ -1752,6 +1752,26 @@ mod tests {
     }
 
     #[test]
+    fn an_hr_that_cannot_draw_a_rule_still_costs_the_line_only_its_own_box() {
+        // The one element whose layout lives in a function the atomic path does
+        // not call. `<hr>` inside an inline is markup the parser normally
+        // breaks up, and where it survives it becomes an empty box: no rule,
+        // but no lost text either, and the rows it takes are its own 1em UA
+        // margins rather than a row for a rule that was never drawn.
+        let src = "<div>a <span><hr class=b></span> b</div>";
+        let css = "span .b { display: inline-block }";
+        assert_eq!(atomic_boxes(src, css, 20), [(2, 1, 0, 0)]);
+        let rows = plain(&lines_styled(src, css, 20));
+        assert_eq!(
+            rows.iter().map(|r| r.trim_end()).collect::<Vec<_>>(),
+            // Two spaces: the box is zero cells wide, and the collapsible
+            // space either side of it is still a space.
+            ["", "", "a  b"],
+            "the text either side of it must survive: {rows:?}"
+        );
+    }
+
+    #[test]
     fn a_link_inside_an_inline_block_is_clickable_and_searchable() {
         // Hit-testing, link hints and `/` search all walk the layout tree, and
         // an atomic inline puts a whole subtree of boxes under a *line* box for
