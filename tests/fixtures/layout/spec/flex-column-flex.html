@@ -1,0 +1,18 @@
+<!-- width: 20 -->
+<!doctype html>
+<html><head><style>
+body { margin: 0 }
+.col { display: flex; flex-direction: column }
+.tall { height: 160px }
+.floor { min-height: 96px }
+.short { height: 48px }
+.a { flex: 1 }
+.b { flex: 2 }
+.p { flex: 0 1 64px }
+.q { flex: 0 1 32px; min-height: 32px }
+</style></head>
+<body>
+<div class="col tall"><div class="a">a</div><div class="b">b</div></div>
+<div class="col floor"><div class="a">c</div><div class="a">d</div></div>
+<div class="col short"><div class="p">p</div><div class="q">q</div></div>
+</body></html>

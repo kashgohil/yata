@@ -28,8 +28,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::engine::{
-    Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_block_level, is_html_space,
-    lays_out_as_flex,
+    Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_block_level, is_column,
+    is_html_space, lays_out_as_flex,
 };
 use crate::style::Styles;
 use crate::style::values::{Display, FlexBasis, Length};
@@ -275,44 +275,70 @@ impl<'a> IntrinsicSizer<'a> {
         }
     }
 
-    /// A flex row's sizes (§9.9): its items sit **side by side**, so both
-    /// widths are sums where a block container's are maxima. That difference is
-    /// the whole reason this function exists — measuring a flex row like a
-    /// block reports the width of its widest item, which is what a two-item
-    /// row would be if it were allowed to wrap, and it is not (M9.6 is
-    /// `nowrap`).
+    /// A flex container's sizes (§9.9), and the one place the *direction*
+    /// changes a measurement.
+    ///
+    /// A **row**'s items sit side by side, so both widths are sums where a
+    /// block container's are maxima. That difference is the whole reason this
+    /// function exists — measuring a flex row like a block reports the width of
+    /// its widest item, which is what a two-item row would be if it were
+    /// allowed to wrap, and it is not (`nowrap`).
+    ///
+    /// A **column**'s items stack, so the width it is being asked for is its
+    /// *cross* axis: a max over its items' outer widths, with no gap term at
+    /// all — the gap between column items is a height, and a `nowrap` column
+    /// has one line, so no cross gap falls between anything. Nor does
+    /// `flex-basis` come into it there: a column's basis is a height and says
+    /// nothing about how wide the container wants to be. Getting this wrong is
+    /// not a visible bug in the column itself; it is a nested column measuring
+    /// three times too wide inside something else, and pushing its siblings
+    /// over (M9.9).
     ///
     /// Simplification, stated rather than hidden: the spec sizes a flex
     /// container from its items' *contributions*, which scale each item by its
-    /// flex fraction (§9.9.1). Here max-content sums the items' max-content
-    /// sizes and min-content sums their min-content sizes, which is exact for
-    /// the case that matters — at a container width equal to either sum, §9.7
-    /// has zero free space to distribute and hands every item exactly the size
-    /// that went into the sum.
+    /// flex fraction (§9.9.1). Here a row's max-content sums the items'
+    /// max-content sizes and its min-content sums their min-content sizes,
+    /// which is exact for the case that matters — at a container width equal to
+    /// either sum, §9.7 has zero free space to distribute and hands every item
+    /// exactly the size that went into the sum.
     fn flex_sizes(&mut self, node: NodeId, computed: &crate::style::ComputedStyle) -> Sizes {
         let pre = self.in_pre(node);
         let sources = flex_sources(self.dom, node, &|n| self.is_hidden(n), pre);
         if sources.is_empty() {
             return Sizes::ZERO;
         }
-        // Gaps are part of what the row asks for: a row of three items with a
-        // one-cell gap needs two cells nothing will ever draw in. Zero
-        // containing width, per this module's percentage rule.
-        let gap = edge_h(computed.gap.column, 0).max(0) * (sources.len() as i32 - 1);
+        let column = is_column(computed);
+        // Gaps are part of what a row asks for: three items with a one-cell gap
+        // need two cells nothing will ever draw in. Zero containing width, per
+        // this module's percentage rule.
+        let gap = if column {
+            0
+        } else {
+            edge_h(computed.gap.column, 0).max(0) * (sources.len() as i32 - 1)
+        };
         let mut out = Sizes { min: gap, max: gap };
         for source in sources {
             let sizes = match source {
                 FlexItemSource::Element(child) => {
-                    self.item_sizes(child).grown_by(self.outer_edges(child))
+                    let content = if column {
+                        self.sizes(child)
+                    } else {
+                        self.item_sizes(child)
+                    };
+                    content.grown_by(self.outer_edges(child))
                 }
                 FlexItemSource::Text(nodes) => {
                     let (min, max) = self.run_widths(&nodes);
                     Sizes { min, max }
                 }
             };
-            out = Sizes {
-                min: out.min + sizes.min,
-                max: out.max + sizes.max,
+            out = if column {
+                out.max_with(sizes)
+            } else {
+                Sizes {
+                    min: out.min + sizes.min,
+                    max: out.max + sizes.max,
+                }
             };
         }
         out
@@ -883,6 +909,37 @@ mod tests {
         // `flex: 1` row in the wild would measure as nothing.
         let growable = "#r { display: flex } .i { flex: 1 }";
         assert_eq!(sizes_of(row, growable, "div"), (2, 2));
+    }
+
+    #[test]
+    fn a_column_asks_for_its_widest_item_where_a_row_asks_for_their_sum() {
+        // M9.9. The width a flex container wants is a sum only when its items
+        // sit side by side. A column's stack, so the width is the *cross* axis:
+        // a max over the items' outer widths, and no gap term either — a
+        // column's gap is a height, and a `nowrap` column has one line, so no
+        // cross gap falls between anything.
+        let markup = "<div id=r><div>aaaa</div><div>bb</div></div>";
+        let row = "#r { display: flex; column-gap: 1em }";
+        assert_eq!(
+            sizes_of(markup, row, "div"),
+            (8, 8),
+            "a row: 4 + 2 items plus the 2-cell gap between them"
+        );
+        for direction in ["column", "column-reverse"] {
+            let css = format!("#r {{ display: flex; flex-direction: {direction}; gap: 1em }}");
+            assert_eq!(
+                sizes_of(markup, &css, "div"),
+                (4, 4),
+                "{direction}: the widest item, not the sum, and no gap"
+            );
+        }
+
+        // `flex-basis` is a main-axis size, so in a column it is a *height* and
+        // says nothing about how wide the container wants to be. A row's
+        // measurement reads it; a column's must not, or a `flex-basis: 160px`
+        // column would report 20 cells of width it never uses.
+        let basis = "#r { display: flex; flex-direction: column } div div { flex: 0 0 160px }";
+        assert_eq!(sizes_of(markup, basis, "div"), (4, 4));
     }
 
     #[test]

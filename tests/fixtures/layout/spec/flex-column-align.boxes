@@ -1,0 +1,86 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.4 step 11 and §9.6 with main
+# and cross swapped (M9.9), before the code existed. Never regenerated.
+#
+# A column's cross axis is the horizontal one, so `align-items` decides
+# **widths and x**. Each container's content width is 128px = 16 cells.
+#
+# `stretch` (unset, the initial value) — an item whose cross size is `auto`
+#   fills the container's content width. That is the whole reason
+#   `flex-direction: column` looks like ordinary block flow, and it is why
+#   `stretch_item` — the field write that grows a *row* item's height after the
+#   fact — could not be reused here. Stretching a height moves nothing inside
+#   the box; stretching a width re-runs the line breaker. So a column's
+#   stretched items are **built at** their stretched width, and the evidence is
+#   in the boxes: the second item is 16 cells wide and so are its anonymous
+#   block and its line box. Had the box been widened after being built at its
+#   10-cell max-content size, the line inside it would still read w=10.
+#
+# The first item states `width: 48px` = 6 cells, so it has a cross size already
+#   and nothing stretches it. Its text breaks at 6 — "alpha", then "beta" —
+#   while the identical string on the next item is a single 10-cell line inside
+#   a 16-cell box. Same text, same column, two line breaks: each item's cross
+#   size reached the breaker.
+#
+# `center` / `flex-end` — an item that is not stretching shrink-wraps instead
+#   (CSS 2.1 §10.3.5's formula, the one a float uses):
+#   min(max(min-content, available), max-content).
+#     item 2  min(max(5, 16), 10) = 10 → 6 cells free → centre at 3, end at 6
+#     item 3  min(max(5, 16), 27) = 16 → 0 free, so it is at x = 0 in all three
+#             containers and its text breaks at 16 in all three:
+#             "one two three" is 13 and " four" would make 18.
+#     item 1  6 cells, 10 free → centre at 5, end at 10.
+#
+# Heights follow: 2 + 1 + 2 = 5 lines per container, stacking at y = 0, 5, 10.
+<html>  x=0 y=0 w=40 h=15
+  <body>  x=0 y=0 w=40 h=15
+    <div.col> flex column  x=0 y=0 w=16 h=5
+      <div.narrow>  x=0 y=0 w=6 h=2
+        anonymous  x=0 y=0 w=6 h=2
+          line  x=0 y=0 w=6 h=1
+            #text "alpha"  x=0 y=0 w=5 h=1
+          line  x=0 y=1 w=6 h=1
+            #text "beta"  x=0 y=1 w=4 h=1
+      <div>  x=0 y=2 w=16 h=1
+        anonymous  x=0 y=2 w=16 h=1
+          line  x=0 y=2 w=16 h=1
+            #text "alpha beta"  x=0 y=2 w=10 h=1
+      <div>  x=0 y=3 w=16 h=2
+        anonymous  x=0 y=3 w=16 h=2
+          line  x=0 y=3 w=16 h=1
+            #text "one two three"  x=0 y=3 w=13 h=1
+          line  x=0 y=4 w=16 h=1
+            #text "four five six"  x=0 y=4 w=13 h=1
+    <div.col.mid> flex column  x=0 y=5 w=16 h=5
+      <div.narrow>  x=5 y=5 w=6 h=2
+        anonymous  x=5 y=5 w=6 h=2
+          line  x=5 y=5 w=6 h=1
+            #text "alpha"  x=5 y=5 w=5 h=1
+          line  x=5 y=6 w=6 h=1
+            #text "beta"  x=5 y=6 w=4 h=1
+      <div>  x=3 y=7 w=10 h=1
+        anonymous  x=3 y=7 w=10 h=1
+          line  x=3 y=7 w=10 h=1
+            #text "alpha beta"  x=3 y=7 w=10 h=1
+      <div>  x=0 y=8 w=16 h=2
+        anonymous  x=0 y=8 w=16 h=2
+          line  x=0 y=8 w=16 h=1
+            #text "one two three"  x=0 y=8 w=13 h=1
+          line  x=0 y=9 w=16 h=1
+            #text "four five six"  x=0 y=9 w=13 h=1
+    <div.col.end> flex column  x=0 y=10 w=16 h=5
+      <div.narrow>  x=10 y=10 w=6 h=2
+        anonymous  x=10 y=10 w=6 h=2
+          line  x=10 y=10 w=6 h=1
+            #text "alpha"  x=10 y=10 w=5 h=1
+          line  x=10 y=11 w=6 h=1
+            #text "beta"  x=10 y=11 w=4 h=1
+      <div>  x=6 y=12 w=10 h=1
+        anonymous  x=6 y=12 w=10 h=1
+          line  x=6 y=12 w=10 h=1
+            #text "alpha beta"  x=6 y=12 w=10 h=1
+      <div>  x=0 y=13 w=16 h=2
+        anonymous  x=0 y=13 w=16 h=2
+          line  x=0 y=13 w=16 h=1
+            #text "one two three"  x=0 y=13 w=13 h=1
+          line  x=0 y=14 w=16 h=1
+            #text "four five six"  x=0 y=14 w=13 h=1

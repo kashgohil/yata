@@ -1,0 +1,66 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.5 (main-axis alignment) on a
+# *vertical* main axis, before the code existed. Never regenerated.
+#
+# `justify-content` is the main-axis property, so in a column it distributes
+# **rows**, and the free space it distributes only exists because the container
+# stated a height: 128px = 8 lines, holding three items whose `flex-grow` is the
+# initial 0 and whose content is one line each. 8 − 3 = 5 lines to hand out.
+#
+# The six values are six weightings of the same three kinds of slot — before the
+# first item, between each adjacent pair, after the last — and whole cells go to
+# the *earliest* slot that asked for any, which is why an odd leftover lands
+# above rather than below.
+#
+# `center`        weights 1 : – : 1 over 5 → 3 above, 2 below.
+#                 y = 3, 4, 5.
+# `space-between` weights – : 1 : 1 : – over 5 → 3 and 2 in the two inner slots.
+#                 y = 8, 8+1+3 = 12, 12+1+2 = 15; the last item ends at 16,
+#                 exactly the container's bottom content edge.
+# `space-evenly`  weights 1 : 1 : 1 : 1 over 5 → 2, 1, 1, and 1 left at the end.
+#                 y = 18, 20, 22.
+#
+# Each container is 8 lines tall whatever its items do with them, because its
+# `height` said so; the three stack at y = 0, 8, 16 and the page is 24.
+# Every item is 20 cells wide at x = 0: `align-items` is unset, so `stretch`,
+# and a column's cross axis is the horizontal one.
+<html>  x=0 y=0 w=20 h=24
+  <body>  x=0 y=0 w=20 h=24
+    <div.col.mid> flex column  x=0 y=0 w=20 h=8
+      <div>  x=0 y=3 w=20 h=1
+        anonymous  x=0 y=3 w=20 h=1
+          line  x=0 y=3 w=20 h=1
+            #text "a"  x=0 y=3 w=1 h=1
+      <div>  x=0 y=4 w=20 h=1
+        anonymous  x=0 y=4 w=20 h=1
+          line  x=0 y=4 w=20 h=1
+            #text "b"  x=0 y=4 w=1 h=1
+      <div>  x=0 y=5 w=20 h=1
+        anonymous  x=0 y=5 w=20 h=1
+          line  x=0 y=5 w=20 h=1
+            #text "c"  x=0 y=5 w=1 h=1
+    <div.col.between> flex column  x=0 y=8 w=20 h=8
+      <div>  x=0 y=8 w=20 h=1
+        anonymous  x=0 y=8 w=20 h=1
+          line  x=0 y=8 w=20 h=1
+            #text "a"  x=0 y=8 w=1 h=1
+      <div>  x=0 y=12 w=20 h=1
+        anonymous  x=0 y=12 w=20 h=1
+          line  x=0 y=12 w=20 h=1
+            #text "b"  x=0 y=12 w=1 h=1
+      <div>  x=0 y=15 w=20 h=1
+        anonymous  x=0 y=15 w=20 h=1
+          line  x=0 y=15 w=20 h=1
+            #text "c"  x=0 y=15 w=1 h=1
+    <div.col.evenly> flex column  x=0 y=16 w=20 h=8
+      <div>  x=0 y=18 w=20 h=1
+        anonymous  x=0 y=18 w=20 h=1
+          line  x=0 y=18 w=20 h=1
+            #text "a"  x=0 y=18 w=1 h=1
+      <div>  x=0 y=20 w=20 h=1
+        anonymous  x=0 y=20 w=20 h=1
+          line  x=0 y=20 w=20 h=1
+            #text "b"  x=0 y=20 w=1 h=1
+      <div>  x=0 y=22 w=20 h=1
+        anonymous  x=0 y=22 w=20 h=1
+          line  x=0 y=22 w=20 h=1
+            #text "c"  x=0 y=22 w=1 h=1

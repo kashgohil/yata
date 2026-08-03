@@ -251,6 +251,43 @@ mod tests {
         out
     }
 
+    /// Every flex item's **content** box under the container with id `r`, as
+    /// `(x, y, width, height)` in layout order. The whole box, because a column
+    /// puts the interesting numbers on the other axis from a row's.
+    fn item_boxes(html_src: &str, css: &str, width: u16) -> Vec<(i32, i32, i32, i32)> {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        let mut out = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                out = b
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let d = tree.get(c).dimensions.content;
+                        (d.x, d.y, d.width, d.height)
+                    })
+                    .collect();
+            }
+        });
+        out
+    }
+
+    /// The flex container's own content box — what its items' sizes had to add
+    /// up to.
+    fn flex_box(html_src: &str, css: &str, width: u16) -> (i32, i32, i32, i32) {
+        let (dom, styles) = styled_dom(html_src, css);
+        let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+        let mut out = None;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex && out.is_none() {
+                let d = b.dimensions.content;
+                out = Some((d.x, d.y, d.width, d.height));
+            }
+        });
+        out.expect("no flex container in the tree")
+    }
+
     #[test]
     fn flex_items_sit_side_by_side_at_their_own_widths() {
         // The row basics: three items 10 cells wide in an 80-cell container.
@@ -992,30 +1029,280 @@ mod tests {
     }
 
     #[test]
-    fn a_column_flex_container_still_stacks_until_m9_9() {
-        // M9.7 implements both *row* directions. A column container keeps the
-        // block layout it had before flex existed, which is far closer to what
-        // a column means than laying it out sideways would be.
-        // `engine::lays_out_as_flex` is the one predicate, and intrinsic sizing
-        // asks it too.
-        let markup = "<div id=r><div>one</div><div>two</div></div>";
-        let block = geometry(markup, "#r { display: block }", 20);
-        for css in [
-            "#r { display: flex; flex-direction: column }",
-            "#r { display: flex; flex-direction: column-reverse }",
-        ] {
-            assert_eq!(geometry(markup, css, 20), block, "css: {css}");
+    fn a_column_stacks_its_items_and_is_as_tall_as_them() {
+        // M9.9 opens the gate `lays_out_as_flex` used to keep shut. The items
+        // stack down the container's content box, each as wide as it (the
+        // initial `align-items: stretch`), and the container is the sum of
+        // their heights — which is why a column looks like ordinary block flow
+        // until something else in flex is asked for.
+        let col = "<div id=r><div>one</div><div>two three four</div></div>";
+        let css = "#r { display: flex; flex-direction: column }";
+        // At 10 cells "two three" is 9 and " four" would make 14, so the
+        // second item is two lines tall.
+        assert_eq!(item_boxes(col, css, 10), [(0, 0, 10, 1), (0, 1, 10, 2)]);
+        assert_eq!(flex_box(col, css, 10), (0, 0, 10, 3));
+    }
+
+    #[test]
+    fn flex_grow_does_nothing_in_an_auto_height_column() {
+        // The result most likely to be "fixed" into a bug. A column's main size
+        // is a height; with `height: auto` the container is exactly as tall as
+        // its items, so the free space is *zero* and `flex-grow` has nothing to
+        // distribute. `flex: 1` really does nothing here, and a browser agrees.
+        let col = "<div id=r><div class=i>a</div><div class=i>b</div></div>";
+        let column = "#r { display: flex; flex-direction: column } .i { flex: 1 }";
+        assert_eq!(item_boxes(col, column, 20), [(0, 0, 20, 1), (0, 1, 20, 1)]);
+
+        // Give the container a definite height and the same declaration splits
+        // it exactly: 96px is 6 lines, 3 each, no row left over.
+        let tall = format!("{column} #r {{ height: 96px }}");
+        assert_eq!(item_boxes(col, &tall, 20), [(0, 0, 20, 3), (0, 3, 20, 3)]);
+
+        // `min-height` is the other way to put free space back, and the reason
+        // a column applies its own clamps before §9.7 rather than leaving them
+        // to the clamp every block gets afterwards.
+        let floor = format!("{column} #r {{ min-height: 96px }}");
+        assert_eq!(item_boxes(col, &floor, 20), [(0, 0, 20, 3), (0, 3, 20, 3)]);
+
+        // ...and `max-height` can make the free space negative on an otherwise
+        // auto-height container. Both items are already at §4.5's automatic
+        // minimum — the height of their own text — so they overflow the single
+        // row the container was capped at rather than shrinking into it.
+        let cap = format!("{column} #r {{ max-height: 16px }}");
+        assert_eq!(item_boxes(col, &cap, 20), [(0, 0, 20, 1), (0, 1, 20, 1)]);
+        assert_eq!(flex_box(col, &cap, 20), (0, 0, 20, 1));
+    }
+
+    #[test]
+    fn a_column_main_axis_is_measured_in_lines_and_a_cross_axis_in_cells() {
+        // The likeliest bug in an axis-generic rewrite is a crossed unit rule.
+        // A width is 8px to the cell and takes its percentage from the
+        // containing width; a height is 16px to the line and takes its
+        // percentage from the containing *height*. The same declaration must
+        // mean different numbers in the two directions.
+        let one = "<div id=r><div class=i>a</div></div>";
+        let column = "#r { display: flex; flex-direction: column } .i { flex: 0 0 64px }";
+        assert_eq!(
+            item_boxes(one, column, 20),
+            [(0, 0, 20, 4)],
+            "64px is 4 lines"
+        );
+        let row = "#r { display: flex } .i { flex: 0 0 64px }";
+        assert_eq!(item_boxes(one, row, 20), [(0, 0, 8, 1)], "64px is 8 cells");
+
+        // A percentage basis on a column's main axis is a percentage of the
+        // container's height: half of 160px = 10 lines is 5.
+        let pct = "#r { display: flex; flex-direction: column; height: 160px }
+                   .i { flex: 0 0 50% }";
+        assert_eq!(item_boxes(one, pct, 20), [(0, 0, 20, 5)]);
+
+        // Percentage *padding* does not follow: it resolves against the
+        // containing block's width on both axes (CSS 2.1 §8.1), so 10% of a
+        // 20-cell column is 2 lines of `padding-top` — not 1, which is what
+        // 10% of the container's 10-line height would have been. The second
+        // item's y is the number that tells them apart.
+        let two = "<div id=r><div class=i>a</div><div>b</div></div>";
+        let pad = "#r { display: flex; flex-direction: column; height: 160px }
+                   .i { padding-top: 10% }";
+        assert_eq!(item_boxes(two, pad, 20), [(0, 2, 20, 1), (0, 3, 20, 1)]);
+    }
+
+    #[test]
+    fn align_items_baseline_degrades_to_flex_start_in_a_column() {
+        // A baseline is a *row* in a cell grid, and a column's cross axis is
+        // the horizontal one — there is no shared row to stitch items to, so
+        // the value has nothing to do. This is a degradation rather than an
+        // implementation, and it is pinned so that it stays a decision.
+        let col = "<div id=r><div>aaaa</div><div>bb</div></div>";
+        let base = "#r { display: flex; flex-direction: column; align-items: baseline }";
+        let start = "#r { display: flex; flex-direction: column; align-items: flex-start }";
+        assert_eq!(geometry(col, base, 20), geometry(col, start, 20));
+        // Not vacuous: neither of those is `stretch`, the initial value, which
+        // would have made both items 20 cells wide.
+        assert_eq!(
+            item_boxes(col, base, 20),
+            [(0, 0, 4, 1), (0, 1, 2, 1)],
+            "a non-stretching column item shrink-wraps its content"
+        );
+        let stretch = "#r { display: flex; flex-direction: column }";
+        assert_eq!(item_boxes(col, stretch, 20), [(0, 0, 20, 1), (0, 1, 20, 1)]);
+    }
+
+    #[test]
+    fn auto_margins_take_a_columns_free_space_on_both_axes() {
+        // §9.5 step 1 and §9.6 step 1, with the axes swapped: an `auto` margin
+        // absorbs the free space before any alignment is consulted. On a
+        // column's main axis that is `margin-top`/`margin-bottom` and it pushes
+        // an item down the page; on its cross axis it is the horizontal pair
+        // and it centres the item across the width.
+        let one = "<div id=r><div class=i>x</div></div>";
+        let pushed = "#r { display: flex; flex-direction: column; height: 96px }
+                      .i { margin-top: auto }";
+        let by_alignment = "#r { display: flex; flex-direction: column; height: 96px;
+                            justify-content: flex-end }";
+        // Nothing here is compared against a number from the implementation:
+        // the two ways of saying "put it at the bottom" have to agree.
+        assert_eq!(geometry(one, pushed, 20), geometry(one, by_alignment, 20));
+        assert_eq!(item_boxes(one, pushed, 20), [(0, 5, 20, 1)]);
+
+        let auto_sides = "#r { display: flex; flex-direction: column }
+                          .i { margin-left: auto; margin-right: auto }";
+        let centred = "#r { display: flex; flex-direction: column; align-items: center }";
+        assert_eq!(
+            item_boxes(one, auto_sides, 20),
+            item_boxes(one, centred, 20)
+        );
+        // An auto cross margin stops the item stretching, so it shrink-wraps to
+        // its one cell of text and the other 19 go to the margins: 10 before,
+        // 9 after, the same "earliest slot first" rule as everywhere else.
+        assert_eq!(item_boxes(one, auto_sides, 20), [(10, 0, 1, 1)]);
+    }
+
+    #[test]
+    fn order_reorders_a_column_the_way_it_reorders_a_row() {
+        // A column's boxes are built in document order — building one never
+        // depends on its neighbours — and sorted into order-modified document
+        // order before the line is placed. The DOM is untouched either way.
+        let col = "<div id=r><div class=a>a</div><div class=b>b</div></div>";
+        let css = "#r { display: flex; flex-direction: column } .a { order: 1 }";
+        assert_eq!(plain(&lines_styled(col, css, 20)), ["b", "a"]);
+        let reversed = "#r { display: flex; flex-direction: column-reverse }";
+        assert_eq!(plain(&lines_styled(col, reversed, 20)), ["b", "a"]);
+    }
+
+    #[test]
+    fn moving_a_column_item_moves_everything_inside_it() {
+        // The column counterpart of
+        // `alignment_moves_everything_inside_the_item_it_moves`. A row can
+        // place an item before building it; a column cannot, because an item's
+        // main size is a height and nothing measures one — so every item is
+        // built against the container's main-start edge and then moved. This is
+        // the test that says the move takes the whole subtree with it, which is
+        // where the classic flex bug (a box that moved and left its text
+        // behind) would live if it lived anywhere.
+        let col = "<div id=r><div class=i><b>hi</b> there</div></div>";
+        let css = "#r { display: flex; flex-direction: column; height: 80px;
+                   justify-content: center }";
+        // One 1-line item in 5 lines: 4 free, 2 of them above it.
+        assert_eq!(item_boxes(col, css, 20), [(0, 2, 20, 1)]);
+
+        let (dom, styles) = styled_dom(col, css);
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let mut texts = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Text {
+                texts.push((b.text.clone().unwrap_or_default(), b.dimensions.content.y));
+            }
+        });
+        assert!(!texts.is_empty(), "the item has text to move");
+        for (text, y) in &texts {
+            assert_eq!(*y, 2, "{text:?} was left behind at row {y}");
         }
-        // ...and both row directions really do something different, so the
-        // comparison above is not vacuous.
-        assert_ne!(geometry(markup, "#r { display: flex }", 20), block);
-        assert_ne!(
-            geometry(
-                markup,
-                "#r { display: flex; flex-direction: row-reverse }",
-                20
-            ),
-            block
+    }
+
+    #[test]
+    fn replaced_and_rule_items_keep_their_own_paths_in_a_column() {
+        // `<img>`, `<br>` and `<hr>` size themselves from the width they are
+        // handed rather than being re-derived as block containers — the same
+        // exception a row makes, and for the same reason. On a column's cross
+        // axis it matters twice over: `align-items` is `stretch` by default,
+        // and stretching an image would rescale the picture to the container's
+        // width instead of leaving it at its own.
+        let col = "<div id=r><img src=logo.png width=16 height=32><div>after</div></div>";
+        let (dom, styles) = styled_dom(col, "#r { display: flex; flex-direction: column }");
+        let imgs = crate::image::discover(&dom, Some("https://fixture.test/page"));
+        let ctx = ImageContext::from_discovery(&imgs, &mut crate::image::ImageCache::default());
+        let tree = layout_document_with(&dom, &styles, 20, Hidden::Respect, &ctx);
+        let mut boxes = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Flex {
+                boxes = b
+                    .children
+                    .iter()
+                    .map(|&c| {
+                        let d = tree.get(c).dimensions.content;
+                        (d.x, d.y, d.width, d.height)
+                    })
+                    .collect();
+            }
+        });
+        // 16 × 32 px is 2 cells by 2 lines. The image keeps both; only the
+        // block below it fills the 20-cell width.
+        assert_eq!(boxes, [(0, 0, 2, 2), (0, 2, 20, 1)]);
+
+        // An `<hr>` does stretch — it is a rule across the box it was given —
+        // and its `margin: 1em 0` from ua.css is a main-axis margin here, so
+        // the container is 1 + 1 + 1 lines tall around a 1-line rule.
+        let rule = "<div id=r><hr></div>";
+        let css = "#r { display: flex; flex-direction: column }";
+        assert_eq!(item_boxes(rule, css, 20), [(0, 1, 20, 1)]);
+        assert_eq!(flex_box(rule, css, 20), (0, 0, 20, 3));
+    }
+
+    #[test]
+    fn flex_basis_content_asks_a_column_item_how_tall_its_content_is() {
+        // §9.2 step 3: `content` is the keyword that overrides the main size
+        // property, so it has to mean the height the item's *content* used and
+        // not the height the item ended up with. Those differ exactly when the
+        // page states a `height`, which is the case here — and it is why
+        // building a column item hands back both numbers.
+        let col = "<div id=r><div class=i>a</div></div>";
+        let basis = "#r { display: flex; flex-direction: column }
+                     .i { flex-basis: content; height: 48px }";
+        assert_eq!(item_boxes(col, basis, 10), [(0, 0, 10, 1)]);
+        // `flex-basis: auto` defers to `height` instead, and 48px is 3 lines.
+        let auto = "#r { display: flex; flex-direction: column } .i { height: 48px }";
+        assert_eq!(item_boxes(col, auto, 10), [(0, 0, 10, 3)]);
+    }
+    #[test]
+    fn a_column_item_is_built_exactly_once() {
+        // The constraint the whole column path is shaped around. Measuring an
+        // item means building it, so the obvious implementation — build to
+        // measure, then rebuild at the size §9.7 resolved — doubles the work at
+        // every level and is exponential in the nesting depth. §9.7's answer is
+        // applied as a field write instead, which is equivalent because content
+        // layout here depends on the width a box was given and on nothing else.
+        //
+        // A rebuild would leave the discarded boxes in the arena, so the tree
+        // of a six-deep column nest has to hold exactly as many boxes as the
+        // identical block-flow nest — 2^6 times as many, if it did not.
+        let mut markup = String::from("<div>leaf</div>");
+        for _ in 0..6 {
+            markup = format!("<div class=c>{markup}</div>");
+        }
+        let block = geometry(&markup, ".c { display: block }", 20).len();
+        for direction in ["column", "column-reverse"] {
+            let css = format!(".c {{ display: flex; flex-direction: {direction} }}");
+            assert_eq!(geometry(&markup, &css, 20).len(), block, "{direction}");
+        }
+    }
+
+    #[test]
+    fn a_percentage_height_inside_a_flexed_column_item_stays_indefinite() {
+        // **Deferred, and on the record.** §9.7 gives this item a definite main
+        // size of 3 lines, but its box was built in order to *measure* that
+        // size, so the `height: 100%` inside it resolved against nothing and
+        // stayed at its content height. Making it definite means laying the
+        // item out a second time, which is the one thing the column path is
+        // written to avoid; `stretch_item`'s doc used to promise M9.9 would
+        // bring this and now says otherwise.
+        let col = "<div id=r><div class=i><div class=fill>x</div></div></div>";
+        let css = "#r { display: flex; flex-direction: column; height: 48px }
+                   .i { flex: 1 } .fill { height: 100% }";
+        assert_eq!(item_boxes(col, css, 20), [(0, 0, 20, 3)], "the item grew");
+
+        let (dom, styles) = styled_dom(col, css);
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let mut blocks = Vec::new();
+        tree.walk(tree.root, &mut |_, b| {
+            if b.kind == BoxKind::Block && b.node.is_some() {
+                blocks.push(b.dimensions.content.height);
+            }
+        });
+        assert_eq!(
+            blocks.last(),
+            Some(&1),
+            "the `height: 100%` child is still its content's 1 line"
         );
     }
 

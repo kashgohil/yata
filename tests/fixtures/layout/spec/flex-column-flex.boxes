@@ -1,0 +1,65 @@
+# SPEC GOLDEN — hand-derived from css-flexbox-1 §9.7 (resolve the flexible
+# lengths) on a *vertical* main axis, before the code existed. Never
+# regenerated. Every length here is vertical, so it goes through the line rule
+# and not the cell rule: 160px is 10 lines, 96px is 6, 64px is 4, 48px and 32px
+# are 3 and 2. Read as widths they would be 20, 12, 8, 6 and 4 cells, and every
+# number below would be wrong — which is the point of testing them.
+#
+# Container 1 — a definite height with `flex: 1` and `flex: 2`.
+#   `flex: 1` is `1 1 0` and `flex: 2` is `2 1 0`, so both bases are 0 lines and
+#   both hypothetical sizes are §4.5's automatic minimum, the item's content
+#   height of 1 line. The container's inner main size is its own `height`: 10.
+#   §9.7 step 4 hands out all 10 lines by grow factor, 1:2, so 3.333… and
+#   6.666…. Whole cells: floor to 3 and 6, and the one line rounding dropped
+#   goes to the earliest item that lost a fraction. 4 + 6 = 10 exactly — the
+#   integer-cell invariant holds on this axis too, and a column that grew to
+#   fill leaves no blank row at its bottom.
+#
+# Container 2 — `height: auto`, so the container is as tall as its items and
+#   there would be nothing to grow into (see `flex-column`) — except that
+#   `min-height: 96px` says it is at least 6 lines. That is what puts free space
+#   back, and it is why the container applies its own min/max height *before*
+#   §9.7 rather than leaving it to the clamp every block gets afterwards. Two
+#   `flex: 1` items over 6 lines: 3 each.
+#
+# Container 3 — shrinking, and a minimum that freezes.
+#   Bases 4 and 2 lines in a container of 3: 3 lines of overflow to take back.
+#   Shrinking is weighted by the *scaled* factor (shrink × base), so the two
+#   scale as 4:2 and the first pass gives 4 − 3·(4/6) = 2 and 2 − 3·(2/6) = 1.
+#   The second item's `min-height: 32px` is 2 lines, so 1 is a violation: it
+#   freezes at 2, and the whole 3 lines of overflow are re-divided among what is
+#   left — one item, which drops from 4 to 1 (its own automatic minimum, the
+#   1-line height of its text, is exactly where it lands). 1 + 2 = 3.
+#   A single pass would have stopped at 2 + 2 = 4 and overflowed the container.
+#
+# Every item's width is the container's 20-cell content width: `align-items` is
+# unset, so `stretch`, and a column's cross axis is the horizontal one.
+<html>  x=0 y=0 w=20 h=19
+  <body>  x=0 y=0 w=20 h=19
+    <div.col.tall> flex column  x=0 y=0 w=20 h=10
+      <div.a>  x=0 y=0 w=20 h=4
+        anonymous  x=0 y=0 w=20 h=1
+          line  x=0 y=0 w=20 h=1
+            #text "a"  x=0 y=0 w=1 h=1
+      <div.b>  x=0 y=4 w=20 h=6
+        anonymous  x=0 y=4 w=20 h=1
+          line  x=0 y=4 w=20 h=1
+            #text "b"  x=0 y=4 w=1 h=1
+    <div.col.floor> flex column  x=0 y=10 w=20 h=6
+      <div.a>  x=0 y=10 w=20 h=3
+        anonymous  x=0 y=10 w=20 h=1
+          line  x=0 y=10 w=20 h=1
+            #text "c"  x=0 y=10 w=1 h=1
+      <div.a>  x=0 y=13 w=20 h=3
+        anonymous  x=0 y=13 w=20 h=1
+          line  x=0 y=13 w=20 h=1
+            #text "d"  x=0 y=13 w=1 h=1
+    <div.col.short> flex column  x=0 y=16 w=20 h=3
+      <div.p>  x=0 y=16 w=20 h=1
+        anonymous  x=0 y=16 w=20 h=1
+          line  x=0 y=16 w=20 h=1
+            #text "p"  x=0 y=16 w=1 h=1
+      <div.q>  x=0 y=17 w=20 h=2
+        anonymous  x=0 y=17 w=20 h=1
+          line  x=0 y=17 w=20 h=1
+            #text "q"  x=0 y=17 w=1 h=1

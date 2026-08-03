@@ -298,8 +298,9 @@ pub fn parse_display(value: &str) -> Option<Display> {
 // before the engine can honour them.
 
 /// `flex-direction`: which axis is the main axis, and which end items start
-/// from. `Row` is the initial value, and the only one M9.6 implements — the
-/// column directions arrive in M9.9 and the reversals with them.
+/// from. `Row` is the initial value; all four are laid out since M9.9, which
+/// made the algorithm axis-generic rather than giving columns a path of their
+/// own.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum FlexDirection {
     #[default]

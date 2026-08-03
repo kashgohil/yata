@@ -10,18 +10,23 @@
 //! go; everything between those two ends is here.
 //!
 //! **Main-axis coordinates.** [`place`] talks in distances from *main-start*,
-//! never in `x`. That is what makes `row-reverse` a mapping in the engine —
-//! main-start is the right edge, so the same offsets are subtracted instead of
-//! added — rather than a second copy of the placement rules with the signs
-//! changed. [`cross_place`] is written the same way, in distances from
-//! *cross-start*, which is what M9.9's column directions will need.
+//! never in `x`. That is what makes a reversed direction a mapping in the
+//! engine — main-start is the far edge, so the same offsets are subtracted
+//! instead of added — rather than a second copy of the placement rules with the
+//! signs changed. [`cross_place`] is written the same way, in distances from
+//! *cross-start*, and between them they serve all four directions: nothing in
+//! this file knows which physical axis is which.
 //!
-//! **The two axes are not symmetric, and the asymmetry is real.** Main-axis
-//! sizes are computed from numbers the algorithm already has, so the engine can
-//! place an item before building it. A cross size is *the item's content's*
-//! height, so nothing here can be asked until the items exist — which is why
-//! the cross-axis functions take an item's outer size as an input rather than
-//! producing it.
+//! **One axis has to be measured from built boxes, and which one depends on the
+//! direction.** A size this file can be handed as a number is one the engine
+//! resolved without laying anything out, and in this engine that means a
+//! *width*: `intrinsic` measures widths, and nothing measures heights. So for a
+//! row the main axis is the free one and the cross axis is the measured one —
+//! which is why the cross-axis functions here take an item's outer size as an
+//! input rather than producing it. For a column (M9.9) it is the other way
+//! round: the engine builds each item to learn its main size and hands the
+//! numbers in, and the cross axis is the one it knows in advance. The
+//! asymmetry is real; it just is not fixed to an axis.
 //!
 //! **Whole cells.** The spec distributes fractions of a pixel and lets the
 //! rasteriser sort it out; a terminal has no such luxury, so the fractions are
@@ -283,8 +288,8 @@ pub(super) struct Placed {
 ///
 /// `items` is the line in main-axis order — each item's outer main size (the
 /// size §9.7 resolved plus its own margin, border and padding) and which of
-/// its two main-axis margins are `auto`. `row-reverse` passes its items in the
-/// same order and flips the offsets afterwards.
+/// its two main-axis margins are `auto`. A reversed direction passes its items
+/// in the same order and flips the offsets afterwards.
 ///
 /// The order of business is the spec's and matters: gaps come out first (they
 /// are not free space, they are structure), then **auto margins take
@@ -447,11 +452,13 @@ fn split(total: i32, weights: &[i32]) -> Vec<i32> {
 /// One item as §9.4 (*cross sizing*) and §9.6 (*cross-axis alignment*) see it,
 /// all in cells and all on the cross axis.
 ///
-/// The item has already been laid out when this struct is built: `outer` is
-/// what it turned out to be, not what it asked for. Cross alignment is the one
-/// part of flex that cannot be decided before the items exist — an item's
-/// height is its content's, and its content's height is only known once it has
-/// been laid out.
+/// `outer` is a size the engine already knows, not one this file computes. For
+/// a **row** that means the item has been laid out by the time this struct is
+/// built — its cross size is its content's height, which nothing knows until
+/// the content exists — so a row's cross alignment necessarily runs last. For a
+/// **column** the cross size is a width, definite from the container's content
+/// box, so the same struct is built *before* the item is (M9.9). Which of the
+/// two it is, is the caller's business; nothing here can tell.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CrossItem {
     /// Outer cross size: the item's margin box on the cross axis.
@@ -539,7 +546,8 @@ fn baseline_extents(items: &[CrossItem]) -> (i32, i32) {
 /// centred whatever its `align-self` says, which is the rule that lets one item
 /// in a row centre itself without the container agreeing to centre all of them.
 ///
-/// `stretch` places at cross-start here and grows the box elsewhere: an item
+/// `stretch` places at cross-start here and the box gets its stretched cross
+/// size elsewhere — grown into it on a row, built at it on a column. An item
 /// that cannot stretch (a specified cross size, an auto margin) is left exactly
 /// where `flex-start` would have put it, which is what the spec says it falls
 /// back to.

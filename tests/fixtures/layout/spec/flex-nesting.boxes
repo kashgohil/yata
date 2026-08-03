@@ -1,0 +1,58 @@
+# SPEC GOLDEN — hand-derived before the code existed, never regenerated. Two
+# facts M9.9 has to get right that neither direction alone can show.
+#
+# Block 1 — a **row inside a column**. The outer column stretches its items to
+#   its 40-cell content width, so the inner row is built at 40 and divides it
+#   the way a row does: two items at `flex: 0 0 80px` = 10 cells, at x = 0 and
+#   x = 10, and the row's own height is its line's cross size, 1. The column
+#   then stacks it above "tail" at y = 0 and y = 1. A column item's cross size
+#   is definite and its children may use it — that is what the inner row's 40
+#   cells are.
+#
+# Block 2 — a **column inside a row**, and the case that fails silently if
+#   intrinsic sizing and the engine disagree. The row asks the column how wide
+#   it wants to be. A row's items sit side by side, so `intrinsic`'s flex
+#   measurement is a *sum*; a column's sit on top of each other, so the width it
+#   asks for is a **max** over its items — and no gap term, because the gap
+#   between column items is a height and a `nowrap` column has one line, so no
+#   cross gap falls between anything. max-content is max(4, 2) = 4, not 4+2 = 6.
+#   Neither item can grow (`flex-grow` is 0), so the row hands the column
+#   exactly 4 cells and "z" starts at x = 4. Summed, the column would have
+#   measured 6 and pushed "z" two cells right — a bug invisible in the column
+#   itself.
+#
+#   The column is then built at 4 cells, stretches both of its own items to 4,
+#   and comes out 2 lines tall. The row's line is therefore 2, and `align-items`
+#   is the initial `stretch`, so "z" — 1 line of content, `height: auto` — grows
+#   to 2 as well. That last growth *is* a field write on a row item's height
+#   (§9.4 step 11), which is why its line box is still 1 row at y = 2.
+<html>  x=0 y=0 w=40 h=4
+  <body>  x=0 y=0 w=40 h=4
+    <div.col> flex column  x=0 y=0 w=40 h=2
+      <div.row.cells> flex row  x=0 y=0 w=40 h=1
+        <div>  x=0 y=0 w=10 h=1
+          anonymous  x=0 y=0 w=10 h=1
+            line  x=0 y=0 w=10 h=1
+              #text "a"  x=0 y=0 w=1 h=1
+        <div>  x=10 y=0 w=10 h=1
+          anonymous  x=10 y=0 w=10 h=1
+            line  x=10 y=0 w=10 h=1
+              #text "b"  x=10 y=0 w=1 h=1
+      <div>  x=0 y=1 w=40 h=1
+        anonymous  x=0 y=1 w=40 h=1
+          line  x=0 y=1 w=40 h=1
+            #text "tail"  x=0 y=1 w=4 h=1
+    <div.row> flex row  x=0 y=2 w=40 h=2
+      <div.col> flex column  x=0 y=2 w=4 h=2
+        <div>  x=0 y=2 w=4 h=1
+          anonymous  x=0 y=2 w=4 h=1
+            line  x=0 y=2 w=4 h=1
+              #text "aaaa"  x=0 y=2 w=4 h=1
+        <div>  x=0 y=3 w=4 h=1
+          anonymous  x=0 y=3 w=4 h=1
+            line  x=0 y=3 w=4 h=1
+              #text "bb"  x=0 y=3 w=2 h=1
+      <div>  x=4 y=2 w=1 h=2
+        anonymous  x=4 y=2 w=1 h=1
+          line  x=4 y=2 w=1 h=1
+            #text "z"  x=4 y=2 w=1 h=1
