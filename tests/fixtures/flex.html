@@ -1,0 +1,44 @@
+<!doctype html>
+<!-- M9.12: a page shaped like something a site would ship, so the M9 features
+     are pinned interacting rather than one at a time. Rendered at 60x10 by
+     tests/snapshots.rs (flex.txt) — 60 cells because the third card must not
+     fit beside the other two — and walked by the inspector and interaction
+     tests in src/browser/app.rs.
+
+     Four things at once, and each one is a different M9 task:
+       .nav      justify-content: space-between       (M9.7)
+       .main     a fixed sidebar beside a flex: 1 column (M9.6)
+       .cards    flex-wrap with a gap                 (M9.10)
+       .clip     max-height + overflow: hidden        (M9.2, M9.3)
+     Every length is a whole number of cells (8px) or lines (16px), so the
+     expected grid can be derived by hand instead of blessed. -->
+<html><head><style>
+body { margin: 0 }
+p, h2 { margin: 0 }
+
+.nav { display: flex; justify-content: space-between }
+
+.main { display: flex }
+.side { flex: 0 0 96px }
+.content { flex: 1 }
+
+.cards { display: flex; flex-wrap: wrap; gap: 8px }
+.card { flex: 0 0 144px }
+
+.clip { max-height: 32px; overflow: hidden }
+</style></head>
+<body>
+<div class="nav"><a href="/">home</a><a href="/blog">blog</a><a href="/about">about</a></div>
+<div class="main">
+  <div class="side"><a href="/one">one</a><h2>two</h2></div>
+  <div class="content">
+    <p>body text that wraps inside the content column beside the sidebar</p>
+    <div class="cards">
+      <div class="card">card one</div>
+      <div class="card">card two</div>
+      <div class="card">card three</div>
+    </div>
+    <div class="clip"><p>kept row</p><p>kept too</p><p>cut away</p></div>
+  </div>
+</div>
+</body></html>

@@ -1871,6 +1871,144 @@ mod tests {
         let _ = lines("<ul><li>a<ul><li>b</li></ul></li></ul>", 1);
     }
 
+    /// M9.12: the inputs a real page produces by accident.
+    ///
+    /// CLAUDE.md is explicit that a panic is a bug, and every one of these is
+    /// a shape the flex algorithm can divide by, index into, or recurse
+    /// through: a container with nothing to distribute free space to, a gap
+    /// larger than the space it divides, a minimum that cannot be satisfied.
+    /// Each case asserts the same two things — layout returns, and every box
+    /// it produced has a non-negative size — because "what the right boxes
+    /// are" is the *other* tests' job and pinning some particular wrong-looking
+    /// answer here would just make the file hard to change.
+    mod degenerate_flex {
+        use super::*;
+
+        /// Every box's content size, which must never go negative: a negative
+        /// width is how a subtraction that should have been clamped shows up
+        /// three stages later, in paint, as a panic.
+        fn sizes(html_src: &str, css: &str, width: u16) -> Vec<(i32, i32)> {
+            let (dom, styles) = styled_dom(html_src, css);
+            let tree = layout_document(&dom, &styles, width, Hidden::Respect);
+            let mut out = Vec::new();
+            tree.walk(tree.root, &mut |_, b| {
+                let d = b.dimensions.content;
+                out.push((d.width, d.height));
+            });
+            assert!(
+                out.iter().all(|&(w, h)| w >= 0 && h >= 0),
+                "negative box size: {out:?}"
+            );
+            out
+        }
+
+        const FLEX: &str = ".r { display: flex } body, div, p { margin: 0 }";
+
+        /// [`FLEX`] plus one more rule — the shape every case below wants, and
+        /// the reason none of them repeats the container declaration.
+        fn css(extra: &str) -> String {
+            format!("{FLEX} {extra}")
+        }
+
+        #[test]
+        fn a_container_with_no_children_lays_out() {
+            assert!(!sizes("<div class=r></div>", FLEX, 20).is_empty());
+        }
+
+        #[test]
+        fn a_container_of_only_whitespace_lays_out() {
+            // Whitespace between flex items is trimmed away (M9.6), so this is
+            // the case where every item the algorithm generated then measured
+            // to nothing.
+            assert!(!sizes("<div class=r>   \n  </div>", FLEX, 20).is_empty());
+        }
+
+        #[test]
+        fn a_display_none_child_is_not_an_item() {
+            let css = ".r { display: flex } .gone { display: none } div { margin: 0 }";
+            let boxes = item_boxes(
+                "<div class=r><div class=gone>x</div><div>y</div></div>",
+                css,
+                20,
+            );
+            assert_eq!(boxes.len(), 1, "{boxes:?}");
+        }
+
+        #[test]
+        fn a_zero_size_item_lays_out() {
+            let _ = sizes(
+                "<div class=r><div class=z></div><div>y</div></div>",
+                &css(".z { width: 0; height: 0 }"),
+                20,
+            );
+        }
+
+        #[test]
+        fn a_container_one_cell_wide_lays_out() {
+            let _ = sizes(
+                "<div class=r><div>alpha</div><div>bravo</div></div>",
+                FLEX,
+                1,
+            );
+        }
+
+        #[test]
+        fn a_zero_height_clipped_container_lays_out() {
+            let _ = sizes(
+                "<div class=r><div>alpha</div><div>bravo</div></div>",
+                &css(".r { height: 0; overflow: hidden }"),
+                20,
+            );
+        }
+
+        #[test]
+        fn a_gap_wider_than_the_container_lays_out() {
+            // Free space goes negative before a single item has been placed —
+            // the shrink pass divides by a total that must not be zero and must
+            // not be signed the way it expects.
+            let _ = sizes(
+                "<div class=r><div>alpha</div><div>bravo</div></div>",
+                &css(".r { gap: 800px }"),
+                20,
+            );
+        }
+
+        #[test]
+        fn an_unsatisfiable_min_width_lays_out() {
+            let _ = sizes(
+                "<div class=r><div>alpha</div><div>bravo</div></div>",
+                &css(".r div { min-width: 800px }"),
+                20,
+            );
+        }
+
+        #[test]
+        fn wrapping_an_item_wider_than_the_line_lays_out() {
+            // §9.3 step 3: an item that does not fit still starts a line, or
+            // the loop that fills lines never advances.
+            let boxes = item_boxes(
+                "<div class=r><div>alpha</div><div>bravo</div></div>",
+                &css(".r { flex-wrap: wrap } .r div { flex: 0 0 800px }"),
+                20,
+            );
+            assert_eq!(boxes.len(), 2, "an item was dropped: {boxes:?}");
+        }
+
+        #[test]
+        fn ten_levels_of_nesting_lay_out() {
+            let mut src = String::new();
+            for _ in 0..10 {
+                src.push_str("<div class=r>");
+            }
+            src.push_str("deep");
+            for _ in 0..10 {
+                src.push_str("</div>");
+            }
+            let out = sizes(&src, FLEX, 20);
+            assert!(out.len() >= 10, "{out:?}");
+        }
+    }
+
     #[test]
     fn display_none_hides_subtree() {
         let out = lines_styled(
