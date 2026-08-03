@@ -469,6 +469,22 @@ pub(super) struct CrossItem {
     pub(super) auto_end: bool,
 }
 
+impl CrossItem {
+    /// Whether this item is one of the ones stitched to the line's shared
+    /// baseline row.
+    ///
+    /// Asking for `baseline` is not enough: §9.4 step 8 collects the items
+    /// "whose `align-self` is `baseline` **and whose cross-axis margins are
+    /// both non-auto**", because an auto margin claims the free space before
+    /// alignment is ever consulted (§9.6 step 1) and such an item is therefore
+    /// never placed at the shared row. One predicate, read by both the sizing
+    /// and the placing, is what keeps the line from being sized for a
+    /// placement that will not happen.
+    fn baseline_aligned(&self) -> bool {
+        self.align == AlignItems::Baseline && !self.auto_start && !self.auto_end
+    }
+}
+
 /// Where §9.6 put one item on the cross axis.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct CrossPlaced {
@@ -483,18 +499,18 @@ pub(super) struct CrossPlaced {
 
 /// §9.4 step 8: the line's cross size, from the items on it.
 ///
-/// Two groups, and the larger wins. Items aligned any way but `baseline` need
-/// room for themselves, so they ask for their own outer cross size.
-/// Baseline-aligned items are stitched together at one row, so what they need
-/// is the deepest anything reaches *above* that row plus the deepest anything
-/// reaches below it — which can be more than any single item's height, and is
-/// the reason a label next to a bordered heading makes its row taller than
-/// either of them alone.
+/// Two groups, and the larger wins. Items not stitched to the shared baseline
+/// row need room for themselves, so they ask for their own outer cross size.
+/// The baseline group is aligned at one row, so what it needs is the deepest
+/// anything in it reaches *above* that row plus the deepest anything reaches
+/// below it — which can be more than any single item's height, and is the
+/// reason a label next to a bordered heading makes its row taller than either
+/// of them alone.
 pub(super) fn cross_size(items: &[CrossItem]) -> i32 {
     let (above, below) = baseline_extents(items);
     let tallest = items
         .iter()
-        .filter(|i| i.align != AlignItems::Baseline)
+        .filter(|i| !i.baseline_aligned())
         .map(|i| i.outer)
         .max()
         .unwrap_or(0);
@@ -505,7 +521,7 @@ pub(super) fn cross_size(items: &[CrossItem]) -> i32 {
 fn baseline_extents(items: &[CrossItem]) -> (i32, i32) {
     items
         .iter()
-        .filter(|i| i.align == AlignItems::Baseline)
+        .filter(|i| i.baseline_aligned())
         .fold((0, 0), |(above, below), i| {
             (
                 above.max(i.baseline.max(0)),
@@ -560,7 +576,13 @@ pub(super) fn cross_place(items: &[CrossItem], line_cross: i32) -> Vec<CrossPlac
                 // never negative: an item that would have sat above the line's
                 // cross-start edge is what *pushed the edge down* in
                 // `cross_size`, rather than escaping the line.
-                AlignItems::Baseline => (max_above - item.baseline).max(0),
+                //
+                // The `min` never binds on a line sized by `cross_size` — the
+                // deepest baseline is exactly what that sizing left room for.
+                // It binds when the container stated a cross size too small for
+                // its own contents, and it is the same safe rule the other four
+                // values follow there: no item starts past the line's end.
+                AlignItems::Baseline => (max_above - item.baseline).max(0).min(free),
             };
             CrossPlaced {
                 cross_start,
@@ -1080,6 +1102,66 @@ mod tests {
         // …and the baseline item still aligns to the baseline group's row, not
         // to the tall item's top or bottom.
         assert_eq!(cross_starts(&[plain, text], 6), [0, 0]);
+    }
+
+    #[test]
+    fn an_auto_cross_margin_takes_an_item_out_of_the_baseline_group() {
+        // M9.8 review. §9.4 step 8 collects the items whose `align-self` is
+        // `baseline` *and whose cross-axis margins are both non-auto*, and the
+        // "and" is load-bearing: an auto margin claims the free space before
+        // alignment is consulted, so such an item is never placed at the shared
+        // row and the line must not be sized as though it were.
+        //
+        // A padded item whose text starts on row 3, next to a 3-row item with
+        // `margin-top: auto`. Counting the second in the group asks for
+        // 3 above + 3 below = 6 rows; it belongs in the other group, where it
+        // asks for its own 3 — so the line is the first item's 3 + 1 = 4.
+        let padded = CrossItem {
+            outer: 4,
+            baseline: 3,
+            ..cross(4, AlignItems::Baseline)
+        };
+        let pushed = CrossItem {
+            outer: 3,
+            baseline: 0,
+            auto_start: true,
+            ..cross(3, AlignItems::Baseline)
+        };
+        assert_eq!(cross_size(&[padded, pushed]), 4);
+        // ...and it really is placed by its margin, not by its baseline: the
+        // one free row goes above it.
+        let placed = cross_place(&[padded, pushed], 4);
+        assert_eq!(placed[0].cross_start, 0);
+        assert_eq!(
+            (placed[1].cross_start, placed[1].auto_start),
+            (0, 1),
+            "the auto margin takes the row, and the margin box fills the line"
+        );
+    }
+
+    #[test]
+    fn a_line_too_short_for_its_baselines_still_starts_every_item_inside_it() {
+        // M9.8 review. A container that states a cross size smaller than its
+        // contents need is the one case where a baseline offset could push an
+        // item's *start* edge past the line's end. Every other alignment value
+        // packs at cross-start there; baseline does the same, so "no item
+        // begins outside the line" holds for all five.
+        let deep = CrossItem {
+            outer: 6,
+            baseline: 5,
+            ..cross(6, AlignItems::Baseline)
+        };
+        let shallow = CrossItem {
+            outer: 2,
+            baseline: 0,
+            ..cross(2, AlignItems::Baseline)
+        };
+        // With the line the items asked for, the shallow one drops the full 5.
+        assert_eq!(cross_size(&[deep, shallow]), 7);
+        assert_eq!(cross_starts(&[deep, shallow], 7), [0, 5]);
+        // Squeezed into 3 rows, it starts inside the line rather than below it.
+        assert_eq!(cross_starts(&[deep, shallow], 3), [0, 1]);
+        assert_eq!(cross_starts(&[deep, shallow], 1), [0, 0]);
     }
 
     #[test]
