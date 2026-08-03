@@ -218,3 +218,77 @@ fn flex_stretch_backgrounds_reach_the_full_line() {
     assert_snapshot("flex-stretch", &grid);
     assert_snapshot("flex-stretch-backgrounds", &backgrounds);
 }
+
+/// M9.12: a flex line wider than the terminal, and the rule for it.
+///
+/// **The rule.** A flex line that cannot fit is laid out at its real width —
+/// the boxes past the column edge exist, with their real x — and paint culls
+/// at that edge. There is no horizontal scroll to reach them and no sideways
+/// scrollbar to hint at them: the reader gets the content by making the
+/// terminal wider, which relayouts. Nothing is silently *dropped* in layout,
+/// which is what would make the geometry a lie; it is dropped at the frame,
+/// where the terminal really does end.
+///
+/// The alternative — shrinking items past their `flex-shrink: 0` to make the
+/// line fit — was rejected: it would let a page that says "this column is
+/// exactly 320px" render at some other width and look correct, which is the
+/// bug class M9.10's review was named after.
+///
+/// `layout/spec/flex-justify-overflow` already pins the geometry half of this.
+/// This is the paint half: which cells actually survive.
+#[test]
+fn a_flex_line_wider_than_the_terminal_is_culled_at_the_column_edge() {
+    let html = r#"<!doctype html>
+<html><head><style>
+body { margin: 0 } div { margin: 0 }
+.row { display: flex }
+.row div { flex: 0 0 96px; background: #eee }
+</style></head>
+<body><div class="row"><div>alpha</div><div>bravo</div><div>charlie</div></div>
+<p style="margin: 0">after</p></body></html>"#;
+
+    // Three 12-cell items in a 20-cell terminal: 36 cells of line for 20 cells
+    // of screen. `alpha` is whole, `bravo` starts at 12 and is cut mid-box,
+    // `charlie` starts at 24 and never appears at all.
+    let grid = render_grid(html, 20, 4);
+    assert_eq!(
+        grid.lines().collect::<Vec<_>>(),
+        ["alpha       bravo", "after"],
+        "{grid}"
+    );
+    assert!(
+        !grid.contains("charlie"),
+        "culling let a whole item through:\n{grid}"
+    );
+
+    // The cull is at the terminal edge, not at the item boundary: the second
+    // item's background fills to column 20 and stops there mid-box.
+    let backgrounds = render_backgrounds(html, 20, 4);
+    assert_eq!(
+        backgrounds.lines().collect::<Vec<_>>(),
+        ["####################"],
+        "{backgrounds}"
+    );
+
+    // Layout keeps the geometry honest — the boxes past the edge are still
+    // there at their real x, so widening the terminal reveals them instead of
+    // reflowing something that was never laid out.
+    let dom = html::parse(html);
+    let sheets = style::sources::inline_sheets(&dom);
+    let refs: Vec<_> = sheets.iter().collect();
+    let styles = style::style_tree(&dom, &refs);
+    let tree = layout::layout_document(&dom, &styles, 20, Hidden::Respect);
+    let mut xs = Vec::new();
+    tree.walk(tree.root, &mut |_, b| {
+        if b.kind == layout::BoxKind::Text {
+            xs.push((b.text.clone().unwrap_or_default(), b.dimensions.content.x));
+        }
+    });
+    assert!(
+        xs.iter().any(|(t, x)| t == "charlie" && *x == 24),
+        "the culled item lost its geometry: {xs:?}"
+    );
+
+    assert_snapshot("flex-viewport-overflow", &grid);
+    assert_snapshot("flex-viewport-overflow-backgrounds", &backgrounds);
+}
