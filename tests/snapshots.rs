@@ -292,3 +292,56 @@ body { margin: 0 } div { margin: 0 }
     assert_snapshot("flex-viewport-overflow", &grid);
     assert_snapshot("flex-viewport-overflow-backgrounds", &backgrounds);
 }
+
+/// M9.12: the whole milestone on one page, through the paint path.
+///
+/// The spec goldens each pin one rule in isolation; a real page asks for four
+/// of them at once and the interesting failures live between them — a card
+/// list that wraps *because* the sidebar took 12 cells first, a clip whose two
+/// surviving rows decide where the next box starts. 60 cells is chosen so the
+/// third card cannot fit beside the other two: at 80 it would not wrap and the
+/// fixture would stop testing M9.10.
+#[test]
+fn flex_page_snapshot() {
+    let grid = render_grid(&fixture("flex.html"), 60, 10);
+    let rows: Vec<&str> = grid.lines().collect();
+
+    // Row 0 — `justify-content: space-between`: the first item at the line's
+    // start, the last ending at its end, the rest of the 47 free cells split
+    // between them.
+    assert!(rows[0].starts_with("home"), "{grid}");
+    assert_eq!(
+        UnicodeWidthStr::width(rows[0]),
+        60,
+        "space-between must reach the far edge:\n{grid}"
+    );
+    assert!(rows[0].ends_with("about"), "{grid}");
+
+    // Rows 1-2 — a 12-cell sidebar (`flex: 0 0 96px`) beside a `flex: 1`
+    // column that wraps at the 48 cells that leaves it.
+    assert!(rows[1].starts_with("one"), "{grid}");
+    assert!(rows[2].starts_with("two"), "{grid}");
+    assert_eq!(
+        &rows[1][12..],
+        "body text that wraps inside the content column",
+        "{grid}"
+    );
+    assert_eq!(&rows[2][12..], "beside the sidebar", "{grid}");
+
+    // Rows 3-5 — two 18-cell cards and a 1-cell gap fit in 48; the third
+    // starts a second line rather than shrinking. `gap: 8px` is half a line
+    // vertically, and a nonzero length never rounds away to nothing, so the
+    // two card lines are separated by a blank row.
+    assert_eq!(&rows[3][12..], "card one           card two", "{grid}");
+    assert_eq!(rows[4], "", "the cross-axis gap is one row:\n{grid}");
+    assert_eq!(&rows[5][12..], "card three", "{grid}");
+
+    // Rows 6-7 — `max-height: 32px` is two lines, and the third paragraph is
+    // clipped away rather than painted over what follows.
+    assert_eq!(&rows[6][12..], "kept row", "{grid}");
+    assert_eq!(&rows[7][12..], "kept too", "{grid}");
+    assert!(!grid.contains("cut away"), "clip leaked:\n{grid}");
+    assert_eq!(rows.len(), 8, "unexpected page height:\n{grid}");
+
+    assert_snapshot("flex", &grid);
+}

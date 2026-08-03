@@ -1,0 +1,8 @@
+home                        blog                       about
+one         body text that wraps inside the content column
+two         beside the sidebar
+            card one           card two
+
+            card three
+            kept row
+            kept too
