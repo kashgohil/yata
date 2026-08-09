@@ -10,6 +10,7 @@ pub mod dom;
 pub mod headless;
 pub mod html;
 pub mod image;
+pub mod js;
 pub mod layout;
 pub mod msg;
 pub mod net;

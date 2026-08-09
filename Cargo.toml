@@ -7,6 +7,7 @@ edition = "2024"
 crossterm = "0.29.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 reqwest = { version = "0.13.4", features = ["blocking", "gzip"] }
+rquickjs = "0.12"
 unicode-width = "0.2"
 
 [dev-dependencies]
