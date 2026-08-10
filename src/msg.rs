@@ -74,4 +74,16 @@ pub enum Msg {
         url: String,
         result: Result<DecodedImage, String>,
     },
+    /// Run this page's `<script>` elements in document order (M10.2).
+    ///
+    /// The loop sends this to itself after a `Msg::Parsed` turn has been
+    /// rendered, so the page is on screen before any script runs and a script
+    /// that spends its whole budget cannot delay first paint. Everything in
+    /// this app is a message (PLAN.md §2); a self-scheduled pass is an
+    /// instance of that rule, not an exception to it. `id` is the page
+    /// generation, so a pass queued for a page the user has navigated away
+    /// from is dropped by the same guard every other message uses.
+    RunScripts {
+        id: FetchId,
+    },
 }

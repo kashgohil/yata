@@ -19,6 +19,7 @@ fn main() -> io::Result<()> {
     let dump_dom = args.iter().any(|a| a == "--dump-dom");
     let dump_text = args.iter().any(|a| a == "--dump-text");
     let dump_boxes = args.iter().any(|a| a == "--dump-boxes");
+    let dump_js = args.iter().any(|a| a == "--dump-js");
     let timing = args.iter().any(|a| a == "--timing");
     // `yata <url>`: the first non-flag argument (`--panic` etc. are flags,
     // not URLs). In the TUI, no argument → no fetch, blank page.
@@ -28,8 +29,8 @@ fn main() -> io::Result<()> {
     // `Screen::new`, raw mode, or the input thread exist. `--dump`'s stdout
     // carries body bytes and nothing else, so piping to a file is byte-exact.
     // Exit codes are part of the spec: 0 success · 1 fetch failure · 2 usage.
-    if dump || dump_dom || dump_text || dump_boxes || timing {
-        if [dump, dump_dom, dump_text, dump_boxes, timing]
+    if dump || dump_dom || dump_text || dump_boxes || dump_js || timing {
+        if [dump, dump_dom, dump_text, dump_boxes, dump_js, timing]
             .into_iter()
             .filter(|&f| f)
             .count()
@@ -48,6 +49,8 @@ fn main() -> io::Result<()> {
             run_dump_text(&url)
         } else if dump_boxes {
             run_dump_boxes(&url)
+        } else if dump_js {
+            run_dump_js(&url)
         } else {
             run_timing(&url)
         });
@@ -114,6 +117,13 @@ fn main() -> io::Result<()> {
         for (id, url) in effect.images {
             net::spawn_image(id, url, tx.clone());
         }
+        // The script pass (M10.2) goes back through the channel rather than
+        // being called here, so it arrives as its own turn — after the render
+        // at the bottom of this one. That ordering is the guarantee: the page
+        // is on screen before any of its script runs.
+        if let Some(id) = effect.run_scripts {
+            let _ = tx.send(Msg::RunScripts { id });
+        }
         // Clipboard is a side channel: OSC 52, not the cell buffer (CLAUDE.md).
         if let Some(text) = effect.yank {
             write!(out, "{}", yank::osc52_set_clipboard(&text))?;
@@ -128,7 +138,9 @@ fn main() -> io::Result<()> {
 
 /// The one usage line. Returns the usage exit code for `main` to exit with.
 fn usage() -> i32 {
-    eprintln!("usage: yata [--dump | --dump-dom | --dump-text | --dump-boxes | --timing] <url>");
+    eprintln!(
+        "usage: yata [--dump | --dump-dom | --dump-text | --dump-boxes | --dump-js | --timing] <url>"
+    );
     2
 }
 
@@ -229,7 +241,10 @@ fn run_dump_dom(url: &str) -> i32 {
 fn run_dump_text(url: &str) -> i32 {
     let rx = headless_fetch(url);
     match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
-        Ok((dom, _)) => {
+        Ok((mut dom, _)) => {
+            // Scripts run before the dump, under the headless rule (one pass,
+            // no timers) that `headless::run_scripts` documents.
+            yata::headless::run_scripts(&mut dom);
             // No worker to fetch <link> sheets in a headless run, so the page
             // is styled by the UA sheet plus its own inline blocks.
             let sheets = style::sources::inline_sheets(&dom);
@@ -262,6 +277,38 @@ fn run_dump_text(url: &str) -> i32 {
     }
 }
 
+/// `--dump-js`: run the page's `<script>` elements in document order and print
+/// one line each — the headless hook for M10, mirroring `--dump-dom` for M2.
+/// A script that throws is reported and the ones after it still run: a page
+/// with a broken script is a degraded page, not an error page, so the exit
+/// code is still 0. External `<script src>` does not appear until M10.10
+/// fetches it.
+fn run_dump_js(url: &str) -> i32 {
+    let rx = headless_fetch(url);
+    match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
+        Ok((mut dom, _)) => {
+            let mut text = String::new();
+            for run in yata::headless::run_scripts(&mut dom) {
+                text.push_str(&run.dump_line());
+                text.push('\n');
+            }
+            let mut out = io::stdout();
+            if out
+                .write_all(text.as_bytes())
+                .and_then(|()| out.flush())
+                .is_err()
+            {
+                return 1;
+            }
+            0
+        }
+        Err(reason) => {
+            eprintln!("{reason}");
+            1
+        }
+    }
+}
+
 /// `--dump-boxes`: the layout stage's box tree on stdout — exactly the lines
 /// `F3` shows, at the fixed `DUMP_TEXT_WIDTH` column so the output is the same
 /// everywhere. This is the hook `tests/layout.rs` goldens are read against, so
@@ -272,10 +319,10 @@ fn run_dump_boxes(url: &str) -> i32 {
     let rx = headless_fetch(url);
     let loaded = recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p)));
     match loaded {
-        Ok(((final_url, ..), (dom, _))) => {
+        Ok(((final_url, ..), (mut dom, _))) => {
             // Relative `src` resolves against the URL the body actually came
             // from (redirects included), like the TUI's discovery does.
-            let text = yata::headless::box_dump(&dom, Some(&final_url), DUMP_TEXT_WIDTH);
+            let text = yata::headless::box_dump(&mut dom, Some(&final_url), DUMP_TEXT_WIDTH);
             let mut out = io::stdout();
             if out
                 .write_all(text.as_bytes())
@@ -327,6 +374,10 @@ fn run_timing(url: &str) -> i32 {
         dom,
         elapsed: parse_elapsed,
     });
+    // The pass the event loop would send itself after painting (M10.2), so the
+    // `script` row is real work and not a stub. Timers never run here — see
+    // `headless::run_scripts` for why that rule exists.
+    app.update(Msg::RunScripts { id });
 
     let started = Instant::now();
     app.draw(renderer.frame());
@@ -362,6 +413,15 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         effect.images.extend(e.images);
         if e.yank.is_some() {
             effect.yank = e.yank;
+        }
+        // Keep only the last pass request, for the same reason as `fetch`: if
+        // two parses landed in one batch, the earlier page is already a stale
+        // generation and its pass would be dropped by the id guard anyway.
+        // Losing this field entirely is a silent bug — the loop would render
+        // pages that never run their script — so it is merged explicitly
+        // rather than by a `..` that would not exist to be forgotten.
+        if e.run_scripts.is_some() {
+            effect.run_scripts = e.run_scripts;
         }
         if e.quit {
             effect.quit = true;
@@ -460,6 +520,39 @@ mod tests {
         assert!(effect.dirty);
         assert!(!effect.quit);
         assert!(effect.fetch.is_none());
+    }
+
+    #[test]
+    fn a_batched_parse_still_reaches_the_loop_with_its_script_request() {
+        // Regression: `apply_batch` merges `Effect` field by field, so a field
+        // added to `Effect` and forgotten here is dropped silently. When that
+        // field is `run_scripts`, the symptom is that no page in the real TUI
+        // ever runs its script, while every test that calls `App::update`
+        // directly still passes.
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://x/".into());
+        let html = b"<p>hi</p><script>1</script>".to_vec();
+        let effect = apply_batch(
+            &mut app,
+            [
+                Msg::Loaded {
+                    id,
+                    url: "http://x/".into(),
+                    status: 200,
+                    body: html.clone(),
+                    elapsed: Duration::ZERO,
+                    content_type: None,
+                },
+                Msg::Parsed {
+                    id,
+                    dom: html::parse(&String::from_utf8(html).unwrap()),
+                    elapsed: Duration::ZERO,
+                },
+                key('z'),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(effect.run_scripts, Some(id));
     }
 
     #[test]

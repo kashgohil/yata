@@ -7,6 +7,23 @@
 //! is M10.2, and there are no bindings here at all, so a fixture calling
 //! `console.log` fails in this module by design.
 //!
+//! ## Where scripts sit in the architecture (M10.2)
+//!
+//! **Script execution is an event source, not a pipeline stage.** It sits
+//! beside the fetcher: a pass is asked for by a message, it owns the DOM for
+//! the duration of one tick, and what comes out is a new version of the DOM
+//! that the pipeline re-runs forward from style. No stage reaches backward and
+//! none mutates its input, so CLAUDE.md's purity invariant is intact — what
+//! changed is that the DOM now has *two* producers, the parser and this, where
+//! it used to have one.
+//!
+//! The browser-classic model is not available here and is not wanted: our
+//! parse finishes on a worker and arrives whole in `Msg::Parsed`, so there is
+//! no token stream left to stop at a `<script>` and nothing for
+//! `document.write` to write into. The pass runs after the page is on screen,
+//! as its own turn of the event loop, so a script that spends its whole budget
+//! cannot delay first paint (UX §3.2).
+//!
 //! ## One host per page generation
 //!
 //! A `Host` is created when a page starts running script and dropped when the
@@ -49,9 +66,11 @@
 //! worst of several runaway shapes in **100.25 ms** — the interrupt costs
 //! ~0.25 ms over the budget, because QuickJS polls the handler every few
 //! thousand bytecode ops rather than continuously. This holds per script; a
-//! page with
-//! many runaway scripts pays it once each, which is what M10.13 re-measures
-//! under adversarial pages before deciding whether the budget alone is enough.
+//! page with many runaway scripts pays it once each, which is what M10.13
+//! re-measures under adversarial pages before deciding whether the budget
+//! alone is enough.
+
+pub mod sources;
 
 use std::fmt;
 use std::sync::Arc;
@@ -60,6 +79,70 @@ use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
 use rquickjs::{CatchResultExt, CaughtError, Context, Runtime, Type, Value};
+
+use crate::dom::Dom;
+use crate::js::sources::Script;
+
+/// What one script did: the name it was known by, and its completion value or
+/// its error. Data, not output — `--dump-js` prints it today and M10.7's
+/// console pane will show it.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ScriptRun {
+    pub name: String,
+    pub outcome: Result<JsValue, JsError>,
+}
+
+/// Run every script the document asks for, in document order — one tick.
+///
+/// The DOM is **lent**, not shared: this borrow is the tick. `App` owns the
+/// `Dom` before and after and there is no copy, no `Rc<RefCell<…>>` and no
+/// field anywhere holding it between passes — the borrow checker enforces
+/// that rather than a convention doing it. It is `&mut` because this is the
+/// DOM's second producer: nothing writes through it until M10.5's bindings
+/// exist, but the tick is where those writes will happen, and the alternative
+/// is that every caller changes shape on the day they land.
+///
+/// A script that throws does not stop the ones after it. Browsers behave the
+/// same way, and the discipline matches a failed stylesheet: a page with a
+/// broken script is a *degraded page*, never an error page.
+///
+/// `host` is the page generation's host, created here on first use: a page
+/// with no script never starts an engine at all, which is why this takes the
+/// slot rather than a live `Host`.
+pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom) -> Vec<ScriptRun> {
+    let scripts = sources::sources(dom);
+    if scripts.is_empty() {
+        return Vec::new();
+    }
+
+    let host = match host {
+        Some(host) => host,
+        None => match Host::new() {
+            Ok(new) => host.insert(new),
+            // The engine itself would not start. The page is degraded, not
+            // broken — and the failure is reported rather than swallowed.
+            Err(error) => {
+                return vec![ScriptRun {
+                    name: error.source.clone(),
+                    outcome: Err(error),
+                }];
+            }
+        },
+    };
+
+    scripts
+        .into_iter()
+        .filter_map(|script| match script {
+            Script::Inline { name, source } => {
+                let outcome = host.eval(&name, &source);
+                Some(ScriptRun { name, outcome })
+            }
+            // M10.10 fetches these. The slot exists so document order is
+            // already right when it does; running nothing is not an error.
+            Script::External { .. } => None,
+        })
+        .collect()
+}
 
 /// Wall clock a single script gets before the interrupt handler stops it.
 ///
@@ -260,7 +343,10 @@ impl JsValue {
         JsValue::Other(typeof_name(value.type_of()).to_string())
     }
 
-    /// How the value reads when a page throws it instead of an `Error`.
+    /// How the value reads when a page *throws* it instead of an `Error`.
+    /// Unquoted, because that is what a browser shows for `throw 'nope'`; the
+    /// `Display` impl quotes instead, because a dump has to tell `42` from
+    /// `"42"`.
     fn describe(&self) -> String {
         match self {
             JsValue::Undefined => "undefined".to_string(),
@@ -269,6 +355,37 @@ impl JsValue {
             JsValue::Num(n) => n.to_string(),
             JsValue::Str(s) => s.clone(),
             JsValue::Other(kind) => kind.clone(),
+        }
+    }
+}
+
+impl fmt::Display for JsValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Quoted so a dump distinguishes the number 42 from the string
+            // "42"; `{:?}` also escapes the newlines a page can put in one.
+            JsValue::Str(s) => write!(f, "{s:?}"),
+            other => write!(f, "{}", other.describe()),
+        }
+    }
+}
+
+impl ScriptRun {
+    /// One line of `--dump-js`. The grammar is fixed, because this is the
+    /// harness the rest of M10 tests against:
+    ///
+    /// ```text
+    /// NAME ok VALUE
+    /// NAME error LINE: MESSAGE     (when the engine reported a line)
+    /// NAME error: MESSAGE          (when it did not)
+    /// ```
+    pub fn dump_line(&self) -> String {
+        match &self.outcome {
+            Ok(value) => format!("{} ok {value}", self.name),
+            Err(error) => match error.line {
+                Some(line) => format!("{} error {line}: {}", self.name, error.message),
+                None => format!("{} error: {}", self.name, error.message),
+            },
         }
     }
 }
@@ -383,8 +500,114 @@ fn line_from_stack(stack: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Host, JsValue, SCRIPT_BUDGET, line_from_stack};
+    use super::{Host, JsValue, SCRIPT_BUDGET, line_from_stack, run_pass};
     use std::time::Instant;
+
+    /// The document-order pass over a parsed page, as `App` and the headless
+    /// hooks run it.
+    fn pass(html: &str) -> Vec<String> {
+        let mut dom = crate::html::parse(html);
+        let mut host = None;
+        run_pass(&mut host, &mut dom)
+            .iter()
+            .map(super::ScriptRun::dump_line)
+            .collect()
+    }
+
+    #[test]
+    fn scripts_run_in_document_order_sharing_one_global_scope() {
+        // Order is observable through the globals: each script appends, so the
+        // final value is the order they ran in.
+        assert_eq!(
+            pass(
+                "<script>var order = 'a';</script>\
+                 <p>text between them</p>\
+                 <script>order += 'b';</script>\
+                 <script>order;</script>"
+            ),
+            [
+                "inline#1 ok undefined",
+                "inline#2 ok \"ab\"",
+                "inline#3 ok \"ab\""
+            ]
+        );
+    }
+
+    #[test]
+    fn a_script_that_throws_does_not_stop_the_ones_after_it() {
+        // Browsers keep going, and the discipline matches a failed stylesheet:
+        // a page with a broken script is a degraded page, not an error page.
+        assert_eq!(
+            pass(
+                "<script>var reached = 1;</script>\
+                 <script>null.x;</script>\
+                 <script>reached + 1;</script>"
+            ),
+            [
+                "inline#1 ok undefined",
+                "inline#2 error 1: cannot read property 'x' of null",
+                "inline#3 ok 2"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_script_starts_no_engine() {
+        let mut dom = crate::html::parse("<p>just prose</p>");
+        let mut host = None;
+        assert!(run_pass(&mut host, &mut dom).is_empty());
+        assert!(
+            host.is_none(),
+            "an engine was started for a page with no script"
+        );
+    }
+
+    #[test]
+    fn an_external_script_runs_nothing_yet_but_holds_its_slot() {
+        // M10.10 fills it. Until then it contributes no line, and — the part
+        // that matters — the inline script after it keeps the name its slot
+        // gives it.
+        assert_eq!(
+            pass("<script src=lib.js></script><script>1 + 1;</script>"),
+            ["inline#2 ok 2"]
+        );
+    }
+
+    #[test]
+    fn the_dump_line_grammar_is_fixed() {
+        // This is the harness the rest of M10 tests against, so its output is
+        // pinned rather than left to drift.
+        assert_eq!(
+            pass("<script>undefined</script>"),
+            ["inline#1 ok undefined"]
+        );
+        assert_eq!(pass("<script>null</script>"), ["inline#1 ok null"]);
+        assert_eq!(pass("<script>42</script>"), ["inline#1 ok 42"]);
+        assert_eq!(pass("<script>'hi'</script>"), ["inline#1 ok \"hi\""]);
+        assert_eq!(pass("<script>({})</script>"), ["inline#1 ok object"]);
+        assert_eq!(
+            pass("<script>throw 'nope'</script>"),
+            ["inline#1 error: nope"]
+        );
+        assert_eq!(
+            pass("<script>\nthrow new Error('boom')</script>"),
+            ["inline#1 error 2: boom"]
+        );
+    }
+
+    #[test]
+    fn the_pass_holds_no_dom_after_it_returns() {
+        // "Lent, not shared" is a borrow, not a field: the caller can mutate
+        // the tree the instant the pass returns, which would not compile if
+        // anything in `src/js` had kept a reference to it.
+        let mut dom = crate::html::parse("<script>1</script>");
+        let mut host = None;
+        let runs = run_pass(&mut host, &mut dom);
+        assert_eq!(runs.len(), 1);
+        let fresh = dom.create_element("p", vec![]);
+        dom.append(dom.root, fresh).unwrap();
+        assert_eq!(dom.node(fresh).parent, Some(dom.root));
+    }
 
     fn host() -> Host {
         Host::new().expect("engine starts")

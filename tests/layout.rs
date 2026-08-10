@@ -84,7 +84,7 @@ fn fixture_width(html: &str) -> u16 {
 /// `F3`. The base URL is a fixed fake: fixtures are offline, and image `src`
 /// only has to resolve, not fetch.
 fn box_dump(html: &str, width: u16) -> String {
-    headless::box_dump(&html::parse(html), Some(FIXTURE_BASE), width)
+    headless::box_dump(&mut html::parse(html), Some(FIXTURE_BASE), width)
 }
 
 /// Strip a spec golden's `# ` header: the derivation is for the reader, the

@@ -19,6 +19,14 @@ pub struct Timings {
     /// Styled tree → display lines at the current column width. Unlike fetch
     /// and parse it runs on the UI thread, so `App` times it where it calls it.
     pub layout: Option<Duration>,
+    /// The document-order `<script>` pass (M10.2): every script the page runs,
+    /// measured on the UI thread where it runs, like style and layout. It sits
+    /// after `layout` because that is when it happens — the pass is its own
+    /// turn of the event loop, *after* the page has been painted, so that a
+    /// script spending its whole budget cannot delay first paint. A page with
+    /// no script still gets a row: the pass walked its tree to find that out,
+    /// and that walk is real work the instrument should show.
+    pub script: Option<Duration>,
     /// The last presented frame's draw + present time, recorded by the event
     /// loop after the fact.
     pub frame: Option<Duration>,
@@ -35,6 +43,7 @@ impl Timings {
             ("parse", self.parse),
             ("style", self.style),
             ("layout", self.layout),
+            ("script", self.script),
             ("frame", self.frame),
         ]
         .into_iter()
@@ -87,6 +96,12 @@ mod tests {
         };
         assert_eq!(layout_only.rows(), ["layout 1.8 ms"]);
 
+        let script_only = Timings {
+            script: Some(Duration::from_micros(700)),
+            ..Timings::default()
+        };
+        assert_eq!(script_only.rows(), ["script 0.7 ms"]);
+
         let frame_only = Timings {
             frame: Some(Duration::from_micros(2_100)),
             ..Timings::default()
@@ -103,6 +118,7 @@ mod tests {
             parse: Some(Duration::from_micros(31_700)),
             style: Some(Duration::from_micros(41_100)),
             layout: Some(Duration::from_micros(1_800)),
+            script: Some(Duration::from_micros(700)),
             frame: Some(Duration::from_micros(2_100)),
         };
         assert_eq!(
@@ -112,6 +128,9 @@ mod tests {
                 "parse 31.7 ms",
                 "style 41.1 ms",
                 "layout 1.8 ms",
+                // After layout: the script pass is its own turn, and it runs
+                // once the page the user is reading is already painted.
+                "script 0.7 ms",
                 "frame 2.1 ms"
             ]
         );

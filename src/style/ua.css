@@ -16,12 +16,15 @@
    must not be able to dump JavaScript source into what someone is reading.
    This is a reader-first departure from what a browser does, and the reason
    the top cascade rank exists. */
-head, meta, link, base, title, style, script, template { display: none !important }
+head, meta, link, base, title, style, script, template, noscript { display: none !important }
 
-/* `<noscript>` is deliberately NOT in that list. A browser hides it because it
-   runs scripts; yata does not (JS is M10), so its content — the "enable
-   JavaScript" notice, the static fallback, the plain <img> or link a page
-   offers scripting-less clients — is exactly what this reader should see. */
+/* `<noscript>` joined that list at M10.2, and the reason is the whole reason
+   the element exists: it is the page's fallback *for a client that does not
+   run scripts*, and this one now does. Showing both would show the reader the
+   "please enable JavaScript" notice on a page whose script has already run —
+   a worse lie than either alone. This reverses the M4 rule that stood while
+   JS was unimplemented; `noscript_content_is_hidden_now_that_scripts_run`
+   records the flip. */
 
 /* Everything that breaks the line. M3's BLOCK and TIGHT tables both land here
    — display:block is only the line-breaking half of what they encoded. */

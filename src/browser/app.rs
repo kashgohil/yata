@@ -14,6 +14,7 @@ use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::{Dom, NodeId};
 use crate::image::ImageSession;
+use crate::js;
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
@@ -48,6 +49,12 @@ pub struct Effect {
     /// Absolute image URLs to fetch (page FetchId, url). Parallel workers,
     /// same discipline as stylesheets (M8).
     pub images: Vec<(FetchId, String)>,
+    /// This page wants its script pass (M10.2). The loop sends `Msg::RunScripts`
+    /// back to itself, so the pass lands as its own turn *after* this one has
+    /// been rendered. Same discipline as `fetch` and `sheets`: `App` decides,
+    /// the loop dispatches — which is also what keeps the pass out of the turn
+    /// that has to paint.
+    pub run_scripts: Option<FetchId>,
 }
 
 /// Link-hint session (`f` / `F`).
@@ -146,6 +153,13 @@ pub struct App {
     /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
     /// stays up while the URL bar is open.
     timing_visible: bool,
+    /// This page generation's JavaScript host, created by its first script
+    /// pass and dropped by the next navigation (`start_fetch`). One host per
+    /// page generation is the rule `src/js` documents: a page's globals,
+    /// closures and — from M10.8 — its listeners and timers cannot outlive it,
+    /// because there is nowhere else for them to live. A page with no script
+    /// never starts an engine, so `None` is the common case.
+    js_host: Option<js::Host>,
     /// The current page's parsed tree, from the fetch worker's `Msg::Parsed`.
     /// `None` between an accepted `Loaded` and its `Parsed` — the old tree
     /// stops matching the shown body the moment a new body lands. Kept whole
@@ -239,6 +253,7 @@ impl App {
             spinner: 0,
             timings: Timings::default(),
             timing_visible: false,
+            js_host: None,
             dom: None,
             dom_view: Viewport::default(),
             dom_view_built: false,
@@ -284,6 +299,10 @@ impl App {
         self.fetch_gen += 1;
         let id = FetchId(self.fetch_gen);
         self.current_fetch = Some(id);
+        // One host per page generation: the old page's globals, closures and
+        // (from M10.8) listeners go with it. Dropping the host is the whole
+        // mechanism — there is nowhere for that state to survive.
+        self.js_host = None;
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -427,8 +446,45 @@ impl App {
                     dirty: true,
                     sheets,
                     images,
+                    // Ask for the script pass, do not run it here: this turn
+                    // owes the user a painted page (UX §3.2), and the pass is
+                    // allowed to be slow.
+                    run_scripts: Some(id),
                     ..Effect::default()
                 }
+            }
+            Msg::RunScripts { id } => {
+                // The same stale-generation guard every other message uses: a
+                // pass queued for a page the user has already left must not
+                // run at all.
+                if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                if matches!(self.fetch, Fetch::Failed { .. }) {
+                    return Effect::default();
+                }
+                let Some(mut dom) = self.dom.take() else {
+                    return Effect::default();
+                };
+
+                let started = Instant::now();
+                // The per-script results have no home in the TUI until M10.7's
+                // console pane; `--dump-js` is where they are visible today.
+                let _runs = js::run_pass(&mut self.js_host, &mut dom);
+                // The DOM comes straight back: the host borrowed it for the
+                // tick and holds nothing now.
+                self.dom = Some(dom);
+
+                // Recorded even when the page had no script: the pass still
+                // walked the tree looking for one, and an instrument that
+                // hides the work it did do is not an instrument.
+                self.timings.script = Some(started.elapsed());
+                // Nothing repaints. No binding exists yet, so no script can
+                // have changed the DOM — invalidation after a mutation is
+                // M10.6, which is also where the errors in `runs` find their
+                // way to M10.7's console pane. Until then `--dump-js` is
+                // where a page's script failures are visible.
+                Effect::default()
             }
             Msg::Image { id, url, result } => {
                 if Some(id) != self.current_fetch {
@@ -2906,12 +2962,122 @@ mod tests {
         }
     }
 
+    // ---- the script pass (M10.2) ------------------------------------------
+
+    /// A page that has been fetched and parsed, ready for its script pass.
+    fn scripted_app(html: &str) -> (App, FetchId) {
+        let mut app = App::new(40, 10);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, html.as_bytes().to_vec());
+        app.update(parsed(id, html));
+        (app, id)
+    }
+
+    #[test]
+    fn the_page_is_painted_before_any_of_its_script_runs() {
+        // The ordering guarantee of M10.2: `Parsed` paints and *asks* for the
+        // pass; the pass is a separate turn, so a script that spends its whole
+        // budget cannot delay first paint (UX §3.2).
+        let (mut app, id) = scripted_app("<p>already visible</p><script>1</script>");
+
+        // The page is laid out and drawable before the pass has run at all.
+        assert_eq!(app.timings().script, None);
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        assert!(
+            (0..10).any(|y| row_text(&frame, y).contains("already visible")),
+            "the page was not on screen before the script pass"
+        );
+
+        // Now the turn the loop sends itself.
+        app.update(Msg::RunScripts { id });
+        assert!(app.timings().script.is_some(), "the pass did not run");
+    }
+
+    #[test]
+    fn the_dom_is_lent_to_the_tick_and_comes_straight_back() {
+        // No `Rc<RefCell<Dom>>`, no second copy: `App` owns the tree again the
+        // moment the tick ends, and can lay out immediately.
+        let (mut app, id) = scripted_app("<p>body text</p><script>1</script>");
+        app.update(Msg::RunScripts { id });
+
+        app.update(Msg::Resize(30, 8));
+        let mut frame = Frame::new(30, 8);
+        app.draw(&mut frame);
+        assert!(
+            (0..8).any(|y| row_text(&frame, y).contains("body text")),
+            "the tree did not come back from the tick"
+        );
+    }
+
+    #[test]
+    fn scripts_run_once_per_page_and_not_on_anything_else() {
+        // The invariant that would rot first, and the one that would put an
+        // unbounded amount of work on the resize path if it did.
+        let (mut app, id) = scripted_app("<p>x</p><script>1</script>");
+        assert_eq!(app.update(Msg::RunScripts { id }).run_scripts, None);
+
+        for (what, msg) in [
+            ("resize", Msg::Resize(30, 8)),
+            ("scroll", key(KeyCode::Char('j'), KeyModifiers::NONE)),
+            ("an inspector toggle", f1()),
+            (
+                "a stylesheet arriving",
+                Msg::Stylesheet {
+                    id,
+                    slot: 0,
+                    sheet: Some(Stylesheet::default()),
+                },
+            ),
+        ] {
+            assert_eq!(
+                app.update(msg).run_scripts,
+                None,
+                "{what} asked for another script pass"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_with_no_script_still_reports_what_the_pass_cost() {
+        // The pass walked the tree to discover there was nothing to run. F4 is
+        // the instrument for what the engine did; hiding that walk would make
+        // it a less honest one.
+        let (mut app, id) = scripted_app("<p>no script anywhere</p>");
+        app.update(Msg::RunScripts { id });
+        assert!(app.timings().script.is_some());
+    }
+
+    #[test]
+    fn a_script_pass_for_a_superseded_page_never_runs() {
+        let (mut app, first) = scripted_app("<p>x</p><script>1</script>");
+        // The user navigates before the pass's turn comes up.
+        let second = app.start_fetch("http://y/".into());
+        assert_ne!(first, second);
+
+        assert_eq!(app.update(Msg::RunScripts { id: first }), Effect::default());
+        assert_eq!(
+            app.timings().script,
+            None,
+            "a stale generation's scripts ran"
+        );
+    }
+
     #[test]
     fn accepted_parsed_records_the_parse_duration_and_f4_shows_it() {
         let mut app = timed_app(40, 10);
         let id = app.start_fetch("http://x/".into());
         load(&mut app, id, body(3));
-        assert_eq!(app.update(parsed(id, "<p>hi</p>")), redraw());
+        // A parse repaints *and* asks for the script pass (M10.2) — the pass
+        // is a later turn, so this one still paints without waiting for it.
+        assert_eq!(
+            app.update(parsed(id, "<p>hi</p>")),
+            Effect {
+                dirty: true,
+                run_scripts: Some(id),
+                ..Effect::default()
+            }
+        );
         assert_eq!(app.timings().parse, Some(Duration::from_micros(31_700)));
 
         app.update(f4());

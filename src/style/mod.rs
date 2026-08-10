@@ -961,13 +961,20 @@ mod tests {
     }
 
     #[test]
-    fn noscript_content_is_for_us() {
-        // A browser hides <noscript> because it runs scripts. yata does not
-        // until M10, so the fallback a page offers scripting-less clients is
-        // exactly what its reader should get.
+    fn noscript_content_is_hidden_now_that_scripts_run() {
+        // The flip, M10.2. This test said the opposite until scripts ran: a
+        // browser hides <noscript> *because* it runs scripts, and the only
+        // reason yata showed it was that it did not. Showing it now would put
+        // "please enable JavaScript" on a page whose script has already run.
         let (dom, styles) = styled("<noscript><p>No JS? Fine.</p></noscript>", "");
-        assert_ne!(styles.get(find(&dom, "noscript")).display, Display::None);
-        assert_eq!(styles.get(find(&dom, "p")).display, Display::Block);
+        assert_eq!(styles.get(find(&dom, "noscript")).display, Display::None);
+        // And it is not overridable, like the rest of that rule: a page cannot
+        // style its own fallback back into view.
+        let (dom, styles) = styled(
+            "<noscript><p>No JS? Fine.</p></noscript>",
+            "noscript { display: block }",
+        );
+        assert_eq!(styles.get(find(&dom, "noscript")).display, Display::None);
     }
 
     #[test]

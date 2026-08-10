@@ -275,12 +275,71 @@ fn dump_boxes_prints_the_box_tree_to_stdout() {
 }
 
 #[test]
+fn dump_js_runs_the_page_scripts_in_document_order() {
+    // Three scripts, the middle one throwing: the third must still run, and
+    // the page must still exit 0 — a broken script is a degraded page, not an
+    // error page.
+    let addr = serve_once(response_with_body(
+        "200 OK",
+        b"<script>var n = 1;</script>\
+          <p>prose in between</p>\
+          <script>n.missing.deeper;</script>\
+          <script>n + 41;</script>",
+    ));
+    let out = yata(&["--dump-js", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dumped = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = dumped.lines().collect();
+    assert_eq!(lines.len(), 3, "one line per script, got:\n{dumped}");
+    assert_eq!(lines[0], "inline#1 ok undefined");
+    assert!(
+        lines[1].starts_with("inline#2 error 1: "),
+        "the error line must carry its line number, got {:?}",
+        lines[1]
+    );
+    assert_eq!(lines[2], "inline#3 ok 42");
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn dump_js_of_a_page_without_script_prints_nothing() {
+    let addr = serve_once(response_with_body("200 OK", b"<p>just prose</p>"));
+    let out = yata(&["--dump-js", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        out.stdout.is_empty(),
+        "expected no lines, got {:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
+#[test]
+fn dump_js_against_a_closed_port_reports_the_reason_and_exits_1() {
+    let addr = serve_once(Vec::new());
+    // Let the one-shot server bind and immediately be gone.
+    let out = yata(&["--dump-js", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty(), "the reason must reach stderr");
+}
+
+#[test]
 fn a_headless_flag_without_a_url_is_a_usage_error() {
     for flags in [
         &["--dump"][..],
         &["--dump-dom"][..],
         &["--dump-text"][..],
         &["--dump-boxes"][..],
+        &["--dump-js"][..],
         &["--timing"][..],
     ] {
         let out = yata(flags);
@@ -308,6 +367,8 @@ fn two_headless_flags_together_is_a_usage_error() {
         ["--dump-text", "--timing"],
         ["--dump-boxes", "--dump-text"],
         ["--dump-boxes", "--timing"],
+        ["--dump-js", "--dump-text"],
+        ["--dump-js", "--timing"],
     ] {
         let out = yata(&[flags[0], flags[1], "http://127.0.0.1:9/"]);
         assert_eq!(out.status.code(), Some(2), "flags: {flags:?}");
