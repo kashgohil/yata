@@ -412,3 +412,66 @@ for the whole of `layout_document`. Both are transient — the memo is dropped
 with the `Engine` and the tree is replaced on the next layout — so this is peak
 *during* a layout, not a leak, and M9 adds nothing that outlives a navigation.
 Worth separating if the number ever approaches the budget; at 45% it is not.
+
+## M10.6 — invalidation: what a script's tick costs (2026-08-13)
+
+Release build, `en.wikipedia.org` (25,599 nodes) and `danluu.com` (1,014), mean
+of 5 **interleaved** rounds — this machine drifts several percent between runs
+of the same thing, so each round measures every case rather than measuring one
+case five times and then the next.
+
+    cargo test --release --lib measure_the_invalidation -- --ignored --nocapture --test-threads=1
+
+The two measurements are `#[ignore]`d: they print numbers and assert nothing,
+and running them in the debug default loop made `cargo test` ten times slower.
+
+### One turn of the JS path, end to end
+
+A turn is everything a click will cost once M10.8 dispatches one: the tick, the
+invalidation it triggers, the draw, and the renderer's diff + present into a
+sink. Dispatch itself is the one piece missing, and it is M10.8's to add.
+
+| turn                              | danluu   | Wikipedia |
+| --------------------------------- | -------- | --------- |
+| tick that changes nothing         | 0.51 ms  |  9.8 ms   |
+| attribute write, paint only       | 0.62 ms  | 45.9 ms   |
+| attribute write, relayouting      | 0.62 ms  | 52.4 ms   |
+
+### The stages behind those numbers (Wikipedia)
+
+| stage                  | cost     |
+| ---------------------- | -------- |
+| restyle                | 43.4 ms  |
+| one layout             |  5.2 ms  |
+| `Styles::layout_eq`    |  0.48 ms |
+
+### What the narrowing buys, and what it cannot
+
+An attribute write that only changes paint skips layout: **52.4 → 45.9 ms**, a
+6.5 ms saving that matches the 5.2 ms layout plus the paint it would have
+dragged behind it. The comparison that decides costs 0.48 ms against the 5.2 ms
+it avoids — an **11× crossover**, so it pays for itself whenever it succeeds and
+costs 9% of a layout when it does not. That is the whole case for keeping it.
+
+**The keypress→screen budget (PLAN.md §4: 10 ms) is met on an ordinary page and
+missed badly on Wikipedia.** danluu's worst turn is 0.62 ms, 6% of the budget.
+Wikipedia's is 52 ms, 5× over — and the narrowing cannot fix that, because
+**43 of those 52 ms are restyle**, which every attribute write pays before
+anything can decide whether layout is needed. Layout is 5 ms; the thing that
+misses the budget is the cascade running over 25,599 nodes to answer a question
+about one element.
+
+The fix is not in this task and is deliberately not attempted here: it is
+scoped restyle — recomputing only the subtree an attribute write can affect,
+which needs the per-selector dependency tracking M10.6 explicitly rules out as
+the wrong size for this milestone. Recorded here so the number is on the table
+when M11 picks it up.
+
+### Counters, not appearances
+
+The four invariants are pinned by the `styles_run` / `layouts` / `paints`
+counters rather than by what is on screen, because a stage that ran when it
+should not have is invisible on screen and ruinous in a profile: a tick that
+mutates nothing runs no stage at all; scrolling a script-built page runs none;
+hover over script-built content restyles and repaints but never relayouts; a
+resize relayouts exactly once and runs no script pass.

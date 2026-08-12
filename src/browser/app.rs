@@ -231,6 +231,17 @@ pub struct App {
     /// zero times, a resize exactly once. Hover must not increment it (M6).
     #[cfg(test)]
     layouts: usize,
+    /// How many times `restyle` has run. Protects the other half of the same
+    /// invariant: scrolling restyles zero times, and a tick whose script only
+    /// read the DOM must not restyle either — an event handler that looks at
+    /// the page and decides to do nothing should cost nothing (M10.6).
+    #[cfg(test)]
+    styles_run: usize,
+    /// How many times the display list has been rebuilt. The cheapest of the
+    /// three stages and the one every path ends with, so it is what says
+    /// whether a "did nothing" tick really did nothing.
+    #[cfg(test)]
+    paints: usize,
     /// Images: LRU cache, page discovery, Kitty placement state (M8).
     images: ImageSession,
 }
@@ -279,6 +290,10 @@ impl App {
             help_view_built: false,
             #[cfg(test)]
             layouts: 0,
+            #[cfg(test)]
+            styles_run: 0,
+            #[cfg(test)]
+            paints: 0,
             images: ImageSession::new(kitty_graphics),
         }
     }
@@ -454,9 +469,13 @@ impl App {
                 }
             }
             Msg::RunScripts { id } => {
-                // The same stale-generation guard every other message uses: a
-                // pass queued for a page the user has already left must not
-                // run at all.
+                // The ordering rule (M10.6): a tick belongs to the generation
+                // that scheduled it. Mutations are applied to the current page
+                // only, and a generation change cancels the pending cycle —
+                // checked here, before any stage runs, because relayouting a
+                // page the user has already left is wasted work at best and
+                // the wrong page at worst. It is the same `FetchId` guard
+                // every other message uses.
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
@@ -468,16 +487,13 @@ impl App {
                 };
 
                 let started = Instant::now();
-                // The whole dirty signal, and deliberately the coarse one
-                // M10.5 asks for: the arena counts every edit, so one
-                // comparison across the tick answers "did this page's script
-                // change the DOM" without a flag to plumb or a counter to keep
-                // in sync. M10.6 refines it into style-versus-layout classes.
-                let before = dom.version();
+                // The arena counts its own edits, so what the tick changed is
+                // answered by two comparisons rather than a flag to plumb.
+                let before = (dom.version(), dom.structure_version());
                 // The per-script results have no home in the TUI until M10.7's
                 // console pane; `--dump-js` is where they are visible today.
                 let _runs = js::run_pass(&mut self.js_host, &mut dom, id.0);
-                let changed = dom.version() != before;
+                let after = (dom.version(), dom.structure_version());
                 // The DOM comes straight back: the host borrowed it for the
                 // tick and holds nothing now.
                 self.dom = Some(dom);
@@ -487,19 +503,8 @@ impl App {
                 // hides the work it did do is not an instrument.
                 self.timings.script = Some(started.elapsed());
 
-                if !changed {
-                    return Effect::default();
-                }
-                // Once per tick, not once per mutation: a script that appends
-                // a thousand nodes lays the page out once. The sequence is the
-                // one an arriving stylesheet already runs.
-                self.restyle();
-                self.relayout();
-                self.dom_view_built = false;
-                self.styles_view_built = false;
-                self.boxes_view_built = false;
-                self.build_visible_inspector();
-                redraw()
+                // One cycle per tick, whatever the script did inside it.
+                self.apply_dom_changes(before, after)
             }
             Msg::Image { id, url, result } => {
                 if Some(id) != self.current_fetch {
@@ -974,6 +979,10 @@ impl App {
         if let Some(tree) = &self.layout_tree {
             let pixels = self.images.pixels();
             self.display_list = paint::paint_with(tree, &pixels);
+            #[cfg(test)]
+            {
+                self.paints += 1;
+            }
         }
     }
 
@@ -1014,6 +1023,10 @@ impl App {
         };
         let pixels = self.images.pixels();
         self.display_list = paint::paint_with(&tree, &pixels);
+        #[cfg(test)]
+        {
+            self.paints += 1;
+        }
         self.layout_tree = Some(tree);
         self.boxes_view_built = false;
         self.revealed = revealed;
@@ -1109,12 +1122,80 @@ impl App {
         // Timed here for the same reason layout is: this stage runs on the UI
         // thread, so it measures itself rather than arriving as message data.
         self.timings.style = Some(started.elapsed());
+        #[cfg(test)]
+        {
+            self.styles_run += 1;
+        }
+    }
+
+    /// The invalidation cycle for a tick that ran JavaScript (M10.6), given
+    /// the arena's `(version, structure_version)` before and after it.
+    ///
+    /// Three outcomes, cheapest first, and the classification is the whole
+    /// point — the win is in *not running* a stage, not in running it faster:
+    ///
+    /// - **Nothing changed** → nothing runs. A handler that reads the page and
+    ///   decides to do nothing must cost nothing.
+    /// - **Attributes only** → restyle, then ask the computed values whether
+    ///   layout would even differ. A `class` toggle that only changes a colour
+    ///   takes `:hover`'s path: recolour the existing tree and repaint.
+    /// - **The tree or its text changed** → restyle and relayout. Boxes were
+    ///   added, removed or resized; there is nothing to compare against.
+    ///
+    /// The middle case is the only narrowing, and it is bounded by
+    /// correctness: comparing two `Styles` is O(nodes) of `Copy` structs, and
+    /// `ComputedStyle::layout_eq` treats any property it does not explicitly
+    /// exempt as layout-relevant, so a wrong answer costs a relayout nobody
+    /// needed rather than a page that failed to update.
+    fn apply_dom_changes(&mut self, before: (u64, u64), after: (u64, u64)) -> Effect {
+        let (edits_before, structure_before) = before;
+        let (edits_after, structure_after) = after;
+        if edits_after == edits_before {
+            return Effect::default();
+        }
+
+        let structural = structure_after != structure_before;
+        // Keep the values the page was laid out with, so the narrowing has
+        // something to compare the new ones against.
+        let previous = self.styles.take();
+        self.restyle();
+
+        let needs_layout = structural
+            || match (&previous, &self.styles) {
+                (Some(old), Some(new)) => !old.layout_eq(new),
+                // No previous styles means nothing has been laid out from
+                // them yet; lay out rather than guess.
+                _ => true,
+            };
+
+        if needs_layout {
+            self.relayout();
+        } else {
+            self.recolour_and_repaint();
+        }
+
+        self.dom_view_built = false;
+        self.styles_view_built = false;
+        self.boxes_view_built = false;
+        self.build_visible_inspector();
+        redraw()
     }
 
     /// Restyle + rebuild the display list from the existing layout tree — no
     /// geometry change. Used for `:hover` (PLAN.md M6: restyle + repaint only).
     fn restyle_and_repaint(&mut self) {
         self.restyle();
+        self.recolour_and_repaint();
+    }
+
+    /// The half of [`Self::restyle_and_repaint`] after the restyle: push the
+    /// new computed values into the existing layout tree and repaint from it,
+    /// with no geometry recomputed.
+    ///
+    /// Split out for M10.6, whose attribute-only path has already restyled by
+    /// the time it gets here — and restyling twice would be both wasted work
+    /// and a second increment on a counter that exists to catch exactly that.
+    fn recolour_and_repaint(&mut self) {
         self.styles_view_built = false;
         if let (Some(tree), Some(styles)) = (self.layout_tree.as_mut(), self.styles.as_ref()) {
             recolour_tree(tree, styles);
@@ -1123,6 +1204,10 @@ impl App {
         if let Some(tree) = &self.layout_tree {
             let pixels = self.images.pixels();
             self.display_list = paint::paint_with(tree, &pixels);
+            #[cfg(test)]
+            {
+                self.paints += 1;
+            }
         }
         self.build_visible_inspector();
     }
@@ -3086,6 +3171,401 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    // ---- invalidation (M10.6) ---------------------------------------------
+
+    /// The three stage counters, as one comparable value. Every M10.6 test
+    /// asserts on these rather than on appearance: a stage that ran when it
+    /// should not have is invisible on screen and ruinous in a profile.
+    fn stages(app: &App) -> (usize, usize, usize) {
+        (app.styles_run, app.layouts, app.paints)
+    }
+
+    /// A page that has been parsed and had its script pass run, with the
+    /// counters read after everything has settled.
+    fn settled(html: &str) -> (App, FetchId, (usize, usize, usize)) {
+        let (mut app, id) = scripted_app(html);
+        app.update(Msg::RunScripts { id });
+        let counts = stages(&app);
+        (app, id, counts)
+    }
+
+    #[test]
+    fn a_tick_that_mutates_nothing_runs_no_stage_at_all() {
+        // Deliverable 4: a handler that only reads must cost nothing. This is
+        // the invariant every later M10 task leans on — M10.8's listeners and
+        // M10.9's timers fire far more often than a page loads.
+        let (mut app, id) = scripted_app(
+            "<p class=x>text</p><script>\
+             document.querySelectorAll('p').length + document.body.textContent.length;</script>",
+        );
+        let before = stages(&app);
+        assert_eq!(app.update(Msg::RunScripts { id }), Effect::default());
+        assert_eq!(
+            stages(&app),
+            before,
+            "a read-only tick ran a stage (styles, layouts, paints)"
+        );
+    }
+
+    #[test]
+    fn a_superseded_generations_tick_runs_no_stage() {
+        // Deliverable 6's ordering rule: mutations belong to the generation
+        // that made them, and a generation change cancels the pending cycle.
+        // The guard is the same `FetchId` check every other message uses, and
+        // it must fire *before* any stage runs — a relayout of a page the user
+        // has already left is wasted work at best and the wrong page at worst.
+        let (mut app, first) = scripted_app(
+            "<div id=list></div><script>\
+             document.getElementById('list').textContent = 'built';</script>",
+        );
+        let before = stages(&app);
+
+        // The user navigates before the pass's turn comes up.
+        let second = app.start_fetch("http://elsewhere/".into());
+        assert_ne!(first, second);
+
+        assert_eq!(app.update(Msg::RunScripts { id: first }), Effect::default());
+        assert_eq!(
+            stages(&app),
+            before,
+            "a superseded generation's tick ran a pipeline stage"
+        );
+    }
+
+    #[test]
+    fn a_tree_edit_restyles_relayouts_and_repaints_once() {
+        // Deliverable 2, first branch: boxes were added, so there is nothing
+        // to compare and everything to redo — but only once.
+        let (mut app, id) = scripted_app(
+            "<div id=list></div><script>\
+             var l = document.getElementById('list');\
+             for (var i = 0; i < 50; i++) l.appendChild(document.createElement('p'));</script>",
+        );
+        let (styled, laid_out, painted) = stages(&app);
+        assert_eq!(app.update(Msg::RunScripts { id }), redraw());
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out + 1, painted + 1),
+            "a tree edit must cost exactly one of each stage"
+        );
+    }
+
+    #[test]
+    fn an_attribute_write_that_only_changes_paint_skips_layout() {
+        // Deliverable 2, the one narrowing: `.tint { color: … }` moves no box,
+        // so the page takes `:hover`'s path — restyle, recolour the existing
+        // tree, repaint. Getting this wrong is not visible on screen, which is
+        // exactly why it is asserted on counters.
+        let (mut app, id) = scripted_app(
+            "<style>.tint { color: #c00 }</style><p id=box>text</p><script>\
+             document.getElementById('box').classList.add('tint');</script>",
+        );
+        let (styled, laid_out, painted) = stages(&app);
+        assert_eq!(app.update(Msg::RunScripts { id }), redraw());
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out, painted + 1),
+            "a paint-only class change relayouted"
+        );
+    }
+
+    #[test]
+    fn an_attribute_write_that_moves_a_box_does_relayout() {
+        // The other half of the narrowing, and the one that must never be
+        // narrowed away: the same shape of write, but the rule it matches
+        // changes a property layout reads.
+        // Two paragraphs, so hiding one does not blank the page — a page that
+        // hides everything is *revealed* again by layout's never-blank rule
+        // (M7), which would mask what this test is looking at.
+        let (mut app, id) = scripted_app(
+            "<style>.gone { display: none }</style>\
+             <p id=box>vanishing</p><p>surviving</p><script>\
+             document.getElementById('box').classList.add('gone');</script>",
+        );
+        let (styled, laid_out, painted) = stages(&app);
+        assert_eq!(app.update(Msg::RunScripts { id }), redraw());
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out + 1, painted + 1),
+            "a class change that hides an element did not relayout"
+        );
+
+        // And it really is hidden — the narrowing decides *whether* to lay
+        // out, never what the answer is.
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        let text: String = (0..10).map(|y| row_text(&frame, y)).collect();
+        assert!(text.contains("surviving"), "{text:?}");
+        assert!(!text.contains("vanishing"), "still on screen: {text:?}");
+    }
+
+    #[test]
+    fn an_attribute_write_no_rule_matches_still_costs_only_a_restyle() {
+        // A `data-` attribute no stylesheet mentions: the cascade cannot have
+        // changed anything, and the comparison proves it rather than assuming.
+        let (mut app, id) = scripted_app(
+            "<p id=box>text</p><script>\
+             document.getElementById('box').setAttribute('data-seen', '1');</script>",
+        );
+        let (styled, laid_out, painted) = stages(&app);
+        assert_eq!(app.update(Msg::RunScripts { id }), redraw());
+        assert_eq!(stages(&app), (styled + 1, laid_out, painted + 1));
+    }
+
+    #[test]
+    fn scrolling_a_script_built_page_runs_no_stage() {
+        // Deliverable 4, and CLAUDE.md's oldest rule: scrolling is cached
+        // display list → repaint at a new offset. A page whose content came
+        // from a script is no different.
+        let (mut app, _id, before) = settled(
+            "<div id=list></div><script>\
+             var l = document.getElementById('list');\
+             for (var i = 0; i < 200; i++) {\
+               var p = document.createElement('p');\
+               p.textContent = 'row ' + i;\
+               l.appendChild(p);\
+             }</script>",
+        );
+        for _ in 0..50 {
+            app.update(key(KeyCode::Char('j'), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            stages(&app),
+            before,
+            "scrolling a script-built page ran a pipeline stage"
+        );
+    }
+
+    #[test]
+    fn hovering_script_built_content_restyles_without_relayout() {
+        // Deliverable 4: the `:hover` path is the one M10.6 borrows for
+        // paint-only mutations, so it has to keep working on content that JS
+        // created rather than the parser.
+        let (mut app, _id, before) = settled(
+            "<style>a:hover { color: #f00 }</style><div id=list></div><script>\
+             var a = document.createElement('a');\
+             a.setAttribute('href', 'https://example.com/');\
+             a.textContent = 'a script-made link';\
+             document.getElementById('list').appendChild(a);</script>",
+        );
+        let (styled, laid_out, painted) = before;
+
+        // Hover the row the link landed on.
+        let moved = app.update(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: column(40).left + 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        if moved.dirty {
+            let (s, l, p) = stages(&app);
+            assert_eq!(l, laid_out, "hover relayouted script-built content");
+            assert_eq!((s, p), (styled + 1, painted + 1));
+        }
+    }
+
+    #[test]
+    fn a_resize_relayouts_once_and_runs_no_script_pass() {
+        // Deliverable 4 and M10.2's rule together: a resize is layout work,
+        // never an excuse to run the page's script again.
+        let (mut app, _id, (styled, laid_out, _painted)) = settled(
+            "<div id=list></div><script>\
+             document.getElementById('list').textContent = 'built';</script>",
+        );
+
+        let effect = app.update(Msg::Resize(30, 8));
+        assert_eq!(effect.run_scripts, None, "a resize asked for a script pass");
+        assert_eq!(
+            app.layouts,
+            laid_out + 1,
+            "a resize must relayout exactly once"
+        );
+        assert_eq!(app.styles_run, styled, "a resize restyled");
+    }
+
+    /// A Wikipedia-sized page with its own scripts neutralised, plus `script`.
+    ///
+    /// The fixture's inline scripts are retyped so the source walk skips them
+    /// (M10.2 decides what runs by `type`): they are not part of the path a
+    /// keypress takes, and leaving them in would measure page load instead.
+    /// The elements stay, so the tree, the cascade and the layout are the
+    /// article's real size.
+    fn wikipedia_with_script(css: &str, script: &str) -> String {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        // Both appended at the end, never prepended: a `<style>` before the
+        // fixture's own doctype opens the head early and parses a *different*
+        // document, which would make the two paths below incomparable.
+        format!(
+            "{}<style>{css}</style><script>{script}</script>",
+            fixture.replace("<script", "<script type=\"text/x-not-run\"")
+        )
+    }
+
+    /// One full turn of the path a click will take once M10.8 dispatches one:
+    /// the tick, the invalidation it triggers, the draw, and the present.
+    /// Returns the wall clock for all of it.
+    fn timed_js_turn(app: &mut App, id: FetchId) -> Duration {
+        // Built outside the measurement: the event loop keeps one renderer for
+        // the life of the process, so its construction is not on the path.
+        let mut renderer = crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
+        let started = Instant::now();
+        app.update(Msg::RunScripts { id });
+        // The draw and the renderer's diff + one batched write, into a sink:
+        // the same pair the event loop times as `frame`.
+        app.draw(renderer.frame());
+        let _ = renderer.present(&mut std::io::sink());
+        started.elapsed()
+    }
+
+    /// A measurement, not an assertion: it asserts nothing and prints numbers,
+    /// so it is `#[ignore]`d out of the default loop it would otherwise make
+    /// ten times slower. Run it the way the numbers in `perf.md` were taken:
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_the_invalidation -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_the_invalidation_paths_on_a_wikipedia_sized_page() {
+        // Deliverables 2, 5 and 7. Interleaved A/B/C: this machine drifts
+        // several percent between runs of the same thing, so a single
+        // before-then-after pair proves nothing.
+        const ROUNDS: u32 = 5;
+        let (mut noop, mut paint_only, mut relayouting) =
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let (mut compare, mut layout_alone) = (Duration::ZERO, Duration::ZERO);
+        let mut restyle_alone = Duration::ZERO;
+        let mut nodes = 0;
+
+        for _ in 0..ROUNDS {
+            // A: a tick that changes nothing at all.
+            let (mut app, id) = scripted_app(&wikipedia_with_script(
+                "",
+                "document.querySelectorAll('a').length;",
+            ));
+            noop += timed_js_turn(&mut app, id);
+            nodes = app.dom.as_ref().map_or(0, |d| d.node_count());
+
+            // B: an attribute write whose only effect is colour — the
+            // narrowing's path.
+            let (mut app, id) = scripted_app(&wikipedia_with_script(
+                ".x-tint p { color: #c00 }",
+                "document.body.classList.add('x-tint');",
+            ));
+            paint_only += timed_js_turn(&mut app, id);
+
+            // C: the same write, but the page's own rules make it move boxes.
+            // The rule shifts every paragraph rather than hiding it, so this
+            // measures the *same* page as B — hiding the content would make
+            // the relayout cheap by having less to lay out.
+            let (mut app, id) = scripted_app(&wikipedia_with_script(
+                ".x-move p { margin-left: 1px }",
+                "document.body.classList.add('x-move');",
+            ));
+            relayouting += timed_js_turn(&mut app, id);
+
+            // The stages themselves, so the turns above can be read as a
+            // breakdown rather than three opaque numbers.
+            let (mut app, _) = scripted_app(&wikipedia_with_script("", "1;"));
+            let dom = app.dom.as_ref().unwrap();
+            let styles = app.styles.as_ref().unwrap();
+
+            let started = Instant::now();
+            assert!(styles.layout_eq(styles));
+            compare += started.elapsed();
+
+            let started = Instant::now();
+            let _ = layout::layout_document_with(
+                dom,
+                styles,
+                column(80).width,
+                layout::Hidden::Respect,
+                &app.images.context(),
+            );
+            layout_alone += started.elapsed();
+
+            let started = Instant::now();
+            app.restyle();
+            restyle_alone += started.elapsed();
+        }
+
+        eprintln!(
+            "M10.6 on {nodes} nodes, mean of {ROUNDS} interleaved rounds:\n  \
+             turn: tick that changes nothing   {:?}\n  \
+             turn: attribute write, paint only {:?}\n  \
+             turn: attribute write, relayout   {:?}\n  \
+             stage: restyle alone              {:?}\n  \
+             stage: one layout alone           {:?}\n  \
+             stage: Styles::layout_eq alone    {:?}",
+            noop / ROUNDS,
+            paint_only / ROUNDS,
+            relayouting / ROUNDS,
+            restyle_alone / ROUNDS,
+            layout_alone / ROUNDS,
+            compare / ROUNDS,
+        );
+    }
+
+    /// A measurement, not an assertion: it asserts nothing and prints numbers,
+    /// so it is `#[ignore]`d out of the default loop it would otherwise make
+    /// ten times slower. Run it the way the numbers in `perf.md` were taken:
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_the_invalidation -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_the_invalidation_paths_on_an_ordinary_page() {
+        // The same three turns on a page the size most of the web is, so the
+        // keypress→screen number can say *where* the budget holds rather than
+        // only that the largest page on the ladder blows it.
+        const ROUNDS: u32 = 5;
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/danluu.com.html"
+        ));
+        let page = |css: &str, script: &str| {
+            format!(
+                "{}<style>{css}</style><script>{script}</script>",
+                fixture.replace("<script", "<script type=\"text/x-not-run\"")
+            )
+        };
+
+        let (mut noop, mut paint_only, mut relayouting) =
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let mut nodes = 0;
+        for _ in 0..ROUNDS {
+            let (mut app, id) = scripted_app(&page("", "document.querySelectorAll('a').length;"));
+            nodes = app.dom.as_ref().map_or(0, |d| d.node_count());
+            noop += timed_js_turn(&mut app, id);
+
+            let (mut app, id) = scripted_app(&page(
+                ".x-tint p { color: #c00 }",
+                "document.body.classList.add('x-tint');",
+            ));
+            paint_only += timed_js_turn(&mut app, id);
+
+            let (mut app, id) = scripted_app(&page(
+                ".x-move p { margin-left: 1px }",
+                "document.body.classList.add('x-move');",
+            ));
+            relayouting += timed_js_turn(&mut app, id);
+        }
+
+        eprintln!(
+            "M10.6 on {nodes} nodes (danluu), mean of {ROUNDS} interleaved rounds:\n  \
+             turn: tick that changes nothing   {:?}\n  \
+             turn: attribute write, paint only {:?}\n  \
+             turn: attribute write, relayout   {:?}",
+            noop / ROUNDS,
+            paint_only / ROUNDS,
+            relayouting / ROUNDS,
+        );
     }
 
     #[test]

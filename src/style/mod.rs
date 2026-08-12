@@ -116,6 +116,32 @@ pub struct ComputedStyle {
 }
 
 impl ComputedStyle {
+    /// Whether these two agree on everything **layout** reads (M10.6).
+    ///
+    /// Implemented by blanking the paint-only properties and comparing the
+    /// rest wholesale, rather than by listing the layout ones. That is
+    /// deliberate: the list below is the *exception* list, so a property added
+    /// to this struct and forgotten here counts as layout-relevant by default.
+    /// The cost of being wrong in that direction is a relayout nobody needed;
+    /// the cost of being wrong the other way is a page that does not update.
+    /// M10.6's rule is correctness first, and this is where it is enforced.
+    ///
+    /// What is exempt: the terminal draws these into cell attributes, and
+    /// `recolour_tree` refreshes them on an existing layout tree. None of them
+    /// can move a box — a bold cell is exactly as wide as a plain one, which
+    /// is a property of a grid that a proportional renderer would not share.
+    pub fn layout_eq(&self, other: &ComputedStyle) -> bool {
+        fn without_paint(mut style: ComputedStyle) -> ComputedStyle {
+            style.color = ColorValue::default();
+            style.background_color = ColorValue::default();
+            style.font_weight = FontWeight::default();
+            style.font_style = FontStyle::default();
+            style.underline = false;
+            style
+        }
+        without_paint(*self) == without_paint(*other)
+    }
+
     /// What a child starts from: the inherited properties of its parent, with
     /// every non-inherited one back at its initial value. `display` and
     /// `background-color` do not inherit — a `<span>` inside a block is not
@@ -183,6 +209,22 @@ pub struct Styles {
 impl Styles {
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         &self.computed[id.0 as usize]
+    }
+
+    /// Whether every node still computes to the same values **layout reads**
+    /// (M10.6). `false` means the page has to be laid out again; `true` means
+    /// whatever changed is paint-only, and refreshing the existing layout
+    /// tree's colours is enough — the path `:hover` has always taken.
+    ///
+    /// Two trees of different sizes are never equal: a node was created, so
+    /// the styled tree grew and the comparison has nothing to align.
+    pub fn layout_eq(&self, other: &Styles) -> bool {
+        self.computed.len() == other.computed.len()
+            && self
+                .computed
+                .iter()
+                .zip(&other.computed)
+                .all(|(a, b)| a.layout_eq(b))
     }
 }
 

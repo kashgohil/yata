@@ -75,6 +75,32 @@ pub struct Dom {
     /// shape by different routes hold different versions, and since it is part
     /// of `Dom` they are therefore not `==`.
     version: u64,
+    /// Bumped by the subset of those edits that changed the **shape of the
+    /// tree or the text in it**: inserts, moves, removals, `set_text`.
+    /// Attribute writes and the creation of a node nothing has inserted yet
+    /// do not touch it.
+    ///
+    /// The distinction is M10.6's whole classification. A structural edit
+    /// always needs a relayout, because boxes were added, removed or resized.
+    /// An attribute write only *might*, and only through the cascade — so it
+    /// can be answered by restyling and comparing computed values, which is
+    /// far cheaper than laying the page out to find out.
+    structure_version: u64,
+}
+
+/// What kind of change an edit was, for `Dom::note_edit`.
+#[derive(Clone, Copy)]
+enum Edit {
+    /// Changed the shape of the tree or the text in it. Always needs layout.
+    Structure,
+    /// Changed an attribute. Can only reach layout through the cascade, so
+    /// M10.6 answers it by restyling and comparing computed values.
+    Attribute,
+    /// Created a node that is in the arena but in no tree. It cannot move a
+    /// box until something inserts it — and the insert is a `Structure` edit
+    /// of its own — but it does grow `node_count`, which the styled tree is
+    /// sized by, so it still counts as an edit.
+    Detached,
 }
 
 impl Dom {
@@ -92,6 +118,7 @@ impl Dom {
             nodes: vec![root],
             root: NodeId(0),
             version: 0,
+            structure_version: 0,
         }
     }
 
@@ -113,14 +140,29 @@ impl Dom {
             None => self.nodes[parent.0 as usize].first_child = Some(id),
         }
         self.nodes[parent.0 as usize].last_child = Some(id);
-        self.version += 1;
+        self.note_edit(Edit::Structure);
         id
+    }
+
+    /// Record an edit against the counters M10.6 classifies by. The single
+    /// place `version` is bumped, so a new mutator cannot forget one of them.
+    fn note_edit(&mut self, edit: Edit) {
+        self.version += 1;
+        if matches!(edit, Edit::Structure) {
+            self.structure_version += 1;
+        }
     }
 
     /// Edits made to this document since it was created. See the field docs:
     /// this is a change *signal*, not a description of the tree.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Edits that changed the tree's shape or its text. See the field docs:
+    /// this is the half of `version` that always needs a relayout.
+    pub fn structure_version(&self) -> u64 {
+        self.structure_version
     }
 
     /// A new element belonging to no tree. It exists in the arena — style will
@@ -148,7 +190,7 @@ impl Dom {
             next_sibling: None,
             data,
         });
-        self.version += 1;
+        self.note_edit(Edit::Detached);
         id
     }
 
@@ -169,7 +211,7 @@ impl Dom {
             None => self.nodes[parent.0 as usize].first_child = Some(child),
         }
         self.nodes[parent.0 as usize].last_child = Some(child);
-        self.version += 1;
+        self.note_edit(Edit::Structure);
         Ok(())
     }
 
@@ -206,7 +248,7 @@ impl Dom {
             None => self.nodes[parent.0 as usize].first_child = Some(child),
         }
         // `last_child` cannot change: `reference` is still after `child`.
-        self.version += 1;
+        self.note_edit(Edit::Structure);
         Ok(())
     }
 
@@ -219,7 +261,7 @@ impl Dom {
             return;
         }
         self.unlink(child);
-        self.version += 1;
+        self.note_edit(Edit::Structure);
     }
 
     /// Set an attribute, replacing any existing one whose name matches
@@ -236,7 +278,7 @@ impl Dom {
             }
             None => attrs.push((name.to_string(), value.to_string())),
         }
-        self.version += 1;
+        self.note_edit(Edit::Attribute);
         true
     }
 
@@ -250,7 +292,7 @@ impl Dom {
             return false;
         };
         attrs.remove(at);
-        self.version += 1;
+        self.note_edit(Edit::Attribute);
         true
     }
 
@@ -262,7 +304,7 @@ impl Dom {
         };
         existing.clear();
         existing.push_str(text);
-        self.version += 1;
+        self.note_edit(Edit::Structure);
         true
     }
 
