@@ -97,6 +97,24 @@ impl DomSlot {
     }
 }
 
+/// Whether `name` is one the serializer could write and the tokenizer read
+/// back as the same attribute.
+///
+/// HTML has no escape for attribute *names*, so a name holding a space or a
+/// quote is not merely ugly — `setAttribute('a b="c', 'x')` serializes to
+/// `a b="c="x"`, which the next parse reads as three different attributes, and
+/// a read-modify-write through `innerHTML` silently corrupts the tree. A
+/// browser refuses these with `InvalidCharacterError` for the same reason, so
+/// the check belongs at the door rather than in the serializer.
+fn is_valid_attribute_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(|ch| {
+            ch.is_whitespace()
+                || ch.is_control()
+                || matches!(ch, '"' | '\'' | '<' | '>' | '/' | '=')
+        })
+}
+
 /// Turn one of `Dom`'s refusals into the exception a browser throws, so a page
 /// that appends a node into its own subtree finds out instead of watching the
 /// call quietly do nothing.
@@ -364,6 +382,12 @@ pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>) -> JsResult<()> {
         Function::new(
             ctx.clone(),
             move |ctx: Ctx<'_>, id: u32, name: String, value: String| {
+                if !is_valid_attribute_name(&name) {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("InvalidCharacterError: '{name}' is not a valid attribute name"),
+                    ));
+                }
                 s.with_mut(&ctx, |dom| {
                     if let Some(node) = node(dom, id) {
                         dom.set_attr(node, &name, &value);
@@ -1301,6 +1325,43 @@ mod tests {
             ),
             "\"HierarchyRequestError: the node cannot be placed there\""
         );
+    }
+
+    #[test]
+    fn an_attribute_name_that_could_not_be_read_back_is_refused() {
+        // HTML has no escape for attribute names, so accepting these would
+        // mean `innerHTML` produces markup that reparses as *different*
+        // attributes — a read-modify-write would corrupt the tree.
+        for bad in [
+            "a b=\"c", // the shape that turns one attribute into three
+            "<script>",
+            "has space",
+            "quote\"",
+            "eq=als",
+            "",
+        ] {
+            assert_eq!(
+                wrote(
+                    BOX,
+                    &format!(
+                        "try {{ box.setAttribute({bad:?}, 'x') }} catch (e) {{ e.message.split(':')[0] }}"
+                    )
+                ),
+                "\"InvalidCharacterError\"",
+                "setAttribute accepted {bad:?}"
+            );
+        }
+        // The names pages actually use keep working.
+        for good in ["data-x", "aria-label", "xml:lang", "_x", "x1"] {
+            assert_eq!(
+                wrote(
+                    BOX,
+                    &format!("box.setAttribute({good:?}, 'v'); box.getAttribute({good:?})")
+                ),
+                "\"v\"",
+                "setAttribute refused {good:?}"
+            );
+        }
     }
 
     #[test]
