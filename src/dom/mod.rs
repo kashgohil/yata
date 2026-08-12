@@ -268,14 +268,26 @@ impl Dom {
 
     /// Refuse an insert that would not leave a tree behind.
     ///
-    /// Two separate conditions, and the second is not implied by the first:
-    /// a node cannot go inside itself or its own descendant, *and* the
-    /// document root cannot be inserted anywhere at all. The ancestor walk
-    /// alone misses the root case, because a **detached** target has no
-    /// ancestors — so `append(orphan, root)` would pass the cycle check and
-    /// hand the document a parent, leaving an arena with no root.
+    /// Three separate conditions, and none implies another:
+    ///
+    /// - A node cannot go inside itself or its own descendant.
+    /// - The document root cannot be inserted anywhere at all. The ancestor
+    ///   walk alone misses this, because a **detached** target has no
+    ///   ancestors — so `append(orphan, root)` would pass the cycle check and
+    ///   hand the document a parent, leaving an arena with no root.
+    /// - Only a document or an element can hold children. Text, comments and
+    ///   the doctype are leaves; a browser throws `HierarchyRequestError`
+    ///   rather than nesting into one. Enforced here rather than left to
+    ///   M10.5's bindings because the two halves of the engine disagree about
+    ///   such a tree: `F1` prints children under a text node, and layout
+    ///   silently drops them, so the reader would be shown content that can
+    ///   never render.
     fn check_insertable(&self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
-        if child == self.root || self.is_ancestor_or_self(child, parent) {
+        let holds_children = matches!(
+            self.nodes[parent.0 as usize].data,
+            NodeData::Document | NodeData::Element { .. }
+        );
+        if !holds_children || child == self.root || self.is_ancestor_or_self(child, parent) {
             return Err(DomError::HierarchyRequest);
         }
         Ok(())
@@ -663,6 +675,27 @@ mod tests {
             Err(DomError::NotFound),
             "the reference is checked first"
         );
+        check_links(&dom);
+    }
+
+    #[test]
+    fn only_documents_and_elements_can_hold_children() {
+        // Text, comments and the doctype are leaves. Allowing a child under
+        // one produces a tree the engine cannot agree with itself about: `F1`
+        // walks children and prints it, layout treats text as a leaf and drops
+        // it, and the reader is shown content that can never render.
+        let (mut dom, div, text, comment) = sample();
+        let orphan = dom.create_element("span", vec![]);
+
+        assert_eq!(dom.append(text, orphan), Err(DomError::HierarchyRequest));
+        assert_eq!(dom.append(comment, orphan), Err(DomError::HierarchyRequest));
+        assert_eq!(dom.node(orphan).parent, None);
+        assert_eq!(dom.children(text).count(), 0);
+
+        // Elements and the document itself still take children, of course.
+        assert_eq!(dom.append(div, orphan), Ok(()));
+        let second = dom.create_text("t");
+        assert_eq!(dom.append(dom.root, second), Ok(()));
         check_links(&dom);
     }
 

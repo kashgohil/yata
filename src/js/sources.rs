@@ -61,24 +61,39 @@ pub fn sources(dom: &Dom) -> Vec<Script> {
 }
 
 fn collect(dom: &Dom, node: NodeId, out: &mut Vec<Script>) {
-    if let NodeData::Element { tag, .. } = &dom.node(node).data
-        && tag == "script"
-    {
-        if runs_as_classic_script(dom, node) {
-            match dom.attr(node, "src").filter(|src| !src.trim().is_empty()) {
-                // `src` wins: a script element with one ignores its own inline
-                // text, exactly as the HTML spec says.
-                Some(src) => out.push(Script::External {
-                    src: src.to_string(),
-                }),
-                None => out.push(Script::Inline {
-                    name: format!("inline#{}", out.len() + 1),
-                    source: text_of(dom, node),
-                }),
+    if let NodeData::Element { tag, .. } = &dom.node(node).data {
+        match tag.as_str() {
+            // Inert containers. Not a matter of *type* — the elements inside
+            // are real `<script>`s — so the walk has to refuse to descend.
+            //
+            // `<template>` holds a parse of something the page may clone
+            // later; a browser keeps it in a separate fragment where nothing
+            // executes. `<noscript>`, with scripting enabled, is not parsed as
+            // markup at all — it is raw text — so there is no script element
+            // in there to find. Our tokenizer does parse it as markup, so this
+            // is where the same result is reached. Getting this wrong would
+            // make the engine both hide a page's no-JS fallback (M10.2's UA
+            // rule) *and* run the script inside it: the worst of both.
+            "template" | "noscript" => return,
+            "script" => {
+                if runs_as_classic_script(dom, node) {
+                    match dom.attr(node, "src").filter(|src| !src.trim().is_empty()) {
+                        // `src` wins: a script element with one ignores its own
+                        // inline text, exactly as the HTML spec says.
+                        Some(src) => out.push(Script::External {
+                            src: src.to_string(),
+                        }),
+                        None => out.push(Script::Inline {
+                            name: format!("inline#{}", out.len() + 1),
+                            source: text_of(dom, node),
+                        }),
+                    }
+                }
+                // A script's children are its text, never more elements.
+                return;
             }
+            _ => {}
         }
-        // A script's children are its text, never more elements.
-        return;
     }
     for child in dom.children(node) {
         collect(dom, child, out);
@@ -213,6 +228,25 @@ mod tests {
         assert_eq!(
             of("<script></script><script>a()</script>"),
             vec![inline("inline#1", ""), inline("inline#2", "a()")]
+        );
+    }
+
+    #[test]
+    fn script_inside_an_inert_container_never_runs() {
+        // `<template>` contents are a parse the page may clone later, not part
+        // of the document; a browser never executes them.
+        assert_eq!(of("<template><script>a()</script></template>"), vec![]);
+        // `<noscript>` is the page's fallback *for a client that does not run
+        // scripts*. This one does — M10.2 hides the element for exactly that
+        // reason — so running the script inside it would be incoherent: the
+        // reader would lose the fallback and get its side effects anyway.
+        assert_eq!(of("<noscript><script>a()</script></noscript>"), vec![]);
+
+        // And an inert container takes no slot, so it does not renumber the
+        // scripts that really do run.
+        assert_eq!(
+            of("<script>a()</script><noscript><script>b()</script></noscript><script>c()</script>"),
+            vec![inline("inline#1", "a()"), inline("inline#2", "c()")]
         );
     }
 
