@@ -468,9 +468,16 @@ impl App {
                 };
 
                 let started = Instant::now();
+                // The whole dirty signal, and deliberately the coarse one
+                // M10.5 asks for: the arena counts every edit, so one
+                // comparison across the tick answers "did this page's script
+                // change the DOM" without a flag to plumb or a counter to keep
+                // in sync. M10.6 refines it into style-versus-layout classes.
+                let before = dom.version();
                 // The per-script results have no home in the TUI until M10.7's
                 // console pane; `--dump-js` is where they are visible today.
                 let _runs = js::run_pass(&mut self.js_host, &mut dom, id.0);
+                let changed = dom.version() != before;
                 // The DOM comes straight back: the host borrowed it for the
                 // tick and holds nothing now.
                 self.dom = Some(dom);
@@ -479,12 +486,20 @@ impl App {
                 // walked the tree looking for one, and an instrument that
                 // hides the work it did do is not an instrument.
                 self.timings.script = Some(started.elapsed());
-                // Nothing repaints. No binding exists yet, so no script can
-                // have changed the DOM — invalidation after a mutation is
-                // M10.6, which is also where the errors in `runs` find their
-                // way to M10.7's console pane. Until then `--dump-js` is
-                // where a page's script failures are visible.
-                Effect::default()
+
+                if !changed {
+                    return Effect::default();
+                }
+                // Once per tick, not once per mutation: a script that appends
+                // a thousand nodes lays the page out once. The sequence is the
+                // one an arriving stylesheet already runs.
+                self.restyle();
+                self.relayout();
+                self.dom_view_built = false;
+                self.styles_view_built = false;
+                self.boxes_view_built = false;
+                self.build_visible_inspector();
+                redraw()
             }
             Msg::Image { id, url, result } => {
                 if Some(id) != self.current_fetch {
@@ -3036,6 +3051,51 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    #[test]
+    fn a_thousand_mutations_in_one_tick_lay_the_page_out_once() {
+        // The coarse signal, and the invariant that makes it worth having:
+        // the pass reports "the DOM changed" once, not once per mutation. Get
+        // this wrong and a script that builds a list relayouts per element —
+        // the single most expensive mistake available in this milestone.
+        let (mut app, id) = scripted_app(
+            "<div id=list></div><script>\
+             var list = document.getElementById('list');\
+             for (var i = 0; i < 1000; i++) {\
+               var row = document.createElement('p');\
+               row.textContent = 'row ' + i;\
+               list.appendChild(row);\
+             }</script>",
+        );
+        let laid_out = app.layouts;
+
+        assert_eq!(app.update(Msg::RunScripts { id }), redraw());
+        assert_eq!(
+            app.layouts,
+            laid_out + 1,
+            "1000 appendChild calls must relayout once, not 1000 times"
+        );
+
+        // And the page really did gain the rows: a tick that changes the tree
+        // without changing the screen is the other half of the bug.
+        let mut frame = Frame::new(40, 10);
+        app.draw(&mut frame);
+        assert!(
+            (0..10).any(|y| row_text(&frame, y).contains("row 0")),
+            "the script's rows never reached the screen"
+        );
+    }
+
+    #[test]
+    fn a_tick_that_changes_nothing_does_not_relayout() {
+        // The other side of the signal: a page whose script only reads must
+        // not pay for a relayout it did not earn.
+        let (mut app, id) =
+            scripted_app("<p>text</p><script>document.querySelectorAll('p').length;</script>");
+        let laid_out = app.layouts;
+        assert_eq!(app.update(Msg::RunScripts { id }), Effect::default());
+        assert_eq!(app.layouts, laid_out, "a read-only tick relayouted");
     }
 
     #[test]

@@ -17,6 +17,126 @@ pub fn parse(input: &str) -> Dom {
     build(tokenize(input))
 }
 
+/// Parse `input` as a **fragment**: the nodes it would contribute to a parent,
+/// rather than a document. Returns the scratch arena they were built in and
+/// the roots to adopt out of it — a caller copies them into the real tree
+/// through `Dom`'s write API (M10.3), which is the only way nodes are ever
+/// created.
+///
+/// This is the honest cheap implementation: parse as a document, take
+/// `<body>`'s children. A browser's fragment algorithm is *context-sensitive*
+/// — it parses with the target element as the insertion context, so a run of
+/// `<td>`s parsed into a `<div>` loses its cells and keeps their text. Ours
+/// does not know the context, so it keeps whatever the document parser made.
+/// `innerHTML` is the only caller and the difference only shows for table
+/// parts written outside a table; see the M10.5 deviations.
+pub fn parse_fragment(input: &str) -> (Dom, Vec<NodeId>) {
+    let dom = parse(input);
+    let roots = match find_body(&dom) {
+        Some(body) => dom.children(body).collect(),
+        None => Vec::new(),
+    };
+    (dom, roots)
+}
+
+fn find_body(dom: &Dom) -> Option<NodeId> {
+    let html = dom.children(dom.root).find(
+        |&node| matches!(&dom.node(node).data, NodeData::Element { tag, .. } if tag == "html"),
+    )?;
+    dom.children(html).find(
+        |&node| matches!(&dom.node(node).data, NodeData::Element { tag, .. } if tag == "body"),
+    )
+}
+
+/// Serialize a node's children as HTML — the `innerHTML` getter.
+///
+/// Escapes what the parser would otherwise read back as markup: `&`, `<` and
+/// `>` in text, `&` and `"` in attribute values. Void elements get no closing
+/// tag, because emitting `</br>` would parse back as a second element.
+pub fn serialize_children(dom: &Dom, node: NodeId) -> String {
+    let mut out = String::new();
+    for child in dom.children(node) {
+        serialize_node(dom, child, &mut out);
+    }
+    out
+}
+
+fn serialize_node(dom: &Dom, node: NodeId, out: &mut String) {
+    match &dom.node(node).data {
+        NodeData::Text(text) => escape_text(text, out),
+        NodeData::Comment(text) => {
+            out.push_str("<!--");
+            out.push_str(text);
+            out.push_str("-->");
+        }
+        NodeData::Doctype(name) => {
+            out.push_str("<!doctype ");
+            out.push_str(name);
+            out.push('>');
+        }
+        NodeData::Element { tag, attrs } => {
+            out.push('<');
+            out.push_str(tag);
+            for (name, value) in attrs {
+                out.push(' ');
+                out.push_str(name);
+                out.push_str("=\"");
+                escape_attribute(value, out);
+                out.push('"');
+            }
+            out.push('>');
+            if VOID.contains(&tag.as_str()) {
+                return;
+            }
+            if super::tokenizer::keeps_text_verbatim(tag) {
+                // `<script>` and `<style>` hold raw text: the tokenizer never
+                // decodes entities inside them, so escaping here would compound
+                // on the next parse — a `>` in a stylesheet would become `&gt;`
+                // and then `&amp;gt;`. Their children are text by construction.
+                for child in dom.children(node) {
+                    if let NodeData::Text(text) = &dom.node(child).data {
+                        out.push_str(text);
+                    }
+                }
+            } else {
+                for child in dom.children(node) {
+                    serialize_node(dom, child, out);
+                }
+            }
+            out.push_str("</");
+            out.push_str(tag);
+            out.push('>');
+        }
+        // The document node has no serialization of its own.
+        NodeData::Document => {
+            for child in dom.children(node) {
+                serialize_node(dom, child, out);
+            }
+        }
+    }
+}
+
+fn escape_text(text: &str, out: &mut String) {
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
+fn escape_attribute(value: &str, out: &mut String) {
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+}
+
 /// Assemble a token stream into the arena DOM.
 pub fn build(tokens: Vec<Token>) -> Dom {
     let mut b = TreeBuilder::new();
@@ -403,6 +523,88 @@ fn write_node(dom: &Dom, id: NodeId, depth: usize, out: &mut String) {
     out.push('\n');
     for child in dom.children(id) {
         write_node(dom, child, depth + 1, out);
+    }
+}
+
+#[cfg(test)]
+mod serialization {
+    use super::*;
+
+    /// Serialize a parsed document's `<body>` contents — what `innerHTML`
+    /// returns for the body, and the shape the round-trip tests use.
+    fn body_html(source: &str) -> String {
+        let dom = parse(source);
+        let body = find_body(&dom).expect("every parse synthesizes a body");
+        serialize_children(&dom, body)
+    }
+
+    #[test]
+    fn text_and_attributes_are_escaped_so_they_parse_back_as_data() {
+        assert_eq!(
+            body_html("<p>a &lt; b &amp; c</p>"),
+            "<p>a &lt; b &amp; c</p>"
+        );
+        assert_eq!(
+            body_html(r#"<a href="?x=1&amp;y=2" title="say &quot;hi&quot;">l</a>"#),
+            r#"<a href="?x=1&amp;y=2" title="say &quot;hi&quot;">l</a>"#
+        );
+    }
+
+    #[test]
+    fn a_void_element_gets_no_closing_tag() {
+        // `</br>` would parse back as a second element.
+        assert_eq!(body_html("<p>a<br>b</p>"), "<p>a<br>b</p>");
+        assert_eq!(body_html(r#"<img src="x.png">"#), r#"<img src="x.png">"#);
+    }
+
+    #[test]
+    fn raw_text_elements_are_written_verbatim() {
+        // The bug the ladder round-trip caught: `<style>` and `<script>` hold
+        // text the tokenizer never decodes, so escaping it here compounds —
+        // `>` would come back as `&gt;`, then `&amp;gt;`, growing on every
+        // pass. A `<title>` is RCDATA and *is* escaped, because its entities
+        // do get decoded.
+        // The `<p>` opens the body: `<style>` and `<script>` written before
+        // one are routed into `<head>` instead (see `HEAD_TAGS`).
+        assert_eq!(
+            body_html("<p></p><style>.a > .b { color: red }</style>"),
+            "<p></p><style>.a > .b { color: red }</style>"
+        );
+        assert_eq!(
+            body_html("<p></p><script>if (a < b && c > d) {}</script>"),
+            "<p></p><script>if (a < b && c > d) {}</script>"
+        );
+        // A `<title>` is RCDATA, so its entities *are* decoded and escaping is
+        // the right inverse for it.
+        assert_eq!(
+            body_html("<p></p><title>AT&amp;T</title>"),
+            "<p></p><title>AT&amp;T</title>"
+        );
+    }
+
+    #[test]
+    fn parsing_a_serialization_gives_the_same_document() {
+        for source in [
+            "<p>plain</p>",
+            "<div class='a b'><ul><li>one</li><li>two</li></ul></div>",
+            "<p>before</p><style>.x > .y{content:'&'}</style><p>after</p>",
+            "<p>a<br>b</p><!-- note --><p title='q&quot;q'>c</p>",
+        ] {
+            let once = body_html(source);
+            let twice = body_html(&once);
+            assert_eq!(once, twice, "serializing {source:?} is not stable");
+        }
+    }
+
+    #[test]
+    fn a_fragment_is_the_body_children_of_a_document_parse() {
+        let (dom, roots) = parse_fragment("<p>one</p><p>two</p>");
+        assert_eq!(roots.len(), 2);
+        assert!(roots.iter().all(|&node| matches!(
+            &dom.node(node).data,
+            NodeData::Element { tag, .. } if tag == "p"
+        )));
+        assert_eq!(parse_fragment("").1.len(), 0);
     }
 }
 

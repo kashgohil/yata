@@ -8,7 +8,7 @@ mod tokenizer;
 mod tree_builder;
 
 pub use tokenizer::{Token, tokenize};
-pub use tree_builder::{build, debug_tree, parse};
+pub use tree_builder::{build, debug_tree, parse, parse_fragment, serialize_children};
 
 /// Decode a fetched body to a string. Lossy UTF-8 today; the charset-detection
 /// seam (see module docs) lives here when a page forces the issue.

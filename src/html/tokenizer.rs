@@ -32,6 +32,18 @@ const RAW_TEXT_TAGS: [&str; 4] = ["script", "style", "title", "textarea"];
 /// still has entities decoded (a `<title>` or `<textarea>` value is user-facing).
 const RCDATA_TAGS: [&str; 2] = ["title", "textarea"];
 
+/// Whether this element's text survives tokenization **uninterpreted** — no
+/// tags, and no entity decoding either.
+///
+/// The serializer (`tree_builder::serialize_children`) has to invert exactly
+/// what this module does, so the answer lives here rather than in a second
+/// list that could drift: escaping a `>` inside a `<style>` would produce
+/// `&gt;` that the next parse reads as four literal characters, and the one
+/// after that writes as `&amp;gt;`.
+pub(super) fn keeps_text_verbatim(tag: &str) -> bool {
+    RAW_TEXT_TAGS.contains(&tag) && !RCDATA_TAGS.contains(&tag)
+}
+
 /// Tokenize an HTML string. Chosen over an iterator type for simplicity — the
 /// whole stream is small relative to a page's layout cost, and the tree builder
 /// wants to make several passes anyway.

@@ -379,6 +379,70 @@ impl Iterator for Children<'_> {
 }
 
 #[cfg(test)]
+/// Every arena invariant, checked over the whole `Vec` rather than the
+/// nodes a test happens to name. This is what the fuzz drives, and it is
+/// the cheapest insurance in M10: a link repaired in one direction only is
+/// invisible until something walks the other way, which may be a page.
+pub(crate) fn check_links(dom: &Dom) {
+    let count = dom.node_count();
+
+    // The arena has a root and it is nobody's child. Everything else is
+    // reachable from it or deliberately detached; a root with a parent is
+    // a document that has been swallowed by its own contents.
+    assert_eq!(dom.node(dom.root).parent, None, "the root gained a parent");
+
+    // How many nodes name each node as their parent, so a child that
+    // claims a parent which does not list it cannot hide.
+    let mut claimed = vec![0usize; count];
+    for i in 0..count {
+        if let Some(parent) = dom.node(NodeId(i as u32)).parent {
+            claimed[parent.0 as usize] += 1;
+        }
+    }
+
+    for (i, &claims) in claimed.iter().enumerate() {
+        let id = NodeId(i as u32);
+        let node = dom.node(id);
+
+        // Walking up terminates — the parent chain holds no cycle.
+        let mut steps = 0;
+        let mut up = node.parent;
+        while let Some(parent) = up {
+            steps += 1;
+            assert!(steps <= count, "cycle in the parent chain above {id:?}");
+            up = dom.node(parent).parent;
+        }
+
+        // The child run reads the same forwards and backwards, and every
+        // node in it claims this node as its parent.
+        let mut walked = 0;
+        let mut prev = None;
+        let mut child = node.first_child;
+        while let Some(current) = child {
+            let node = dom.node(current);
+            assert_eq!(node.parent, Some(id), "{current:?} does not claim {id:?}");
+            assert_eq!(
+                node.prev_sibling, prev,
+                "prev_sibling broken at {current:?}"
+            );
+            prev = Some(current);
+            child = node.next_sibling;
+            walked += 1;
+            assert!(walked <= count, "cycle in the sibling run under {id:?}");
+        }
+        assert_eq!(node.last_child, prev, "last_child wrong on {id:?}");
+        assert_eq!(walked, claims, "{id:?} does not list every child of it");
+
+        // A node with no parent is out of the tree entirely: no sibling
+        // link may point back into it.
+        if node.parent.is_none() {
+            assert_eq!(node.prev_sibling, None, "detached {id:?} kept a sibling");
+            assert_eq!(node.next_sibling, None, "detached {id:?} kept a sibling");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -453,69 +517,6 @@ mod tests {
     }
 
     // ---- the write side (M10.3) ----
-
-    /// Every arena invariant, checked over the whole `Vec` rather than the
-    /// nodes a test happens to name. This is what the fuzz drives, and it is
-    /// the cheapest insurance in M10: a link repaired in one direction only is
-    /// invisible until something walks the other way, which may be a page.
-    fn check_links(dom: &Dom) {
-        let count = dom.node_count();
-
-        // The arena has a root and it is nobody's child. Everything else is
-        // reachable from it or deliberately detached; a root with a parent is
-        // a document that has been swallowed by its own contents.
-        assert_eq!(dom.node(dom.root).parent, None, "the root gained a parent");
-
-        // How many nodes name each node as their parent, so a child that
-        // claims a parent which does not list it cannot hide.
-        let mut claimed = vec![0usize; count];
-        for i in 0..count {
-            if let Some(parent) = dom.node(NodeId(i as u32)).parent {
-                claimed[parent.0 as usize] += 1;
-            }
-        }
-
-        for (i, &claims) in claimed.iter().enumerate() {
-            let id = NodeId(i as u32);
-            let node = dom.node(id);
-
-            // Walking up terminates — the parent chain holds no cycle.
-            let mut steps = 0;
-            let mut up = node.parent;
-            while let Some(parent) = up {
-                steps += 1;
-                assert!(steps <= count, "cycle in the parent chain above {id:?}");
-                up = dom.node(parent).parent;
-            }
-
-            // The child run reads the same forwards and backwards, and every
-            // node in it claims this node as its parent.
-            let mut walked = 0;
-            let mut prev = None;
-            let mut child = node.first_child;
-            while let Some(current) = child {
-                let node = dom.node(current);
-                assert_eq!(node.parent, Some(id), "{current:?} does not claim {id:?}");
-                assert_eq!(
-                    node.prev_sibling, prev,
-                    "prev_sibling broken at {current:?}"
-                );
-                prev = Some(current);
-                child = node.next_sibling;
-                walked += 1;
-                assert!(walked <= count, "cycle in the sibling run under {id:?}");
-            }
-            assert_eq!(node.last_child, prev, "last_child wrong on {id:?}");
-            assert_eq!(walked, claims, "{id:?} does not list every child of it");
-
-            // A node with no parent is out of the tree entirely: no sibling
-            // link may point back into it.
-            if node.parent.is_none() {
-                assert_eq!(node.prev_sibling, None, "detached {id:?} kept a sibling");
-                assert_eq!(node.next_sibling, None, "detached {id:?} kept a sibling");
-            }
-        }
-    }
 
     #[test]
     fn created_nodes_are_detached() {

@@ -43,7 +43,8 @@ use rquickjs::context::EvalOptions;
 use rquickjs::{Ctx, Exception, Function, Object, Result as JsResult};
 
 use crate::css;
-use crate::dom::{Dom, NodeData, NodeId};
+use crate::dom::{Dom, DomError, NodeData, NodeId};
+use crate::html;
 use crate::style::{StyleContext, matching};
 
 /// The tree the current tick is working on, shared between the host and every
@@ -78,6 +79,35 @@ impl DomSlot {
                 ctx,
                 "the DOM is not available outside a script tick",
             )),
+        }
+    }
+
+    /// The same, for a binding that writes. Every mutation goes through
+    /// `Dom`'s API (M10.3), so the invariants that API enforces — no cycles,
+    /// no reused ids, only elements holding children — hold for anything a
+    /// page can do, and `Dom::version` counts the edit for the dirty signal.
+    fn with_mut<T>(&self, ctx: &Ctx<'_>, f: impl FnOnce(&mut Dom) -> T) -> JsResult<T> {
+        match self.dom.borrow_mut().as_mut() {
+            Some(dom) => Ok(f(dom)),
+            None => Err(Exception::throw_message(
+                ctx,
+                "the DOM is not available outside a script tick",
+            )),
+        }
+    }
+}
+
+/// Turn one of `Dom`'s refusals into the exception a browser throws, so a page
+/// that appends a node into its own subtree finds out instead of watching the
+/// call quietly do nothing.
+fn throw_dom_error(ctx: &Ctx<'_>, error: DomError) -> rquickjs::Error {
+    match error {
+        DomError::HierarchyRequest => Exception::throw_message(
+            ctx,
+            "HierarchyRequestError: the node cannot be placed there",
+        ),
+        DomError::NotFound => {
+            Exception::throw_message(ctx, "NotFoundError: the node is not a child of this one")
         }
     }
 }
@@ -243,6 +273,168 @@ pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>) -> JsResult<()> {
         })?,
     )?;
 
+    // ---- writes (M10.5) ----
+
+    let s = Rc::clone(slot);
+    api.set(
+        "createElement",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, tag: String| {
+            s.with_mut(&ctx, |dom| {
+                // Lowercased like the parser's tags, so `createElement('DIV')`
+                // and a parsed `<div>` are the same tag to selector matching.
+                id_of(dom.create_element(&tag.to_ascii_lowercase(), Vec::new()))
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "createTextNode",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, text: String| {
+            s.with_mut(&ctx, |dom| id_of(dom.create_text(&text)))
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "appendChild",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, parent: u32, child: u32| {
+            let outcome = s.with_mut(&ctx, |dom| match (node(dom, parent), node(dom, child)) {
+                (Some(parent), Some(child)) => dom.append(parent, child),
+                _ => Err(DomError::NotFound),
+            })?;
+            outcome.map_err(|error| throw_dom_error(&ctx, error))
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "insertBefore",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, parent: u32, child: u32, reference: u32| {
+                let outcome = s.with_mut(&ctx, |dom| {
+                    match (node(dom, parent), node(dom, child), node(dom, reference)) {
+                        (Some(parent), Some(child), Some(reference)) => {
+                            dom.insert_before(parent, child, reference)
+                        }
+                        _ => Err(DomError::NotFound),
+                    }
+                })?;
+                outcome.map_err(|error| throw_dom_error(&ctx, error))
+            },
+        )?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "remove",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with_mut(&ctx, |dom| {
+                if let Some(node) = node(dom, id) {
+                    dom.remove(node);
+                }
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "removeChild",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, parent: u32, child: u32| {
+            let outcome = s.with_mut(&ctx, |dom| {
+                let (Some(parent), Some(child)) = (node(dom, parent), node(dom, child)) else {
+                    return Err(DomError::NotFound);
+                };
+                // `removeChild` is `remove` plus a check the caller named the
+                // right parent — the one thing it has that `remove` does not.
+                if dom.node(child).parent != Some(parent) {
+                    return Err(DomError::NotFound);
+                }
+                dom.remove(child);
+                Ok(())
+            })?;
+            outcome.map_err(|error| throw_dom_error(&ctx, error))
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setAttribute",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, id: u32, name: String, value: String| {
+                s.with_mut(&ctx, |dom| {
+                    if let Some(node) = node(dom, id) {
+                        dom.set_attr(node, &name, &value);
+                    }
+                })
+            },
+        )?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "removeAttribute",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, name: String| {
+            s.with_mut(&ctx, |dom| {
+                if let Some(node) = node(dom, id) {
+                    dom.remove_attr(node, &name);
+                }
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setTextContent",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, text: String| {
+            s.with_mut(&ctx, |dom| {
+                let Some(node) = node(dom, id) else {
+                    return;
+                };
+                // On a text node it is the text; on an element it replaces
+                // every child with one text node — including the empty case,
+                // which is how a page clears a container.
+                if dom.set_text(node, &text) {
+                    return;
+                }
+                clear_children(dom, node);
+                if !text.is_empty() {
+                    let child = dom.create_text(&text);
+                    let _ = dom.append(node, child);
+                }
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "innerHTML",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                node(dom, id).map_or_else(String::new, |node| html::serialize_children(dom, node))
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setInnerHTML",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, source: String| {
+            s.with_mut(&ctx, |dom| {
+                let Some(target) = node(dom, id) else {
+                    return;
+                };
+                clear_children(dom, target);
+                let (fragment, roots) = html::parse_fragment(&source);
+                for root in roots {
+                    adopt(dom, target, &fragment, root);
+                }
+            })
+        })?,
+    )?;
+
     ctx.globals().set("__dom", api)?;
     // Named, so a stack frame from inside the object model says where it came
     // from instead of the engine's anonymous `eval_script`.
@@ -256,6 +448,37 @@ pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>) -> JsResult<()> {
 
 fn id_of(node: NodeId) -> u32 {
     node.0
+}
+
+/// Detach every child of `node`. They stay in the arena — ids are never
+/// reused (M10.3), so a handle a script still holds keeps meaning the node it
+/// always meant, detached rather than dangling.
+fn clear_children(dom: &mut Dom, node: NodeId) {
+    for child in dom.children(node).collect::<Vec<_>>() {
+        dom.remove(child);
+    }
+}
+
+/// Copy `source`'s subtree out of a fragment arena and into `dom` under
+/// `parent`. Nodes are *rebuilt* through the write API rather than moved:
+/// there is no way to transplant a node between arenas, and there should not
+/// be — an id only means anything in the arena that issued it.
+///
+/// Comments and the doctype are dropped: `Dom`'s write API creates elements
+/// and text, which is what M10.3 defined, and nothing renders the rest.
+fn adopt(dom: &mut Dom, parent: NodeId, fragment: &Dom, source: NodeId) {
+    let copy = match &fragment.node(source).data {
+        NodeData::Element { tag, attrs } => dom.create_element(tag, attrs.clone()),
+        NodeData::Text(text) => dom.create_text(text),
+        NodeData::Comment(_) | NodeData::Doctype(_) | NodeData::Document => return,
+    };
+    // The parent is always an element or the document, and `copy` is fresh, so
+    // this cannot be refused; ignoring the result keeps the recursion honest
+    // about there being no error path to report.
+    let _ = dom.append(parent, copy);
+    for child in fragment.children(source) {
+        adopt(dom, copy, fragment, child);
+    }
 }
 
 /// A JS-supplied id, bounds-checked. A page cannot reach these numbers (the
@@ -407,15 +630,109 @@ const PRELUDE: &str = r#"
 
   function orNull(value) { return value === undefined ? null : value; }
 
+  // A class attribute as an ordered set of tokens, the DOM's model of it:
+  // split on ASCII whitespace, duplicates collapsed, order of first
+  // appearance kept.
+  function tokens(node) {
+    const value = orNull(raw.getAttribute(idOf(node), "class")) || "";
+    const seen = [];
+    for (const token of value.split(/\s+/)) {
+      if (token !== "" && seen.indexOf(token) === -1) seen.push(token);
+    }
+    return seen;
+  }
+
+  // Writing the set back serializes it single-spaced, so whitespace a page
+  // wrote by hand is normalized the first time it touches classList.
+  function setTokens(node, list) {
+    raw.setAttribute(idOf(node), "class", list.join(" "));
+  }
+
+  // A *live view*, not a snapshot: every call re-reads the attribute, so
+  // `el.classList.add('x')` is visible to a `getAttribute('class')` right
+  // after it, and two `classList` reads see each other's writes.
+  function classListFor(node) {
+    return {
+      contains: function (name) { return tokens(node).indexOf(String(name)) !== -1; },
+      add: function () {
+        const list = tokens(node);
+        for (const name of arguments) {
+          if (list.indexOf(String(name)) === -1) list.push(String(name));
+        }
+        setTokens(node, list);
+      },
+      remove: function () {
+        let list = tokens(node);
+        for (const name of arguments) {
+          list = list.filter(function (t) { return t !== String(name); });
+        }
+        setTokens(node, list);
+      },
+      toggle: function (name, force) {
+        const list = tokens(node);
+        const at = list.indexOf(String(name));
+        const present = at !== -1;
+        const want = force === undefined ? !present : !!force;
+        if (want && !present) list.push(String(name));
+        if (!want && present) list.splice(at, 1);
+        setTokens(node, list);
+        return want;
+      },
+      get length() { return tokens(node).length; },
+      item: function (i) { const list = tokens(node); return i < list.length ? list[i] : null; },
+      toString: function () { return tokens(node).join(" "); },
+    };
+  }
+
   function Element() {
     throw new TypeError("Illegal constructor");
   }
 
   Object.defineProperties(Element.prototype, {
     tagName: { get: function () { return orNull(raw.tagName(idOf(this))); } },
-    id: { get: function () { return orNull(raw.getAttribute(idOf(this), "id")) || ""; } },
-    className: { get: function () { return orNull(raw.getAttribute(idOf(this), "class")) || ""; } },
-    textContent: { get: function () { return raw.textContent(idOf(this)); } },
+    id: {
+      get: function () { return orNull(raw.getAttribute(idOf(this), "id")) || ""; },
+      set: function (value) { raw.setAttribute(idOf(this), "id", String(value)); },
+    },
+    className: {
+      get: function () { return orNull(raw.getAttribute(idOf(this), "class")) || ""; },
+      set: function (value) { raw.setAttribute(idOf(this), "class", String(value)); },
+    },
+    classList: { get: function () { return classListFor(this); } },
+    innerHTML: {
+      get: function () { return raw.innerHTML(idOf(this)); },
+      set: function (value) { raw.setInnerHTML(idOf(this), String(value)); },
+    },
+    textContent: {
+      get: function () { return raw.textContent(idOf(this)); },
+      set: function (value) { raw.setTextContent(idOf(this), String(value)); },
+    },
+    setAttribute: {
+      value: function (name, value) {
+        raw.setAttribute(idOf(this), String(name), String(value));
+      }
+    },
+    removeAttribute: {
+      value: function (name) { raw.removeAttribute(idOf(this), String(name)); }
+    },
+    appendChild: {
+      value: function (child) { raw.appendChild(idOf(this), idOf(child)); return child; }
+    },
+    insertBefore: {
+      value: function (child, reference) {
+        // `insertBefore(node, null)` is an append; pages rely on it.
+        if (reference === null || reference === undefined) {
+          raw.appendChild(idOf(this), idOf(child));
+        } else {
+          raw.insertBefore(idOf(this), idOf(child), idOf(reference));
+        }
+        return child;
+      }
+    },
+    removeChild: {
+      value: function (child) { raw.removeChild(idOf(this), idOf(child)); return child; }
+    },
+    remove: { value: function () { raw.remove(idOf(this)); } },
     parentElement: { get: function () { return wrap(raw.parentElement(idOf(this))); } },
     children: { get: function () { return raw.children(idOf(this)).map(wrap); } },
     firstElementChild: {
@@ -439,6 +756,8 @@ const PRELUDE: &str = r#"
     get documentElement() { return wrap(raw.documentElement()); },
     get body() { return wrap(raw.body()); },
     get title() { return raw.title(); },
+    createElement: function (tag) { return wrap(raw.createElement(String(tag))); },
+    createTextNode: function (text) { return wrap(raw.createTextNode(String(text))); },
     getElementById: function (id) { return wrap(raw.getElementById(String(id))); },
     querySelector: function (sel) { return wrap(raw.querySelector(String(sel))); },
     querySelectorAll: function (sel) { return raw.querySelectorAll(String(sel)).map(wrap); },
@@ -736,6 +1055,438 @@ mod tests {
         })
         .expect("the fixture has a text node");
         assert_eq!(text_of(&dom, text), "just text");
+    }
+
+    // ---- writes (M10.5) ----
+
+    /// Run `script` against `page` and hand back both the completion value and
+    /// the tree it left behind — the DOM effect and the script's own view of
+    /// it are the two halves a write binding has to get right.
+    ///
+    /// `box` is bound for the script: a browser would expose an element's `id`
+    /// as a global by itself, and we deliberately do not (see the M10.4
+    /// deviations), so the tests say so out loud instead of relying on it.
+    fn mutate(page: &str, script: &str) -> (String, Dom) {
+        let script = format!("var box = document.getElementById('box');\n{script}");
+        let mut dom = html::parse(&format!("{page}<script>{script}</script>"));
+        let mut host = None;
+        let runs = js::run_pass(&mut host, &mut dom, 7);
+        crate::dom::check_links(&dom);
+        let line = runs.last().expect("the script ran").dump_line();
+        (line, dom)
+    }
+
+    fn wrote(page: &str, script: &str) -> String {
+        let (line, _) = mutate(page, script);
+        line.strip_prefix("inline#1 ok ")
+            .unwrap_or(&line)
+            .to_string()
+    }
+
+    const BOX: &str = "<div id=box class='a  b'><p>one</p><p>two</p></div>";
+
+    #[test]
+    fn text_content_replaces_every_child_with_one_text_node() {
+        assert_eq!(
+            wrote(BOX, "box.textContent = 'replaced'; box.innerHTML"),
+            "\"replaced\""
+        );
+        // The empty case is how a page clears a container, and it must leave
+        // no text node behind rather than an empty one.
+        let (_, dom) = mutate(BOX, "box.textContent = '';");
+        let target = find_descendant(&dom, dom.root, &mut |dom, node| {
+            dom.attr(node, "id") == Some("box")
+        })
+        .unwrap();
+        assert_eq!(dom.children(target).count(), 0);
+    }
+
+    #[test]
+    fn id_and_class_writes_are_visible_to_the_next_query() {
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.id = 'renamed'; document.querySelector('#renamed') !== null"
+            ),
+            "true"
+        );
+        assert_eq!(
+            wrote(BOX, "box.className = 'x y'; box.getAttribute('class')"),
+            "\"x y\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.setAttribute('data-k', 'v'); box.getAttribute('data-k')"
+            ),
+            "\"v\""
+        );
+        assert_eq!(
+            wrote(BOX, "box.removeAttribute('class'); box.className"),
+            "\"\""
+        );
+    }
+
+    #[test]
+    fn class_list_is_a_live_view_over_the_attribute() {
+        // Live, not a snapshot: the write is visible to a read right after it,
+        // through either spelling.
+        assert_eq!(
+            wrote(BOX, "box.classList.add('c'); box.getAttribute('class')"),
+            "\"a b c\""
+        );
+        assert_eq!(
+            wrote(BOX, "box.classList.add('c'); box.classList.contains('c')"),
+            "true"
+        );
+        assert_eq!(
+            wrote(BOX, "box.classList.remove('a'); box.className"),
+            "\"b\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "[box.classList.toggle('a'), box.classList.toggle('z'), box.className].join('|')"
+            ),
+            "\"false|true|b z\""
+        );
+        // `toggle(name, force)` sets rather than flips.
+        assert_eq!(
+            wrote(BOX, "box.classList.toggle('a', true); box.className"),
+            "\"a b\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "[box.classList.contains('a'), box.classList.contains('nope')].join('|')"
+            ),
+            "\"true|false\""
+        );
+    }
+
+    #[test]
+    fn class_list_follows_the_dom_on_whitespace_and_duplicates() {
+        // The attribute is an ordered set of tokens: `'a  b'` is two tokens,
+        // and writing the set back serializes it single-spaced.
+        assert_eq!(wrote(BOX, "box.classList.length"), "2");
+        assert_eq!(
+            wrote(BOX, "box.classList.add('a'); box.className"),
+            "\"a b\""
+        );
+        assert_eq!(
+            wrote(
+                "<div id=box class='dup dup  x'></div>",
+                "box.classList.length"
+            ),
+            "2"
+        );
+        assert_eq!(
+            wrote(
+                "<div id=box class='dup dup  x'></div>",
+                "box.classList.add('y'); box.className"
+            ),
+            "\"dup x y\""
+        );
+        assert_eq!(
+            wrote(
+                "<div id=box class='  spaced  '></div>",
+                "box.classList.toString()"
+            ),
+            "\"spaced\""
+        );
+    }
+
+    #[test]
+    fn created_nodes_join_the_tree_and_are_found_by_queries() {
+        assert_eq!(
+            wrote(
+                BOX,
+                "var e = document.createElement('SPAN'); e.textContent = 'new';\
+                 document.body.appendChild(e);\
+                 document.querySelector('span').textContent"
+            ),
+            "\"new\""
+        );
+        // `createElement` lowercases, so a created tag and a parsed one are
+        // the same tag to the selector matcher.
+        assert_eq!(
+            wrote(
+                BOX,
+                "document.body.appendChild(document.createElement('SPAN')).tagName"
+            ),
+            "\"SPAN\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.appendChild(document.createTextNode('!')); box.textContent"
+            ),
+            "\"onetwo!\""
+        );
+    }
+
+    #[test]
+    fn tree_edits_move_and_remove() {
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.insertBefore(document.createElement('i'), box.firstElementChild);\
+                 box.firstElementChild.tagName"
+            ),
+            "\"I\""
+        );
+        // `insertBefore(node, null)` is an append — pages rely on it.
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.insertBefore(document.createElement('i'), null);\
+                 box.children[box.children.length - 1].tagName"
+            ),
+            "\"I\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.removeChild(box.firstElementChild); box.children.length"
+            ),
+            "1"
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "document.querySelector('p').remove(); document.querySelectorAll('p').length"
+            ),
+            "1"
+        );
+        // Appending a node that already has a parent moves it (M10.3), it does
+        // not alias it into two places.
+        assert_eq!(
+            wrote(
+                BOX,
+                "document.body.appendChild(box.firstElementChild);\
+                 [box.children.length, document.body.children.length].join('|')"
+            ),
+            "\"1|3\""
+        );
+    }
+
+    #[test]
+    fn a_refused_edit_throws_instead_of_doing_nothing() {
+        // The page has to find out. A silent no-op here is the failure mode
+        // M10.3's refusals exist to make visible.
+        assert_eq!(
+            wrote(BOX, "try { box.appendChild(box) } catch (e) { e.message }"),
+            "\"HierarchyRequestError: the node cannot be placed there\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "try { box.appendChild(document.documentElement) } catch (e) { e.message }"
+            ),
+            "\"HierarchyRequestError: the node cannot be placed there\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "try { document.body.removeChild(box.firstElementChild) } catch (e) { e.message }"
+            ),
+            "\"NotFoundError: the node is not a child of this one\""
+        );
+        // A text node cannot hold children (M10.3's rule, surfaced here).
+        assert_eq!(
+            wrote(
+                BOX,
+                "try { document.createTextNode('t').appendChild(document.createElement('b')) }\
+                 catch (e) { e.message }"
+            ),
+            "\"HierarchyRequestError: the node cannot be placed there\""
+        );
+    }
+
+    #[test]
+    fn inner_html_reads_back_what_the_parser_built() {
+        assert_eq!(wrote(BOX, "box.innerHTML"), "\"<p>one</p><p>two</p>\"");
+        // Escaping: what comes out must parse back as text, not as markup.
+        assert_eq!(
+            wrote("<div id=box>a &lt; b &amp; c</div>", "box.innerHTML"),
+            "\"a &lt; b &amp; c\""
+        );
+        assert_eq!(
+            wrote(
+                r#"<div id=box><a href='?x=1&amp;y=2' title='he said "hi"'>l</a></div>"#,
+                "box.innerHTML"
+            ),
+            "\"<a href=\\\"?x=1&amp;y=2\\\" title=\\\"he said &quot;hi&quot;\\\">l</a>\""
+        );
+        // A void element gets no closing tag: `</br>` would parse back as a
+        // second element.
+        assert_eq!(
+            wrote("<div id=box>a<br>b</div>", "box.innerHTML"),
+            "\"a<br>b\""
+        );
+    }
+
+    #[test]
+    fn inner_html_writes_a_parsed_fragment() {
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.innerHTML = '<b>bold</b> text'; box.children.length"
+            ),
+            "1"
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.innerHTML = '<b>bold</b> &amp; text'; box.textContent"
+            ),
+            "\"bold & text\""
+        );
+        // Setting it empty clears the container.
+        assert_eq!(wrote(BOX, "box.innerHTML = ''; box.innerHTML"), "\"\"");
+        // And the new subtree is a real part of the document.
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.innerHTML = '<ul><li class=item>a</li><li class=item>b</li></ul>';\
+                 document.querySelectorAll('#box li.item').length"
+            ),
+            "2"
+        );
+    }
+
+    #[test]
+    fn inner_html_round_trips_the_ladder_fixtures() {
+        // parse → serialize → parse gives the same tree. If it does not, one
+        // of the two is lying about what the document says.
+        for fixture in [
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/example.com.html"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/motherfuckingwebsite.com.html"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/danluu.com.html"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/news.ycombinator.com.html"
+            )),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/en.wikipedia.org.html"
+            )),
+        ] {
+            let dom = html::parse(fixture);
+            let body = find_tag(&dom, dom.root, "body").expect("every parse synthesizes a body");
+            let serialized = html::serialize_children(&dom, body);
+
+            let reparsed = html::parse(&format!("<body>{serialized}"));
+            let reparsed_body = find_tag(&reparsed, reparsed.root, "body").unwrap();
+            assert_eq!(
+                html::serialize_children(&reparsed, reparsed_body),
+                serialized,
+                "a second round trip changed the document"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fragment_is_parsed_without_its_context() {
+        // The deviation, deliberately: a browser parses `innerHTML` *with the
+        // target element as context*, so table parts written into a `<div>`
+        // lose their tags and keep their text. Ours parses as a document and
+        // adopts the body's children, so the cells survive.
+        let (_, dom) = mutate("<div id=box></div>", "box.innerHTML = '<td>cell</td>';");
+        let serialized = {
+            let target = find_descendant(&dom, dom.root, &mut |dom, node| {
+                dom.attr(node, "id") == Some("box")
+            })
+            .unwrap();
+            html::serialize_children(&dom, target)
+        };
+        assert_eq!(
+            serialized, "<td>cell</td>",
+            "a browser would give `cell` here — see the M10.5 deviations"
+        );
+    }
+
+    #[test]
+    fn a_script_set_style_attribute_reaches_computed_values() {
+        // The write goes through `setAttribute`, and the cascade's existing
+        // `style=""` parsing does the rest — no new path.
+        let (_, dom) = mutate(
+            "<p id=box>text</p>",
+            "box.setAttribute('style', 'display: none');",
+        );
+        let styles = crate::style::style_tree(&dom, &[]);
+        let target = find_descendant(&dom, dom.root, &mut |dom, node| {
+            dom.attr(node, "id") == Some("box")
+        })
+        .unwrap();
+        assert_eq!(
+            styles.get(target).display,
+            crate::style::values::Display::None
+        );
+    }
+
+    #[test]
+    fn a_class_set_by_script_is_matched_by_the_page_stylesheet() {
+        // A binding that changes the tree but not the screen is the bug this
+        // milestone exists to prevent, so the assertion goes all the way to a
+        // computed value: the page's own rule has to find the element the
+        // script just tagged.
+        let (_, dom) = mutate(
+            "<style>.hidden { display: none }</style><p id=box>text</p>",
+            "box.classList.add('hidden');",
+        );
+        let sheets = crate::style::sources::inline_sheets(&dom);
+        let styles = crate::style::style_tree(&dom, &sheets.iter().collect::<Vec<_>>());
+        let target = find_descendant(&dom, dom.root, &mut |dom, node| {
+            dom.attr(node, "id") == Some("box")
+        })
+        .unwrap();
+        assert_eq!(
+            styles.get(target).display,
+            crate::style::values::Display::None
+        );
+    }
+
+    #[test]
+    fn mutating_a_collection_while_iterating_it_is_a_snapshot() {
+        // The semantics chosen, and the reason: `children` returns a plain
+        // array taken at the moment of the call, so removing during iteration
+        // visits every element exactly once. A live collection would skip
+        // every other one, which is the classic bug this avoids.
+        assert_eq!(
+            wrote(
+                "<div id=box><p>1</p><p>2</p><p>3</p><p>4</p></div>",
+                "var seen = 0; for (const c of box.children) { seen++; c.remove(); }\
+                 [seen, box.children.length].join('|')"
+            ),
+            "\"4|0\""
+        );
+        // Removing the same node twice is a no-op, not a corruption: the id
+        // still means that node, it simply has no parent any more.
+        assert_eq!(
+            wrote(
+                BOX,
+                "var p = box.firstElementChild; p.remove(); p.remove(); p.tagName"
+            ),
+            "\"P\""
+        );
+        // And a handle to a removed node still reads.
+        assert_eq!(
+            wrote(
+                BOX,
+                "var p = box.firstElementChild; p.remove(); p.textContent"
+            ),
+            "\"one\""
+        );
     }
 
     #[test]
