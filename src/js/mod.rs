@@ -3,9 +3,10 @@
 //! M10 embeds QuickJS through `rquickjs` (PLAN.md §6 M10; the human sign-off
 //! CLAUDE.md rule 1 requires covers `rquickjs` and nothing else). This module
 //! owns the engine and the rules that keep a page's script from taking the
-//! browser down with it. It executes nothing on its own — `<script>` ordering
-//! is M10.2, and there are no bindings here at all, so a fixture calling
-//! `console.log` fails in this module by design.
+//! browser down with it: the execution budget, the memory and stack caps, and
+//! the boundary that keeps engine types out of the rest of the tree. What a
+//! page can *reach* is `bindings`; a name that module does not define — and
+//! `console.log` is one until M10.7 — is undefined by design, not by accident.
 //!
 //! ## Where scripts sit in the architecture (M10.2)
 //!
@@ -53,9 +54,11 @@
 //!
 //! ## What a page can reach
 //!
-//! Nothing, yet, and nothing by accident later: QuickJS's core intrinsics are
-//! the language only — no file, process or network access exists to bind. A
-//! page reaches exactly what M10.4 onward hands it and no more.
+//! Exactly what `bindings` hands it, and nothing by accident: QuickJS's core
+//! intrinsics are the language only — no file, process or network access
+//! exists for a page to find. Since M10.4 that means `window`, `document` and
+//! the read half of the DOM; everything else a real browser has is absent
+//! rather than stubbed, so a page's feature detection gets a true answer.
 //!
 //! ## `q` still quits (PLAN.md §1.5)
 //!
@@ -70,9 +73,14 @@
 //! re-measures under adversarial pages before deciding whether the budget
 //! alone is enough.
 
+// Private: the object model is reached by running script, never by calling
+// into it from Rust. Keeping the module closed is what stops `DomSlot::lend`
+// from becoming an API somebody outside the engine can hand a tree to.
+mod bindings;
 pub mod sources;
 
 use std::fmt;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -94,13 +102,16 @@ pub struct ScriptRun {
 
 /// Run every script the document asks for, in document order — one tick.
 ///
-/// The DOM is **lent**, not shared: this borrow is the tick. `App` owns the
-/// `Dom` before and after and there is no copy, no `Rc<RefCell<…>>` and no
-/// field anywhere holding it between passes — the borrow checker enforces
-/// that rather than a convention doing it. It is `&mut` because this is the
-/// DOM's second producer: nothing writes through it until M10.5's bindings
-/// exist, but the tick is where those writes will happen, and the alternative
-/// is that every caller changes shape on the day they land.
+/// The DOM is **lent**, not shared. `App` owns the `Dom` before and after,
+/// there is no copy, and nothing holds the tree between passes: the tick moves
+/// it into the host's slot (`bindings::DomSlot`, which every binding reads
+/// through) and moves it back out before returning. Outside a tick the slot is
+/// empty and every binding throws, which is the honest answer for a callback
+/// that runs when no tick owns a tree.
+///
+/// `page` is the page generation the tree belongs to. Handles minted during
+/// the tick carry it, so one held past a navigation refuses to resolve rather
+/// than reading whatever node now sits at its index.
 ///
 /// A script that throws does not stop the ones after it. Browsers behave the
 /// same way, and the discipline matches a failed stylesheet: a page with a
@@ -109,7 +120,7 @@ pub struct ScriptRun {
 /// `host` is the page generation's host, created here on first use: a page
 /// with no script never starts an engine at all, which is why this takes the
 /// slot rather than a live `Host`.
-pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom) -> Vec<ScriptRun> {
+pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom, page: u64) -> Vec<ScriptRun> {
     let scripts = sources::sources(dom);
     if scripts.is_empty() {
         return Vec::new();
@@ -130,7 +141,14 @@ pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom) -> Vec<ScriptRun> {
         },
     };
 
-    scripts
+    // The lend, and the whole of it: the tree goes into the slot the bindings
+    // read through, and comes back out below. `Dom::new_document` is a
+    // one-node placeholder standing in the caller's variable meanwhile — the
+    // caller cannot observe it, because it holds a `&mut` for the whole call.
+    host.dom
+        .lend(std::mem::replace(dom, Dom::new_document()), page);
+
+    let runs: Vec<ScriptRun> = scripts
         .into_iter()
         .filter_map(|script| match script {
             Script::Inline { name, source } => {
@@ -141,7 +159,15 @@ pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom) -> Vec<ScriptRun> {
             // already right when it does; running nothing is not an error.
             Script::External { .. } => None,
         })
-        .collect()
+        .collect();
+
+    // Back to the caller. A handle a script stored in a global outlives this,
+    // and that is correct: it stays valid for as long as the page does, and
+    // stops resolving the moment a different page is lent in.
+    if let Some(returned) = host.dom.take() {
+        *dom = returned;
+    }
+    runs
 }
 
 /// Wall clock a single script gets before the interrupt handler stops it.
@@ -208,6 +234,10 @@ pub struct Host {
     /// Fixed reference point for the deadline arithmetic: `Instant` has no
     /// integer form, and the interrupt handler needs a lock-free one.
     origin: Instant,
+    /// The tree the current tick is working on. Shared with every binding
+    /// closure, which is why it is an `Rc` and why it is empty between ticks —
+    /// see `bindings`.
+    dom: Rc<bindings::DomSlot>,
 }
 
 impl Host {
@@ -238,11 +268,22 @@ impl Host {
             true
         })));
 
+        let dom = Rc::new(bindings::DomSlot::default());
+        let installed = context.with(|ctx| {
+            bindings::install(&ctx, &dom)
+                .catch(&ctx)
+                .map_err(|caught| JsError::from_caught("<bindings>", &caught))
+        });
+        // A prelude that will not install is a broken engine, not a broken
+        // page: fail here rather than hand every script a DOM-less window.
+        installed?;
+
         Ok(Host {
             runtime,
             context,
             budget,
             origin,
+            dom,
         })
     }
 
@@ -439,7 +480,7 @@ impl JsError {
         JsError {
             message,
             source: name.to_string(),
-            line: line_from_stack(&stack),
+            line: line_from_stack(&stack, name),
             stack,
             timed_out: false,
         }
@@ -477,8 +518,30 @@ fn typeof_name(ty: Type) -> &'static str {
 
 /// Read the line number back out of QuickJS's stack string.
 ///
-/// `Exception` exposes only `message` and `stack`, so the stack's first frame
-/// is the only place the location exists. It comes in two shapes:
+/// `Exception` exposes only `message` and `stack`, so the stack is the only
+/// place the location exists.
+///
+/// The frame to report is the first one **in the script being run**, not the
+/// first one on the stack. When a binding throws — an invalid selector, a
+/// stale handle — the innermost frame is inside `<bindings>`, and reporting
+/// its line would point a page author at a line number in our prelude that
+/// has nothing to do with their bug. The first frame is the fallback for a
+/// stack that never names the script, such as a parse error.
+fn line_from_stack(stack: &str, source: &str) -> Option<u32> {
+    let mut innermost = None;
+    for frame in stack.lines() {
+        let Some((file, line)) = frame_location(frame) else {
+            continue;
+        };
+        if file == source {
+            return Some(line);
+        }
+        innermost.get_or_insert(line);
+    }
+    innermost
+}
+
+/// One stack frame's file and line. QuickJS writes them in two shapes:
 ///
 /// ```text
 ///     at page.js:1:1             (parse errors)
@@ -487,15 +550,15 @@ fn typeof_name(ty: Type) -> &'static str {
 ///
 /// Splitting from the right is what makes a URL source name (`https://…`,
 /// full of colons) parse correctly.
-fn line_from_stack(stack: &str) -> Option<u32> {
-    let frame = stack.lines().next()?.trim();
+fn frame_location(frame: &str) -> Option<(&str, u32)> {
+    let frame = frame.trim();
     let location = match frame.rsplit_once('(') {
         Some((_, inside)) => inside.strip_suffix(')')?,
         None => frame.strip_prefix("at ")?,
     };
     let (file_and_line, _column) = location.rsplit_once(':')?;
-    let (_file, line) = file_and_line.rsplit_once(':')?;
-    line.parse().ok()
+    let (file, line) = file_and_line.rsplit_once(':')?;
+    Some((file, line.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -508,7 +571,7 @@ mod tests {
     fn pass(html: &str) -> Vec<String> {
         let mut dom = crate::html::parse(html);
         let mut host = None;
-        run_pass(&mut host, &mut dom)
+        run_pass(&mut host, &mut dom, 1)
             .iter()
             .map(super::ScriptRun::dump_line)
             .collect()
@@ -555,7 +618,7 @@ mod tests {
     fn a_page_with_no_script_starts_no_engine() {
         let mut dom = crate::html::parse("<p>just prose</p>");
         let mut host = None;
-        assert!(run_pass(&mut host, &mut dom).is_empty());
+        assert!(run_pass(&mut host, &mut dom, 1).is_empty());
         assert!(
             host.is_none(),
             "an engine was started for a page with no script"
@@ -602,7 +665,7 @@ mod tests {
         // anything in `src/js` had kept a reference to it.
         let mut dom = crate::html::parse("<script>1</script>");
         let mut host = None;
-        let runs = run_pass(&mut host, &mut dom);
+        let runs = run_pass(&mut host, &mut dom, 1);
         assert_eq!(runs.len(), 1);
         let fresh = dom.create_element("p", vec![]);
         dom.append(dom.root, fresh).unwrap();
@@ -812,14 +875,33 @@ mod tests {
 
     #[test]
     fn stack_frames_parse_in_both_of_quickjs_shapes() {
-        assert_eq!(line_from_stack("    at page.js:12:3\n"), Some(12));
-        assert_eq!(line_from_stack("    at <eval> (page.js:7:1)\n"), Some(7));
+        assert_eq!(
+            line_from_stack("    at page.js:12:3\n", "page.js"),
+            Some(12)
+        );
+        assert_eq!(
+            line_from_stack("    at <eval> (page.js:7:1)\n", "page.js"),
+            Some(7)
+        );
         // A source name that is a URL: colons in the name must not confuse it.
         assert_eq!(
-            line_from_stack("    at f (https://example.com/a.js:31:4)\n    at g (x:1:1)\n"),
+            line_from_stack(
+                "    at f (https://example.com/a.js:31:4)\n    at g (x:1:1)\n",
+                "https://example.com/a.js"
+            ),
             Some(31)
         );
-        assert_eq!(line_from_stack(""), None);
-        assert_eq!(line_from_stack("garbage"), None);
+        assert_eq!(line_from_stack("", "page.js"), None);
+        assert_eq!(line_from_stack("garbage", "page.js"), None);
+    }
+
+    #[test]
+    fn an_error_thrown_inside_a_binding_reports_the_page_line() {
+        // The innermost frame is in our prelude. Reporting *its* line would
+        // point a page author at a line number in code they cannot see.
+        let stack = "    at querySelector (<bindings>:73:74)\n    at <eval> (inline#1:2:10)\n";
+        assert_eq!(line_from_stack(stack, "inline#1"), Some(2));
+        // A stack that never names the script still reports something.
+        assert_eq!(line_from_stack(stack, "other.js"), Some(73));
     }
 }

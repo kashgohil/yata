@@ -470,7 +470,7 @@ impl App {
                 let started = Instant::now();
                 // The per-script results have no home in the TUI until M10.7's
                 // console pane; `--dump-js` is where they are visible today.
-                let _runs = js::run_pass(&mut self.js_host, &mut dom);
+                let _runs = js::run_pass(&mut self.js_host, &mut dom, id.0);
                 // The DOM comes straight back: the host borrowed it for the
                 // tick and holds nothing now.
                 self.dom = Some(dom);

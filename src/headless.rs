@@ -30,8 +30,13 @@ use crate::style;
 /// one page.
 pub fn run_scripts(dom: &mut Dom) -> Vec<ScriptRun> {
     let mut host = None;
-    js::run_pass(&mut host, dom)
+    // One page, one host, both gone when this returns, so any page generation
+    // will do — nothing here outlives the call to hold a stale handle.
+    js::run_pass(&mut host, dom, HEADLESS_PAGE)
 }
+
+/// The page generation headless runs use. Only its constancy matters.
+const HEADLESS_PAGE: u64 = 1;
 
 /// Style → layout → `F3` box lines, as one newline-terminated block of text.
 ///
