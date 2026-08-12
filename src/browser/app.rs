@@ -3010,6 +3010,41 @@ mod tests {
     }
 
     #[test]
+    fn a_script_appended_paragraph_is_absent_in_the_first_frame_and_present_in_the_second() {
+        // M10.2 deliverable 2, finishable only now that M10.5 can append: the
+        // page paints *without* what its script adds, and the script's own
+        // turn brings it. Both halves matter — the first is the promise that a
+        // slow script cannot delay first paint, the second that the pass is
+        // not merely allowed to be slow but actually reaches the screen.
+        let (mut app, id) = scripted_app(
+            "<p>parsed content</p><script>\
+             var added = document.createElement('p');\
+             added.textContent = 'appended by script';\
+             document.body.appendChild(added);</script>",
+        );
+
+        let mut first = Frame::new(40, 10);
+        app.draw(&mut first);
+        let first_text: String = (0..10).map(|y| row_text(&first, y)).collect();
+        assert!(first_text.contains("parsed content"), "{first_text:?}");
+        assert!(
+            !first_text.contains("appended by script"),
+            "the script ran before the page was painted: {first_text:?}"
+        );
+
+        assert_eq!(app.update(Msg::RunScripts { id }), redraw());
+
+        let mut second = Frame::new(40, 10);
+        app.draw(&mut second);
+        let second_text: String = (0..10).map(|y| row_text(&second, y)).collect();
+        assert!(
+            second_text.contains("appended by script"),
+            "the script's paragraph never reached the second frame: {second_text:?}"
+        );
+        assert!(second_text.contains("parsed content"));
+    }
+
+    #[test]
     fn the_dom_is_lent_to_the_tick_and_comes_straight_back() {
         // No `Rc<RefCell<Dom>>`, no second copy: `App` owns the tree again the
         // moment the tick ends, and can lay out immediately.
