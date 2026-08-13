@@ -141,7 +141,11 @@ const CONSOLE_MAX_ITEMS: u32 = 20;
 
 /// Install the primitives and evaluate the prelude that builds the object
 /// model on top of them. Called once per host.
-pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>, console: &Console) -> JsResult<()> {
+pub fn install<'js>(
+    ctx: &Ctx<'js>,
+    slot: &Rc<DomSlot>,
+    console: &Console,
+) -> JsResult<Function<'js>> {
     let api = Object::new(ctx.clone())?;
 
     // The console's caps, read by the formatter in the prelude, so the numbers
@@ -494,6 +498,18 @@ pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>, console: &Console) -> JsResult
         })?,
     )?;
 
+    // A listener's exception, reported with whatever location its stack
+    // carries. Parsed here rather than in JS so the console shows the same
+    // shape a script's uncaught throw does (M10.7).
+    let errors = console.clone();
+    api.set(
+        "reportError",
+        Function::new(ctx.clone(), move |message: String, stack: String| {
+            let (source, line) = super::script_frame(&stack);
+            errors.push(console::Level::Error, source, line, &message);
+        })?,
+    )?;
+
     ctx.globals().set("__dom", api)?;
     // Named, so a stack frame from inside the object model says where it came
     // from instead of the engine's anonymous `eval_script`.
@@ -501,8 +517,8 @@ pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>, console: &Console) -> JsResult
     options.global = true;
     options.strict = false;
     options.filename = Some("<bindings>".to_string());
-    ctx.eval_with_options::<(), _>(PRELUDE, options)?;
-    Ok(())
+    // The prelude's value is its dispatcher (see the end of `PRELUDE`).
+    ctx.eval_with_options::<Function<'js>, _>(PRELUDE, options)
 }
 
 fn id_of(node: NodeId) -> u32 {
@@ -900,13 +916,189 @@ const PRELUDE: &str = r#"
     debug: writer("debug"),
   };
 
+  // ---- events (M10.8) ----
+
+  // The registry lives here, not in the arena: the DOM stays plain data that
+  // `Msg::Parsed` can carry and tests can compare. Keyed by node id, or by the
+  // strings "document"/"window" for the two targets that are not nodes.
+  const listeners = new Map();
+
+  function keyOf(target) {
+    if (target === globalThis) return "window";
+    if (target === document) return "document";
+    return idOf(target);
+  }
+
+  // The legacy third argument is a boolean `capture`; the modern one is an
+  // options object. Anything else in that object — `passive`, `signal` — is
+  // ignored, deliberately and on the record.
+  function captureOf(options) {
+    return options === true || (!!options && options.capture === true);
+  }
+
+  function addListener(target, type, fn, options) {
+    if (typeof fn !== "function") return;
+    const key = keyOf(target);
+    const capture = captureOf(options);
+    const list = listeners.get(key) || [];
+    // The DOM deduplicates on (type, callback, capture): registering the same
+    // handler twice runs it once.
+    for (const entry of list) {
+      if (entry.type === type && entry.fn === fn && entry.capture === capture) return;
+    }
+    list.push({
+      type: String(type),
+      fn: fn,
+      capture: capture,
+      once: !!options && options.once === true,
+      target: target,
+    });
+    listeners.set(key, list);
+  }
+
+  function removeListener(target, type, fn, options) {
+    const key = keyOf(target);
+    const list = listeners.get(key);
+    if (!list) return;
+    const capture = captureOf(options);
+    for (let i = 0; i < list.length; i++) {
+      if (list[i].type === type && list[i].fn === fn && list[i].capture === capture) {
+        list.splice(i, 1);
+        return;
+      }
+    }
+  }
+
+  function makeEvent(type, target, bubbles) {
+    let stopped = false;
+    let stoppedImmediately = false;
+    let prevented = false;
+    const event = {
+      type: type,
+      target: target,
+      currentTarget: null,
+      eventPhase: 0,
+      bubbles: bubbles,
+      cancelable: true,
+      get defaultPrevented() { return prevented; },
+      preventDefault: function () { prevented = true; },
+      stopPropagation: function () { stopped = true; },
+      stopImmediatePropagation: function () { stopped = true; stoppedImmediately = true; },
+    };
+    // Read by the dispatcher, not by the page: kept off the object so a page
+    // cannot forge them.
+    return {
+      event: event,
+      stopped: function () { return stopped; },
+      stoppedImmediately: function () { return stoppedImmediately; },
+      prevented: function () { return prevented; },
+      clearImmediate: function () { stoppedImmediately = false; },
+    };
+  }
+
+  // Run one node's listeners. `phase` is 1 capture, 2 target, 3 bubble; at the
+  // target both capture and non-capture listeners run, in registration order,
+  // which is what the DOM specifies.
+  function fire(key, state, phase) {
+    const registered = listeners.get(key);
+    if (!registered) return;
+    // **Snapshotted before the phase runs.** A listener that adds or removes
+    // listeners during dispatch cannot change what *this* dispatch does — the
+    // alternative is a page that can make dispatch iterate a list it is
+    // mutating, and the result depends on the iteration order of the engine.
+    const snapshot = registered.slice();
+    const wantCapture = phase === 1;
+    state.clearImmediate();
+    for (const entry of snapshot) {
+      if (state.stoppedImmediately()) return;
+      if (entry.type !== state.event.type) continue;
+      if (phase !== 2 && entry.capture !== wantCapture) continue;
+      if (entry.once) removeListener(entry.target, entry.type, entry.fn, entry.capture);
+      state.event.currentTarget = entry.target;
+      state.event.eventPhase = phase;
+      try {
+        entry.fn.call(entry.target, state.event);
+      } catch (error) {
+        // A listener that throws does not stop the others and does not break
+        // the page — the same discipline as a script that throws (M10.2).
+        raw.reportError(String(error && error.message ? error.message : error),
+                        (error && error.stack) || "");
+      }
+    }
+  }
+
+  // Root → target, with the two non-node targets at the front. Built from the
+  // arena at dispatch time, so a path is always the tree as it is now.
+  function pathTo(target) {
+    // The path *ends* at the target, so an event aimed at `window` has a path
+    // of one. Appending both non-node targets unconditionally would make
+    // `document` the target of a `load` event and quietly skip every
+    // non-capture listener on `window` — which is where pages put `load`.
+    if (target === globalThis) return ["window"];
+    if (target === document) return ["window", "document"];
+
+    const chain = [];
+    let id = idOf(target);
+    while (id !== null && id !== undefined) {
+      chain.push(id);
+      id = raw.parentElement(id);
+    }
+    chain.reverse();
+    return ["window", "document"].concat(chain);
+  }
+
+  function dispatch(kind, id, type, bubbles) {
+    const target = kind === "window" ? globalThis : kind === "document" ? document : wrap(id);
+    if (target === null) return false;
+
+    const state = makeEvent(String(type), target, !!bubbles);
+    const path = pathTo(target);
+    const last = path.length - 1;
+
+    for (let i = 0; i < last && !state.stopped(); i++) fire(path[i], state, 1);
+    if (!state.stopped()) fire(path[last], state, 2);
+    if (state.event.bubbles) {
+      for (let i = last - 1; i >= 0 && !state.stopped(); i--) fire(path[i], state, 3);
+    }
+    state.event.currentTarget = null;
+    state.event.eventPhase = 0;
+    return state.prevented();
+  }
+
+  Object.defineProperties(Element.prototype, {
+    addEventListener: {
+      value: function (type, fn, options) { addListener(this, String(type), fn, options); }
+    },
+    removeEventListener: {
+      value: function (type, fn, options) { removeListener(this, String(type), fn, options); }
+    },
+  });
+  document.addEventListener = function (type, fn, options) {
+    addListener(document, String(type), fn, options);
+  };
+  document.removeEventListener = function (type, fn, options) {
+    removeListener(document, String(type), fn, options);
+  };
+  globalThis.addEventListener = function (type, fn, options) {
+    addListener(globalThis, String(type), fn, options);
+  };
+  globalThis.removeEventListener = function (type, fn, options) {
+    removeListener(globalThis, String(type), fn, options);
+  };
+
   // `window`, `globalThis` and the global scope are one object: pages branch
   // on `typeof window` and read `window.x` for a top-level `var x`.
   globalThis.window = globalThis;
   globalThis.document = document;
   globalThis.Element = Element;
-})(__dom);
-delete globalThis.__dom;
+
+  // The primitive object goes away here rather than in a statement after the
+  // call, so that this function's value — the dispatcher — is what the eval
+  // returns. Rust holds it as a `Persistent`, which is why dispatch needs no
+  // global name a page could find or overwrite.
+  delete globalThis.__dom;
+  return dispatch;
+})(__dom)
 "#;
 
 #[cfg(test)]
@@ -1661,6 +1853,345 @@ mod tests {
                 "var p = box.firstElementChild; p.remove(); p.textContent"
             ),
             "\"one\""
+        );
+    }
+
+    // ---- events (M10.8) ---------------------------------------------------
+
+    /// Run `page`'s scripts, then click the element with `id=t`, and return
+    /// what the console saw plus whether the default action was cancelled.
+    fn click(page: &str) -> (Vec<String>, bool) {
+        let mut dom = html::parse(page);
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 1, &console);
+
+        let target = find_descendant(&dom, dom.root, &mut |dom, node| {
+            dom.attr(node, "id") == Some("t")
+        })
+        .expect("the fixture has a target");
+        let prevented = js::dispatch(
+            &mut host,
+            &mut dom,
+            1,
+            &console,
+            js::Target::Node(target.0),
+            "click",
+        );
+        crate::dom::check_links(&dom);
+        (
+            console.entries().iter().map(ToString::to_string).collect(),
+            prevented,
+        )
+    }
+
+    #[test]
+    fn dispatch_runs_capture_then_target_then_bubble() {
+        // The exact sequence, not "the handler ran": phase order is the whole
+        // deliverable, and a dispatch that fires the right listeners in the
+        // wrong order is a page that behaves differently from every browser.
+        let (entries, _) = click(
+            r#"<div id=outer><p id=mid><b id=t>x</b></p></div><script>
+              var log = [];
+              function note(where) {
+                return function (e) { log.push(where + '@' + e.eventPhase); };
+              }
+              window.addEventListener('click', note('window'), true);
+              document.addEventListener('click', note('document'), true);
+              document.getElementById('outer').addEventListener('click', note('outer-capture'), true);
+              document.getElementById('mid').addEventListener('click', note('mid-capture'), true);
+              document.getElementById('t').addEventListener('click', note('target-first'));
+              document.getElementById('t').addEventListener('click', note('target-second'), true);
+              document.getElementById('mid').addEventListener('click', note('mid-bubble'));
+              document.getElementById('outer').addEventListener('click', note('outer-bubble'));
+              window.addEventListener('click', function () { console.log(log.join(' ')); });
+            </script>"#,
+        );
+        assert_eq!(
+            entries,
+            [concat!(
+                "log   ",
+                "window@1 document@1 outer-capture@1 mid-capture@1 ",
+                // At the target both flags run, in registration order — the
+                // capture flag stops mattering once the event is there.
+                "target-first@2 target-second@2 ",
+                "mid-bubble@3 outer-bubble@3"
+            )]
+        );
+    }
+
+    #[test]
+    fn the_event_object_carries_what_a_page_reads_from_it() {
+        let (entries, _) = click(
+            "<div id=outer><b id=t>x</b></div><script>\
+             document.getElementById('outer').addEventListener('click', function (e) {\
+               console.log(e.type, e.target.tagName, e.currentTarget.tagName,\
+                           e.eventPhase, e.bubbles, e.defaultPrevented);\
+             });</script>",
+        );
+        assert_eq!(entries, ["log   click B DIV 3 true false"]);
+    }
+
+    #[test]
+    fn prevent_default_is_reported_to_the_caller() {
+        // The whole point: `App` skips the navigation when this is true.
+        let (_, prevented) = click(
+            "<a id=t href='/next'>go</a><script>\
+             document.getElementById('t').addEventListener('click', function (e) {\
+               e.preventDefault();\
+             });</script>",
+        );
+        assert!(prevented);
+
+        let (_, prevented) = click("<a id=t href='/next'>go</a><script>1;</script>");
+        assert!(!prevented, "a page with no listener cancels nothing");
+    }
+
+    #[test]
+    fn stop_propagation_ends_the_walk_and_stop_immediate_ends_the_node() {
+        // `stopPropagation` lets the rest of *this* node's listeners run.
+        let (entries, _) = click(
+            "<div id=outer><b id=t>x</b></div><script>\
+             var t = document.getElementById('t');\
+             t.addEventListener('click', function (e) { e.stopPropagation(); console.log('first'); });\
+             t.addEventListener('click', function () { console.log('second'); });\
+             document.getElementById('outer').addEventListener('click', function () { console.log('ancestor'); });\
+             </script>",
+        );
+        assert_eq!(entries, ["log   first", "log   second"]);
+
+        // `stopImmediatePropagation` does not.
+        let (entries, _) = click(
+            "<div id=outer><b id=t>x</b></div><script>\
+             var t = document.getElementById('t');\
+             t.addEventListener('click', function (e) { e.stopImmediatePropagation(); console.log('first'); });\
+             t.addEventListener('click', function () { console.log('second'); });\
+             document.getElementById('outer').addEventListener('click', function () { console.log('ancestor'); });\
+             </script>",
+        );
+        assert_eq!(entries, ["log   first"]);
+    }
+
+    #[test]
+    fn the_listener_list_is_snapshotted_before_a_phase_runs() {
+        // The reentrancy rule. Without it a page can make dispatch iterate a
+        // list it is mutating, and what happens then is a property of the
+        // engine's iteration order rather than of the page.
+        let (entries, _) = click(
+            "<b id=t>x</b><script>\
+             var t = document.getElementById('t');\
+             t.addEventListener('click', function () {\
+               t.addEventListener('click', function () { console.log('added during dispatch'); });\
+               console.log('first');\
+             });\
+             t.addEventListener('click', function () { console.log('second'); });\
+             </script>",
+        );
+        assert_eq!(
+            entries,
+            ["log   first", "log   second"],
+            "a listener added during dispatch ran in the same dispatch"
+        );
+
+        // And one removed during dispatch still runs, for the same reason.
+        let (entries, _) = click(
+            "<b id=t>x</b><script>\
+             var t = document.getElementById('t');\
+             function second() { console.log('second'); }\
+             t.addEventListener('click', function () { t.removeEventListener('click', second); console.log('first'); });\
+             t.addEventListener('click', second);\
+             </script>",
+        );
+        assert_eq!(entries, ["log   first", "log   second"]);
+    }
+
+    #[test]
+    fn once_fires_exactly_once_and_remove_takes_effect_next_time() {
+        let (entries, _) = click(
+            "<b id=t>x</b><script>\
+             var t = document.getElementById('t');\
+             t.addEventListener('click', function () { console.log('once'); }, {once: true});\
+             </script>",
+        );
+        assert_eq!(entries, ["log   once"]);
+
+        // Registering the same function twice is one registration, as the DOM
+        // specifies.
+        let (entries, _) = click(
+            "<b id=t>x</b><script>\
+             var t = document.getElementById('t');\
+             function handler() { console.log('handled'); }\
+             t.addEventListener('click', handler);\
+             t.addEventListener('click', handler);\
+             </script>",
+        );
+        assert_eq!(entries, ["log   handled"]);
+
+        // The legacy boolean-capture form is accepted on both sides, so a
+        // remove that spells it that way actually removes.
+        let (entries, _) = click(
+            "<div id=outer><b id=t>x</b></div><script>\
+             var o = document.getElementById('outer');\
+             function handler() { console.log('should not run'); }\
+             o.addEventListener('click', handler, true);\
+             o.removeEventListener('click', handler, true);\
+             </script>",
+        );
+        assert!(entries.is_empty(), "{entries:?}");
+    }
+
+    #[test]
+    fn a_listener_that_throws_does_not_stop_the_others() {
+        // The same discipline as a script that throws (M10.2), and it lands in
+        // the console with the line it threw on (M10.7).
+        let (entries, _) = click(
+            "<b id=t>x</b><script>\
+             var t = document.getElementById('t');\
+             t.addEventListener('click', function () { null.x; });\
+             t.addEventListener('click', function () { console.log('still ran'); });\
+             </script>",
+        );
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(
+            entries[0].starts_with("error inline#1:1: cannot read property 'x' of null"),
+            "{:?}",
+            entries[0]
+        );
+        assert_eq!(entries[1], "log   still ran");
+    }
+
+    #[test]
+    fn listeners_mutate_through_the_same_bindings() {
+        let (entries, _) = click(
+            "<button id=t>press</button><p id=out>before</p><script>\
+             document.getElementById('t').addEventListener('click', function () {\
+               document.getElementById('out').textContent = 'after';\
+               console.log(document.getElementById('out').textContent);\
+             });</script>",
+        );
+        assert_eq!(entries, ["log   after"]);
+    }
+
+    #[test]
+    fn dom_content_loaded_then_load_fire_after_the_pass() {
+        // Pages register almost all of their behaviour inside these two.
+        let mut dom = html::parse(
+            "<p>x</p><script>\
+             document.addEventListener('DOMContentLoaded', function () { console.log('dcl'); });\
+             window.addEventListener('DOMContentLoaded', function () { console.log('dcl on window'); });\
+             window.addEventListener('load', function () { console.log('load'); });\
+             console.log('script body');</script>",
+        );
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 1, &console);
+        assert_eq!(
+            console
+                .entries()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "log   script body",
+                "log   dcl",
+                // `DOMContentLoaded` bubbles, which is the only reason a
+                // listener for it on `window` ever runs.
+                "log   dcl on window",
+                "log   load",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_listener_on_a_removed_node_never_fires() {
+        // The node is detached, not freed, so the registration survives — the
+        // handle still reads, which is the proof — but dispatch walks the
+        // tree, and the node is no longer in it.
+        //
+        // (The script is one line: `\` continuations in a Rust string strip
+        // the newline, so a `//` comment inside one comments out the rest.)
+        let (entries, _) = click(
+            "<div id=t>still here<b id=gone>x</b></div><script>\
+             var gone = document.getElementById('gone');\
+             gone.addEventListener('click', function () { console.log('should not run'); });\
+             gone.remove();\
+             console.log('removed node still reads as ' + gone.tagName);\
+             </script>",
+        );
+        assert_eq!(entries, ["log   removed node still reads as B"]);
+    }
+
+    #[test]
+    fn a_runaway_listener_is_stopped_by_the_script_budget() {
+        // A listener that loops forever is a runaway script that happened to
+        // be reached by a click, and it is held to the same budget.
+        let started = std::time::Instant::now();
+        let (entries, _) = click(
+            "<b id=t>x</b><script>\
+             document.getElementById('t').addEventListener('click', function () { while (true) {} });\
+             </script>",
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < 3 * super::super::SCRIPT_BUDGET,
+            "a runaway listener ran for {elapsed:?}"
+        );
+        assert!(
+            entries.iter().any(|e| e.starts_with("error")),
+            "the overrun was not reported: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn listeners_on_dropped_nodes_are_retained_and_cost_what_they_cost() {
+        // Deliverable 7's number. A listener registration holds its callback
+        // and its target handle, and `remove()` detaches the node without
+        // freeing it (ids are never reused, M10.3), so nothing here is
+        // reclaimed until the page goes.
+        // Small enough that a `dev` build — where QuickJS itself is compiled
+        // unoptimized — finishes inside the execution budget. The number is a
+        // *delta* from a warm host, so the engine's fixed overhead is not
+        // divided into it.
+        const NODES: usize = 500;
+        let console = Console::new();
+        let mut host = Some(Host::new(&console).expect("the engine starts"));
+
+        let mut warm = html::parse("<p>x</p><script>1</script>");
+        js::run_pass(&mut host, &mut warm, 1, &console);
+        let before = host.as_ref().unwrap().heap_bytes();
+
+        let page = format!(
+            "<div id=host></div><script>\
+             var host = document.getElementById('host');\
+             for (var i = 0; i < {NODES}; i++) {{\
+               var el = document.createElement('span');\
+               el.addEventListener('click', function () {{}});\
+               host.appendChild(el);\
+               el.remove();\
+             }}\
+             'done'</script>"
+        );
+        let mut dom = html::parse(&page);
+        let runs = js::run_pass(&mut host, &mut dom, 1, &console);
+        let after = host.as_ref().unwrap().heap_bytes();
+
+        assert_eq!(
+            runs.last().map(|r| r.outcome.clone()),
+            Some(Ok(JsValue::Str("done".into()))),
+            "the loop did not finish inside the budget — lower NODES"
+        );
+        eprintln!(
+            "LISTENER-COST {NODES} listener-bearing nodes created and dropped: \
+             heap {before} -> {after} bytes (~{} each), arena {} nodes",
+            (after - before) / NODES,
+            dom.node_count()
+        );
+        // Nothing is reclaimed, which is the point of the measurement — but it
+        // must at least be *linear*, not quadratic in the number of nodes.
+        assert!(
+            (after - before) / NODES < 4096,
+            "a listener-bearing node cost {} bytes",
+            (after - before) / NODES
         );
     }
 

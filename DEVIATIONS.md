@@ -276,6 +276,61 @@ atomic path does not call.
 
 ---
 
+## JavaScript (M10)
+
+### yata's keybindings always win: key events never reach the page
+
+**We do:** dispatch `click` to the page, and nothing else. `keydown`, `keyup`
+and `keypress` are not bound, so a page cannot see — or capture — `j`, `f`,
+`/`, `q` or any other key. Every keystroke belongs to the browser.
+**A browser does:** deliver every key to the focused element first, and let a
+page call `preventDefault()` on it. Gmail's `j`/`k` and every "press `/` to
+search" box work that way.
+**Why:** UX §3.3 makes this keyboard-first, and CLAUDE.md gives keybindings
+exactly one source of truth — the table `keys::BINDINGS` holds and the `?`
+overlay is generated from. A page that could take `q` could trap the reader in
+it. Between page fidelity and a reader who can always leave, the reader wins,
+and this is the one place in M10 where we do not even try to match a browser.
+**Trigger:** a ladder page whose *only* interaction is a keyboard handler —
+where a reader cannot do the thing the page exists for without keys reaching
+it. The fix then is not "dispatch everything": it is a narrow, explicit
+allowance (keys yata has no binding for, or a mode the reader opts into),
+because the invariant being protected is that the reader can always get out.
+
+### `load` does not wait for images
+
+**We do:** fire `DOMContentLoaded` and then `load` at the end of the
+document-order script pass, before any image has been fetched or decoded.
+**A browser does:** fire `load` only once every subresource — images included
+— has finished, which is why pages measure images inside it.
+**Why:** images arrive on worker threads as their own messages (M8), long
+after the pass, and holding `load` for them would mean holding it for a fetch
+that may never complete. A page's `load` handler running early is a smaller
+lie than one that never runs.
+**Trigger:** a ladder page whose `load` handler measures an image — reads
+`naturalWidth`, or sizes something against a photo — and lays itself out wrong
+because the bytes were not there yet.
+
+### A listener keeps its node alive, and its node is never freed
+
+**We do:** keep every registration for the life of the page. `remove()`
+detaches a node without freeing it (ids are never reused, M10.3), and the
+listener registry holds the callback and the target, so a page that creates
+and drops listener-bearing nodes grows until it navigates. Measured: **~940 bytes
+per listener-bearing node** (500 of them add 0.47 MB of JS heap). The
+execution budget caps one tick at roughly 3,400 such nodes, so a single script
+cannot reach 10⁵ — but M10.9's timers will let a page get there across many.
+**A browser does:** collect a detached node and its listeners once the page
+drops its last reference.
+**Why:** the arena's ids are stable by design, which is what makes a handle a
+page holds mean the same node forever; freeing nodes would require the
+indirection that guarantee exists to avoid.
+**Trigger:** a page at steady state — not growing its own DOM — whose memory
+climbs past the PLAN.md §4 budget of 100 MB. At ~1 KB each that is about 10⁵
+retained nodes, which needs roughly 30 ticks of a script running flat out.
+
+---
+
 ## Not implemented at all
 
 These are absences rather than choices, listed because "what hole is going to

@@ -87,7 +87,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
-use rquickjs::{CatchResultExt, CaughtError, Context, Runtime, Type, Value};
+use rquickjs::{CatchResultExt, CaughtError, Context, Function, Persistent, Runtime, Type, Value};
 
 use crate::dom::Dom;
 use crate::js::console::{Console, Level};
@@ -186,6 +186,27 @@ pub fn run_pass(
         })
         .collect();
 
+    // The two events a page hangs almost all of its behaviour on, in the order
+    // a browser fires them and inside the same tick as the pass — so a
+    // listener registered by the last script still sees them, and everything
+    // they mutate lands in one invalidation cycle (M10.6).
+    //
+    // They fire even if every script threw: a page whose first script broke
+    // may still have registered a handler in its second.
+    for (target, kind) in [
+        (Target::Document, "DOMContentLoaded"),
+        (Target::Window, "load"),
+    ] {
+        if let Err(error) = host.dispatch(target, kind, kind == "DOMContentLoaded") {
+            console.push(
+                Level::Error,
+                Some(error.source.clone()),
+                error.line,
+                &error.message,
+            );
+        }
+    }
+
     // Back to the caller. A handle a script stored in a global outlives this,
     // and that is correct: it stays valid for as long as the page does, and
     // stops resolving the moment a different page is lent in.
@@ -247,6 +268,19 @@ struct Budget {
 /// lifetime rule (one per page generation) and the threading rule (UI thread,
 /// created where it runs).
 pub struct Host {
+    /// The prelude's event dispatcher (M10.8), held across ticks.
+    ///
+    /// A `Persistent` rather than a global name: the page never sees it, so it
+    /// cannot be called, overwritten or deleted, and the engine keeps the only
+    /// way to start a dispatch. That is what makes "no synthetic dispatch API"
+    /// a property of the build rather than a promise.
+    ///
+    /// **Declared first on purpose.** Rust drops fields in declaration order,
+    /// and a `Persistent` roots a JS object: releasing it *after* the runtime
+    /// is freed trips QuickJS's own assertion that nothing is still alive
+    /// (`list_empty(&rt->gc_obj_list)`), which aborts the process. It has to
+    /// go before `context` and `runtime`.
+    dispatch: Persistent<Function<'static>>,
     /// The engine handle. `Context` keeps the runtime alive on its own, so
     /// this is not what makes the host valid — it is how the limits get set
     /// and how the tests read the heap back. Holding it is deliberate: it is
@@ -294,16 +328,17 @@ impl Host {
         })));
 
         let dom = Rc::new(bindings::DomSlot::default());
-        let installed = context.with(|ctx| {
+        let dispatch = context.with(|ctx| {
             bindings::install(&ctx, &dom, console)
+                .map(|dispatcher| Persistent::save(&ctx, dispatcher))
                 .catch(&ctx)
                 .map_err(|caught| JsError::from_caught("<bindings>", &caught))
-        });
-        // A prelude that will not install is a broken engine, not a broken
-        // page: fail here rather than hand every script a DOM-less window.
-        installed?;
+            // A prelude that will not install is a broken engine, not a broken
+            // page: fail here rather than hand every script a DOM-less window.
+        })?;
 
         Ok(Host {
+            dispatch,
             runtime,
             context,
             budget,
@@ -325,10 +360,6 @@ impl Host {
     /// normally, and globals set before the error survive, because a page's
     /// broken script must not disable the rest of its page.
     pub fn eval(&mut self, name: &str, source: &str) -> Result<JsValue, JsError> {
-        let deadline = (self.origin.elapsed() + SCRIPT_BUDGET).as_nanos() as u64;
-        self.budget.tripped.store(false, Ordering::Relaxed);
-        self.budget.deadline.store(deadline, Ordering::Relaxed);
-
         // `EvalOptions` is `#[non_exhaustive]`, so it can only be built by
         // mutating the default.
         let mut options = EvalOptions::default();
@@ -340,14 +371,52 @@ impl Host {
         options.strict = false;
         options.filename = Some(name.to_string());
 
+        self.under_budget(name, |ctx| {
+            ctx.eval_with_options::<Value, _>(source, options)
+                .map(|value| JsValue::from_value(&value))
+        })
+    }
+
+    /// Dispatch one event through the prelude's dispatcher (M10.8), and report
+    /// whether a listener called `preventDefault()`.
+    ///
+    /// `target` says where the event starts: a node, `document`, or `window`.
+    /// A page with no listeners at all still pays only a map lookup per node
+    /// on the path.
+    pub fn dispatch(&mut self, target: Target, kind: &str, bubbles: bool) -> Result<bool, JsError> {
+        let (tag, id) = match target {
+            Target::Node(id) => ("node", id),
+            Target::Document => ("document", 0),
+            Target::Window => ("window", 0),
+        };
+        let dispatcher = self.dispatch.clone();
+        let kind = kind.to_string();
+        // Under the same budget as a script: a listener that loops forever is
+        // a runaway script that happens to have been reached by a click.
+        self.under_budget(&format!("{kind} listener"), move |ctx| {
+            dispatcher
+                .restore(ctx)?
+                .call::<_, bool>((tag, id, kind.as_str(), bubbles))
+        })
+    }
+
+    /// Run `body` inside the context with the execution budget armed, and turn
+    /// whatever it produces into plain data. The one place the deadline is set
+    /// and cleared, so every way into JS — a script, a listener, and M10.9's
+    /// timers — is interruptible on the same terms.
+    fn under_budget<T>(
+        &mut self,
+        name: &str,
+        body: impl for<'js> FnOnce(&rquickjs::Ctx<'js>) -> rquickjs::Result<T>,
+    ) -> Result<T, JsError> {
+        let deadline = (self.origin.elapsed() + SCRIPT_BUDGET).as_nanos() as u64;
+        self.budget.tripped.store(false, Ordering::Relaxed);
+        self.budget.deadline.store(deadline, Ordering::Relaxed);
+
         let result = self.context.with(|ctx| {
-            match ctx
-                .eval_with_options::<Value, _>(source, options)
+            body(&ctx)
                 .catch(&ctx)
-            {
-                Ok(value) => Ok(JsValue::from_value(&value)),
-                Err(caught) => Err(JsError::from_caught(name, &caught)),
-            }
+                .map_err(|caught| JsError::from_caught(name, &caught))
         });
 
         // Disarm before returning: the handler outlives the tick, and a stale
@@ -364,6 +433,75 @@ impl Host {
     fn heap_bytes(&self) -> usize {
         self.runtime.memory_usage().malloc_size as usize
     }
+}
+
+/// Dispatch one event at `target`, as its own tick (M10.8).
+///
+/// Returns whether a listener called `preventDefault()`, which is the caller's
+/// cue to skip the default action — following a link, in every case this
+/// milestone has. A page with no script has no host and therefore no
+/// listeners, so this costs nothing at all rather than starting an engine to
+/// find that out.
+///
+/// The DOM is lent for the dispatch exactly as it is for the document-order
+/// pass: listeners read and mutate through the same bindings, and the caller
+/// runs one invalidation cycle after.
+pub fn dispatch(
+    host: &mut Option<Host>,
+    dom: &mut Dom,
+    page: u64,
+    console: &Console,
+    target: Target,
+    kind: &str,
+) -> bool {
+    let Some(host) = host.as_mut() else {
+        return false;
+    };
+
+    host.dom
+        .lend(std::mem::replace(dom, Dom::new_document()), page);
+    // Which events bubble, as the DOM says. It matters more than it looks:
+    // `DOMContentLoaded` bubbles, which is the only reason a listener put on
+    // `window` for it ever runs, and `load` does not.
+    let bubbles = matches!(kind, "click" | "DOMContentLoaded");
+    let prevented = match host.dispatch(target, kind, bubbles) {
+        Ok(prevented) => prevented,
+        Err(error) => {
+            console.push(
+                Level::Error,
+                Some(error.source.clone()),
+                error.line,
+                &error.message,
+            );
+            false
+        }
+    };
+    if let Some(returned) = host.dom.take() {
+        *dom = returned;
+    }
+    prevented
+}
+
+/// Where an event starts. `document` and `window` are event targets without
+/// being nodes, which is why this is not just a `NodeId`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Target {
+    Node(u32),
+    Document,
+    Window,
+}
+
+/// The script name and line from a listener's stack, skipping frames inside
+/// the prelude — a page author cannot act on a line number in our glue.
+fn script_frame(stack: &str) -> (Option<String>, Option<u32>) {
+    for frame in stack.lines() {
+        if let Some((file, line)) = frame_location(frame)
+            && file != "<bindings>"
+        {
+            return (Some(file.to_string()), Some(line));
+        }
+    }
+    (None, None)
 }
 
 /// A JavaScript value, owned and engine-free, in the shapes the rest of the

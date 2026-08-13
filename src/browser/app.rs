@@ -1565,6 +1565,8 @@ impl App {
                     yank: Some(url),
                     ..Effect::default()
                 }
+            } else if self.dispatch_click(link.node) {
+                redraw()
             } else {
                 self.follow_href(&href)
             };
@@ -1622,6 +1624,9 @@ impl App {
             return Effect::default();
         };
         let href = href.to_string();
+        if self.dispatch_click(focus) {
+            return redraw();
+        }
         self.follow_href(&href)
     }
 
@@ -1642,6 +1647,52 @@ impl App {
                 .viewport
                 .scroll_to_offset(y.saturating_sub(page.saturating_sub(1)));
         }
+    }
+
+    /// Dispatch a `click` at `node` and report whether a listener cancelled the
+    /// default action (M10.8).
+    ///
+    /// Every way a reader can activate a link goes through here **before** the
+    /// navigation: the mouse, `Enter` on a keyboard-focused link, and a hint
+    /// follow. A page whose handler works with the mouse but not with `f` has
+    /// broken the flagship feature (UX §3.4), so the three paths share this
+    /// one call rather than each remembering to make it.
+    ///
+    /// The dispatch is a tick: the DOM is lent to it, and whatever its
+    /// listeners mutated runs one invalidation cycle (M10.6) before this
+    /// returns.
+    fn dispatch_click(&mut self, node: NodeId) -> bool {
+        let Some(id) = self.current_fetch else {
+            return false;
+        };
+        // No host means the page ran no script, so it has no listeners: not a
+        // reason to start an engine.
+        if self.js_host.is_none() {
+            return false;
+        }
+        let Some(mut dom) = self.dom.take() else {
+            return false;
+        };
+
+        let before = (dom.version(), dom.structure_version());
+        let logged_before = self.console.entries().len();
+        let prevented = js::dispatch(
+            &mut self.js_host,
+            &mut dom,
+            id.0,
+            &self.console,
+            js::Target::Node(node.0),
+            "click",
+        );
+        let after = (dom.version(), dom.structure_version());
+        self.dom = Some(dom);
+
+        self.apply_dom_changes(before, after);
+        if self.console.entries().len() != logged_before {
+            self.console_view_built = false;
+            self.build_visible_inspector();
+        }
+        prevented
     }
 
     fn follow_href(&mut self, href: &str) -> Effect {
@@ -1678,9 +1729,14 @@ impl App {
         let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
             return Effect::default();
         };
-        let Some((_node, href)) = layout::link_at(tree, dom, x, y) else {
+        let Some((node, href)) = layout::link_at(tree, dom, x, y) else {
             return Effect::default();
         };
+        if self.dispatch_click(node) {
+            // `preventDefault()`: the page handled the click itself. Whatever
+            // its listeners changed has already been drawn.
+            return redraw();
+        }
         self.follow_href(&href)
     }
 
@@ -3251,6 +3307,141 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    // ---- events (M10.8) ---------------------------------------------------
+
+    /// A loaded page whose script has run, ready to be clicked.
+    fn live_page(w: u16, h: u16, html: &str) -> (App, FetchId) {
+        let mut app = App::new(w, h);
+        let id = app.start_fetch("http://x/".into());
+        load(&mut app, id, html.as_bytes().to_vec());
+        app.update(parsed(id, html));
+        app.update(Msg::RunScripts { id });
+        (app, id)
+    }
+
+    /// A page with one link whose listener cancels the click.
+    const CANCELS: &str = "<p><a href='/next'>go</a></p><script>\
+         document.querySelector('a').addEventListener('click', function (e) {\
+           e.preventDefault();\
+           document.querySelector('a').textContent = 'handled';\
+         });</script>";
+
+    #[test]
+    fn a_mouse_click_dispatches_before_it_navigates() {
+        let (mut app, _) = live_page(80, 12, CANCELS);
+        let effect = app.update(click_first_link(&app));
+        assert_eq!(
+            effect.fetch, None,
+            "preventDefault() did not cancel the navigation"
+        );
+        // And the listener's mutation is on screen, in the same turn.
+        assert!(screen(&mut app, 80, 12).contains("handled"));
+    }
+
+    #[test]
+    fn enter_on_a_focused_link_dispatches_before_it_navigates() {
+        // UX §3.4: a page whose handler works with the mouse but not with the
+        // keyboard has broken the flagship feature.
+        let (mut app, _) = live_page(80, 12, CANCELS);
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(effect.fetch, None, "Enter navigated past preventDefault()");
+        assert!(screen(&mut app, 80, 12).contains("handled"));
+    }
+
+    #[test]
+    fn a_hint_follow_dispatches_before_it_navigates() {
+        let (mut app, _) = live_page(80, 12, CANCELS);
+        app.update(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        let label = app
+            .hint
+            .as_ref()
+            .expect("hints opened")
+            .labels
+            .first()
+            .expect("one link")
+            .0
+            .clone();
+        let mut effect = Effect::default();
+        for ch in label.chars() {
+            effect = app.update(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(effect.fetch, None, "`f` navigated past preventDefault()");
+        assert!(screen(&mut app, 80, 12).contains("handled"));
+    }
+
+    #[test]
+    fn a_click_with_no_prevent_default_still_navigates() {
+        // The listener runs, the navigation happens: the dispatch is not a
+        // veto by default.
+        let (mut app, _) = live_page(
+            80,
+            12,
+            "<p><a href='/next'>go</a></p><script>\
+             document.querySelector('a').addEventListener('click', function () {\
+               document.querySelector('a').textContent = 'seen';\
+             });</script>",
+        );
+        let effect = app.update(click_first_link(&app));
+        let (_, url) = effect.fetch.expect("the click must still navigate");
+        assert_eq!(url, "http://final/next");
+        // The listener's mutation is observable until the new page lands. Note
+        // what is *not* asserted: anything the listener logged, because
+        // starting a navigation clears the console — it is page-local, and by
+        // this point the page it belonged to is on its way out.
+        assert!(screen(&mut app, 80, 12).contains("seen"));
+    }
+
+    #[test]
+    fn a_dispatch_that_mutates_runs_exactly_one_cycle() {
+        // M10.6's counters, applied to the other entry point into JS: however
+        // many listeners mutate, the pipeline runs once.
+        let (mut app, _) = live_page(
+            80,
+            12,
+            "<p><a href='#'>go</a></p><div id=out></div><script>\
+             var out = document.getElementById('out');\
+             function add() { for (var i = 0; i < 100; i++) out.appendChild(document.createElement('p')); }\
+             document.querySelector('a').addEventListener('click', function (e) { e.preventDefault(); add(); });\
+             document.querySelector('a').addEventListener('click', add);\
+             </script>",
+        );
+        let (styled, laid_out, painted) = stages(&app);
+        app.update(click_first_link(&app));
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out + 1, painted + 1),
+            "200 appendChild calls across two listeners must cost one cycle"
+        );
+    }
+
+    #[test]
+    fn a_dispatch_that_mutates_nothing_costs_nothing() {
+        let (mut app, _) = live_page(
+            80,
+            12,
+            "<p><a href='#'>go</a></p><script>\
+             document.querySelector('a').addEventListener('click', function (e) {\
+               e.preventDefault();\
+               document.querySelectorAll('p').length;\
+             });</script>",
+        );
+        let before = stages(&app);
+        app.update(click_first_link(&app));
+        assert_eq!(stages(&app), before, "a read-only listener ran a stage");
+    }
+
+    #[test]
+    fn a_page_with_no_script_pays_nothing_for_a_click() {
+        // No host means no listeners, and finding that out must not start an
+        // engine — most pages on the ladder have no script at all.
+        let (mut app, _) = live_page(80, 12, "<p><a href='/next'>go</a></p>");
+        assert!(app.js_host.is_none());
+        let effect = app.update(click_first_link(&app));
+        assert!(effect.fetch.is_some());
+        assert!(app.js_host.is_none(), "a click started an engine");
     }
 
     // ---- the console pane (M10.7) -----------------------------------------
