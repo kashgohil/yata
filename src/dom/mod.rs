@@ -51,6 +51,30 @@ pub struct Node {
     pub data: NodeData,
 }
 
+/// How deeply the tree may nest.
+///
+/// Not an arbitrary tidiness limit: **style and layout both recurse over the
+/// tree**, so a deep enough subtree overflows the native stack — which is a
+/// process abort, not an error, and nothing a page or a `catch` can recover
+/// from.
+///
+/// The number comes from measurement, and layout is the binding constraint by
+/// a wide margin: style survives past 2,000 levels, but **layout overflows
+/// between 200 and 300** on a 2 MB thread (a Rust test thread; the main thread
+/// has 8 MB and would reach roughly four times further). 128 sits at half the
+/// measured floor on the *smaller* stack.
+///
+/// Against real pages that is still generous. The ladder's deepest nesting:
+/// example.com 7, motherfuckingwebsite 6, danluu 7, Hacker News 15, and
+/// Wikipedia — the deepest page in the suite — **62**. A page would have to be
+/// twice as deeply nested as Wikipedia before the cap could be noticed.
+///
+/// The cap lives here, in the arena, because this is the one place every node
+/// enters the tree — from the parser and from a script alike. A guard at the
+/// script boundary alone would leave a hostile *server* able to do the same
+/// thing with markup.
+pub const MAX_DEPTH: usize = 128;
+
 /// Why a tree edit was refused. These are the two DOM exceptions M10.5 turns
 /// into JS throws, named after them so the mapping needs no lookup table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -60,6 +84,9 @@ pub enum DomError {
     HierarchyRequest,
     /// The reference node is not a child of the parent it was given with.
     NotFound,
+    /// The insert would nest deeper than [`MAX_DEPTH`]. A browser has no such
+    /// limit; we do, because our style and layout walks recurse.
+    TooDeep,
 }
 
 /// The arena. `nodes[root.0]` is always the `Document`.
@@ -124,7 +151,16 @@ impl Dom {
 
     /// Append `data` as the new last child of `parent`, wiring both directions of
     /// every link. Returns the new node's id.
+    /// Append `data` as the new last child of `parent`. When `parent` is
+    /// already at [`MAX_DEPTH`] the node is attached to the deepest ancestor
+    /// that is not — the content is kept, the nesting is not.
+    ///
+    /// Flattening rather than dropping, because this path is the *parser*: the
+    /// alternative is discarding a hostile page's text along with its
+    /// structure, and a reader is better served by prose in the wrong place
+    /// than by nothing.
     pub fn append_child(&mut self, parent: NodeId, data: NodeData) -> NodeId {
+        let parent = self.insertion_point(parent);
         let id = NodeId(self.nodes.len() as u32);
         let prev = self.nodes[parent.0 as usize].last_child;
         self.nodes.push(Node {
@@ -310,7 +346,7 @@ impl Dom {
 
     /// Refuse an insert that would not leave a tree behind.
     ///
-    /// Three separate conditions, and none implies another:
+    /// Four separate conditions, and none implies another:
     ///
     /// - A node cannot go inside itself or its own descendant.
     /// - The document root cannot be inserted anywhere at all. The ancestor
@@ -324,6 +360,8 @@ impl Dom {
     ///   such a tree: `F1` prints children under a text node, and layout
     ///   silently drops them, so the reader would be shown content that can
     ///   never render.
+    /// - The tree may not nest past [`MAX_DEPTH`], because style and layout
+    ///   recurse and a deep enough subtree aborts the process.
     fn check_insertable(&self, parent: NodeId, child: NodeId) -> Result<(), DomError> {
         let holds_children = matches!(
             self.nodes[parent.0 as usize].data,
@@ -332,7 +370,45 @@ impl Dom {
         if !holds_children || child == self.root || self.is_ancestor_or_self(child, parent) {
             return Err(DomError::HierarchyRequest);
         }
+        // A script gets an exception rather than the parser's flattening: it
+        // asked for a specific place, and quietly putting the node somewhere
+        // else would be a lie about what `appendChild` did.
+        if self.depth_of(parent) >= MAX_DEPTH {
+            return Err(DomError::TooDeep);
+        }
         Ok(())
+    }
+
+    /// How far `node` sits from the root, counting to at most `MAX_DEPTH + 1`
+    /// — the exact number past the cap does not matter and walking a
+    /// pathological chain to find it would be the very cost being avoided.
+    fn depth_of(&self, node: NodeId) -> usize {
+        let mut depth = 0;
+        let mut walk = self.nodes[node.0 as usize].parent;
+        while let Some(parent) = walk {
+            depth += 1;
+            if depth > MAX_DEPTH {
+                return depth;
+            }
+            walk = self.nodes[parent.0 as usize].parent;
+        }
+        depth
+    }
+
+    /// Where a child of `parent` may actually go: `parent` itself, or the
+    /// deepest ancestor still inside the cap.
+    fn insertion_point(&self, parent: NodeId) -> NodeId {
+        if self.depth_of(parent) < MAX_DEPTH {
+            return parent;
+        }
+        let mut walk = parent;
+        while self.depth_of(walk) >= MAX_DEPTH {
+            match self.nodes[walk.0 as usize].parent {
+                Some(up) => walk = up,
+                None => break,
+            }
+        }
+        walk
     }
 
     /// Walks parents from `id` up to the root.

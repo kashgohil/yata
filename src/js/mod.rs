@@ -82,6 +82,7 @@ mod bindings;
 // which `App` hands to the loop. Everything else in that module stays closed.
 pub use bindings::{FetchAsk, MAX_IN_FLIGHT};
 pub mod console;
+mod hostile;
 pub mod queue;
 pub mod sources;
 pub mod storage;

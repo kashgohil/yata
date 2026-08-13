@@ -329,6 +329,24 @@ indirection that guarantee exists to avoid.
 climbs past the PLAN.md §4 budget of 100 MB. At ~1 KB each that is about 10⁵
 retained nodes, which needs roughly 30 ticks of a script running flat out.
 
+### The tree may not nest deeper than 128
+
+**We do:** refuse to nest past `dom::MAX_DEPTH` — a script's `appendChild`
+throws, and the parser attaches the node to the deepest permitted ancestor
+instead, flattening rather than discarding the content.
+**A browser does:** nest as deep as a page likes; the limits are in the
+thousands and are rarely reached.
+**Why:** style and layout both recurse over the tree, so a deep enough subtree
+overflows the native stack — a process abort, not an error, and nothing a page
+or a `catch` can recover from. Measured, layout dies between 200 and 300 levels
+on a 2 MB thread. The cap lives in the arena because that is the one place
+every node enters the tree, from a hostile script and a hostile *server* alike.
+For scale, the ladder's deepest page is Wikipedia at 62.
+**Trigger:** a real page whose content is wrong because of the cap — nesting
+past 128 that a reader would notice. The fix then is not a bigger number: it is
+making the style and layout walks iterative, which removes the constraint
+instead of moving it.
+
 ---
 
 ## Not implemented at all

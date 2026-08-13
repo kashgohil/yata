@@ -227,6 +227,10 @@ fn throw_dom_error(ctx: &Ctx<'_>, error: DomError) -> rquickjs::Error {
         DomError::NotFound => {
             Exception::throw_message(ctx, "NotFoundError: the node is not a child of this one")
         }
+        DomError::TooDeep => Exception::throw_message(
+            ctx,
+            "HierarchyRequestError: the tree is already as deeply nested as this browser allows",
+        ),
     }
 }
 
@@ -1566,6 +1570,17 @@ const PRELUDE: &str = r#"
       get length() { return raw.storageLength(session); },
     };
   }
+
+  // Defined so it can explain itself. A page calling it gets `not a function`
+  // otherwise, which tells its author nothing about *why* — and the why is
+  // architectural rather than a gap: we parse a page before running any of its
+  // scripts, so there is no open token stream to write into.
+  document.write = function () {
+    console.warn('document.write is not supported: this browser finishes parsing ' +
+                 'a page before running its scripts, so there is no token stream ' +
+                 'left to write into');
+  };
+  document.writeln = document.write;
 
   globalThis.location = location;
   document.location = location;

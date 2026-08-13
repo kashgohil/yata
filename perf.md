@@ -475,3 +475,83 @@ should not have is invisible on screen and ruinous in a profile: a tick that
 mutates nothing runs no stage at all; scrolling a script-built page runs none;
 hover over script-built content restyles and repaints but never relayouts; a
 resize relayouts exactly once and runs no script pass.
+
+## M10.13 — hostile pages (2026-08-13)
+
+Every case ran to completion with no panic, no abort, and a page that could
+still be styled, laid out and scrolled afterwards. Times are the whole case
+including the page load, `dev` build (the numbers a `cargo test` run prints).
+
+| What was tried | What happened | Time |
+| --- | --- | --- |
+| `while (true) {}` in a script | interrupted, error in console | 102 ms |
+| the same in a `click` listener | interrupted, page intact | 102 ms |
+| the same in a timer callback | interrupted, page intact | 102 ms |
+| unbounded recursion | `RangeError`, host reusable | 1.9 ms |
+| allocation bomb | out-of-memory error, host reusable | 29 ms |
+| a timer scheduling two more, 8 ticks | each tick its own budget | 2.1 ms |
+| a promise that re-queues itself | stopped at the 10,000-job pump bound | 25 ms |
+| 100,000 `appendChild` | interrupted mid-loop, tree consistent | 113 ms |
+| 1 MB `innerHTML` | parsed and adopted | 175 ms |
+| 10,000-deep nesting (`appendChild`) | refused past depth 128, script caught it | 2.6 ms |
+| 10,000-deep nesting (`innerHTML`) | flattened at depth 128 | 32 ms |
+| `document.body.remove()` | page lays out empty | 1.9 ms |
+| a listener removing its own node | snapshot semantics hold | 2.0 ms |
+| `location.href` ×10,000 | one navigation, last wins | 11 ms |
+| `location.href` in dispatch / timer | one navigation each | 2.6 / 1.8 ms |
+| `fetch()` ×10,000 | 32 requests, 9,968 refusals | — |
+| `console.log(window)`, circular JSON | cycle guard, no hang | 2.3 ms |
+| `document.write` | ignored with a console line | — |
+| 100,000 `console.log` | ring buffer held at 500 | — |
+| 100,000 `localStorage.setItem` | `QuotaExceededError` | — |
+
+### The one that aborted the process
+
+**Deep nesting.** Style and layout both recurse over the tree, so a deep
+enough subtree overflows the native stack — a process abort, not an error, and
+nothing a `catch` can reach. Measured on a 2 MB test thread: style survives
+past 2,000 levels; **layout dies between 200 and 300.** Layout is the binding
+constraint by an order of magnitude.
+
+The fix is a rule in the arena rather than a guard at the script boundary,
+because a hostile *server* can do the same thing with markup: `Dom::MAX_DEPTH`
+is 128, refused with an exception for a script and flattened onto the deepest
+permitted ancestor for the parser. Flattening rather than dropping, because
+the alternative discards a page's text along with its structure.
+
+Ladder depths for scale: example.com 7, motherfuckingwebsite 6, danluu 7,
+Hacker News 15, **Wikipedia 62**. A page must be twice as deeply nested as the
+deepest page in the suite before the cap is reachable.
+
+### `q` still quits: the M10.1 rule holds
+
+Every runaway shape costs **one budget**, ~102 ms, and every one of them is a
+separate tick: a listener, a timer callback and a script are interrupted on
+the same terms because they share one `Host::under_budget`. Nothing chains
+inside a tick — a timer that schedules two more does not run them, it queues
+two messages, and the loop serves input between messages. So worst-case
+keypress→screen under adversarial JS is one budget plus the frame, and quit
+latency is the same. M10.1's rule stands unchanged and needs no escape hatch.
+
+**A page can still hold ~100% of one core forever** by scheduling a 4 ms
+interval whose callback burns its whole budget. That is accepted, deliberately:
+the reader can still scroll, still quit, and still see the page, because the
+loop interleaves input between ticks. A per-page duty-cycle budget would be
+the fix if a real page ever makes this unbearable; nothing on the ladder does.
+
+### Memory over 100 navigations
+
+Alternating a script-heavy page (300 nodes, 300 listeners, 50 console lines, a
+pending timer, a storage write) with a light one, release build:
+
+    after   0 navigations   9.9 MB
+    after  20              10.6 MB
+    after  40              10.7 MB
+    after  60              10.8 MB
+    after  80              10.8 MB
+    after 100              10.8 MB
+
+**Flat.** It plateaus after roughly 40 and does not climb again, so nothing
+per-page is leaking: the arena, the host, its listeners, its timers and the
+console all go with the page. What remains is the allocator's high-water mark
+plus per-origin storage, which is quota-bounded.
