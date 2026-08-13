@@ -668,54 +668,67 @@ has, and is the case the narrowing exists for.
 
 | turn | full restyle | scoped restyle |
 | --- | --- | --- |
-| `<body>` class, paint only | 46.99 ms (46.08–47.52) | 47.00 ms (46.46–47.88) |
-| `<body>` class, relayouting | 53.54 ms (52.36–54.51) | 53.82 ms (52.99–54.98) |
-| **leaf class, paint only** | 47.99 ms (47.15–49.80) | **3.26 ms (2.65–3.70)** |
-| **leaf class, relayouting** | 54.16 ms (53.77–54.77) | **10.61 ms (10.03–11.35)** |
+| `<body>` class, paint only | 47.23 ms (46.52–47.60) | 49.71 ms (47.60–55.63) |
+| `<body>` class, relayouting | 53.56 ms (52.48–54.30) | 54.47 ms (53.28–55.48) |
+| **leaf class, paint only** | 47.12 ms (46.91–47.51) | **4.00 ms (3.63–4.38)** |
+| **leaf class, relayouting** | 53.61 ms (52.72–54.50) | **10.79 ms (10.49–11.00)** |
 
 **danluu.com, 1,017 nodes:**
 
 | turn | full restyle | scoped restyle |
 | --- | --- | --- |
-| `<body>` class, paint only | 1.09 ms (1.07–1.12) | 1.08 ms (1.06–1.10) |
-| `<body>` class, relayouting | 1.53 ms (1.50–1.60) | 1.51 ms (1.49–1.54) |
-| leaf class, paint only | 1.07 ms (1.06–1.08) | **0.84 ms (0.82–0.85)** |
-| leaf class, relayouting | 1.53 ms (1.49–1.60) | **1.28 ms (1.25–1.32)** |
+| `<body>` class, paint only | 1.18 ms (1.11–1.24) | 1.17 ms (1.12–1.20) |
+| `<body>` class, relayouting | 1.59 ms (1.56–1.65) | 1.59 ms (1.53–1.74) |
+| leaf class, paint only | 1.13 ms (1.08–1.19) | **0.91 ms (0.85–0.97)** |
+| leaf class, relayouting | 1.52 ms (1.48–1.57) | **1.36 ms (1.28–1.47)** |
 
 ### The stages behind them (Wikipedia)
 
 | stage | cost |
 | --- | --- |
-| full restyle | 43.55 ms |
-| **scoped restyle, one leaf** | **39.9 µs** |
-| `Styles::clone` (new in M11.3) | 180 µs |
-| `Styles::layout_eq` | 474 µs |
-| one layout | 5.68 ms |
-| a tick that changes nothing | 7.62 ms |
+| full restyle | 43.22 ms |
+| **scoped restyle, one leaf** (incl. its copy) | **116 µs** |
+| — of which `Styles::clone` | 74 µs |
+| `Styles::layout_eq` | 437 µs |
+| one layout | 5.65 ms |
+| a tick that changes nothing | 10.6 ms |
 
-**The cascade is no longer the cost of an attribute write: 43.55 ms → 0.04 ms,
-a factor of 1,090.** The clone is what M11.3 added — the invalidation path
-keeps the values the page was laid out with so `Styles::layout_eq` can stay the
-comparison that decides on layout, unchanged. It costs 0.18 ms against the
-43 ms it sits beside.
+**The cascade is no longer the cost of an attribute write: 43.22 ms → ~40 µs of
+actual cascade.** What is left of the scoped stage is not the cascade at all —
+**two thirds of it is the defensive copy** of the styled tree, kept so
+`Styles::layout_eq` can stay the comparison that decides on layout, unchanged
+(the task's requirement). 5 MB of `Copy` structs: 74 µs against a warm
+allocator, ~530 µs against a cold one, which is why the two numbers above are
+measured after a discarded warm-up copy — whichever ran first otherwise paid
+the page faults for both and the pair swapped places.
 
 ### Does keypress→screen fit the 10 ms budget on Wikipedia?
 
-**Paint-only: yes, and by 3×.** 47.99 → **3.26 ms**, a third of the budget,
-where M10.6 left it at 5× over.
+**Paint-only: yes, and by 2.5×.** 47.12 → **4.00 ms**, where M10.6 left it at
+5× over.
 
-**Relayouting: no — 10.61 ms, missing by 6%.** Where the remaining 10.6 ms
-goes, and none of it is style: **5.68 ms is one layout of the whole document**,
-which is M12's incremental layout and not this task's; the rest is the display
-list, the recolour, the frame diff and the present, each of which walks the
-whole page. Restyle is now 0.4% of that turn. The honest statement is that this
-task moved the bottleneck rather than removing it, and the next 5.7 ms is
-named.
+**Relayouting: no — 10.79 ms, missing by 8%.** Where the remaining 10.8 ms
+goes, and almost none of it is style: **5.65 ms is one layout of the whole
+document**, which is M12's incremental layout and not this task's; the rest is
+the display list, the recolour, the frame diff and the present, each of which
+walks the whole page. Restyle is now ~1% of that turn. This task moved the
+bottleneck rather than removing it, and the next 5.7 ms is named.
 
-**A class written on `<body>` still costs a full restyle, and always will.**
-47 ms, unmoved, because `<body>`'s subtree is the document — the narrowing did
-not fail there, it correctly found nothing to narrow. A page that restyles
-everything pays for restyling everything.
+### What the narrowing costs the page it cannot help
+
+**A class written on `<body>` is ~1–2 ms slower than before** (47.2 → 49.7 ms
+paint-only, 53.6 → 54.5 relayouting; the spreads overlap on the second). That
+subtree *is* the document, so the scoped pass resolves the same nodes and then
+pays the defensive copy on top — a cold 5 MB clone, which is most of the delta.
+The narrowing did not fail there; it correctly found nothing to narrow, and a
+page that restyles everything now pays about 3% extra for the privilege. On
+danluu the same case is inside the noise.
+
+That is the trade the task specified: keeping `Styles::layout_eq` as the
+deciding comparison means keeping a copy of what the page was laid out with.
+Removing the copy is possible — compare during the subtree walk instead — but
+it replaces a comparison this milestone trusts with one that would need its own
+oracle. It is on the table for M12 with a measured 74 µs–0.5 ms to justify it.
 
 ### The `:hover` path was not touched
 
@@ -725,6 +738,14 @@ argument is about the one being entered, while the one being left has to lose
 its `:hover` styling in the same pass. It is also not an attribute write, so the
 arena's change list knows nothing about it. Narrowing it needs its own argument
 and its own measurement.
+
+### A tick that falls back pays nothing for the narrowing
+
+`App::restyle_scoped` makes its copy **after** every bail — the overflowed
+change list, the unstyled page, the arena that grew past the styled `Vec`. A
+tick that cannot narrow takes exactly M10.6's path, moving the old tree out
+rather than copying it, which is why the `full` columns above are a faithful
+measurement of the old code and not of the new code with a switch thrown.
 
 ### No regression where the change is not
 

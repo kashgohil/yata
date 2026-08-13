@@ -1339,8 +1339,14 @@ impl App {
 
     /// The narrowed restyle (M11.3): recompute only the subtrees this tick's
     /// attribute writes can have reached, in place, and leave the rest of the
-    /// styled tree alone. `false` means the tick did not qualify and the caller
-    /// must run a full pass.
+    /// styled tree alone.
+    ///
+    /// Returns the values the page was **laid out** with, which the caller
+    /// compares the new ones against — the scoped pass writes in place, so
+    /// that tree has to be copied out of the way before it runs, and this is
+    /// the only place that knows the pass is going ahead. `None` means the tick
+    /// did not qualify and the caller must run a full pass, which replaces the
+    /// tree rather than editing it and so needs no copy at all.
     ///
     /// Three ways it does not qualify, all of them the whole document's fault
     /// rather than a node's:
@@ -1356,15 +1362,25 @@ impl App {
     /// Correctness rests entirely on [`style::restyle_subtree`]'s argument
     /// about combinators; read it before changing either side.
     #[must_use]
-    fn restyle_scoped(&mut self, changes: &AttrChanges) -> bool {
+    fn restyle_scoped(&mut self, changes: &AttrChanges) -> Option<Styles> {
         // The A/B switch, and the only thing that reads `full_restyle_only`.
         #[cfg(test)]
         if self.full_restyle_only {
-            return false;
+            return None;
         }
         let AttrChanges::Nodes(roots) = changes else {
-            return false;
+            return None;
         };
+        // An attribute-only tick that wrote to nothing cannot happen: the three
+        // `Edit` kinds are structural (handled by the caller), an attribute
+        // write (which lands in this list), and creating a detached node (which
+        // grows the arena past the size check below). Asserted rather than
+        // trusted, because the failure would be silent — a tick that skipped
+        // its restyle and looked like one that had nothing to do.
+        debug_assert!(
+            !roots.is_empty(),
+            "an attribute-only tick reported no attribute writes"
+        );
         // Both read `&self`, so they cannot outlive the borrow of `styles`.
         let base = self.current_url();
         let hover = self.hover;
@@ -1373,13 +1389,17 @@ impl App {
         #[cfg(test)]
         let styled_before = self.styles.as_ref().map_or(0, Styles::nodes_styled);
         let started = Instant::now();
+        let previous;
         {
             let (Some(dom), Some(styles)) = (self.dom.as_ref(), self.styles.as_mut()) else {
-                return false;
+                return None;
             };
             if styles.node_count() != dom.node_count() {
-                return false;
+                return None;
             }
+            // Past every bail: the copy is paid only by a tick that actually
+            // narrows, never by one that falls back.
+            previous = styles.clone();
             let sheets: Vec<&Stylesheet> = self.sheets.iter().flatten().collect();
             let ctx = StyleContext {
                 hover,
@@ -1398,7 +1418,7 @@ impl App {
                 .map_or(0, Styles::nodes_styled)
                 .saturating_sub(styled_before);
         }
-        true
+        Some(previous)
     }
 
     /// The invalidation cycle for a tick that ran JavaScript (M10.6), given
@@ -1438,20 +1458,26 @@ impl App {
         }
 
         let structural = structure_after != structure_before;
-        // Keep the values the page was laid out with, so the narrowing has
-        // something to compare the new ones against. Not worth cloning on the
-        // structural path, which lays out whatever the comparison would say.
-        let previous = match structural {
-            true => None,
-            false => self.styles.clone(),
-        };
         // M11.3: an attribute-only tick recomputes the subtrees its writes can
         // have reached, not the document. Everything downstream is unchanged —
         // the comparison below is what keeps the narrowing honest.
-        let scoped = !structural && changes.is_some_and(|changes| self.restyle_scoped(&changes));
-        if !scoped {
-            self.restyle();
-        }
+        let scoped = match structural {
+            true => None,
+            false => changes.as_ref().and_then(|c| self.restyle_scoped(c)),
+        };
+        // The values the page was laid out with, so the comparison below has
+        // something to compare the new ones against. The scoped pass edits the
+        // tree in place and so hands back a copy; every other path replaces it,
+        // and can move the old one out for free — which is what M10.6 did, and
+        // what keeps a tick that falls back paying nothing for the narrowing.
+        let previous = match scoped {
+            Some(previous) => Some(previous),
+            None => {
+                let previous = self.styles.take();
+                self.restyle();
+                previous
+            }
+        };
 
         let needs_layout = structural
             || match (&previous, &self.styles) {
@@ -5174,13 +5200,6 @@ mod tests {
             assert!(styles.layout_eq(styles));
             compare += started.elapsed();
 
-            // What M11.3 added to the path: the styled tree is cloned so the
-            // comparison above still has the values the page was laid out with.
-            let started = Instant::now();
-            let copy = styles.clone();
-            clone_alone += started.elapsed();
-            assert_eq!(copy.node_count(), styles.node_count());
-
             let started = Instant::now();
             let _ = layout::layout_document_with(
                 dom,
@@ -5197,8 +5216,29 @@ mod tests {
             let dom = app.dom.as_mut().unwrap();
             dom.set_attr(leaf, "class", "x-tint");
             let changes = dom.take_attr_changes();
+
+            // What M11.3 added to the path, measured on the same tree the
+            // scoped pass is about to copy: `Styles::layout_eq` still decides
+            // on layout, so the values the page was laid out with have to
+            // survive a pass that writes in place. `scoped_alone` below
+            // *includes* this copy — it is part of the stage, not beside it.
+            //
+            // One copy thrown away first. It is 5 MB, and whichever of the two
+            // measurements runs against a cold allocator pays the page faults
+            // for all of them — which made these two numbers swap places
+            // depending on the order they were written in. Warming it measures
+            // the steady state, which is every attribute write after a page's
+            // first.
+            drop(app.styles.as_ref().unwrap().clone());
+
             let started = Instant::now();
-            assert!(app.restyle_scoped(&changes));
+            let copy = app.styles.as_ref().unwrap().clone();
+            clone_alone += started.elapsed();
+            assert_eq!(copy.node_count(), app.dom.as_ref().unwrap().node_count());
+            drop(copy);
+
+            let started = Instant::now();
+            assert!(app.restyle_scoped(&changes).is_some());
             scoped_alone += started.elapsed();
 
             let started = Instant::now();
