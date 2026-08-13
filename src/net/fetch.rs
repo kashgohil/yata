@@ -121,6 +121,40 @@ pub fn spawn_stylesheet(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) 
     });
 }
 
+/// The largest external script this engine will run. A mis-served 200 MB file
+/// must not take the process with it, and no honest script is anywhere near
+/// this — jQuery is 90 KB, React with its DOM package is under 150 KB.
+/// Refusing loudly (a console line, M10.7) beats decoding a gigabyte to find
+/// out it was a video.
+pub const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
+
+/// Fetch one `<script src>` on a detached worker (M10.10), modelled on
+/// `spawn_stylesheet`: the slot is allocated in document order before the
+/// fetch starts, so arrival order cannot change execution order.
+///
+/// `None` means "this slot will never run": a failed fetch, a non-success
+/// status, or a body past [`MAX_SCRIPT_BYTES`]. The page is degraded, never an
+/// error page — a missing script is the same class of problem as a missing
+/// stylesheet.
+pub fn spawn_script(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) {
+    thread::spawn(move || {
+        let source = match get(&url) {
+            // A 404's body is an error page, not JavaScript. Running it would
+            // put whatever HTML-shaped garbage recovers into the engine.
+            Ok((status, body)) if (200..300).contains(&status) => {
+                if body.len() > MAX_SCRIPT_BYTES {
+                    None
+                } else {
+                    // The same lossy-UTF-8 seam every other body decode uses.
+                    Some(crate::html::decode_body(&body))
+                }
+            }
+            _ => None,
+        };
+        let _ = tx.send(Msg::Script { id, slot, source });
+    });
+}
+
 /// Fetch and decode one `<img>` on a detached worker (M8). One `Msg::Image`
 /// goes out — success or soft failure. Never an error page: a broken image is
 /// a degraded page, not a navigation failure.

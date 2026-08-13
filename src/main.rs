@@ -125,6 +125,11 @@ fn main() -> io::Result<()> {
         for (id, slot, url) in effect.sheets {
             net::spawn_stylesheet(id, slot, url, tx.clone());
         }
+        // One worker per external script (M10.10), parallel with everything
+        // else — the *fetches* race, the executions do not.
+        for (id, slot, url) in effect.scripts {
+            net::spawn_script(id, slot, url, tx.clone());
+        }
         // One worker per image URL (M8), parallel with the page and sheets.
         for (id, url) in effect.images {
             net::spawn_image(id, url, tx.clone());
@@ -297,9 +302,12 @@ fn run_dump_text(url: &str) -> i32 {
 /// fetches it.
 fn run_dump_js(url: &str) -> i32 {
     let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
-        Ok((mut dom, _)) => {
-            let (runs, console, pending) = yata::headless::run_scripts(&mut dom);
+    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l.0, p))) {
+        Ok((final_url, (mut dom, _))) => {
+            // Pointed at a real URL, so external scripts are fetched here —
+            // the one headless path that does; see `headless::run_scripts_from`.
+            let (runs, console, pending) =
+                yata::headless::run_scripts_from(&mut dom, Some(&final_url));
             let mut text = String::new();
             for run in runs {
                 text.push_str(&run.dump_line());
@@ -437,6 +445,11 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         // Images accumulate like sheets: each parse in a batch may request its
         // own URLs; stale generations are dropped by the FetchId guard in App.
         effect.images.extend(e.images);
+        // Scripts accumulate like sheets and images: each parse in a batch may
+        // request its own, and stale generations are dropped by the `FetchId`
+        // guard in `App`, not here.
+        effect.scripts.extend(e.scripts);
+        effect.timers.extend(e.timers);
         if e.yank.is_some() {
             effect.yank = e.yank;
         }

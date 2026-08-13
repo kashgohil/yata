@@ -12,9 +12,13 @@
 use crate::browser::inspector;
 use crate::dom::Dom;
 use crate::image::{self, ImageCache, ImageContext};
+use std::sync::mpsc;
+
 use crate::js::console::Console;
 use crate::js::{self, ScriptRun};
 use crate::layout;
+use crate::msg::Msg;
+use crate::net::{self, FetchId};
 use crate::style;
 
 /// The document-order script pass, headless (M10.2).
@@ -30,11 +34,94 @@ use crate::style;
 /// The host is created and dropped inside this call: nothing headless outlives
 /// one page.
 pub fn run_scripts(dom: &mut Dom) -> (Vec<ScriptRun>, Console, usize) {
+    run_scripts_from(dom, None)
+}
+
+/// The same pass, but **fetching** `<script src>` from `base_url`.
+///
+/// Only `--dump-js` uses this, and the split is deliberate. No other headless
+/// path fetches a subresource — `<link>` stylesheets are not fetched either
+/// (M4.3) — and the layout goldens run against a fake base (`fixture.test`),
+/// so a fetching `box_dump` would have tests opening connections, which
+/// CLAUDE.md forbids. `--dump-js` is the tool for inspecting what a page's
+/// JavaScript actually does, is always pointed at a real URL, and is what
+/// M10.14's ladder sweep reads; without fetching it would report that the
+/// ladder runs almost no script, which is an artefact rather than a finding.
+///
+/// Still no timers, on either path.
+pub fn run_scripts_from(dom: &mut Dom, base_url: Option<&str>) -> (Vec<ScriptRun>, Console, usize) {
     let mut host = None;
     let console = Console::new();
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
-    let runs = js::run_pass(&mut host, dom, HEADLESS_PAGE, &console);
+    // The queue, headless: external scripts are never fetched here (no worker
+    // and no network on this path), so their slots stay holes and everything
+    // after one waits — the same rule the TUI follows, with the arrivals that
+    // would unblock it simply never coming.
+    let (mut queue, externals) = js::queue::ScriptQueue::new(js::sources::sources(dom), &console);
+
+    // Fetch what we were given a base for; settle the rest as unfetchable so
+    // the queue can drain instead of waiting forever on a hole.
+    let (tx, rx) = mpsc::channel();
+    let mut in_flight = 0;
+    for external in externals {
+        match base_url.and_then(|base| net::resolve_url(base, &external.url)) {
+            Some(url) => {
+                net::spawn_script(FetchId(1), external.slot, url, tx.clone());
+                in_flight += 1;
+            }
+            None => {
+                console.push(
+                    js::console::Level::Warn,
+                    Some(external.url.clone()),
+                    None,
+                    match base_url {
+                        Some(_) => "could not resolve this script's URL",
+                        None => "external scripts are not fetched on this headless path",
+                    },
+                );
+                queue.fill(external.slot, None);
+            }
+        }
+    }
+    drop(tx);
+
+    let mut runs = Vec::new();
+    loop {
+        let ready = queue.take_ready_prefix();
+        let finished = queue.is_finished();
+        if !ready.is_empty() || finished {
+            runs.extend(js::run_prefix(
+                &mut host,
+                dom,
+                HEADLESS_PAGE,
+                &console,
+                ready,
+                finished,
+            ));
+        }
+        if finished || in_flight == 0 {
+            break;
+        }
+        // Block for the next body. The worker always answers — success or
+        // `None` — so this cannot hang on a slow server any longer than the
+        // fetch itself takes.
+        match rx.recv() {
+            Ok(Msg::Script { slot, source, .. }) => {
+                if source.is_none() {
+                    console.push(
+                        js::console::Level::Warn,
+                        None,
+                        None,
+                        "a <script src> could not be fetched",
+                    );
+                }
+                queue.fill(slot, source);
+                in_flight -= 1;
+            }
+            _ => break,
+        }
+    }
     // Timers are never *run* here — the rule above — but the count is
     // reported, so "the page scheduled work" is distinguishable from "the page
     // did nothing".

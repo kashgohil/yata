@@ -75,6 +75,19 @@ pub enum Msg {
         url: String,
         result: Result<DecodedImage, String>,
     },
+    /// One `<script src>`'s body, from its own worker (M10.10). `slot` is the
+    /// script's position in the document-order queue, so a script that arrives
+    /// second but is written first still runs first.
+    ///
+    /// `source: None` means the slot will never run — a failed fetch, a
+    /// non-success status, or a body past `net::MAX_SCRIPT_BYTES`. Like a
+    /// missing stylesheet that is a *degraded page*, not an error page: the
+    /// slot settles empty and the rest of the queue proceeds.
+    Script {
+        id: FetchId,
+        slot: usize,
+        source: Option<String>,
+    },
     /// A timer's deadline came up (M10.9), sent by the timer thread — one
     /// more producer on the one channel, which is the whole of what PLAN.md
     /// M10 predicted the M1 architecture would absorb. `page` is the

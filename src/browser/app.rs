@@ -14,6 +14,7 @@ use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::{Dom, NodeId};
 use crate::image::ImageSession;
+use crate::js::queue::ScriptQueue;
 use crate::js::{self, console::Console};
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
@@ -50,6 +51,11 @@ pub struct Effect {
     /// Absolute image URLs to fetch (page FetchId, url). Parallel workers,
     /// same discipline as stylesheets (M8).
     pub images: Vec<(FetchId, String)>,
+    /// External scripts to fetch, as (fetch id, document slot, absolute URL)
+    /// — one worker each, exactly like `sheets`. The slots were allocated in
+    /// document order before any fetch started, so arrival order cannot change
+    /// execution order (M10.10).
+    pub scripts: Vec<(FetchId, usize, String)>,
     /// Timer work this page's script asked for (M10.9), for the loop to hand
     /// to the timer thread. Same discipline as `fetch` and `sheets`: `App`
     /// decides, the loop dispatches — nothing in `App` or `src/js/` touches a
@@ -161,6 +167,11 @@ pub struct App {
     /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
     /// stays up while the URL bar is open.
     timing_visible: bool,
+    /// The page's scripts in document order, with the position execution has
+    /// reached (M10.10). External ones are holes until their worker reports;
+    /// nothing after a hole runs, because the script that has not arrived may
+    /// define what the next one calls.
+    script_queue: ScriptQueue,
     /// Everything this page's JavaScript had to say (M10.7): console calls,
     /// uncaught exceptions, scripts skipped for their type — one ordered list,
     /// shown by `F5`. Page-local like the host: cleared on navigation, because
@@ -281,6 +292,7 @@ impl App {
             spinner: 0,
             timings: Timings::default(),
             timing_visible: false,
+            script_queue: ScriptQueue::default(),
             console: Console::new(),
             console_view: Viewport::default(),
             console_view_built: false,
@@ -342,6 +354,7 @@ impl App {
         // errors on this page's pane would be a lie about this page.
         self.console.clear();
         self.console_view_built = false;
+        self.script_queue = ScriptQueue::default();
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -492,6 +505,28 @@ impl App {
                     ..Effect::default()
                 }
             }
+            Msg::Script { id, slot, source } => {
+                // Same stale-generation guard as every other net message: a
+                // body requested by a page the user has left must not run.
+                if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                let failed = source.is_none();
+                self.script_queue.fill(slot, source);
+                if failed {
+                    self.console.push(
+                        crate::js::console::Level::Warn,
+                        None,
+                        None,
+                        "a <script src> could not be fetched: the rest of the page's \
+                         scripts continue",
+                    );
+                }
+                let Some(dom) = self.dom.take() else {
+                    return Effect::default();
+                };
+                self.run_ready_scripts(id, dom)
+            }
             Msg::Timer { page, id } => {
                 // The same stale-generation guard every other message uses: a
                 // deadline that came up for a page the user has left is not
@@ -537,41 +572,19 @@ impl App {
                 if matches!(self.fetch, Fetch::Failed { .. }) {
                     return Effect::default();
                 }
-                let Some(mut dom) = self.dom.take() else {
+                let Some(dom) = self.dom.take() else {
                     return Effect::default();
                 };
 
-                let started = Instant::now();
-                // The arena counts its own edits, so what the tick changed is
-                // answered by two comparisons rather than a flag to plumb.
-                let before = (dom.version(), dom.structure_version());
-                // The per-script results are data; what a reader sees of them
-                // is the console (M10.7), which `run_pass` appends to directly.
-                let logged_before = self.console.entries().len();
-                let _runs = js::run_pass(&mut self.js_host, &mut dom, id.0, &self.console);
-                let after = (dom.version(), dom.structure_version());
-                let logged = self.console.entries().len() != logged_before;
-                // The DOM comes straight back: the host borrowed it for the
-                // tick and holds nothing now.
-                self.dom = Some(dom);
+                // The queue is built once, here, from the parsed document:
+                // every slot exists before any fetch starts.
+                let (queue, externals) =
+                    ScriptQueue::new(js::sources::sources(&dom), &self.console);
+                self.script_queue = queue;
+                let scripts = self.resolve_script_urls(id, externals);
 
-                // Recorded even when the page had no script: the pass still
-                // walked the tree looking for one, and an instrument that
-                // hides the work it did do is not an instrument.
-                self.timings.script = Some(started.elapsed());
-
-                // One cycle per tick, whatever the script did inside it.
-                let mut effect = self.apply_dom_changes(before, after);
-                effect.timers = self.take_timer_requests(id);
-                if logged {
-                    // A script that only logged changed no box, but it did
-                    // change what the console pane holds and what the
-                    // statusline says about the page — so the frame is stale
-                    // even though the pipeline had nothing to do.
-                    self.console_view_built = false;
-                    self.build_visible_inspector();
-                    effect.dirty = true;
-                }
+                let mut effect = self.run_ready_scripts(id, dom);
+                effect.scripts = scripts;
                 effect
             }
             Msg::Image { id, url, result } => {
@@ -1685,6 +1698,81 @@ impl App {
                 .viewport
                 .scroll_to_offset(y.saturating_sub(page.saturating_sub(1)));
         }
+    }
+
+    /// Run whatever the queue can run now, and fold the result into one
+    /// `Effect`. Called by the script pass and by every arriving body, so a
+    /// prefix that completes late goes through exactly the same path as the
+    /// first one.
+    fn run_ready_scripts(&mut self, id: FetchId, mut dom: Dom) -> Effect {
+        let ready = self.script_queue.take_ready_prefix();
+        let finished = self.script_queue.is_finished();
+
+        let started = Instant::now();
+        let before = (dom.version(), dom.structure_version());
+        let logged_before = self.console.entries().len();
+        let _runs = js::run_prefix(
+            &mut self.js_host,
+            &mut dom,
+            id.0,
+            &self.console,
+            ready,
+            finished,
+        );
+        let after = (dom.version(), dom.structure_version());
+        let logged = self.console.entries().len() != logged_before;
+        // The DOM comes straight back: the host borrowed it for the tick and
+        // holds nothing now.
+        self.dom = Some(dom);
+
+        // **Accumulated**, not replaced: a page's script time is the sum of
+        // every prefix that ran, so `F4` shows what the page cost rather than
+        // what its last arriving script cost.
+        let elapsed = started.elapsed();
+        self.timings.script = Some(self.timings.script.unwrap_or_default() + elapsed);
+
+        let mut effect = self.apply_dom_changes(before, after);
+        effect.timers = self.take_timer_requests(id);
+        if logged {
+            // A script that only logged changed no box, but it did change what
+            // the console pane holds and what the statusline says about the
+            // page — so the frame is stale even though the pipeline had
+            // nothing to do.
+            self.console_view_built = false;
+            self.build_visible_inspector();
+            effect.dirty = true;
+        }
+        effect
+    }
+
+    /// Resolve each external script's `src` against the page URL, dropping the
+    /// ones that will not resolve — a slot whose URL is unusable settles empty
+    /// rather than waiting forever.
+    fn resolve_script_urls(
+        &mut self,
+        id: FetchId,
+        externals: Vec<crate::js::queue::External>,
+    ) -> Vec<(FetchId, usize, String)> {
+        let base = self.current_url();
+        let mut out = Vec::new();
+        for external in externals {
+            match base
+                .as_deref()
+                .and_then(|base| net::resolve_url(base, &external.url))
+            {
+                Some(url) => out.push((id, external.slot, url)),
+                None => {
+                    self.console.push(
+                        crate::js::console::Level::Warn,
+                        Some(external.url.clone()),
+                        None,
+                        "could not resolve this script's URL",
+                    );
+                    self.script_queue.fill(external.slot, None);
+                }
+            }
+        }
+        out
     }
 
     /// Turn the timer work a tick asked for into requests the loop can hand to
@@ -3367,6 +3455,179 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    // ---- external scripts (M10.10) ----------------------------------------
+
+    /// A page loaded from `http://final/` (what `load` reports), parsed, with
+    /// its script pass run — so the queue exists and its externals have been
+    /// requested.
+    fn page_with_scripts(html: &str) -> (App, FetchId, Effect) {
+        let (mut app, id) = scripted_app(html);
+        let effect = app.update(Msg::RunScripts { id });
+        (app, id, effect)
+    }
+
+    #[test]
+    fn external_scripts_are_requested_in_document_order() {
+        let (_, id, effect) = page_with_scripts(
+            "<script src='a.js'></script><script>1;</script><script src='b.js'></script>",
+        );
+        assert_eq!(
+            effect.scripts,
+            [
+                (id, 0, "http://final/a.js".to_string()),
+                (id, 2, "http://final/b.js".to_string()),
+            ],
+            "slots are allocated in document order, before any fetch starts"
+        );
+    }
+
+    #[test]
+    fn execution_order_is_the_document_not_the_network() {
+        // The task's named case: `[external, inline, external]` where the
+        // second external arrives first must still execute 1, 2, 3.
+        let (mut app, id, _) = page_with_scripts(
+            "<script src='a.js'></script>\
+             <script>order.push('inline'); </script>\
+             <script src='b.js'></script>\
+             <script>console.log(order.join(','));</script>",
+        );
+        // Nothing has run: slot 0 is a hole, so even the inline script waits.
+        assert!(
+            app.console.entries().is_empty(),
+            "{:?}",
+            app.console.entries()
+        );
+
+        // The *second* external lands first. Still nothing may run.
+        app.update(Msg::Script {
+            id,
+            slot: 2,
+            source: Some("order.push('b.js');".into()),
+        });
+        assert!(app.console.entries().is_empty());
+
+        // The first arrives and unblocks all four, in document order.
+        app.update(Msg::Script {
+            id,
+            slot: 0,
+            source: Some("var order = ['a.js'];".into()),
+        });
+        assert_eq!(
+            app.console
+                .entries()
+                .iter()
+                .map(|e| e.text.clone())
+                .collect::<Vec<_>>(),
+            ["a.js,inline,b.js"]
+        );
+    }
+
+    #[test]
+    fn a_hole_that_never_fills_holds_the_rest() {
+        // A browser would not run them either: the script that never arrived
+        // may be the one that defined everything after it.
+        let (mut app, id, _) = page_with_scripts(
+            "<script src='never.js'></script><script>console.log('should not run');</script>",
+        );
+        app.update(Msg::Script {
+            id,
+            slot: 99,
+            source: Some("nowhere".into()),
+        });
+        assert!(
+            app.console
+                .entries()
+                .iter()
+                .all(|e| e.text != "should not run"),
+            "{:?}",
+            app.console.entries()
+        );
+    }
+
+    #[test]
+    fn a_failed_fetch_is_a_degraded_page_not_an_error_page() {
+        let (mut app, id, _) = page_with_scripts(
+            "<p>page text</p><script src='gone.js'></script>\
+             <script>console.log('after the failure');</script>",
+        );
+        app.update(Msg::Script {
+            id,
+            slot: 0,
+            source: None,
+        });
+
+        let texts: Vec<String> = app
+            .console
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("could not be fetched")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "after the failure"), "{texts:?}");
+        // The page itself is untouched — no error page, no lost content.
+        assert!(screen(&mut app, 40, 8).contains("page text"));
+    }
+
+    #[test]
+    fn a_superseded_generations_script_never_runs() {
+        let (mut app, first, _) = page_with_scripts("<script src='a.js'></script>");
+        let second = app.start_fetch("http://elsewhere/".into());
+        assert_ne!(first, second);
+
+        assert_eq!(
+            app.update(Msg::Script {
+                id: first,
+                slot: 0,
+                source: Some("console.log('from the old page');".into()),
+            }),
+            Effect::default()
+        );
+        assert!(app.console.is_empty(), "a stale generation's script ran");
+    }
+
+    #[test]
+    fn an_external_script_that_mutates_runs_one_invalidation_cycle() {
+        let (mut app, id, _) = page_with_scripts("<div id=out></div><script src='a.js'></script>");
+        let (styled, laid_out, painted) = stages(&app);
+
+        app.update(Msg::Script {
+            id,
+            slot: 0,
+            source: Some(
+                "var out = document.getElementById('out');\
+                 for (var i = 0; i < 50; i++) out.appendChild(document.createElement('p'));"
+                    .into(),
+            ),
+        });
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out + 1, painted + 1),
+            "an arriving script's mutations must cost one cycle"
+        );
+    }
+
+    #[test]
+    fn the_script_row_sums_every_prefix_rather_than_the_last() {
+        // `F4` should say what the page's script cost, not what its last
+        // arriving script cost.
+        let (mut app, id, _) =
+            page_with_scripts("<script>1;</script><script src='a.js'></script><script>2;</script>");
+        let after_pass = app.timings().script.expect("the pass was timed");
+        app.update(Msg::Script {
+            id,
+            slot: 1,
+            source: Some("3;".into()),
+        });
+        let after_arrival = app.timings().script.expect("the arrival was timed");
+        assert!(
+            after_arrival >= after_pass,
+            "the script row went backwards: {after_pass:?} then {after_arrival:?}"
+        );
     }
 
     // ---- timers (M10.9) ---------------------------------------------------

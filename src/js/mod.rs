@@ -78,6 +78,7 @@
 // from becoming an API somebody outside the engine can hand a tree to.
 mod bindings;
 pub mod console;
+pub mod queue;
 pub mod sources;
 
 use std::fmt;
@@ -94,7 +95,6 @@ use rquickjs::{
 use crate::dom::Dom;
 use crate::js::bindings::{TimerAsk, TimerQueue};
 use crate::js::console::{Console, Level};
-use crate::js::sources::Script;
 use crate::timers::TimerId;
 
 /// What one script did: the name it was known by, and its completion value or
@@ -106,11 +106,11 @@ pub struct ScriptRun {
     pub outcome: Result<JsValue, JsError>,
 }
 
-/// Run every script the document asks for, in document order — one tick.
+/// Run a ready prefix of the page's script queue — one tick (M10.10).
 ///
 /// The DOM is **lent**, not shared. `App` owns the `Dom` before and after,
-/// there is no copy, and nothing holds the tree between passes: the tick moves
-/// it into the host's slot (`bindings::DomSlot`, which every binding reads
+/// there is no copy, and nothing holds the tree between ticks: this moves it
+/// into the host's slot (`bindings::DomSlot`, which every binding reads
 /// through) and moves it back out before returning. Outside a tick the slot is
 /// empty and every binding throws, which is the honest answer for a callback
 /// that runs when no tick owns a tree.
@@ -119,6 +119,9 @@ pub struct ScriptRun {
 /// the tick carry it, so one held past a navigation refuses to resolve rather
 /// than reading whatever node now sits at its index.
 ///
+/// `finished` says this was the last prefix — the queue has nothing pending —
+/// which is when `DOMContentLoaded` and `load` fire.
+///
 /// A script that throws does not stop the ones after it. Browsers behave the
 /// same way, and the discipline matches a failed stylesheet: a page with a
 /// broken script is a *degraded page*, never an error page.
@@ -126,30 +129,44 @@ pub struct ScriptRun {
 /// `host` is the page generation's host, created here on first use: a page
 /// with no script never starts an engine at all, which is why this takes the
 /// slot rather than a live `Host`.
-pub fn run_pass(
+pub fn run_prefix(
     host: &mut Option<Host>,
     dom: &mut Dom,
     page: u64,
     console: &Console,
+    scripts: Vec<(String, String)>,
+    finished: bool,
 ) -> Vec<ScriptRun> {
-    let scripts = sources::sources(dom);
-    if scripts.is_empty() {
+    if scripts.is_empty() && !finished {
         return Vec::new();
     }
 
     let host = match host {
         Some(host) => host,
-        None => match Host::new(console) {
-            Ok(new) => host.insert(new),
-            // The engine itself would not start. The page is degraded, not
-            // broken — and the failure is reported rather than swallowed.
-            Err(error) => {
-                return vec![ScriptRun {
-                    name: error.source.clone(),
-                    outcome: Err(error),
-                }];
+        None => {
+            // A page whose only scripts all failed to fetch never starts an
+            // engine: there is nothing to run and nothing to fire events at.
+            if scripts.is_empty() {
+                return Vec::new();
             }
-        },
+            match Host::new(console) {
+                Ok(new) => host.insert(new),
+                // The engine itself would not start. The page is degraded, not
+                // broken — and the failure is reported rather than swallowed.
+                Err(error) => {
+                    console.push(
+                        Level::Error,
+                        Some(error.source.clone()),
+                        error.line,
+                        &error.message,
+                    );
+                    return vec![ScriptRun {
+                        name: error.source.clone(),
+                        outcome: Err(error),
+                    }];
+                }
+            }
+        }
     };
 
     // The lend, and the whole of it: the tree goes into the slot the bindings
@@ -161,53 +178,42 @@ pub fn run_pass(
 
     let runs: Vec<ScriptRun> = scripts
         .into_iter()
-        .filter_map(|script| match script {
-            Script::Inline { name, source } => {
-                let outcome = host.eval(&name, &source);
-                // Uncaught exceptions join the console in the order they
-                // happened, interleaved with whatever the script logged before
-                // throwing — that interleaving is most of the story.
-                if let Err(error) = &outcome {
-                    console.push(
-                        Level::Error,
-                        Some(error.source.clone()),
-                        error.line,
-                        &error.message,
-                    );
-                }
-                Some(ScriptRun { name, outcome })
+        .map(|(name, source)| {
+            let outcome = host.eval(&name, &source);
+            // Uncaught exceptions join the console in the order they happened,
+            // interleaved with whatever the script logged before throwing —
+            // that interleaving is most of the story.
+            if let Err(error) = &outcome {
+                console.push(
+                    Level::Error,
+                    Some(error.source.clone()),
+                    error.line,
+                    &error.message,
+                );
             }
-            // Not an error, but the reader deserves to know the page asked for
-            // something we do not run — "nothing happened" is otherwise
-            // indistinguishable from "we ignored it".
-            Script::Skipped { name, reason } => {
-                console.push(Level::Warn, Some(name), None, &reason);
-                None
-            }
-            // M10.10 fetches these. The slot exists so document order is
-            // already right when it does; running nothing is not an error.
-            Script::External { .. } => None,
+            ScriptRun { name, outcome }
         })
         .collect();
 
     // The two events a page hangs almost all of its behaviour on, in the order
-    // a browser fires them and inside the same tick as the pass — so a
-    // listener registered by the last script still sees them, and everything
-    // they mutate lands in one invalidation cycle (M10.6).
+    // a browser fires them — but only once the queue has nothing left to run,
+    // so a listener registered by the *last* external script still sees them.
     //
-    // They fire even if every script threw: a page whose first script broke
-    // may still have registered a handler in its second.
-    for (target, kind) in [
-        (Target::Document, "DOMContentLoaded"),
-        (Target::Window, "load"),
-    ] {
-        if let Err(error) = host.dispatch(target, kind, kind == "DOMContentLoaded") {
-            console.push(
-                Level::Error,
-                Some(error.source.clone()),
-                error.line,
-                &error.message,
-            );
+    // They fire even if every script threw or failed to arrive: a page whose
+    // first script broke may still have registered a handler in its second.
+    if finished {
+        for (target, kind) in [
+            (Target::Document, "DOMContentLoaded"),
+            (Target::Window, "load"),
+        ] {
+            if let Err(error) = host.dispatch(target, kind, kind == "DOMContentLoaded") {
+                console.push(
+                    Level::Error,
+                    Some(error.source.clone()),
+                    error.line,
+                    &error.message,
+                );
+            }
         }
     }
 
@@ -222,6 +228,28 @@ pub fn run_pass(
         *dom = returned;
     }
     runs
+}
+
+/// The whole document-order pass in one call, with every external script
+/// treated as unfetchable — what `run_pass` was before M10.10 split execution
+/// across arrivals.
+///
+/// Test-only: the engine's real callers drive the queue a prefix at a time,
+/// and a test that is about `classList` should not have to say so.
+#[cfg(test)]
+pub fn run_pass(
+    host: &mut Option<Host>,
+    dom: &mut Dom,
+    page: u64,
+    console: &Console,
+) -> Vec<ScriptRun> {
+    let (mut queue, externals) = queue::ScriptQueue::new(sources::sources(dom), console);
+    for external in externals {
+        queue.fill(external.slot, None);
+    }
+    let ready = queue.take_ready_prefix();
+    let finished = queue.is_finished();
+    run_prefix(host, dom, page, console, ready, finished)
 }
 
 /// Wall clock a single script gets before the interrupt handler stops it.
