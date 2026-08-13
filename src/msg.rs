@@ -6,6 +6,7 @@ use crate::css::Stylesheet;
 use crate::dom::Dom;
 use crate::image::DecodedImage;
 use crate::net::FetchId;
+use crate::timers::TimerId;
 
 /// Everything the UI thread reacts to arrives as one of these over the single
 /// mpsc channel. Producers (input thread, fetch workers) only send; the event
@@ -73,6 +74,15 @@ pub enum Msg {
         id: FetchId,
         url: String,
         result: Result<DecodedImage, String>,
+    },
+    /// A timer's deadline came up (M10.9), sent by the timer thread — one
+    /// more producer on the one channel, which is the whole of what PLAN.md
+    /// M10 predicted the M1 architecture would absorb. `page` is the
+    /// generation that scheduled it, so a message for a page the user has left
+    /// is dropped by the same guard every other message uses.
+    Timer {
+        page: FetchId,
+        id: TimerId,
     },
     /// Run this page's `<script>` elements in document order (M10.2).
     ///

@@ -10,6 +10,7 @@ use yata::browser::app::{App, Effect};
 use yata::browser::yank;
 use yata::msg::Msg;
 use yata::term::{self, Renderer};
+use yata::timers::{TimerRequest, Timers};
 use yata::{html, layout, net, style};
 
 fn main() -> io::Result<()> {
@@ -91,6 +92,10 @@ fn main() -> io::Result<()> {
     // `Msg::InputClosed`, which resolves to quit through the normal
     // `update` → `Effect` path (still just `effect.quit`, no extra loop branch).
     spawn_input_thread(tx.clone());
+    // One timer thread for the app (M10.9), one more producer on the same
+    // channel. It parks on a condvar until the earliest deadline, so a page
+    // with nothing scheduled costs no wakeups at all.
+    let timers = Timers::spawn(tx.clone());
 
     let mut out = io::stdout();
     render(&mut app, &mut renderer, &mut out)?;
@@ -105,7 +110,14 @@ fn main() -> io::Result<()> {
         // A committed navigation: `App` already started the generation, the
         // loop's only job is to spawn the worker with its own Sender clone.
         if let Some((id, url)) = effect.fetch {
+            // A new generation: everything the old page scheduled is dead. The
+            // `FetchId` guard would drop those messages anyway; cancelling
+            // means the thread does not wake for them at all.
+            timers.apply(TimerRequest::CancelOthers { keep: id });
             net::spawn_fetch(id, url, tx.clone());
+        }
+        for request in effect.timers {
+            timers.apply(request);
         }
         // One worker per linked stylesheet, all spawned before this turn's
         // render: they run in parallel with each other and with the page the
@@ -244,7 +256,7 @@ fn run_dump_text(url: &str) -> i32 {
         Ok((mut dom, _)) => {
             // Scripts run before the dump, under the headless rule (one pass,
             // no timers) that `headless::run_scripts` documents.
-            yata::headless::run_scripts(&mut dom);
+            let _ = yata::headless::run_scripts(&mut dom);
             // No worker to fetch <link> sheets in a headless run, so the page
             // is styled by the UA sheet plus its own inline blocks.
             let sheets = style::sources::inline_sheets(&dom);
@@ -287,7 +299,7 @@ fn run_dump_js(url: &str) -> i32 {
     let rx = headless_fetch(url);
     match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
         Ok((mut dom, _)) => {
-            let (runs, console) = yata::headless::run_scripts(&mut dom);
+            let (runs, console, pending) = yata::headless::run_scripts(&mut dom);
             let mut text = String::new();
             for run in runs {
                 text.push_str(&run.dump_line());
@@ -299,6 +311,12 @@ fn run_dump_js(url: &str) -> i32 {
             for entry in console.entries() {
                 text.push_str(&entry.to_string());
                 text.push('\n');
+            }
+            // Headless never *runs* timers (M10.2's determinism rule), but it
+            // says how many are outstanding, so a test can tell "the page
+            // scheduled work" from "the page did nothing".
+            if pending > 0 {
+                text.push_str(&format!("timers pending {pending}\n"));
             }
             let mut out = io::stdout();
             if out

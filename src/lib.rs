@@ -17,3 +17,4 @@ pub mod net;
 pub mod paint;
 pub mod style;
 pub mod term;
+pub mod timers;

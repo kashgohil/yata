@@ -29,13 +29,17 @@ use crate::style;
 ///
 /// The host is created and dropped inside this call: nothing headless outlives
 /// one page.
-pub fn run_scripts(dom: &mut Dom) -> (Vec<ScriptRun>, Console) {
+pub fn run_scripts(dom: &mut Dom) -> (Vec<ScriptRun>, Console, usize) {
     let mut host = None;
     let console = Console::new();
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
     let runs = js::run_pass(&mut host, dom, HEADLESS_PAGE, &console);
-    (runs, console)
+    // Timers are never *run* here — the rule above — but the count is
+    // reported, so "the page scheduled work" is distinguishable from "the page
+    // did nothing".
+    let pending = host.as_mut().map_or(0, js::Host::pending_timers);
+    (runs, console, pending)
 }
 
 /// The page generation headless runs use. Only its constancy matters.

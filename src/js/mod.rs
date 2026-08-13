@@ -87,11 +87,15 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rquickjs::context::EvalOptions;
-use rquickjs::{CatchResultExt, CaughtError, Context, Function, Persistent, Runtime, Type, Value};
+use rquickjs::{
+    CatchResultExt, CaughtError, Context, Function, Object, Persistent, Runtime, Type, Value,
+};
 
 use crate::dom::Dom;
+use crate::js::bindings::{TimerAsk, TimerQueue};
 use crate::js::console::{Console, Level};
 use crate::js::sources::Script;
+use crate::timers::TimerId;
 
 /// What one script did: the name it was known by, and its completion value or
 /// its error. Data, not output — `--dump-js` prints it today and M10.7's
@@ -207,6 +211,10 @@ pub fn run_pass(
         }
     }
 
+    // Promise jobs the page queued run before the tick ends — a `.then` that
+    // never fires is indistinguishable to a page from a broken engine.
+    host.pump_microtasks(console);
+
     // Back to the caller. A handle a script stored in a global outlives this,
     // and that is correct: it stays valid for as long as the page does, and
     // stops resolving the moment a different page is lent in.
@@ -268,7 +276,8 @@ struct Budget {
 /// lifetime rule (one per page generation) and the threading rule (UI thread,
 /// created where it runs).
 pub struct Host {
-    /// The prelude's event dispatcher (M10.8), held across ticks.
+    /// The prelude's entry points — `dispatch` (M10.8) and `fireTimer`
+    /// (M10.9) — held across ticks.
     ///
     /// A `Persistent` rather than a global name: the page never sees it, so it
     /// cannot be called, overwritten or deleted, and the engine keeps the only
@@ -280,7 +289,10 @@ pub struct Host {
     /// is freed trips QuickJS's own assertion that nothing is still alive
     /// (`list_empty(&rt->gc_obj_list)`), which aborts the process. It has to
     /// go before `context` and `runtime`.
-    dispatch: Persistent<Function<'static>>,
+    entries: Persistent<Object<'static>>,
+    /// Timer work the page asked for during a tick, drained by `App` and
+    /// handed to the timer thread by the event loop.
+    timers: TimerQueue,
     /// The engine handle. `Context` keeps the runtime alive on its own, so
     /// this is not what makes the host valid — it is how the limits get set
     /// and how the tests read the heap back. Holding it is deliberate: it is
@@ -328,9 +340,10 @@ impl Host {
         })));
 
         let dom = Rc::new(bindings::DomSlot::default());
-        let dispatch = context.with(|ctx| {
-            bindings::install(&ctx, &dom, console)
-                .map(|dispatcher| Persistent::save(&ctx, dispatcher))
+        let timers = TimerQueue::default();
+        let entries = context.with(|ctx| {
+            bindings::install(&ctx, &dom, console, &timers)
+                .map(|entry_points| Persistent::save(&ctx, entry_points))
                 .catch(&ctx)
                 .map_err(|caught| JsError::from_caught("<bindings>", &caught))
             // A prelude that will not install is a broken engine, not a broken
@@ -338,7 +351,8 @@ impl Host {
         })?;
 
         Ok(Host {
-            dispatch,
+            entries,
+            timers,
             runtime,
             context,
             budget,
@@ -389,15 +403,83 @@ impl Host {
             Target::Document => ("document", 0),
             Target::Window => ("window", 0),
         };
-        let dispatcher = self.dispatch.clone();
+        let entries = self.entries.clone();
         let kind = kind.to_string();
         // Under the same budget as a script: a listener that loops forever is
         // a runaway script that happens to have been reached by a click.
         self.under_budget(&format!("{kind} listener"), move |ctx| {
-            dispatcher
+            entries
                 .restore(ctx)?
+                .get::<_, Function>("dispatch")?
                 .call::<_, bool>((tag, id, kind.as_str(), bubbles))
         })
+    }
+
+    /// Fire one timer's callback (M10.9). Unknown ids — a timer cancelled
+    /// after its message was already in the channel — do nothing.
+    pub fn fire_timer(&mut self, id: TimerId) -> Result<(), JsError> {
+        let entries = self.entries.clone();
+        self.under_budget("timer callback", move |ctx| {
+            entries
+                .restore(ctx)?
+                .get::<_, Function>("fireTimer")?
+                .call::<_, ()>((id.0 as f64,))
+        })
+    }
+
+    /// How many timers the page is still holding callbacks for. What
+    /// `--dump-js` reports so a test can tell "the page scheduled work" from
+    /// "the page did nothing".
+    pub fn pending_timers(&mut self) -> usize {
+        let entries = self.entries.clone();
+        self.under_budget("timer count", move |ctx| {
+            entries
+                .restore(ctx)?
+                .get::<_, Function>("pending")?
+                .call::<_, f64>(())
+        })
+        .map_or(0, |count| count as usize)
+    }
+
+    /// Run every queued promise job to quiescence (M10.9).
+    ///
+    /// QuickJS queues them; nothing runs them unless we do, so without this a
+    /// `.then` never fires. Bounded, because `Promise.resolve().then(f)` that
+    /// re-queues itself is a loop the queue can never drain — and unlike a
+    /// runaway script it never returns to the interrupt handler, so the
+    /// execution budget cannot see it. The bound turns that into an error in
+    /// the console instead of a hung UI.
+    fn pump_microtasks(&mut self, console: &Console) {
+        for _ in 0..MAX_MICROTASKS {
+            match self.runtime.execute_pending_job() {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(exception) => {
+                    let error = exception.0.with(|ctx| {
+                        let caught = CaughtError::from_error(&ctx, rquickjs::Error::Exception);
+                        JsError::from_caught("microtask", &caught)
+                    });
+                    console.push(
+                        Level::Error,
+                        Some(error.source.clone()),
+                        error.line,
+                        &error.message,
+                    );
+                }
+            }
+        }
+        console.push(
+            Level::Error,
+            None,
+            None,
+            "a promise kept queueing more work: stopped after the microtask limit \
+             so the page could be drawn",
+        );
+    }
+
+    /// Timer work the page asked for during the tick that just ended.
+    pub fn take_timer_requests(&self) -> Vec<TimerAsk> {
+        self.timers.drain()
     }
 
     /// Run `body` inside the context with the execution budget armed, and turn
@@ -476,10 +558,50 @@ pub fn dispatch(
             false
         }
     };
+    host.pump_microtasks(console);
     if let Some(returned) = host.dom.take() {
         *dom = returned;
     }
     prevented
+}
+
+/// How many promise jobs one tick may run before the engine calls it a loop.
+///
+/// A microtask that queues another microtask is legal and common — a chain of
+/// `.then`s is exactly that — so the number has to be far above any honest
+/// page's chain. 10,000 is: a page resolving a hundred promises with a
+/// hundred links each fits, and a self-requeueing loop hits it in a few
+/// milliseconds rather than never.
+const MAX_MICROTASKS: usize = 10_000;
+
+/// Fire one timer's callback, as its own tick (M10.9).
+///
+/// The same shape as [`dispatch`]: the DOM is lent for the callback, promise
+/// jobs the callback queued are pumped to quiescence before it returns, and
+/// the caller runs one invalidation cycle after.
+pub fn fire_timer(
+    host: &mut Host,
+    dom: &mut Dom,
+    page: u64,
+    console: &Console,
+    id: TimerId,
+) -> Result<(), JsError> {
+    host.dom
+        .lend(std::mem::replace(dom, Dom::new_document()), page);
+    let outcome = host.fire_timer(id);
+    if let Err(error) = &outcome {
+        console.push(
+            Level::Error,
+            Some(error.source.clone()),
+            error.line,
+            &error.message,
+        );
+    }
+    host.pump_microtasks(console);
+    if let Some(returned) = host.dom.take() {
+        *dom = returned;
+    }
+    outcome
 }
 
 /// Where an event starts. `document` and `window` are event targets without

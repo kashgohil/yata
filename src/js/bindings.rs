@@ -38,6 +38,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use rquickjs::context::EvalOptions;
 use rquickjs::{Ctx, Exception, Function, Object, Result as JsResult};
@@ -98,6 +99,30 @@ impl DomSlot {
     }
 }
 
+/// Timer work a tick asked for, collected for the event loop to hand to the
+/// timer thread. `App` drains it after every tick, exactly as it drains the
+/// console: a binding decides, the loop dispatches, and nothing inside
+/// `src/js/` touches a thread.
+#[derive(Clone, Default)]
+pub struct TimerQueue {
+    requests: Rc<RefCell<Vec<TimerAsk>>>,
+}
+
+/// A timer id and what to do with it: `Some(delay)` schedules, `None` cancels.
+pub type TimerAsk = (u64, Option<Duration>);
+
+impl TimerQueue {
+    /// `Some(delay)` schedules, `None` cancels.
+    fn push(&self, id: u64, delay: Option<Duration>) {
+        self.requests.borrow_mut().push((id, delay));
+    }
+
+    /// Take everything asked for since the last drain.
+    pub fn drain(&self) -> Vec<TimerAsk> {
+        std::mem::take(&mut *self.requests.borrow_mut())
+    }
+}
+
 /// Whether `name` is one the serializer could write and the tokenizer read
 /// back as the same attribute.
 ///
@@ -145,7 +170,8 @@ pub fn install<'js>(
     ctx: &Ctx<'js>,
     slot: &Rc<DomSlot>,
     console: &Console,
-) -> JsResult<Function<'js>> {
+    timers: &TimerQueue,
+) -> JsResult<Object<'js>> {
     let api = Object::new(ctx.clone())?;
 
     // The console's caps, read by the formatter in the prelude, so the numbers
@@ -510,6 +536,32 @@ pub fn install<'js>(
         })?,
     )?;
 
+    // Timers (M10.9). The prelude owns the callbacks and the ids; all that
+    // crosses here is "schedule id N in D milliseconds" and "cancel id N".
+    let queue = timers.clone();
+    api.set(
+        "scheduleTimer",
+        Function::new(ctx.clone(), move |id: f64, delay: f64| {
+            // A page can pass anything: `NaN`, `-1`, `Infinity`. The floor is
+            // applied by the timer thread; this only has to produce a finite
+            // non-negative number for it.
+            let delay = if delay.is_finite() && delay > 0.0 {
+                Duration::from_millis(delay as u64)
+            } else {
+                Duration::ZERO
+            };
+            queue.push(id as u64, Some(delay));
+        })?,
+    )?;
+
+    let queue = timers.clone();
+    api.set(
+        "cancelTimer",
+        Function::new(ctx.clone(), move |id: f64| {
+            queue.push(id as u64, None);
+        })?,
+    )?;
+
     ctx.globals().set("__dom", api)?;
     // Named, so a stack frame from inside the object model says where it came
     // from instead of the engine's anonymous `eval_script`.
@@ -517,8 +569,9 @@ pub fn install<'js>(
     options.global = true;
     options.strict = false;
     options.filename = Some("<bindings>".to_string());
-    // The prelude's value is its dispatcher (see the end of `PRELUDE`).
-    ctx.eval_with_options::<Function<'js>, _>(PRELUDE, options)
+    // The prelude's value is its entry-point object (see the end of
+    // `PRELUDE`): `dispatch`, `fireTimer`, `pending`.
+    ctx.eval_with_options::<Object<'js>, _>(PRELUDE, options)
 }
 
 fn id_of(node: NodeId) -> u32 {
@@ -1086,6 +1139,70 @@ const PRELUDE: &str = r#"
     removeListener(globalThis, String(type), fn, options);
   };
 
+  // ---- timers (M10.9) ----
+
+  // Callbacks live here; Rust only ever sees an id and a delay. Ids are
+  // browser-compatible: positive integers, never reused within a page, so
+  // `clearTimeout` on an id that already fired is harmless rather than a
+  // cancellation of whoever got that number next.
+  const timers = new Map();
+  let nextTimerId = 1;
+
+  function schedule(fn, delay, args, repeating) {
+    if (typeof fn === "string") {
+      // `setTimeout("code")` is an implicit `eval`, and the surface is not
+      // worth it. A browser accepts it; we say why instead.
+      throw new TypeError(
+        "setTimeout with a string is not supported: pass a function"
+      );
+    }
+    if (typeof fn !== "function") return 0;
+    const id = nextTimerId++;
+    const ms = Number(delay);
+    timers.set(id, {
+      fn: fn,
+      args: args,
+      repeating: repeating,
+      delay: isFinite(ms) && ms > 0 ? ms : 0,
+    });
+    raw.scheduleTimer(id, isFinite(ms) && ms > 0 ? ms : 0);
+    return id;
+  }
+
+  function cancel(id) {
+    const key = Number(id);
+    if (timers.delete(key)) raw.cancelTimer(key);
+  }
+
+  // Called by the engine when a deadline comes up. Returns nothing a page can
+  // see; its only job is to run the callback and re-arm an interval.
+  function fireTimer(id) {
+    const timer = timers.get(id);
+    if (timer === undefined) return;
+    // A one-shot is gone before its callback runs, so a `clearTimeout` inside
+    // itself is a no-op rather than a cancel of the next id.
+    if (!timer.repeating) timers.delete(id);
+    try {
+      timer.fn.apply(globalThis, timer.args);
+    } catch (error) {
+      raw.reportError(String(error && error.message ? error.message : error),
+                      (error && error.stack) || "");
+    }
+    // An interval re-arms **after** its callback returns, timed from this
+    // moment: a callback that runs longer than the interval falls behind
+    // rather than building a queue of catch-up ticks it can never drain.
+    if (timer.repeating && timers.has(id)) raw.scheduleTimer(id, timer.delay);
+  }
+
+  globalThis.setTimeout = function (fn, delay) {
+    return schedule(fn, delay, Array.prototype.slice.call(arguments, 2), false);
+  };
+  globalThis.setInterval = function (fn, delay) {
+    return schedule(fn, delay, Array.prototype.slice.call(arguments, 2), true);
+  };
+  globalThis.clearTimeout = cancel;
+  globalThis.clearInterval = cancel;
+
   // `window`, `globalThis` and the global scope are one object: pages branch
   // on `typeof window` and read `window.x` for a top-level `var x`.
   globalThis.window = globalThis;
@@ -1097,7 +1214,9 @@ const PRELUDE: &str = r#"
   // returns. Rust holds it as a `Persistent`, which is why dispatch needs no
   // global name a page could find or overwrite.
   delete globalThis.__dom;
-  return dispatch;
+  // Two entry points for the engine: one to dispatch an event, one to fire a
+  // timer. Rust holds them as `Persistent`s, so a page can reach neither.
+  return { dispatch: dispatch, fireTimer: fireTimer, pending: function () { return timers.size; } };
 })(__dom)
 "#;
 
@@ -1854,6 +1973,236 @@ mod tests {
             ),
             "\"one\""
         );
+    }
+
+    // ---- timers and microtasks (M10.9) ------------------------------------
+
+    /// Run `script`, then fire whatever timers it scheduled, in the order the
+    /// timer thread would: earliest deadline first, ties by insertion. Returns
+    /// the console.
+    ///
+    /// The clock is *not* involved — the scheduling order is computed here so
+    /// the test asserts the engine's behaviour rather than the machine's load.
+    fn with_timers(script: &str, rounds: usize) -> Vec<String> {
+        let mut dom = html::parse(&format!("<p id=out>x</p><script>{script}</script>"));
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 1, &console);
+
+        let mut queue: Vec<(Duration, u64, u64)> = Vec::new();
+        let mut seq = 0u64;
+        let mut now = Duration::ZERO;
+        let drain = |host: &Option<Host>, queue: &mut Vec<_>, seq: &mut u64, now: Duration| {
+            for (id, delay) in host.as_ref().unwrap().take_timer_requests() {
+                match delay {
+                    Some(delay) => {
+                        *seq += 1;
+                        queue.push((now + delay.max(crate::timers::MIN_DELAY), *seq, id));
+                    }
+                    None => queue.retain(|&(_, _, queued)| queued != id),
+                }
+            }
+        };
+        drain(&host, &mut queue, &mut seq, now);
+
+        for _ in 0..rounds {
+            queue.sort();
+            if queue.is_empty() {
+                break;
+            }
+            let (due, _, id) = queue.remove(0);
+            now = due;
+            let engine = host.as_mut().expect("the page ran script");
+            let _ = js::fire_timer(engine, &mut dom, 1, &console, crate::timers::TimerId(id));
+            drain(&host, &mut queue, &mut seq, now);
+        }
+        console.entries().iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn set_timeout_runs_its_callback_with_its_extra_arguments() {
+        assert_eq!(
+            with_timers(
+                "setTimeout(function (a, b) { console.log('fired', a, b); }, 5, 'one', 2);",
+                4
+            ),
+            ["log   fired one 2"]
+        );
+    }
+
+    #[test]
+    fn timers_fire_in_deadline_order_not_registration_order() {
+        // Deliverable 8's sequence: deadline first, ties by insertion, and a
+        // timer scheduled from inside a callback runs after the current one.
+        assert_eq!(
+            with_timers(
+                "setTimeout(function () { console.log('c'); }, 30);\
+                 setTimeout(function () { console.log('a'); }, 0);\
+                 setTimeout(function () { console.log('b'); }, 0);\
+                 setTimeout(function () {\
+                   console.log('nested-parent');\
+                   setTimeout(function () { console.log('nested-child'); }, 0);\
+                 }, 10);",
+                8
+            ),
+            [
+                "log   a",
+                "log   b",
+                "log   nested-parent",
+                "log   nested-child",
+                "log   c",
+            ]
+        );
+    }
+
+    #[test]
+    fn an_interval_repeats_until_it_is_cleared() {
+        assert_eq!(
+            with_timers(
+                "var n = 0;\
+                 var h = setInterval(function () {\
+                   n++;\
+                   console.log('tick ' + n);\
+                   if (n === 3) clearInterval(h);\
+                 }, 10);",
+                10
+            ),
+            ["log   tick 1", "log   tick 2", "log   tick 3"]
+        );
+    }
+
+    #[test]
+    fn a_cleared_timeout_never_runs() {
+        assert_eq!(
+            with_timers(
+                "var h = setTimeout(function () { console.log('should not run'); }, 5);\
+                 clearTimeout(h);\
+                 setTimeout(function () { console.log('the other one'); }, 5);",
+                4
+            ),
+            ["log   the other one"]
+        );
+    }
+
+    #[test]
+    fn timer_ids_are_positive_and_never_reused() {
+        assert_eq!(
+            with_timers(
+                "var a = setTimeout(function () {}, 5);\
+                 clearTimeout(a);\
+                 var b = setTimeout(function () {}, 5);\
+                 console.log(a > 0 && b > 0 && a !== b);",
+                2
+            ),
+            ["log   true"]
+        );
+    }
+
+    #[test]
+    fn set_timeout_with_a_string_throws_instead_of_evaluating_it() {
+        // An implicit `eval` is not worth the surface. A browser accepts it;
+        // we say why, in the console, where the page's author can see it.
+        let entries = with_timers("setTimeout('console.log(1)', 5);", 2);
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(
+            entries[0].contains("setTimeout with a string is not supported"),
+            "{:?}",
+            entries[0]
+        );
+    }
+
+    #[test]
+    fn a_timer_callback_that_throws_is_reported_and_the_next_one_still_runs() {
+        let entries = with_timers(
+            "setTimeout(function () { null.x; }, 5);\
+             setTimeout(function () { console.log('the next one'); }, 10);",
+            4,
+        );
+        assert_eq!(entries.len(), 2, "{entries:?}");
+        assert!(entries[0].starts_with("error"), "{:?}", entries[0]);
+        assert_eq!(entries[1], "log   the next one");
+    }
+
+    #[test]
+    fn a_timer_callback_mutates_through_the_same_bindings() {
+        assert_eq!(
+            with_timers(
+                "setTimeout(function () {\
+                   document.getElementById('out').textContent = 'changed';\
+                   console.log(document.getElementById('out').textContent);\
+                 }, 5);",
+                2
+            ),
+            ["log   changed"]
+        );
+    }
+
+    #[test]
+    fn promise_jobs_run_after_the_script_and_before_the_tick_ends() {
+        // QuickJS queues them and nothing runs them unless we do, so without
+        // the pump a `.then` is indistinguishable from a broken engine.
+        let mut dom = html::parse(
+            "<p>x</p><script>\
+             console.log('sync');\
+             Promise.resolve(1).then(function (v) { console.log('then ' + v); });\
+             Promise.resolve().then(function () { return 2; })\
+                              .then(function (v) { console.log('chained ' + v); });\
+             console.log('sync end');</script>",
+        );
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 1, &console);
+        assert_eq!(
+            console
+                .entries()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "log   sync",
+                "log   sync end",
+                "log   then 1",
+                "log   chained 2",
+                // The load events come after the microtasks the script queued,
+                // because the pump runs at the end of the tick.
+            ]
+        );
+    }
+
+    #[test]
+    fn a_promise_that_requeues_itself_ends_as_an_error_not_a_hang() {
+        // The bound exists because this loop never returns to the interrupt
+        // handler: the execution budget cannot see it, so only a count can
+        // stop it.
+        let started = std::time::Instant::now();
+        let mut dom = html::parse(
+            "<p>x</p><script>function again() { Promise.resolve().then(again); } again();</script>",
+        );
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 1, &console);
+        let elapsed = started.elapsed();
+
+        let entries: Vec<String> = console.entries().iter().map(ToString::to_string).collect();
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert!(
+            entries[0].contains("a promise kept queueing more work"),
+            "{:?}",
+            entries[0]
+        );
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn pending_timers_are_counted_for_the_headless_dump() {
+        let mut dom = html::parse(
+            "<p>x</p><script>setTimeout(function () {}, 50); setInterval(function () {}, 50);\
+             var gone = setTimeout(function () {}, 50); clearTimeout(gone);</script>",
+        );
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 1, &console);
+        assert_eq!(host.as_mut().map(Host::pending_timers), Some(2));
     }
 
     // ---- events (M10.8) ---------------------------------------------------

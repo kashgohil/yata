@@ -21,6 +21,7 @@ use crate::net::{self, FetchId};
 use crate::paint::{self, DisplayList};
 use crate::style::sources::{self, Source};
 use crate::style::{self, StyleContext, Styles};
+use crate::timers::{TimerId, TimerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use unicode_width::UnicodeWidthStr;
 
@@ -49,6 +50,11 @@ pub struct Effect {
     /// Absolute image URLs to fetch (page FetchId, url). Parallel workers,
     /// same discipline as stylesheets (M8).
     pub images: Vec<(FetchId, String)>,
+    /// Timer work this page's script asked for (M10.9), for the loop to hand
+    /// to the timer thread. Same discipline as `fetch` and `sheets`: `App`
+    /// decides, the loop dispatches — nothing in `App` or `src/js/` touches a
+    /// thread.
+    pub timers: Vec<TimerRequest>,
     /// This page wants its script pass (M10.2). The loop sends `Msg::RunScripts`
     /// back to itself, so the pass lands as its own turn *after* this one has
     /// been rendered. Same discipline as `fetch` and `sheets`: `App` decides,
@@ -486,6 +492,37 @@ impl App {
                     ..Effect::default()
                 }
             }
+            Msg::Timer { page, id } => {
+                // The same stale-generation guard every other message uses: a
+                // deadline that came up for a page the user has left is not
+                // that page's problem any more.
+                if Some(page) != self.current_fetch {
+                    return Effect::default();
+                }
+                let Some(mut dom) = self.dom.take() else {
+                    return Effect::default();
+                };
+                let Some(host) = self.js_host.as_mut() else {
+                    self.dom = Some(dom);
+                    return Effect::default();
+                };
+
+                let before = (dom.version(), dom.structure_version());
+                let logged_before = self.console.entries().len();
+                let outcome = js::fire_timer(host, &mut dom, page.0, &self.console, id);
+                let after = (dom.version(), dom.structure_version());
+                self.dom = Some(dom);
+                let _ = outcome;
+
+                let mut effect = self.apply_dom_changes(before, after);
+                effect.timers = self.take_timer_requests(page);
+                if self.console.entries().len() != logged_before {
+                    self.console_view_built = false;
+                    self.build_visible_inspector();
+                    effect.dirty = true;
+                }
+                effect
+            }
             Msg::RunScripts { id } => {
                 // The ordering rule (M10.6): a tick belongs to the generation
                 // that scheduled it. Mutations are applied to the current page
@@ -525,6 +562,7 @@ impl App {
 
                 // One cycle per tick, whatever the script did inside it.
                 let mut effect = self.apply_dom_changes(before, after);
+                effect.timers = self.take_timer_requests(id);
                 if logged {
                     // A script that only logged changed no box, but it did
                     // change what the console pane holds and what the
@@ -1647,6 +1685,28 @@ impl App {
                 .viewport
                 .scroll_to_offset(y.saturating_sub(page.saturating_sub(1)));
         }
+    }
+
+    /// Turn the timer work a tick asked for into requests the loop can hand to
+    /// the timer thread, tagged with the generation that asked.
+    fn take_timer_requests(&mut self, page: FetchId) -> Vec<TimerRequest> {
+        let Some(host) = self.js_host.as_ref() else {
+            return Vec::new();
+        };
+        host.take_timer_requests()
+            .into_iter()
+            .map(|(id, delay)| match delay {
+                Some(delay) => TimerRequest::Schedule {
+                    page,
+                    id: TimerId(id),
+                    delay,
+                },
+                None => TimerRequest::Cancel {
+                    page,
+                    id: TimerId(id),
+                },
+            })
+            .collect()
     }
 
     /// Dispatch a `click` at `node` and report whether a listener cancelled the
@@ -3309,6 +3369,141 @@ mod tests {
         }
     }
 
+    // ---- timers (M10.9) ---------------------------------------------------
+
+    #[test]
+    fn a_script_that_schedules_a_timer_asks_the_loop_for_it() {
+        // `App` decides, the loop dispatches: the request reaches the event
+        // loop as data on the `Effect`, exactly like a fetch.
+        let (mut app, id) =
+            scripted_app("<p id=out>x</p><script>setTimeout(function () {}, 25);</script>");
+        let effect = app.update(Msg::RunScripts { id });
+        assert_eq!(
+            effect.timers,
+            [TimerRequest::Schedule {
+                page: id,
+                id: TimerId(1),
+                delay: Duration::from_millis(25),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_timer_tick_runs_exactly_one_invalidation_cycle() {
+        // M10.6's counters at the third entry point into JS. However much the
+        // callback mutates, the pipeline runs once.
+        let (mut app, id) = scripted_app(
+            "<div id=out></div><script>setTimeout(function () {\
+               var out = document.getElementById('out');\
+               for (var i = 0; i < 100; i++) out.appendChild(document.createElement('p'));\
+             }, 5);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        let (styled, laid_out, painted) = stages(&app);
+
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert!(effect.dirty);
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out + 1, painted + 1),
+            "one timer tick must cost one cycle whatever it mutated"
+        );
+    }
+
+    #[test]
+    fn a_timer_that_mutates_nothing_costs_nothing() {
+        let (mut app, id) = scripted_app(
+            "<p id=out>x</p><script>setTimeout(function () {\
+               document.querySelectorAll('p').length;\
+             }, 5);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert_eq!(stages(&app), before, "a read-only timer ran a stage");
+    }
+
+    #[test]
+    fn a_timer_for_a_superseded_page_never_runs() {
+        // Deliverable 4: navigation drops the host and its callbacks, and a
+        // message already in flight is dropped by the `FetchId` guard.
+        let (mut app, first) = scripted_app(
+            "<p id=out>x</p><script>setTimeout(function () {\
+               document.getElementById('out').textContent = 'from the old page';\
+             }, 10000);</script>",
+        );
+        app.update(Msg::RunScripts { id: first });
+        let before = stages(&app);
+
+        let second = app.start_fetch("http://elsewhere/".into());
+        assert_ne!(first, second);
+        assert!(app.js_host.is_none(), "navigation kept the old host");
+
+        assert_eq!(
+            app.update(Msg::Timer {
+                page: first,
+                id: TimerId(1)
+            }),
+            Effect::default()
+        );
+        assert_eq!(stages(&app), before, "a stale timer ran a pipeline stage");
+    }
+
+    #[test]
+    fn an_interval_reschedules_itself_after_each_tick() {
+        let (mut app, id) = scripted_app(
+            "<p id=out>x</p><script>var n = 0;\
+             var h = setInterval(function () {\
+               n++;\
+               document.getElementById('out').textContent = 'tick ' + n;\
+               if (n === 2) clearInterval(h);\
+             }, 10);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+
+        // First tick: the page updates and the interval asks to be rearmed.
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert!(screen(&mut app, 40, 6).contains("tick 1"));
+        assert_eq!(
+            effect.timers,
+            [TimerRequest::Schedule {
+                page: id,
+                id: TimerId(1),
+                delay: Duration::from_millis(10),
+            }]
+        );
+
+        // Second tick clears it: no rearm, and a cancel for the loop.
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert!(screen(&mut app, 40, 6).contains("tick 2"));
+        assert_eq!(
+            effect.timers,
+            [TimerRequest::Cancel {
+                page: id,
+                id: TimerId(1)
+            }]
+        );
+
+        // And a third message — one already in flight — does nothing.
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert_eq!(effect, Effect::default());
+    }
+
     // ---- events (M10.8) ---------------------------------------------------
 
     /// A loaded page whose script has run, ready to be clicked.
@@ -3923,6 +4118,80 @@ mod tests {
     /// ```text
     /// cargo test --release --lib measure_the_invalidation -- --ignored --nocapture
     /// ```
+    /// A measurement, not an assertion — see the note on the M10.6 pair.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_an_interval -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_an_interval_animating_a_page() {
+        // M10.9 deliverable 6: a 4 ms interval that toggles a class is the
+        // shape of a page animating itself. Two questions — what one tick
+        // costs, and whether a keystroke still lands inside its budget while
+        // the interval is running.
+        const ROUNDS: u32 = 5;
+        for (label, fixture) in [
+            (
+                "danluu",
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/danluu.com.html"
+                )),
+            ),
+            (
+                "wikipedia",
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/en.wikipedia.org.html"
+                )),
+            ),
+        ] {
+            let page = format!(
+                "{}<style>.beat p {{ color: #c00 }}</style><script>\
+                 var on = false;\
+                 setInterval(function () {{\
+                   on = !on;\
+                   if (on) document.body.classList.add('beat');\
+                   else document.body.classList.remove('beat');\
+                 }}, 4);</script>",
+                fixture.replace("<script", "<script type=\"text/x-not-run\"")
+            );
+
+            let (mut app, id) = scripted_app(&page);
+            app.update(Msg::RunScripts { id });
+            let mut renderer =
+                crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
+            let (mut tick, mut keypress) = (Duration::ZERO, Duration::ZERO);
+
+            for _ in 0..ROUNDS {
+                // One interval tick, all the way to the screen.
+                let started = Instant::now();
+                app.update(Msg::Timer {
+                    page: id,
+                    id: TimerId(1),
+                });
+                app.draw(renderer.frame());
+                let _ = renderer.present(&mut std::io::sink());
+                tick += started.elapsed();
+
+                // A keystroke arriving beside it: scroll, which must touch no
+                // pipeline stage at all.
+                let started = Instant::now();
+                app.update(key(KeyCode::Char('j'), KeyModifiers::NONE));
+                app.draw(renderer.frame());
+                let _ = renderer.present(&mut std::io::sink());
+                keypress += started.elapsed();
+            }
+
+            eprintln!(
+                "M10.9 {label}: interval tick {:?} · keypress→screen while it runs {:?}",
+                tick / ROUNDS,
+                keypress / ROUNDS,
+            );
+        }
+    }
+
     #[test]
     #[ignore]
     fn measure_the_invalidation_paths_on_an_ordinary_page() {
