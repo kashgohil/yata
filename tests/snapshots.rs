@@ -23,7 +23,13 @@ fn fixture(name: &str) -> String {
 
 /// Full paint path: layout tree → display list → frame.
 fn render_frame(html: &str, width: u16, height: u16) -> Frame {
-    let dom = html::parse(html);
+    let mut dom = html::parse(html);
+    // Scripts run before the snapshot, under the headless rule (one pass, no
+    // timers, no subresource fetches) that `headless::run_scripts` documents.
+    // A grid that showed a page as it was *before* its script would pin a
+    // browser nobody uses (M10.2).
+    let _ = yata::headless::run_scripts(&mut dom, None);
+    let dom = dom;
     let sheets = style::sources::inline_sheets(&dom);
     let refs: Vec<_> = sheets.iter().collect();
     let styles = style::style_tree(&dom, &refs);
@@ -344,4 +350,34 @@ fn flex_page_snapshot() {
     assert_eq!(rows.len(), 8, "unexpected page height:\n{grid}");
 
     assert_snapshot("flex", &grid);
+}
+
+/// A page shaped like something a site would ship: a script that builds a list
+/// from data, a `DOMContentLoaded` handler, a click handler on a script-built
+/// button, an element revealed by removing a class, and one deliberate error.
+///
+/// The single features are pinned by M10.1–M10.13; what this pins is them
+/// *interacting* — the list only exists because `DOMContentLoaded` fired after
+/// the pass, the notice is only visible because a class was removed and the
+/// cascade re-ran, and the error did not stop any of it.
+#[test]
+fn js_page_snapshot() {
+    let grid = render_grid(&fixture("js.html"), 80, 24);
+
+    // Built by the `DOMContentLoaded` handler, from data.
+    assert!(grid.contains("The Mythical Man-Month (1975)"), "{grid}");
+    assert!(
+        grid.contains("The Practice of Programming (1999)"),
+        "{grid}"
+    );
+    // Written by the same handler, replacing what the markup said.
+    assert!(grid.contains("3 books"), "{grid}");
+    assert!(!grid.contains("loading…"), "{grid}");
+    // Hidden in the markup, revealed by removing a class — the cascade saw it.
+    assert!(grid.contains("Revealed by removing a class."), "{grid}");
+    // The script-built button is on the page even though the script that made
+    // it also threw afterwards.
+    assert!(grid.contains("add another"), "{grid}");
+
+    assert_snapshot("js", &grid);
 }

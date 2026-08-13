@@ -1,0 +1,49 @@
+<!doctype html>
+<title>What a script-driven page looks like</title>
+<style>
+  .hidden { display: none }
+  .item { font-weight: bold }
+  #status { font-style: italic }
+</style>
+<h1>Reading list</h1>
+<p id="status">loading…</p>
+<div id="list"></div>
+<div id="notice" class="hidden">Revealed by removing a class.</div>
+<div id="controls"></div>
+<script>
+  // The shape a real page has: data in, list out.
+  var books = [
+    { title: 'The Mythical Man-Month', year: 1975 },
+    { title: 'Structure and Interpretation', year: 1985 },
+    { title: 'The Practice of Programming', year: 1999 }
+  ];
+
+  document.addEventListener('DOMContentLoaded', function () {
+    var list = document.getElementById('list');
+    books.forEach(function (book) {
+      var row = document.createElement('p');
+      row.className = 'item';
+      row.textContent = book.title + ' (' + book.year + ')';
+      list.appendChild(row);
+    });
+    document.getElementById('status').textContent = books.length + ' books';
+    document.getElementById('notice').classList.remove('hidden');
+
+    var button = document.createElement('a');
+    button.setAttribute('href', '#');
+    button.setAttribute('id', 'more');
+    button.textContent = 'add another';
+    button.addEventListener('click', function (e) {
+      e.preventDefault();
+      var row = document.createElement('p');
+      row.className = 'item';
+      row.textContent = 'Added by a click';
+      list.appendChild(row);
+    });
+    document.getElementById('controls').appendChild(button);
+  });
+
+  // One deliberate error, so the console pane has something to show and the
+  // page still renders around it.
+  document.getElementById('does-not-exist').textContent = 'never runs';
+</script>

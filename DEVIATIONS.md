@@ -347,6 +347,258 @@ past 128 that a reader would notice. The fix then is not a bigger number: it is
 making the style and layout walks iterative, which removes the constraint
 instead of moving it.
 
+### The execution model
+
+**We do:** finish parsing a page, style it, lay it out and **paint it**, and
+only then run its scripts — as a separate turn of the event loop. A script
+never blocks the parser, and can never delay first paint.
+**A browser does:** stop its parser at every classic `<script>`, run it against
+a half-built document, and let it `document.write` into the token stream.
+**Why:** our parse finishes on a worker and arrives whole (M2), so there is no
+open token stream to stop or write into — and UX §3.2 says the page appears as
+soon as it is parsed, which a blocking script would break. `document.write` and
+`writeln` exist only to say this in the console.
+**Trigger:** a page whose first paint is visibly *wrong* rather than merely
+early — a spinner or placeholder that a reader sees and reacts to before the
+script replaces it.
+
+### `defer` and `async` both mean "document order"
+
+**We do:** run every script in document order, ignoring both attributes.
+**A browser does:** treat `defer` as "after parsing, in order" and `async` as
+"whenever it arrives, out of order".
+**Why:** nothing blocks the parser here, so `defer` is already what everything
+does. `async` is the only one that would change anything, and what it would
+change is *execution order* — the one property M10.10's queue exists to
+guarantee, for a benefit (parallel execution) a single-threaded engine cannot
+take.
+**Trigger:** a page that depends on an `async` script running before an earlier
+one, which is a race a browser also loses.
+
+### A script inserted by a script never runs
+
+**We do:** build the execution queue once, from the parsed document.
+`document.body.appendChild(scriptElement)` adds an element and nothing else —
+no fetch, no execution.
+**A browser does:** fetch and run it.
+**Why:** the queue is what makes execution order independent of arrival order
+(M10.10), and a script that can extend the queue while it drains reopens
+exactly the ordering question the queue answers.
+**Trigger:** a ladder page whose content arrives through a script it injects —
+which is how a great deal of third-party JavaScript bootstraps itself.
+
+### Scripts are not blocked on pending stylesheets
+
+**We do:** run a script as soon as its slot is ready, whether or not the page's
+`<link>` stylesheets have arrived.
+**A browser does:** block a script that follows a stylesheet until that sheet
+has loaded, because the script may read computed styles.
+**Why:** nothing can observe the difference — `getComputedStyle` does not
+exist here.
+**Trigger:** implementing `getComputedStyle`, which would make the ordering
+observable the day it lands.
+
+### `type=module` is not run at all
+
+**We do:** skip a module script and say so in the console.
+**A browser does:** fetch it, resolve its imports, and run it deferred with its
+own scope.
+**Why:** modules need a loader and a resolver, which is a milestone rather than
+a feature.
+**Trigger:** a ladder page whose only script is a module.
+
+## The DOM, as JavaScript sees it
+
+### The arena never shrinks, and a removed node's handle stays valid forever
+
+**We do:** keep every node for the life of the page. `remove()` detaches
+without freeing, ids are never reused, and a handle a script kept on a removed
+node still reads correctly. Measured: 100,000 append/remove pairs leave 100,002
+nodes and ~11.1 MB; a listener-bearing node costs ~940 bytes.
+**A browser does:** collect a detached node once the page drops its last
+reference to it.
+**Why:** stable ids are what make a handle mean the same node forever, which is
+what stops a stale reference from silently reading a *different* element.
+Freeing would need the indirection that guarantee exists to avoid.
+**Trigger:** a page at steady state — not growing its own DOM — whose memory
+climbs past the PLAN.md §4 budget of 100 MB. The 100-navigation curve in
+`perf.md` shows it is all reclaimed on navigation, so this is a within-page
+concern only.
+
+### `innerHTML` parses without a context element
+
+**We do:** parse the fragment as a document and adopt `<body>`'s children, so
+`div.innerHTML = '<td>cell</td>'` keeps the `<td>`.
+**A browser does:** parse with the target element as the insertion context,
+which drops the cell and keeps `cell`.
+**Why:** the context-sensitive algorithm is a second parser mode, and the
+difference only shows for table parts written outside a table.
+**Trigger:** a page that builds table rows through `innerHTML` on a non-table
+element and renders them wrong.
+
+### Collections are snapshots, not live
+
+**We do:** return a plain array from `children` and `querySelectorAll`. It
+never updates, and `for (const c of el.children) c.remove()` visits every
+element exactly once.
+**A browser does:** return live `HTMLCollection`/`NodeList` objects that change
+underneath an iteration — which is why that same loop skips every other
+element in a browser.
+**Why:** a snapshot is what a page usually means, and the live version's most
+famous property is being a bug generator.
+**Trigger:** a page that depends on a collection updating — holding one across
+a mutation and expecting the new nodes.
+
+### There is no `Node` interface, no CSSOM, and no `getComputedStyle`
+
+**We do:** hand JavaScript element handles only. Text and comment nodes are
+never exposed, so `childNodes`, `nodeType`, `firstChild` and `parentNode` do
+not exist; `el.style.color` does not exist (though `setAttribute('style', …)`
+works and reaches computed values); `getComputedStyle` does not exist.
+**A browser does:** all of it.
+**Why:** each is a surface with its own object model, and M10's binding list is
+what the ladder needs rather than what the DOM has.
+**Trigger:** a page whose layout depends on reading back a computed value —
+measuring an element and positioning against it.
+
+### Attribute selectors do not parse, in CSS or in `querySelector`
+
+**We do:** reject `[attr]` — the CSS parser has never supported it (M4), and
+`querySelector` reuses that parser, so `querySelector('script[data-x]')` throws
+`SyntaxError`.
+**A browser does:** support the whole selector grammar.
+**Why:** one selector syntax and one matcher is the rule; the gap is M4's, and
+M10 inherited it rather than growing a second parser.
+**Trigger:** already met — danluu.com's analytics script calls
+`querySelector('script[data-cf-beacon]')` and throws. The fix belongs in the
+CSS parser, where it fixes the cascade at the same time.
+
+### `getElementsByTagName` and `getElementsByClassName` are absent
+
+**We do:** not implement them. M10.4 left them out on the evidence available
+then — no ladder fixture appeared to need them.
+**A browser does:** implement both, returning live collections.
+**Why:** they were judged unnecessary, and that judgement is now known to be
+wrong: motherfuckingwebsite.com's Google Analytics snippet calls
+`getElementsByTagName` and throws at its fourth line.
+**Trigger:** already met. This is the clearest single fix M11 could make to how
+much of the real web runs.
+
+### Named element globals are absent
+
+**We do:** not expose `<div id=box>` as `window.box`.
+**A browser does:** expose it, for historical reasons everyone regrets.
+**Why:** it puts page-controlled names into the global scope.
+**Trigger:** a page that relies on it, which some old ones do.
+
+## Events
+
+### Key events never reach the page — yata's bindings always win
+
+*(See the entry above under JavaScript (M10.8), which states this in full.)*
+
+### Only `click`, `DOMContentLoaded` and `load` exist
+
+**We do:** dispatch those three. No `mousemove`/`mouseover` (so `:hover` stays
+a style-only concept a page cannot observe), no `submit`/`change` (forms are
+M11), no `focus`/`blur`, and no synthetic dispatch — there is no `el.click()`
+or `dispatchEvent`, which is what keeps the dispatcher private to the engine.
+**A browser does:** dispatch the whole event set, and lets a page raise its
+own.
+**Why:** these three are what the ladder's interaction needs; every other
+event is surface without a caller.
+**Trigger:** a page whose only interaction is a form or a hover menu.
+
+## Timers
+
+### Every timer is clamped to 4 ms, not just nested ones
+
+**We do:** floor every delay at `timers::MIN_DELAY` = 4 ms.
+**A browser does:** clamp only *nested* timers to 4 ms; a first-level
+`setTimeout(f, 1)` really is 1 ms.
+**Why:** the floor is what stops `setTimeout(f, 0)` re-arming itself into a
+spin, and 4 ms is under half the 10 ms keypress→screen budget, so a timer
+firing at the floor still leaves the loop most of a budget for a keystroke.
+**Trigger:** a page whose animation is visibly wrong at 250 ticks a second.
+
+### No `requestAnimationFrame`
+
+**We do:** not implement it. A page animating through `rAF` gets nothing.
+**A browser does:** call back before each repaint, at the display's rate.
+**Why:** a terminal has no frame clock to synchronise to — no vsync, no
+compositor — and the renderer draws when something changed. The honest callback
+rate would be "whenever we felt like it", which `setTimeout` already offers
+without pretending.
+**Trigger:** a ladder page whose content only appears from inside a `rAF`
+callback. The fix then is to alias it to a 16 ms timer and say so, not to
+invent a frame clock.
+
+## Web APIs
+
+### `localStorage` is per-session and never touches disk
+
+**We do:** keep storage in memory, scoped per origin, with a 1 MB quota per
+origin per area. It dies with the process.
+**A browser does:** persist it across restarts, with roughly 5 MB.
+**Why:** the UI thread does no disk I/O (CLAUDE.md) and `setItem` is
+synchronous inside a tick, so durability means either blocking the loop or a
+persistence worker with its own consistency story. And persistent per-origin
+storage is a tracking surface a browser for *reading* does not need.
+**Trigger:** a page whose usefulness depends on remembering across runs — a
+reader-mode preference, a login.
+
+### `fetch` is same-origin only, and never sends credentials
+
+**We do:** reject a cross-origin `fetch` with a console line the reader can
+see, and send no credentials with any request.
+**A browser does:** send the request and let CORS decide who may *read* the
+response; it sends cookies when the page asks.
+**Why:** we have no CORS implementation, and `fetch` reads bodies — so allowing
+arbitrary cross-origin reads would let any page pull whatever the reader's
+network position can reach (an intranet, a localhost service) and post it back
+out. No credentials because there are none: cookies are M11.
+**Trigger:** a ladder page whose content comes from an API on another host. The
+fix then is real CORS — preflights, `Access-Control-*`, opaque responses — not
+a flag, because the restriction exists precisely because we cannot tell an
+allowed read from a forbidden one.
+
+### No cookies, no `history.pushState`, no `XMLHttpRequest`
+
+**We do:** leave all three undefined rather than stubbed.
+**A browser does:** implement them.
+**Why:** a page can feature-detect an absence; it cannot detect a `pushState`
+that silently does nothing. Cookies are M11's; `pushState` needs URL rewriting
+without a fetch, which is a bigger idea than a binding.
+**Trigger:** for `XMLHttpRequest`, a page that uses it instead of `fetch` —
+still common in older code.
+
+## Budgets
+
+### A script gets 100 ms, and then it is stopped
+
+**We do:** interrupt any script, listener, timer callback or promise
+continuation that runs longer than `js::SCRIPT_BUDGET` = 100 ms. The overrun is
+uncatchable, becomes an error in the console, and the host stays usable.
+**A browser does:** let it run, and eventually offer the reader a dialog.
+**Why:** JS runs on the UI thread, so a runaway script is a frozen browser.
+Measured worst case for every runaway shape M10.13 tried: **one budget, ~102
+ms** — a script, a listener and a timer callback are all interrupted on the
+same terms, and nothing chains inside a tick. `q` still quits within one
+budget, which is the rule PLAN.md §1.5 asked for.
+**Trigger:** an honest page whose script legitimately needs more than 100 ms of
+straight-line CPU and is killed for it.
+
+### A page may hold a core indefinitely through legal ticks
+
+**We do:** accept it. A 4 ms interval whose callback burns its whole budget
+keeps one core busy forever, and no per-page duty-cycle budget exists.
+**A browser does:** the same, mostly — with more cores to spare.
+**Why:** every individual tick is bounded and the loop serves input *between*
+ticks, so the reader can still scroll, still quit and still read. A duty-cycle
+budget would be the fix; nothing on the ladder needs it.
+**Trigger:** a real page that makes the terminal unpleasant to use while it is
+open.
+
 ---
 
 ## Not implemented at all

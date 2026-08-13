@@ -28,3 +28,7 @@ harness = false
 [[bench]]
 name = "layout"
 harness = false
+
+[[bench]]
+name = "js"
+harness = false

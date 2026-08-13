@@ -555,3 +555,93 @@ pending timer, a storage write) with a light one, release build:
 per-page is leaking: the arena, the host, its listeners, its timers and the
 console all go with the page. What remains is the allocator's high-water mark
 plus per-origin storage, which is quota-bounded.
+
+## M10 — JavaScript (2026-08-13)
+
+Release build, fixtures served from `127.0.0.1`, measurements **interleaved** —
+this machine drifts 5–10% between runs, so each round measures every page
+rather than one page repeatedly.
+
+### The full pipeline, now with the script pass in it
+
+Mean of 3 interleaved rounds, ignoring the first `fetch` (cold connection):
+
+| stage | danluu.com | en.wikipedia.org |
+| --- | --- | --- |
+| fetch | 2.0 ms | 2.6 ms |
+| parse | 0.3 ms | 13.0 ms |
+| style | 0.4 ms | 42.9 ms |
+| layout | 0.6 ms | 6.1 ms |
+| **script** | **0.0 ms** | **1.1 ms** |
+| frame | 0.0 ms | 0.0 ms |
+| **total** | **3.3 ms** | **65.7 ms** |
+
+**Both budgets hold** (PLAN.md §4: danluu < 50 ms, a Wikipedia article
+< 250 ms) with room to spare, and the stage M10 added is the *cheapest* one on
+both pages. Wikipedia's script row is 1.1 ms for three inline scripts, two of
+which run and one of which throws on `document.cookie`; the page's cost is
+still style, at 65% of the total.
+
+### `benches/js.rs` — what M10 added, isolated
+
+The pipeline benches gained the script pass inside their totals; this one
+measures the four costs that did not exist before (criterion, release):
+
+| what | time |
+| --- | --- |
+| engine startup | **794 µs** |
+| a document-order pass building 200 nodes | 1.25 ms |
+| `querySelectorAll('a')` on Wikipedia (incl. parse) | 21.4 ms |
+| click → mutate → restyle → relayout | **99 µs** |
+
+Two of these are worth stating plainly. **Starting an engine costs 0.8 ms**,
+which is why "a page with no script never starts one" is a rule rather than an
+optimisation — it is most of what a script-free page would otherwise pay for
+JavaScript existing. And a **whole click round trip on a small page is 99 µs**,
+1% of the keypress budget: interaction over script-built content is cheap, and
+what makes Wikipedia expensive is the restyle, not the JavaScript.
+
+### Keypress→screen, and what M10 did to it
+
+From the M10.6 and M10.9 sections above, unchanged by later tasks:
+
+- an ordinary page's worst turn is **0.62 ms**, 6% of the 10 ms budget;
+- a keystroke arriving *between* ticks is answered in **~20 µs**, because
+  scrolling touches no pipeline stage;
+- a keystroke arriving *during* a tick waits for it — one budget at worst,
+  ~102 ms, which M10.13 confirmed for every runaway shape;
+- Wikipedia's own worst turn is 52 ms and **misses the budget**, of which
+  43 ms is restyle. M10 did not cause that and cannot fix it; scoped restyle
+  (M11) can.
+
+### Scrolling still never restyles or relayouts
+
+Unchanged, and now pinned on script-built content as well as parsed content:
+`scrolling_a_script_built_page_runs_no_stage` scrolls 50 steps through a
+200-element list built entirely by JavaScript and asserts all three stage
+counters are flat.
+
+### Memory
+
+Wikipedia's peak RSS is unchanged by M10 at **45 MB**, 45% of the 100 MB
+budget — the engine is not started at all for a page whose scripts do nothing,
+and the article's three scripts allocate almost nothing.
+
+Over a session, alternating a script-heavy page with a light one (M10.13's
+measurement): 9.9 → 10.8 MB across 100 navigations, **flat after about 40**.
+Nothing per-page leaks.
+
+### Idle CPU: not confirmed
+
+The gate asks for 0% with a script-heavy page loaded, and again with a
+ten-second timer pending. **Neither has been measured**, and the number is not
+claimed. Running the TUI in this environment is not possible — under
+`script(1)` the binary writes 59 bytes of terminal setup and exits, because
+stdin is not a terminal and the input thread's death quits the app.
+
+What *is* established, in-process: the timer thread parks on a condvar and
+produces no message while a ten-second deadline is outstanding
+(`a_pending_timer_leaves_the_thread_parked`), `n` scheduled timers produce
+exactly `n` messages, and the event loop's only wait remains a blocking
+`recv`. The measurement someone with a terminal should make is two readings of
+`top` — one with a script-heavy page idle, one with a long timer pending.

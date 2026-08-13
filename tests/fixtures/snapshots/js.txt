@@ -1,0 +1,14 @@
+Reading list
+
+
+3 books
+
+
+The Mythical Man-Month (1975)
+
+Structure and Interpretation (1985)
+
+The Practice of Programming (1999)
+
+Revealed by removing a class.
+add another
