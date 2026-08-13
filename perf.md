@@ -764,3 +764,38 @@ one JS query, and `benches/parse.rs` is flat. Rebuilding both with
 not work done. Recorded here as a property of this bench on this machine, so
 the next task that sees a 10% move on it looks at the CGU count before looking
 at its own diff.
+
+## M11.4 — fragment navigation: the jump that is only a scroll (2026-08-14)
+
+Machine A, release build, mean of 5 **interleaved** rounds after one discarded
+warm-up round: the jump and the plain scroll it is measured against run
+alternately in the same process, on the same page.
+
+    cargo test --release --lib measure_a_fragment_jump -- --ignored --nocapture --test-threads=1
+
+**en.wikipedia.org, 25,596 nodes, ~3.6k boxes, 80×24:**
+
+| turn or stage | cost |
+| --- | --- |
+| **turn: citation click, to the screen** | **390 µs (340–477)** |
+| turn: one scroll step, the same repaint | 32 µs (29–37) |
+| stage: fragment → node (DOM walk) | 43 µs (39–46) |
+| stage: node → row (layout walk) | 213 µs (204–221) |
+
+**Keypress→screen budget (PLAN.md §4: 10 ms): met, by 25×.** A fragment jump
+is a scroll — cached display list, repainted at a new offset — and the counter
+assertions in `a_fragment_click_puts_the_target_on_the_top_row_and_runs_no_stage`
+pin that: `styles_run`, `layouts` and `paints` are all flat across the jump. The
+43 ms restyle and 5.7 ms layout M11.3 measured on this page are not on this
+path at all.
+
+**The DOM walk is not the cost, so there is no id map.** Finding one `id`
+among 25,596 nodes is 43 µs — 0.4% of the budget. The *layout* walk that turns
+that node into a row is 5× more (213 µs), because it asks `is_under` of every
+box it passes and each answer climbs the DOM to the root. Both together are 2.5%
+of the budget, which is why neither is indexed: an id map would fix a number
+nobody can see.
+
+The remaining ~130 µs of the turn is the frame diff and present. A jump repaints
+every row (the whole viewport moved); a `j` scroll repaints one row's worth of
+difference, which is the whole of the 32 µs baseline.

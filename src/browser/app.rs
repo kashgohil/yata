@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::browser::error_page;
+use crate::browser::fragment;
 use crate::browser::help;
 use crate::browser::hints;
 use crate::browser::history::History;
@@ -99,6 +100,25 @@ struct ScrollAnchor {
     text_index: usize,
     /// Document y of that fragment before the resize (fallback for rewrap).
     box_y: i32,
+}
+
+/// Where a page that has not been laid out yet should end up once it has.
+///
+/// Two shapes of one idea, in one slot (M11.4). A history restore knows the
+/// offset the reader left; a fragment navigation knows only a name, because
+/// the node it points at does not exist until the parse lands — so the
+/// fragment is stored as *text* and resolved against the tree the first layout
+/// of that generation produces.
+///
+/// One slot rather than two, because only one of them can win and the winner
+/// has to be decided somewhere: `start_fetch` writes the fragment out of the
+/// URL, and `navigate_restore` and `reload` overwrite it immediately after,
+/// which is what makes `H` return the reader to their own position rather than
+/// to whatever the URL's fragment happens to name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingScroll {
+    Offset(usize),
+    Fragment(String),
 }
 
 /// Where the current fetch stands. `Loaded` retains the raw body for the
@@ -267,10 +287,11 @@ pub struct App {
     /// Brief statusline message (e.g. "yanked"), cleared by the next non-yank
     /// action (scroll, key binding, navigation, …).
     status_msg: Option<String>,
-    /// Scroll offset to restore after layout of a *specific* fetch generation
-    /// (history back/forward, reload). Tied to `FetchId` so a resize while the
-    /// old page is still on screen cannot consume the restore.
-    pending_scroll: Option<(FetchId, usize)>,
+    /// Where to scroll after the first layout of a *specific* fetch generation
+    /// (history back/forward, reload, a fragment on a cross-document link).
+    /// Tied to `FetchId` so a resize while the old page is still on screen
+    /// cannot consume the restore.
+    pending_scroll: Option<(FetchId, PendingScroll)>,
     /// Active in-page search (`/` … Enter), if any.
     search: Option<SearchSession>,
     /// Scrollable help overlay content (`?`).
@@ -400,6 +421,14 @@ impl App {
         self.console_view_built = false;
         self.script_queue = ScriptQueue::default();
         self.script_queue_page = None;
+        // A fragment on a cross-document navigation (`href="/other#x"`, and a
+        // URL typed or passed on the command line): the node it names does not
+        // exist yet, so the *text* is held against this generation and turned
+        // into an offset by the first layout the generation produces. This is
+        // also the one write of the slot that is unconditional — every caller
+        // that wants an offset instead writes it after this returns.
+        self.pending_scroll =
+            fragment_of(&url).map(|fragment| (id, PendingScroll::Fragment(fragment.to_string())));
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -496,6 +525,19 @@ impl App {
                     self.apply_error_page(url, reason);
                     return redraw();
                 }
+                // A redirect drops the fragment — `Location` is joined against
+                // the previous URL and a join takes the target's fragment,
+                // which a bare path does not have. HTML keeps the original in
+                // that case, and so do we: the URL bar, `location.hash` and
+                // the row we are about to scroll to have to agree.
+                let url = match &self.pending_scroll {
+                    Some((pending, PendingScroll::Fragment(fragment)))
+                        if *pending == id && !fragment.is_empty() && !url.contains('#') =>
+                    {
+                        format!("{url}#{fragment}")
+                    }
+                    _ => url,
+                };
                 // Document path: show raw body until Parsed lands.
                 let text = String::from_utf8_lossy(&body).into_owned();
                 self.viewport.set_content(&text, self.size.0, self.page());
@@ -1247,12 +1289,25 @@ impl App {
         // History/reload restore: only apply when this layout belongs to the
         // generation that requested it. A resize while the *old* page is still
         // on screen (fetch Loading, previous DOM live) must not consume it.
-        if let Some((id, scroll)) = self.pending_scroll
-            && Some(id) == self.current_fetch
+        //
+        // A fragment is resolved here for the same reason and with the same
+        // guard: it is the first moment the node it names has a box. It is
+        // consumed here too — resolved once, never retried. A script that
+        // appends the target element later does not pull the viewport, because
+        // a page that yanks the reader somewhere seconds after they arrived is
+        // worse than one that left them at the top; the reader sees the page
+        // where it opened, the URL bar showing the fragment, and clicking the
+        // link again jumps now that the element exists.
+        if matches!(&self.pending_scroll, Some((id, _)) if Some(*id) == self.current_fetch)
             && matches!(self.fetch, Fetch::Loaded { .. })
+            && let Some((_, pending)) = self.pending_scroll.take()
         {
-            self.pending_scroll = None;
-            let _ = self.viewport.scroll_to_offset(scroll);
+            match pending {
+                PendingScroll::Offset(scroll) => {
+                    let _ = self.viewport.scroll_to_offset(scroll);
+                }
+                PendingScroll::Fragment(fragment) => self.scroll_to_fragment(&fragment),
+            }
         }
         // F3 (and any open inspector) must reflect the new geometry — not a
         // stale cache from before this relayout (resize / stylesheet / parse).
@@ -1685,14 +1740,19 @@ impl App {
     /// Start a navigation. When `push_history` is true and there is a current
     /// page, push it (with scroll) onto the back stack and clear forward.
     fn navigate(&mut self, url: String, push_history: bool) -> Effect {
-        if push_history && let Some(cur) = self.current_url() {
-            // Same document (including pure fragment): no fetch, no history.
+        if let Some(cur) = self.current_url() {
+            // Same document (a pure fragment change): no fetch, no new
+            // generation — a scroll and a URL. Checked before `push_history`
+            // rather than inside it, because `location.replace('#x')` is a
+            // fragment jump that happens not to push, and the two callers must
+            // reach the same place (M11.4).
             if same_document(&cur, &url) {
-                return Effect::default();
+                return self.jump_to_fragment(url, push_history);
             }
-            self.history.push(cur, self.viewport.offset());
+            if push_history {
+                self.history.push(cur, self.viewport.offset());
+            }
         }
-        self.pending_scroll = None;
         self.hover = None;
         self.focus = None;
         self.hint = None;
@@ -1706,6 +1766,89 @@ impl App {
         }
     }
 
+    /// A same-document move: the fragment changes, the document does not.
+    ///
+    /// This is a **scroll** (CLAUDE.md), and the whole point of the path: the
+    /// cached display list is repainted at a new offset, nothing upstream of
+    /// paint runs, and a citation click on Wikipedia therefore costs
+    /// microseconds instead of the 43 ms a restyle of that page costs.
+    fn jump_to_fragment(&mut self, url: String, push_history: bool) -> Effect {
+        if push_history && let Some(cur) = self.current_url() {
+            // The URL changed, so history records it, holding the offset the
+            // reader is leaving — that is what makes `H` return them to the
+            // paragraph they were reading rather than to the top of the page.
+            // The `location.hash` binding has promised this since M10.11.
+            self.history.push(cur, self.viewport.offset());
+        }
+        self.status_msg = None;
+        // Hover, focus, hints and the search session all survive: the document
+        // they point into is the same document. Only `navigate` proper, which
+        // replaces the document, clears them.
+        let fragment = fragment_of(&url).unwrap_or_default().to_string();
+        self.set_current_url(url);
+        self.scroll_to_fragment(&fragment);
+        redraw()
+    }
+
+    /// Put the node a fragment names at the **top** of the viewport, clamped
+    /// by the end of the document.
+    ///
+    /// Top, not centred, and unconditional rather than search's
+    /// scroll-into-view: a fragment jump is a `G`-style move, and a reader who
+    /// clicks a citation has to be able to tell that something happened.
+    ///
+    /// Two ways this does nothing, each a decision rather than a fallthrough:
+    ///
+    /// - no document laid out yet (an error page, or a body that has not
+    ///   parsed) — there is nothing to scroll;
+    /// - the fragment names nothing (`fragment::resolve` returns `None`): no
+    ///   scroll, no error page, no console line. A link to an id a page
+    ///   dropped years ago is not an error the reader can act on, and every
+    ///   stale citation on the web would otherwise print a complaint.
+    ///
+    /// A target that was found but generated no box — `display: none`, a node
+    /// in `<head>`, or an inline whose text merged into its neighbour's box —
+    /// lands on the nearest laid-out ancestor rather than nowhere. The
+    /// reasoning is in `layout::nearest_y`, and it is the third case that
+    /// decides it: those anchors are visible on screen, and the layout tree
+    /// cannot tell them from the hidden ones.
+    fn scroll_to_fragment(&mut self, fragment: &str) {
+        let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
+            return;
+        };
+        let Some(target) = fragment::resolve(dom, fragment) else {
+            return;
+        };
+        let y = match target {
+            fragment::Target::Top => 0,
+            fragment::Target::Node(node) => match layout::nearest_y(tree, dom, node) {
+                Some(y) => y.max(0) as usize,
+                None => return,
+            },
+        };
+        let _ = self.viewport.scroll_to_offset(y);
+    }
+
+    /// Replace the URL this page is known by, without touching the fetch
+    /// generation: no new `FetchId`, no `Fetch` transition, so the sheets,
+    /// images and scripts already in flight are not cancelled — the page did
+    /// not reload. The `Fetch` variant is the only place a page URL lives
+    /// (`current_url` reads it and nothing else), so it is the only place a
+    /// fragment can be written.
+    ///
+    /// The URL it holds is also the base relative hrefs resolve against, and
+    /// that stays correct: `net::resolve_url` joins through `reqwest::Url`,
+    /// which drops a base's fragment exactly as the URL spec says — pinned by
+    /// `a_fragment_in_the_base_never_reaches_the_resolved_url`.
+    fn set_current_url(&mut self, url: String) {
+        match &mut self.fetch {
+            Fetch::Idle => {}
+            Fetch::Loading { url: current, .. }
+            | Fetch::Loaded { url: current, .. }
+            | Fetch::Failed { url: current, .. } => *current = url,
+        }
+    }
+
     /// Navigate without pushing history, restoring `scroll` after layout of
     /// *this* fetch generation.
     fn navigate_restore(&mut self, url: String, scroll: usize) -> Effect {
@@ -1715,7 +1858,9 @@ impl App {
         self.search = None;
         self.status_msg = None;
         let id = self.start_fetch(url.clone());
-        self.pending_scroll = Some((id, scroll));
+        // After `start_fetch`, deliberately: a restored entry's URL may carry a
+        // fragment, and the offset the reader left is the more specific answer.
+        self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
         Effect {
             dirty: true,
             fetch: Some((id, url)),
@@ -1729,14 +1874,36 @@ impl App {
         };
         let scroll = self.viewport.offset();
         let entry = if back {
-            self.history.go_back(cur, scroll)
+            self.history.go_back(cur.clone(), scroll)
         } else {
-            self.history.go_forward(cur, scroll)
+            self.history.go_forward(cur.clone(), scroll)
         };
-        match entry {
-            Some(e) => self.navigate_restore(e.url, e.scroll),
-            None => Effect::default(),
+        let Some(entry) = entry else {
+            return Effect::default();
+        };
+        // A same-document entry must not fetch. `H` after a citation click
+        // would otherwise refetch Wikipedia in order to arrive at the page
+        // already on screen — 250 ms and a network round trip to go nowhere,
+        // and every script on the page would run again.
+        //
+        // The check lives here rather than in `Entry`, which gains no field and
+        // no second stack. "Same document" is a property of the *pair* — where
+        // we are and where the entry points — not of the entry: the same entry
+        // is a same-document restore when the reader is on that document and a
+        // fetch when they are not (A → A#x → B → back → back exercises both,
+        // off one entry each). Storing a flag would be storing an answer to a
+        // question that is only asked later, and `same_document` is the same
+        // predicate that decided to push the entry in the first place.
+        if same_document(&cur, &entry.url) {
+            self.set_current_url(entry.url);
+            self.status_msg = None;
+            // The entry's offset, not the fragment in its URL: the reader may
+            // have scrolled after the jump, and where they *were* is what a
+            // back button owes them.
+            let _ = self.viewport.scroll_to_offset(entry.scroll);
+            return redraw();
         }
+        self.navigate_restore(entry.url, entry.scroll)
     }
 
     fn reload(&mut self) -> Effect {
@@ -1744,13 +1911,15 @@ impl App {
             return Effect::default();
         };
         // Reload is not a new history entry; keep scroll via pending restore
-        // tied to the new generation.
+        // tied to the new generation. After `start_fetch` for the same reason
+        // as `navigate_restore`: `r` on a page whose URL carries a fragment
+        // owes the reader their own position, not a second jump to the anchor.
         let scroll = self.viewport.offset();
         self.hover = None;
         self.focus = None;
         self.hint = None;
         let id = self.start_fetch(url.clone());
-        self.pending_scroll = Some((id, scroll));
+        self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
         Effect {
             dirty: true,
             fetch: Some((id, url)),
@@ -2055,25 +2224,18 @@ impl App {
             );
             return;
         };
-        // A pure fragment change is a same-document move: no fetch, exactly
-        // what a link to `#x` already does. Checked here rather than left to
-        // `navigate`, which only consults `same_document` on the push-history
-        // path — a `location.replace('#x')` would otherwise refetch the page.
-        //
-        // It does not *scroll* to the target either, because following a link
-        // to a fragment does not: fragment scrolling is unimplemented for both
-        // (M11), and having script do something links cannot would be the
-        // wrong kind of difference.
-        if let Some(current) = self.current_url()
-            && same_document(&current, &url)
-        {
-            return;
-        }
         // `assign` pushes history, `replace` does not — M6's distinction,
-        // carried through rather than reinvented.
+        // carried through rather than reinvented. A pure fragment change is a
+        // same-document move, and `navigate` is where that is decided for both
+        // callers: `location.hash = 'x'` scrolls exactly where a click on
+        // `<a href="#x">` scrolls, because it is the same function (M11.4).
         let navigation = self.navigate(url, !request.replace);
         if navigation.fetch.is_some() {
             *effect = navigation;
+        } else {
+            // A same-document jump hands the loop no fetch, but the viewport
+            // moved, so the frame is owed a repaint.
+            effect.dirty |= navigation.dirty;
         }
     }
 
@@ -2683,6 +2845,14 @@ fn same_document(a: &str, b: &str) -> bool {
         s.split_once('#').map(|(u, _)| u).unwrap_or(s)
     }
     strip(a) == strip(b)
+}
+
+/// The fragment a URL carries, without its `#`. `Some("")` for a bare `#`,
+/// which is the top of the document rather than an absent fragment — the two
+/// are different navigations and `href="#"` is nine of the Wikipedia fixture's
+/// links.
+fn fragment_of(url: &str) -> Option<&str> {
+    url.split_once('#').map(|(_, fragment)| fragment)
 }
 
 #[cfg(test)]
@@ -5489,6 +5659,646 @@ mod tests {
         );
     }
 
+    // ---- fragment navigation (M11.4) --------------------------------------
+
+    /// A page far taller than the viewport with `id=target` in the middle of
+    /// it, and a link to it at the top. `body` goes before the target, so a
+    /// jump has somewhere to jump *from* and somewhere to come back to.
+    fn anchored_page(w: u16, h: u16) -> App {
+        let filler =
+            |what: &str| -> String { (0..40).map(|i| format!("<p>{what} {i}</p>")).collect() };
+        page(
+            w,
+            h,
+            &format!(
+                "<p><a href='#target'>jump</a></p>{}<p id=target>the target</p>{}",
+                filler("before"),
+                filler("after"),
+            ),
+        )
+    }
+
+    /// The top visible row of a drawn frame — where a fragment jump has to put
+    /// its target, and the only assertion the reader can actually make.
+    fn top_row(app: &App) -> String {
+        let (w, h) = app.size();
+        let mut frame = Frame::new(w, h);
+        app.draw(&mut frame);
+        row_text(&frame, 0).trim().to_string()
+    }
+
+    /// Everything on screen, for the cases where the target cannot reach the
+    /// top row because the document ends first.
+    fn visible_text(app: &App) -> String {
+        let (w, h) = app.size();
+        let mut frame = Frame::new(w, h);
+        app.draw(&mut frame);
+        (0..h).map(|y| row_text(&frame, y)).collect()
+    }
+
+    #[test]
+    fn a_fragment_click_puts_the_target_on_the_top_row_and_runs_no_stage() {
+        // Deliverables 2 and 3. The counters are the point: a jump is a
+        // scroll, so the cached display list is repainted at a new offset and
+        // *nothing* upstream of paint runs. Getting this wrong costs 43 ms on
+        // Wikipedia and is invisible on screen, which is exactly why the test
+        // asserts on counters rather than on appearance alone.
+        let mut app = anchored_page(80, 10);
+        let before = stages(&app);
+        assert!(!top_row(&app).contains("the target"));
+
+        let effect = app.update(click_first_link(&app));
+        assert!(
+            effect.dirty,
+            "the viewport moved without asking for a frame"
+        );
+        assert!(effect.fetch.is_none(), "a fragment click fetched");
+        assert_eq!(
+            stages(&app),
+            before,
+            "a fragment jump restyled, relayouted or repainted"
+        );
+        assert_eq!(top_row(&app), "the target");
+        assert!(app.viewport.offset() > 0);
+    }
+
+    #[test]
+    fn a_fragment_jump_changes_the_url_without_touching_the_fetch_generation() {
+        // Deliverable 4. A new generation would cancel the sheets, images and
+        // scripts still in flight — the page did not reload.
+        let mut app = anchored_page(80, 10);
+        let (generation, current) = (app.fetch_gen, app.current_fetch);
+
+        app.update(click_first_link(&app));
+        assert_eq!(app.current_url().as_deref(), Some("http://final/#target"));
+        // …and the reader can see it: the status row reads the same string.
+        let mut frame = Frame::new(80, 10);
+        app.draw(&mut frame);
+        assert!(
+            row_text(&frame, 9).contains("http://final/#target"),
+            "the URL bar still shows the old URL: {:?}",
+            row_text(&frame, 9)
+        );
+        assert_eq!(
+            app.fetch_gen, generation,
+            "a fragment jump bumped the generation"
+        );
+        assert_eq!(app.current_fetch, current);
+        assert!(matches!(app.fetch, Fetch::Loaded { .. }));
+
+        // And the URL the page is now known by is still a usable base: a
+        // stylesheet that stopped loading after a citation click is the
+        // expensive version of this bug.
+        assert_eq!(
+            app.resolve_href("style.css").as_deref(),
+            Some("http://final/style.css")
+        );
+        assert_eq!(
+            app.resolve_href("#other").as_deref(),
+            Some("http://final/#other")
+        );
+    }
+
+    #[test]
+    fn the_bare_fragment_goes_to_the_top_and_an_unknown_one_goes_nowhere() {
+        // Deliverable 1's two named cases. `href="#"` is nine of the Wikipedia
+        // fixture's links and means the top of the document; a fragment that
+        // matches nothing means *stay put* — no scroll, no error page, no
+        // console line — and the URL still changes, because it did.
+        let mut app = anchored_page(80, 10);
+        app.update(click_first_link(&app));
+        let at_target = app.viewport.offset();
+        assert!(at_target > 0);
+
+        app.follow_href("#nothing-is-named-this");
+        assert_eq!(
+            app.viewport.offset(),
+            at_target,
+            "an unknown fragment moved the viewport"
+        );
+        assert!(app.console.is_empty(), "an unknown fragment complained");
+        assert!(app.dom.is_some(), "an unknown fragment replaced the page");
+        assert_eq!(
+            app.current_url().as_deref(),
+            Some("http://final/#nothing-is-named-this")
+        );
+
+        app.follow_href("#");
+        assert_eq!(app.viewport.offset(), 0, "a bare # must go to the top");
+        assert_eq!(app.current_url().as_deref(), Some("http://final/#"));
+    }
+
+    #[test]
+    fn a_target_near_the_end_is_clamped_by_the_end_of_the_document() {
+        // Deliverable 2's other half: top of the viewport, *clamped*. There
+        // are not enough rows left to put the last paragraph on the top row,
+        // and a browser does not invent them.
+        let mut app = page(
+            80,
+            10,
+            &format!(
+                "<p><a href='#target'>jump</a></p>{}<p id=target>the target</p>",
+                (0..40)
+                    .map(|i| format!("<p>line {i}</p>"))
+                    .collect::<String>(),
+            ),
+        );
+        app.update(click_first_link(&app));
+        let jumped = app.viewport.offset();
+        assert!(visible_text(&app).contains("the target"));
+        // As far down as `G` goes and no further: the same clamp every scroll
+        // gets, rather than a second opinion about where the document ends.
+        app.update(ch('G'));
+        assert_eq!(jumped, app.viewport.offset());
+    }
+
+    #[test]
+    fn a_hidden_target_lands_on_the_nearest_laid_out_ancestor() {
+        // Deliverable 8, first case: `display: none`. The reader goes to where
+        // the element would have been — the wrapper's row — rather than
+        // nowhere. `layout::nearest_y` documents why the other answer is not
+        // available: a box that was never generated and a box that was merged
+        // into its neighbour are indistinguishable from the layout tree, and
+        // the second case is an anchor the reader can plainly see.
+        let mut app = page(
+            80,
+            10,
+            &format!(
+                "<style>#hidden {{ display: none }}</style>\
+                 <p><a href='#hidden'>jump</a></p>{}\
+                 <div id=wrap><p>wrapper</p><p id=hidden>invisible</p></div>{}",
+                (0..40)
+                    .map(|i| format!("<p>before {i}</p>"))
+                    .collect::<String>(),
+                (0..40)
+                    .map(|i| format!("<p>after {i}</p>"))
+                    .collect::<String>(),
+            ),
+        );
+        let stages_before = stages(&app);
+
+        app.follow_href("#hidden");
+        // The wrapper's box, margin row included — the reader is at the top of
+        // the block that holds the target, with what came before it off screen.
+        let seen = visible_text(&app);
+        assert!(seen.contains("wrapper"), "{seen:?}");
+        assert!(
+            !seen.contains("before 39"),
+            "the jump stopped short: {seen:?}"
+        );
+        assert_eq!(
+            stages(&app),
+            stages_before,
+            "a jump to a hidden target ran a stage"
+        );
+        assert!(
+            !visible_text(&app).contains("invisible"),
+            "the target is still hidden — the jump does not reveal it"
+        );
+        assert_eq!(app.current_url().as_deref(), Some("http://final/#hidden"));
+    }
+
+    #[test]
+    fn history_comes_back_to_where_the_reader_was_without_fetching() {
+        // Deliverable 5, and the reason it is a deliverable: `H` off a
+        // fragment jump that refetched would be a network round trip to land
+        // on the page already on screen.
+        let mut app = anchored_page(80, 10);
+        app.update(ch('j'));
+        app.update(ch('j'));
+        let reading = app.viewport.offset();
+        assert!(reading > 0);
+
+        app.follow_href("#target");
+        let at_target = app.viewport.offset();
+        assert_ne!(at_target, reading);
+        let stages_before = stages(&app);
+
+        let back = app.update(ch('H'));
+        assert!(back.fetch.is_none(), "H off a fragment jump refetched");
+        assert_eq!(
+            app.viewport.offset(),
+            reading,
+            "H did not restore the offset"
+        );
+        assert_eq!(app.current_url().as_deref(), Some("http://final/"));
+
+        let forward = app.update(ch('L'));
+        assert!(forward.fetch.is_none(), "L back to a fragment refetched");
+        assert_eq!(
+            app.viewport.offset(),
+            at_target,
+            "L did not return to the citation"
+        );
+        assert_eq!(app.current_url().as_deref(), Some("http://final/#target"));
+        assert_eq!(
+            stages(&app),
+            stages_before,
+            "a same-document history move ran a stage"
+        );
+    }
+
+    #[test]
+    fn a_cross_document_link_with_a_fragment_scrolls_once_its_own_layout_exists() {
+        // Deliverable 7. The fragment cannot be resolved when the navigation
+        // starts — the node it names does not exist until the parse lands — so
+        // it is held as text against *this* generation, and a resize of the
+        // page still on screen must not consume it.
+        let mut app = page(80, 10, "<p><a href='/other#target'>go</a></p>");
+        let effect = app.update(click_first_link(&app));
+        let (id, url) = effect.fetch.expect("a cross-document link must fetch");
+        assert_eq!(url, "http://final/other#target");
+
+        app.update(Msg::Resize(70, 10));
+        assert!(
+            app.pending_scroll.is_some(),
+            "a resize during Loading consumed the fragment"
+        );
+
+        // Filler on both sides: a target at the very end of a document cannot
+        // reach the top row, because the scroll clamps there.
+        let body = format!(
+            "{}<p id=target>the target</p>{}",
+            (0..40)
+                .map(|i| format!("<p>before {i}</p>"))
+                .collect::<String>(),
+            (0..40)
+                .map(|i| format!("<p>after {i}</p>"))
+                .collect::<String>(),
+        );
+        app.update(Msg::Loaded {
+            id,
+            url: "http://final/other#target".into(),
+            status: 200,
+            body: body.clone().into_bytes(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(parsed(id, &body));
+        assert_eq!(top_row(&app), "the target");
+        assert!(
+            app.pending_scroll.is_none(),
+            "the fragment was not consumed"
+        );
+    }
+
+    #[test]
+    fn a_redirect_that_drops_the_fragment_does_not_lose_it() {
+        // `Location` is joined against the previous URL and a bare path has no
+        // fragment of its own, so reqwest reports one without it. HTML keeps
+        // the original — and the URL bar has to agree with the row we scrolled
+        // to.
+        let mut app = App::new(80, 10);
+        let id = app.start_fetch("http://final/old#target".into());
+        // Filler on both sides: a target at the very end of a document cannot
+        // reach the top row, because the scroll clamps there.
+        let body = format!(
+            "{}<p id=target>the target</p>{}",
+            (0..40)
+                .map(|i| format!("<p>before {i}</p>"))
+                .collect::<String>(),
+            (0..40)
+                .map(|i| format!("<p>after {i}</p>"))
+                .collect::<String>(),
+        );
+        app.update(Msg::Loaded {
+            id,
+            url: "http://final/new".into(),
+            status: 200,
+            body: body.clone().into_bytes(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        assert_eq!(
+            app.current_url().as_deref(),
+            Some("http://final/new#target")
+        );
+        app.update(parsed(id, &body));
+        assert_eq!(top_row(&app), "the target");
+    }
+
+    #[test]
+    fn a_restored_offset_beats_the_fragment_in_the_url_it_restores() {
+        // The one-slot decision, stated as a test: a history entry for
+        // `/other#target` restores the offset the reader left, not the anchor
+        // the URL happens to name. Same rule for `r`.
+        let body = format!(
+            "{}<p id=target>the target</p>{}",
+            (0..40)
+                .map(|i| format!("<p>before {i}</p>"))
+                .collect::<String>(),
+            (0..40)
+                .map(|i| format!("<p>after {i}</p>"))
+                .collect::<String>(),
+        );
+        let mut app = App::new(80, 10);
+        let id = app.start_fetch("http://final/other#target".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://final/other#target".into(),
+            status: 200,
+            body: body.clone().into_bytes(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(parsed(id, &body));
+        let at_target = app.viewport.offset();
+        assert!(at_target > 0, "the fragment did not land on the first load");
+
+        // The reader scrolls on from the anchor, then leaves and comes back.
+        app.update(ch('j'));
+        app.update(ch('j'));
+        let reading = app.viewport.offset();
+        let effect = app.navigate("http://final/elsewhere".into(), true);
+        let (next, _) = effect.fetch.expect("a cross-document navigation");
+        app.update(Msg::Loaded {
+            id: next,
+            url: "http://final/elsewhere".into(),
+            status: 200,
+            body: b"<p>elsewhere</p>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(parsed(next, "<p>elsewhere</p>"));
+
+        let back = app.update(ch('H'));
+        let (restored, url) = back.fetch.expect("a different document must fetch");
+        assert_eq!(url, "http://final/other#target");
+        app.update(Msg::Loaded {
+            id: restored,
+            url: "http://final/other#target".into(),
+            status: 200,
+            body: body.clone().into_bytes(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(parsed(restored, &body));
+        assert_eq!(
+            app.viewport.offset(),
+            reading,
+            "the restore landed on the fragment instead of the reader's position"
+        );
+    }
+
+    #[test]
+    fn a_fragment_is_resolved_once_and_never_retried() {
+        // Deliverable 8, second case. A page whose script appends the target
+        // later does not get to yank the viewport at some arbitrary moment
+        // after the reader has arrived and started reading; the reader sees
+        // the page where it opened, with the fragment in the URL bar, and a
+        // second click on the link jumps now that the element exists.
+        let body = format!(
+            "<p>top</p>{}<script>\
+             var late = document.createElement('p');\
+             late.setAttribute('id', 'late');\
+             late.textContent = 'the late target';\
+             document.body.appendChild(late);</script>",
+            (0..40)
+                .map(|i| format!("<p>line {i}</p>"))
+                .collect::<String>(),
+        );
+        let mut app = App::new(80, 10);
+        let id = app.start_fetch("http://final/page#late".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://final/page#late".into(),
+            status: 200,
+            body: body.clone().into_bytes(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(parsed(id, &body));
+        assert_eq!(app.viewport.offset(), 0, "nothing named `late` existed yet");
+
+        app.update(Msg::RunScripts { id });
+        assert_eq!(
+            app.viewport.offset(),
+            0,
+            "the element arriving later pulled the viewport"
+        );
+        // …and the link works from here. The appended paragraph is the last
+        // thing in the document, so the scroll clamps before it reaches the
+        // top row — it is on screen, which is what the reader asked for.
+        app.follow_href("#late");
+        assert!(app.viewport.offset() > 0);
+        assert!(
+            visible_text(&app).contains("the late target"),
+            "a second click did not reach the element the script added"
+        );
+    }
+
+    #[test]
+    fn location_hash_jumps_exactly_where_a_link_jumps() {
+        // Deliverable 6: one implementation, two callers. The comment in
+        // `js/bindings.rs` that promised a history entry for a fragment change
+        // is now true, and `replace` still does not push one.
+        let tall = |script: &str| {
+            format!(
+                "<p>top</p>{}<p id=target>the target</p><script>{script}</script>",
+                (0..40)
+                    .map(|i| format!("<p>line {i}</p>"))
+                    .collect::<String>(),
+            )
+        };
+
+        let (mut app, id) = scripted_app(&tall("location.hash = 'target';"));
+        let stages_before = stages(&app);
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(effect.fetch.is_none(), "a fragment change fetched");
+        assert!(effect.dirty, "the jump did not ask for a frame");
+        assert_eq!(app.current_url().as_deref(), Some("http://final/#target"));
+        assert_eq!(stages(&app), stages_before, "a script's jump ran a stage");
+        let at_target = app.viewport.offset();
+        assert!(at_target > 0, "the script's jump did not scroll");
+        assert!(
+            app.history.can_back(),
+            "a fragment change pushed no history"
+        );
+
+        // `H` returns to the top of the page the script left.
+        app.update(ch('H'));
+        assert_eq!(app.viewport.offset(), 0);
+        assert_eq!(app.current_url().as_deref(), Some("http://final/"));
+
+        // `replace` reaches the same place without an entry.
+        let (mut app, id) = scripted_app(&tall("location.replace('#target');"));
+        app.update(Msg::RunScripts { id });
+        assert_eq!(app.viewport.offset(), at_target);
+        assert!(!app.history.can_back(), "replace pushed a history entry");
+    }
+
+    #[test]
+    fn location_hash_reads_back_what_a_script_set() {
+        // The URL bar and `location.hash` read the same string, so the fix for
+        // one is the fix for the other — one tick later. A script cannot see
+        // its own assignment *within* the tick that made it: the navigation is
+        // a request the tick records and `apply_script_navigation` acts on
+        // afterwards, which is the same discipline every other side effect in
+        // `src/js` follows.
+        let (mut app, id) = scripted_app(
+            "<p id=target>x</p><script>\
+             location.hash = 'target';\
+             setTimeout(function () { console.log('hash=' + location.hash); }, 0);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        let logged: Vec<String> = app
+            .console
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert!(
+            logged.iter().any(|t| t == "hash=#target"),
+            "the next tick read a stale location.hash: {logged:?}"
+        );
+    }
+
+    /// The Wikipedia article, as the reader meets it: 686 `href="#…"` links
+    /// against 269 `cite_note` ids, and a citation click that until now did
+    /// nothing at all.
+    fn wikipedia_page(w: u16, h: u16) -> App {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        // The fixture's own scripts are neutered for the same reason M11.3's
+        // measurement neuters them: this test is about navigation, not about
+        // what Wikipedia's analytics does on the way past.
+        page(
+            w,
+            h,
+            &fixture.replace("<script", "<script type=\"text/x-not-run\""),
+        )
+    }
+
+    #[test]
+    fn a_wikipedia_citation_click_lands_on_the_citation_and_h_comes_back() {
+        // The acceptance round trip, on the ladder's biggest page.
+        let mut app = wikipedia_page(80, 24);
+        for _ in 0..30 {
+            app.update(ch('j'));
+        }
+        let reading = app.viewport.offset();
+        let stages_before = stages(&app);
+
+        let effect = app.follow_href("#cite_note-Linnaeus1758-1");
+        assert!(effect.fetch.is_none(), "a citation click fetched Wikipedia");
+        assert!(effect.dirty);
+        assert_eq!(
+            stages(&app),
+            stages_before,
+            "a citation click restyled or relayouted 25,601 nodes"
+        );
+        assert_ne!(
+            app.viewport.offset(),
+            reading,
+            "the citation click went nowhere"
+        );
+        // The `<li>` the citation lives in, at the top of the viewport: its
+        // backlinks come first, then the reference text.
+        let top = top_row(&app);
+        assert!(
+            top.contains("Linnaeus"),
+            "the citation is not on the top row, which reads {top:?}"
+        );
+        assert_eq!(
+            app.current_url().as_deref(),
+            Some("http://final/#cite_note-Linnaeus1758-1")
+        );
+
+        let back = app.update(ch('H'));
+        assert!(back.fetch.is_none(), "H refetched Wikipedia");
+        assert_eq!(
+            app.viewport.offset(),
+            reading,
+            "H did not return the reader"
+        );
+        assert_eq!(stages(&app), stages_before, "H ran a pipeline stage");
+    }
+
+    /// A measurement, not an assertion — the M11.3 shape, A/B interleaved in
+    /// one process because this machine drifts several percent between runs.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_a_fragment_jump -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_a_fragment_jump_on_a_wikipedia_sized_page() {
+        // Deliverable 9: a fragment jump is a keypress→screen path (PLAN.md
+        // §4: 10 ms). Two costs to separate — the DOM walk that finds the id
+        // (25,601 nodes) and the layout walk that finds its row (~3.6k boxes)
+        // — measured against the scroll they are bolted onto, since a plain
+        // `j` is the same repaint without either walk.
+        const ROUNDS: usize = 5;
+        let mut jump = Vec::new();
+        let mut scroll = Vec::new();
+        let mut resolve = Vec::new();
+        let mut row = Vec::new();
+        let mut nodes = 0;
+
+        // Round 0 is thrown away: the first turn in the process pays for pages
+        // the allocator has not touched and code the CPU has not seen.
+        for round in 0..=ROUNDS {
+            let mut app = wikipedia_page(80, 24);
+            let mut renderer =
+                crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
+            nodes = app.dom.as_ref().map_or(0, |d| d.node_count());
+
+            // A: the jump, all the way to the screen.
+            let started = Instant::now();
+            app.follow_href("#cite_note-Linnaeus1758-1");
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let jumped = started.elapsed();
+
+            // B: the same repaint without either walk — one scroll step.
+            let started = Instant::now();
+            app.update(ch('j'));
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let scrolled = started.elapsed();
+
+            // The two walks on their own, so the turn reads as a breakdown.
+            let dom = app.dom.as_ref().unwrap();
+            let tree = app.layout_tree.as_ref().unwrap();
+            let started = Instant::now();
+            let target = fragment::resolve(dom, "cite_note-Linnaeus1758-1");
+            let resolved = started.elapsed();
+            let fragment::Target::Node(node) = target.expect("the fixture lost its citation")
+            else {
+                unreachable!("a cite_note id is an element, not the top of the document")
+            };
+            let started = Instant::now();
+            assert!(layout::nearest_y(tree, dom, node).is_some());
+            let rowed = started.elapsed();
+
+            if round > 0 {
+                jump.push(jumped);
+                scroll.push(scrolled);
+                resolve.push(resolved);
+                row.push(rowed);
+            }
+        }
+
+        eprintln!(
+            "M11.4 fragment jump on en.wikipedia.org ({nodes} nodes), \
+             mean of {ROUNDS} interleaved rounds:\n  \
+             turn:  citation click, to the screen  {}\n  \
+             turn:  one scroll step, same repaint  {}\n  \
+             stage: fragment -> node (DOM walk)    {}\n  \
+             stage: node -> row (layout walk)      {}",
+            summarize(&jump),
+            summarize(&scroll),
+            summarize(&resolve),
+            summarize(&row),
+        );
+    }
+
     // ---- F2: the computed-styles surface (M4.5) ---------------------------
 
     #[test]
@@ -6136,18 +6946,12 @@ mod tests {
                  <p style='margin:0'><a href='/gone'>SECRET</a></p></div></body>"
             )
         };
-        let screen = |app: &App| {
-            let mut frame = Frame::new(40, 8);
-            app.draw(&mut frame);
-            (0..8).map(|y| row_text(&frame, y)).collect::<String>()
-        };
-
         // Control: with nothing clipping, the second row is a real, reachable
         // link — so the assertions below are about the clip, not the markup.
         let mut app = page(40, 8, &markup("visible"));
         app.update(key(KeyCode::Tab, KeyModifiers::NONE));
         app.update(key(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(screen(&app).contains("SECRET"));
+        assert!(visible_text(&app).contains("SECRET"));
         assert_eq!(
             app.update(key(KeyCode::Enter, KeyModifiers::NONE))
                 .fetch
@@ -6159,11 +6963,11 @@ mod tests {
         // Clipped: the row paints nothing before or after Tab, and Tab has
         // exactly one link to cycle through however often it is pressed.
         let mut app = page(40, 8, &markup("hidden"));
-        assert!(!screen(&app).contains("SECRET"));
+        assert!(!visible_text(&app).contains("SECRET"));
         for _ in 0..3 {
             app.update(key(KeyCode::Tab, KeyModifiers::NONE));
             assert!(
-                !screen(&app).contains("SECRET"),
+                !visible_text(&app).contains("SECRET"),
                 "the focus overlay repainted clipped-away text"
             );
         }

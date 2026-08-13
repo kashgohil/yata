@@ -1,5 +1,6 @@
 pub mod app;
 pub mod error_page;
+pub mod fragment;
 pub mod help;
 pub mod hints;
 pub mod history;

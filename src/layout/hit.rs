@@ -159,9 +159,79 @@ fn walk_dom_links(dom: &Dom, id: NodeId, out: &mut Vec<(NodeId, String)>) {
 
 /// First content-box y of `node` in the layout tree, if any box was generated.
 pub fn first_y(tree: &LayoutTree, node: NodeId) -> Option<i32> {
+    y_of(tree, |n| n == node)
+}
+
+/// The row to scroll to in order to show `node` — what a fragment jump needs
+/// (M11.4). In order: the first box in document order belonging to the node or
+/// to anything inside it; failing that, the first box of the nearest ancestor
+/// that was laid out; failing that, `None`.
+///
+/// Neither fallback is a nicety, because a great many anchor targets generate
+/// no box of their own:
+///
+/// - a non-atomic inline is laid out as the text inside it, so
+///   `<span id="x">heading</span>` is found through its text — an inline
+///   element's rendered position *is* its content's position;
+/// - and even that text can be absent from the tree, because a line merges
+///   adjacent same-styled pieces into one box and the merged box keeps the
+///   *first* piece's node. `<p>see <span id="x">this</span></p>` renders as a
+///   single text box belonging to the paragraph's first text node, and the
+///   only record left of where the span sits is its ancestor.
+///
+/// So an exact-or-subtree lookup answers `None` for targets the reader can
+/// plainly see, and answering `None` means the click does nothing — which the
+/// reader cannot tell from a broken link. The ancestor is approximate (the
+/// paragraph's first row, not the wrapped line the span landed on) and it is
+/// the closest thing on screen to the truth.
+///
+/// A `display: none` target takes the same path and lands where the element
+/// *would* be. That is the accepted cost of the rule: the two cases are
+/// indistinguishable from here — a box that was never generated and a box that
+/// was merged away look identical in the tree — and moving the reader to the
+/// right region beats leaving them where they were with nothing to show for
+/// the click.
+///
+/// Same walk and same coordinate as [`first_y`] and the resize anchor,
+/// deliberately: a second way to compute where a box sits is a second way to
+/// disagree about it.
+pub fn nearest_y(tree: &LayoutTree, dom: &Dom, node: NodeId) -> Option<i32> {
+    // Ancestors nearest first, so a smaller index is a better fallback.
+    let mut ancestors = Vec::new();
+    let mut current = dom.node(node).parent;
+    while let Some(id) = current {
+        ancestors.push(id);
+        current = dom.node(id).parent;
+    }
+
+    let mut inside = None;
+    let mut fallback: Option<(usize, i32)> = None;
+    tree.walk(tree.root, &mut |_, b| {
+        if inside.is_some() {
+            return;
+        }
+        let Some(box_node) = b.node else {
+            return;
+        };
+        let y = b.dimensions.content.y;
+        if is_under(dom, box_node, node) {
+            inside = Some(y);
+        } else if let Some(depth) = ancestors.iter().position(|&a| a == box_node)
+            && fallback.is_none_or(|(nearest, _)| depth < nearest)
+        {
+            fallback = Some((depth, y));
+        }
+    });
+    inside.or(fallback.map(|(_, y)| y))
+}
+
+fn y_of(tree: &LayoutTree, mut want: impl FnMut(NodeId) -> bool) -> Option<i32> {
     let mut found = None;
     tree.walk(tree.root, &mut |_, b| {
-        if found.is_none() && b.node == Some(node) {
+        if found.is_none()
+            && let Some(node) = b.node
+            && want(node)
+        {
             found = Some(b.dimensions.content.y);
         }
     });
@@ -201,6 +271,67 @@ mod tests {
         let link = &links[0];
         let got = link_at(&tree, &dom, link.x, link.y);
         assert_eq!(got.map(|(_, h)| h).as_deref(), Some("x"));
+    }
+
+    fn node_with_id(dom: &crate::dom::Dom, id: &str) -> NodeId {
+        (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .expect("fixture id")
+    }
+
+    #[test]
+    fn an_inline_target_is_found_through_the_text_inside_it() {
+        // M11.4: `<span id=x>` generates no box of its own, so an exact-match
+        // lookup answers `None` for one of the commonest anchor targets on the
+        // web. Its rendered position is its text's position.
+        let (dom, tree) = laid("<p>first</p><p><span id=x>marked</span></p>");
+        let span = node_with_id(&dom, "x");
+        assert_eq!(first_y(&tree, span), None, "an inline generated a box");
+        assert_eq!(
+            nearest_y(&tree, &dom, span),
+            first_y(&tree, dom.node(span).parent.unwrap()),
+            "the inline's own text is on the paragraph's row"
+        );
+        // …and it is the second paragraph's row, not the first's.
+        assert!(nearest_y(&tree, &dom, span).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_target_whose_text_was_merged_away_falls_back_to_its_ancestor() {
+        // The line builder merges adjacent same-styled pieces and the merged
+        // box keeps the *first* piece's node, so nothing in the tree belongs
+        // to this span at all — not even its text.
+        let (dom, tree) = laid("<p>first</p><p>see <span id=x>this</span></p>");
+        let span = node_with_id(&dom, "x");
+        let paragraph = dom.node(span).parent.unwrap();
+        assert_eq!(nearest_y(&tree, &dom, span), first_y(&tree, paragraph));
+        assert!(nearest_y(&tree, &dom, span).unwrap() > 0);
+    }
+
+    #[test]
+    fn a_target_with_no_box_lands_where_it_would_have_been() {
+        // `display: none` is the same shape as the merge above from here, and
+        // takes the same answer: the nearest ancestor that was laid out.
+        let (dom, tree) = laid(
+            "<p>first</p><div id=wrap><p style='display:none'><span id=x>gone</span></p></div>",
+        );
+        let span = node_with_id(&dom, "x");
+        assert_eq!(
+            nearest_y(&tree, &dom, span),
+            first_y(&tree, node_with_id(&dom, "wrap")),
+            "a hidden target did not fall back to its laid-out ancestor"
+        );
+    }
+
+    #[test]
+    fn a_target_in_the_head_lands_at_the_top_of_the_document() {
+        // Nothing in `<head>` is laid out, so the walk keeps climbing and the
+        // first ancestor with a box is the document itself. The rule does not
+        // stop early for this case: the reader asked to go somewhere, and the
+        // top is where the nearest laid-out ancestor is.
+        let (dom, tree) = laid("<head><meta id=x></head><body><p>text</p></body>");
+        assert_eq!(nearest_y(&tree, &dom, node_with_id(&dom, "x")), Some(0));
     }
 
     #[test]

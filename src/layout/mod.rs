@@ -19,7 +19,7 @@ pub use dimensions::{Dimensions, EdgeSizes, Rect};
 pub use engine::{Hidden, layout_tree, layout_tree_with, term_color, term_style};
 pub use hit::{
     LinkHit, collect_links, dom_links, first_y, hit_test, is_under, link_at, nearest_link,
-    visible_links,
+    nearest_y, visible_links,
 };
 pub use intrinsic::IntrinsicSizer;
 
