@@ -291,6 +291,14 @@ pub fn install<'js>(
 
     let s = Rc::clone(slot);
     api.set(
+        "documentRoot",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>| {
+            s.with(&ctx, |dom| id_of(dom.root))
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
         "documentElement",
         Function::new(ctx.clone(), move |ctx: Ctx<'_>| {
             s.with(&ctx, |dom| {
@@ -330,6 +338,54 @@ pub fn install<'js>(
                 .map(id_of)
             })
         })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "getElementsByTagName",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, scope: u32, name: String| {
+                s.with(&ctx, |dom| {
+                    let wanted = name.to_ascii_lowercase();
+                    collect_descendants(dom, scope, |dom, node| match &dom.node(node).data {
+                        // `*` matches every element, which is what the DOM says
+                        // and what a page uses to walk a subtree.
+                        NodeData::Element { tag, .. } => {
+                            wanted == "*" || tag.eq_ignore_ascii_case(&wanted)
+                        }
+                        _ => false,
+                    })
+                })
+            },
+        )?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "getElementsByClassName",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, scope: u32, names: String| {
+                s.with(&ctx, |dom| {
+                    let wanted: Vec<&str> = names.split_whitespace().collect();
+                    collect_descendants(dom, scope, |dom, node| {
+                        if wanted.is_empty() {
+                            return false;
+                        }
+                        let Some(classes) = dom.attr(node, "class") else {
+                            return false;
+                        };
+                        // **All** of them, not any: `getElementsByClassName('a b')`
+                        // is an intersection, which pages rely on for compound
+                        // state classes.
+                        wanted
+                            .iter()
+                            .all(|want| classes.split_whitespace().any(|have| have == *want))
+                    })
+                })
+            },
+        )?,
     )?;
 
     let s = Rc::clone(slot);
@@ -899,6 +955,26 @@ fn node(dom: &Dom, id: u32) -> Option<NodeId> {
     ((id as usize) < dom.node_count()).then_some(NodeId(id))
 }
 
+/// Every descendant of `scope` matching `keep`, in document order — the shape
+/// both `getElementsBy*` collections need.
+///
+/// `scope` is a node id from the prelude; an id outside the arena yields
+/// nothing rather than panicking, like every other primitive here. The walk is
+/// `for_each_descendant`, the same one `querySelectorAll` uses: a second
+/// traversal in this module would be a second thing to keep correct.
+fn collect_descendants(dom: &Dom, scope: u32, keep: impl Fn(&Dom, NodeId) -> bool) -> Vec<u32> {
+    let Some(scope) = node(dom, scope) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for_each_descendant(dom, scope, &mut |node| {
+        if keep(dom, node) {
+            found.push(id_of(node));
+        }
+    });
+    found
+}
+
 /// Visit every descendant of `node` in document order, excluding `node`.
 ///
 /// A callback rather than a returned `Vec`: `textContent` is a property, and a
@@ -1159,6 +1235,16 @@ const PRELUDE: &str = r#"
     getAttribute: {
       value: function (name) { return orNull(raw.getAttribute(idOf(this), String(name))); }
     },
+    getElementsByTagName: {
+      value: function (name) {
+        return raw.getElementsByTagName(idOf(this), String(name)).map(wrap);
+      }
+    },
+    getElementsByClassName: {
+      value: function (names) {
+        return raw.getElementsByClassName(idOf(this), String(names)).map(wrap);
+      }
+    },
     hasAttribute: {
       value: function (name) { return raw.getAttribute(idOf(this), String(name)) !== undefined; }
     },
@@ -1171,6 +1257,12 @@ const PRELUDE: &str = r#"
     createElement: function (tag) { return wrap(raw.createElement(String(tag))); },
     createTextNode: function (text) { return wrap(raw.createTextNode(String(text))); },
     getElementById: function (id) { return wrap(raw.getElementById(String(id))); },
+    getElementsByTagName: function (name) {
+      return raw.getElementsByTagName(raw.documentRoot(), String(name)).map(wrap);
+    },
+    getElementsByClassName: function (names) {
+      return raw.getElementsByClassName(raw.documentRoot(), String(names)).map(wrap);
+    },
     querySelector: function (sel) { return wrap(raw.querySelector(String(sel))); },
     querySelectorAll: function (sel) { return raw.querySelectorAll(String(sel)).map(wrap); },
   };
@@ -2464,6 +2556,94 @@ mod tests {
                 "var p = box.firstElementChild; p.remove(); p.textContent"
             ),
             "\"one\""
+        );
+    }
+
+    // ---- collections (M11.1) ----------------------------------------------
+
+    const NESTED: &str = "<div id=box class='a b'><p class='a'>one</p>\
+         <section><p class='b other'>two</p><span class='a b'>three</span></section></div>";
+
+    #[test]
+    fn get_elements_by_tag_name_walks_in_document_order() {
+        let page = NESTED;
+        assert_eq!(
+            eval_on(
+                page,
+                "document.getElementsByTagName('p').map(function (e) { return e.textContent; }).join(',')"
+            ),
+            "inline#1 ok \"one,two\""
+        );
+        // Case-insensitive, because HTML tag names are.
+        assert_eq!(
+            eval_on(page, "document.getElementsByTagName('P').length"),
+            "inline#1 ok 2"
+        );
+        // A miss is an empty array, not null — pages index straight into it.
+        assert_eq!(
+            eval_on(page, "document.getElementsByTagName('table').length"),
+            "inline#1 ok 0"
+        );
+        // `*` is every element.
+        assert_eq!(
+            eval_on(page, "document.getElementsByTagName('*').length > 5"),
+            "inline#1 ok true"
+        );
+    }
+
+    #[test]
+    fn an_element_scoped_call_excludes_itself_and_everything_outside() {
+        assert_eq!(
+            eval_on(
+                NESTED,
+                "var s = document.querySelector('section');\
+                 [s.getElementsByTagName('p').length, s.getElementsByTagName('section').length,\
+                  document.getElementById('box').getElementsByTagName('p').length].join(',')"
+            ),
+            "inline#1 ok \"1,0,2\""
+        );
+    }
+
+    #[test]
+    fn get_elements_by_class_name_needs_every_class() {
+        assert_eq!(
+            eval_on(NESTED, "document.getElementsByClassName('a').length"),
+            "inline#1 ok 3"
+        );
+        // Both, not either: an intersection is what a page means by two names.
+        assert_eq!(
+            eval_on(
+                NESTED,
+                "document.getElementsByClassName('a b').map(function (e) { return e.tagName; }).join(',')"
+            ),
+            "inline#1 ok \"DIV,SPAN\""
+        );
+        assert_eq!(
+            eval_on(
+                NESTED,
+                "document.getElementsByClassName('a missing').length"
+            ),
+            "inline#1 ok 0"
+        );
+        assert_eq!(
+            eval_on(NESTED, "document.getElementsByClassName('').length"),
+            "inline#1 ok 0"
+        );
+    }
+
+    #[test]
+    fn the_analytics_shape_that_started_this_task_now_runs() {
+        // motherfuckingwebsite.com's Google Analytics snippet, reduced to the
+        // line it threw on: `s.getElementsByTagName(o)[0]` where `o` is
+        // 'script' and `s` is `document`.
+        assert_eq!(
+            eval_on(
+                "<p>page</p>",
+                "var o = 'script', s = document;\
+                 var m = s.getElementsByTagName(o)[0];\
+                 m.parentNode === undefined ? 'reached, no parentNode' : 'reached'"
+            ),
+            "inline#1 ok \"reached, no parentNode\""
         );
     }
 
