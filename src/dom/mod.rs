@@ -75,6 +75,29 @@ pub struct Node {
 /// thing with markup.
 pub const MAX_DEPTH: usize = 128;
 
+/// How many distinct nodes the attribute-change list remembers before it stops
+/// trying (M11.3).
+///
+/// The list exists so a restyle can be narrowed to the subtrees a tick's writes
+/// can reach; past a few dozen roots the narrowing has no benefit left to
+/// deliver — those subtrees overlap and add up to the document — and an
+/// unbounded list is exactly the shape M10.13 exists to refuse. So the cap is
+/// not a precision limit: it is the point at which the whole-document answer
+/// is both correct and no slower.
+pub const MAX_TRACKED_ATTR_CHANGES: usize = 32;
+
+/// Which nodes had an attribute written since the list was last read.
+///
+/// `TooMany` is not an error: it is the honest answer that the caller should
+/// stop narrowing and recompute everything.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AttrChanges {
+    /// Every node written to, once each, in the order they were first written.
+    Nodes(Vec<NodeId>),
+    /// More than [`MAX_TRACKED_ATTR_CHANGES`] distinct nodes were written.
+    TooMany,
+}
+
 /// Why a tree edit was refused. These are the two DOM exceptions M10.5 turns
 /// into JS throws, named after them so the mapping needs no lookup table.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -113,6 +136,16 @@ pub struct Dom {
     /// can be answered by restyling and comparing computed values, which is
     /// far cheaper than laying the page out to find out.
     structure_version: u64,
+    /// *Which* nodes those attribute writes landed on, since the list was last
+    /// read (M11.3) — the difference between knowing that the cascade's answer
+    /// may have moved and knowing where. Bounded by
+    /// [`MAX_TRACKED_ATTR_CHANGES`] and deduplicated, because a script that
+    /// writes the same `class` in a loop has changed one node, not a thousand.
+    attr_changes: Vec<NodeId>,
+    /// The list gave up: more than the cap's worth of distinct nodes. Kept as a
+    /// flag rather than by letting the `Vec` grow, so a hostile page cannot buy
+    /// memory with attribute writes.
+    attr_changes_overflowed: bool,
 }
 
 /// What kind of change an edit was, for `Dom::note_edit`.
@@ -120,9 +153,10 @@ pub struct Dom {
 enum Edit {
     /// Changed the shape of the tree or the text in it. Always needs layout.
     Structure,
-    /// Changed an attribute. Can only reach layout through the cascade, so
-    /// M10.6 answers it by restyling and comparing computed values.
-    Attribute,
+    /// Changed an attribute on this node. Can only reach layout through the
+    /// cascade, so M10.6 answers it by restyling and comparing computed
+    /// values — and M11.3 restyles only the subtree it can have reached.
+    Attribute(NodeId),
     /// Created a node that is in the arena but in no tree. It cannot move a
     /// box until something inserts it — and the insert is a `Structure` edit
     /// of its own — but it does grow `node_count`, which the styled tree is
@@ -146,6 +180,8 @@ impl Dom {
             root: NodeId(0),
             version: 0,
             structure_version: 0,
+            attr_changes: Vec::new(),
+            attr_changes_overflowed: false,
         }
     }
 
@@ -184,8 +220,40 @@ impl Dom {
     /// place `version` is bumped, so a new mutator cannot forget one of them.
     fn note_edit(&mut self, edit: Edit) {
         self.version += 1;
-        if matches!(edit, Edit::Structure) {
-            self.structure_version += 1;
+        match edit {
+            Edit::Structure => self.structure_version += 1,
+            Edit::Attribute(id) => self.note_attr_change(id),
+            Edit::Detached => {}
+        }
+    }
+
+    /// Remember that `id`'s attributes moved, unless the list has already
+    /// given up or already knows.
+    fn note_attr_change(&mut self, id: NodeId) {
+        if self.attr_changes_overflowed || self.attr_changes.contains(&id) {
+            return;
+        }
+        if self.attr_changes.len() == MAX_TRACKED_ATTR_CHANGES {
+            self.attr_changes_overflowed = true;
+            // Nothing reads the list once it has overflowed, and holding onto
+            // the ids would be memory a page bought by writing attributes.
+            self.attr_changes.clear();
+            self.attr_changes.shrink_to_fit();
+            return;
+        }
+        self.attr_changes.push(id);
+    }
+
+    /// The nodes whose attributes changed since this was last called, and clear
+    /// the list. Reading is taking: the answer describes one tick, and a list
+    /// that survived into the next one would narrow the next restyle against
+    /// writes it has already accounted for.
+    pub fn take_attr_changes(&mut self) -> AttrChanges {
+        let overflowed = std::mem::take(&mut self.attr_changes_overflowed);
+        let nodes = std::mem::take(&mut self.attr_changes);
+        match overflowed {
+            true => AttrChanges::TooMany,
+            false => AttrChanges::Nodes(nodes),
         }
     }
 
@@ -314,7 +382,7 @@ impl Dom {
             }
             None => attrs.push((name.to_string(), value.to_string())),
         }
-        self.note_edit(Edit::Attribute);
+        self.note_edit(Edit::Attribute(id));
         true
     }
 
@@ -328,7 +396,7 @@ impl Dom {
             return false;
         };
         attrs.remove(at);
-        self.note_edit(Edit::Attribute);
+        self.note_edit(Edit::Attribute(id));
         true
     }
 
@@ -953,6 +1021,67 @@ mod tests {
         let _ = dom.append(text, dom.root);
         let _ = dom.set_text(el, "not a text node");
         assert_eq!(dom.version(), quiet);
+    }
+
+    #[test]
+    fn the_attribute_change_list_names_nodes_once_and_empties_when_read() {
+        // M11.3's input. A scoped restyle is only as sound as this list: a node
+        // written to and *not* reported is a page that silently stops updating.
+        let (mut dom, div, text, _) = sample();
+
+        assert_eq!(dom.take_attr_changes(), AttrChanges::Nodes(vec![]));
+
+        dom.set_attr(div, "class", "one");
+        dom.set_attr(div, "class", "two");
+        dom.set_attr(div, "data-x", "1");
+        dom.remove_attr(div, "data-x");
+        assert_eq!(
+            dom.take_attr_changes(),
+            AttrChanges::Nodes(vec![div]),
+            "four writes to one node are one node"
+        );
+        // Reading is taking: the next tick starts empty, or it would restyle
+        // subtrees for writes already accounted for.
+        assert_eq!(dom.take_attr_changes(), AttrChanges::Nodes(vec![]));
+
+        // Refused writes are not changes, and structural edits are not this
+        // list's business — they restyle the document either way.
+        dom.set_attr(text, "id", "nope");
+        dom.set_text(text, "changed");
+        let fresh = dom.create_element("p", vec![("id".into(), "born-with-it".into())]);
+        dom.append(div, fresh).unwrap();
+        dom.remove(fresh);
+        assert_eq!(dom.take_attr_changes(), AttrChanges::Nodes(vec![]));
+    }
+
+    #[test]
+    fn too_many_attribute_writes_report_too_many_rather_than_growing() {
+        // The M10.13 shape: a page that touches everything must not be able to
+        // buy memory with attribute writes, and by then the subtrees it dirtied
+        // add up to the document anyway.
+        let mut dom = Dom::new_document();
+        let nodes: Vec<NodeId> = (0..MAX_TRACKED_ATTR_CHANGES + 1)
+            .map(|_| {
+                let el = dom.create_element("div", vec![]);
+                dom.append(dom.root, el).unwrap();
+                el
+            })
+            .collect();
+
+        for &node in &nodes[..MAX_TRACKED_ATTR_CHANGES] {
+            dom.set_attr(node, "class", "x");
+        }
+        let AttrChanges::Nodes(listed) = dom.take_attr_changes() else {
+            panic!("the cap itself must still be a list");
+        };
+        assert_eq!(listed.len(), MAX_TRACKED_ATTR_CHANGES);
+
+        for &node in &nodes {
+            dom.set_attr(node, "class", "y");
+        }
+        assert_eq!(dom.take_attr_changes(), AttrChanges::TooMany);
+        // And giving up is also one tick's answer: the next one starts clean.
+        assert_eq!(dom.take_attr_changes(), AttrChanges::Nodes(vec![]));
     }
 
     #[test]

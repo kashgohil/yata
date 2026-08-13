@@ -12,7 +12,7 @@ use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
-use crate::dom::{Dom, NodeId};
+use crate::dom::{AttrChanges, Dom, NodeId};
 use crate::image::ImageSession;
 use crate::js::queue::ScriptQueue;
 use crate::js::storage::Storage;
@@ -287,11 +287,25 @@ pub struct App {
     /// the page and decides to do nothing should cost nothing (M10.6).
     #[cfg(test)]
     styles_run: usize,
+    /// How many *nodes* those restyles resolved (M11.3). `styles_run` counts
+    /// passes and so cannot tell a subtree from a document — this is the only
+    /// counter that says the scoped path really was scoped, and the difference
+    /// between the two on Wikipedia is 25,599 nodes against a handful.
+    #[cfg(test)]
+    nodes_styled: usize,
     /// How many times the display list has been rebuilt. The cheapest of the
     /// three stages and the one every path ends with, so it is what says
     /// whether a "did nothing" tick really did nothing.
     #[cfg(test)]
     paints: usize,
+    /// Turns M11.3's narrowing off, so the measurement can time the old path
+    /// and the new one **in the same process, on the same page, interleaved**.
+    /// This machine drifts several percent between runs, so a
+    /// before-commit/after-commit pair is not evidence. Nothing but
+    /// `measure_the_invalidation_*` sets it, and `restyle_scoped` is the only
+    /// reader.
+    #[cfg(test)]
+    full_restyle_only: bool,
     /// Images: LRU cache, page discovery, Kitty placement state (M8).
     images: ImageSession,
 }
@@ -351,7 +365,11 @@ impl App {
             #[cfg(test)]
             styles_run: 0,
             #[cfg(test)]
+            nodes_styled: 0,
+            #[cfg(test)]
             paints: 0,
+            #[cfg(test)]
+            full_restyle_only: false,
             images: ImageSession::new(kitty_graphics),
         }
     }
@@ -1313,7 +1331,74 @@ impl App {
         #[cfg(test)]
         {
             self.styles_run += 1;
+            // A fresh tree starts its count at zero, so this pass *is* its
+            // count — every node the walk reached.
+            self.nodes_styled += self.styles.as_ref().map_or(0, Styles::nodes_styled);
         }
+    }
+
+    /// The narrowed restyle (M11.3): recompute only the subtrees this tick's
+    /// attribute writes can have reached, in place, and leave the rest of the
+    /// styled tree alone. `false` means the tick did not qualify and the caller
+    /// must run a full pass.
+    ///
+    /// Three ways it does not qualify, all of them the whole document's fault
+    /// rather than a node's:
+    ///
+    /// - the writes overflowed the arena's list, so there is no scope to narrow
+    ///   to (and by then the subtrees would add up to the document anyway);
+    /// - nothing has been styled or parsed yet, so there are no parent values
+    ///   to resolve against;
+    /// - a script created a node, which grew the arena without changing the
+    ///   tree's shape — the dense styled `Vec` is a slot short and a full pass
+    ///   is what resizes it.
+    ///
+    /// Correctness rests entirely on [`style::restyle_subtree`]'s argument
+    /// about combinators; read it before changing either side.
+    #[must_use]
+    fn restyle_scoped(&mut self, changes: &AttrChanges) -> bool {
+        // The A/B switch, and the only thing that reads `full_restyle_only`.
+        #[cfg(test)]
+        if self.full_restyle_only {
+            return false;
+        }
+        let AttrChanges::Nodes(roots) = changes else {
+            return false;
+        };
+        // Both read `&self`, so they cannot outlive the borrow of `styles`.
+        let base = self.current_url();
+        let hover = self.hover;
+        // The tree is the one the last full pass built, so its count already
+        // has that pass in it; only the growth belongs to this one.
+        #[cfg(test)]
+        let styled_before = self.styles.as_ref().map_or(0, Styles::nodes_styled);
+        let started = Instant::now();
+        {
+            let (Some(dom), Some(styles)) = (self.dom.as_ref(), self.styles.as_mut()) else {
+                return false;
+            };
+            if styles.node_count() != dom.node_count() {
+                return false;
+            }
+            let sheets: Vec<&Stylesheet> = self.sheets.iter().flatten().collect();
+            let ctx = StyleContext {
+                hover,
+                visited: &self.visited,
+                base_url: base.as_deref(),
+            };
+            style::restyle_subtree(dom, &sheets, &ctx, styles, roots);
+        }
+        self.timings.style = Some(started.elapsed());
+        #[cfg(test)]
+        {
+            self.styles_run += 1;
+            self.nodes_styled += self
+                .styles
+                .as_ref()
+                .map_or(0, Styles::nodes_styled)
+                .saturating_sub(styled_before);
+        }
+        true
     }
 
     /// The invalidation cycle for a tick that ran JavaScript (M10.6), given
@@ -1324,29 +1409,49 @@ impl App {
     ///
     /// - **Nothing changed** → nothing runs. A handler that reads the page and
     ///   decides to do nothing must cost nothing.
-    /// - **Attributes only** → restyle, then ask the computed values whether
-    ///   layout would even differ. A `class` toggle that only changes a colour
-    ///   takes `:hover`'s path: recolour the existing tree and repaint.
+    /// - **Attributes only** → restyle *the subtrees the writes can have
+    ///   reached* (M11.3), then ask the computed values whether layout would
+    ///   even differ. A `class` toggle that only changes a colour takes
+    ///   `:hover`'s path: recolour the existing tree and repaint.
     /// - **The tree or its text changed** → restyle and relayout. Boxes were
     ///   added, removed or resized; there is nothing to compare against.
     ///
     /// The middle case is the only narrowing, and it is bounded by
-    /// correctness: comparing two `Styles` is O(nodes) of `Copy` structs, and
+    /// correctness at both ends. The *scope* comes from
+    /// [`style::restyle_subtree`], whose argument about combinators is the
+    /// thing to read before touching this. The *verdict* comes from comparing
+    /// the two `Styles` — O(nodes) of `Copy` structs — where
     /// `ComputedStyle::layout_eq` treats any property it does not explicitly
     /// exempt as layout-relevant, so a wrong answer costs a relayout nobody
-    /// needed rather than a page that failed to update.
+    /// needed rather than a page that failed to update. That comparison is why
+    /// the styled tree is cloned rather than replaced: the scoped pass writes
+    /// in place, and the values the page was laid out with have to survive it.
     fn apply_dom_changes(&mut self, before: (u64, u64), after: (u64, u64)) -> Effect {
         let (edits_before, structure_before) = before;
         let (edits_after, structure_after) = after;
+        // Read unconditionally, and before the early return: the list describes
+        // this tick, and one that survived into the next would narrow a restyle
+        // against writes already accounted for.
+        let changes = self.dom.as_mut().map(Dom::take_attr_changes);
         if edits_after == edits_before {
             return Effect::default();
         }
 
         let structural = structure_after != structure_before;
         // Keep the values the page was laid out with, so the narrowing has
-        // something to compare the new ones against.
-        let previous = self.styles.take();
-        self.restyle();
+        // something to compare the new ones against. Not worth cloning on the
+        // structural path, which lays out whatever the comparison would say.
+        let previous = match structural {
+            true => None,
+            false => self.styles.clone(),
+        };
+        // M11.3: an attribute-only tick recomputes the subtrees its writes can
+        // have reached, not the document. Everything downstream is unchanged —
+        // the comparison below is what keeps the narrowing honest.
+        let scoped = !structural && changes.is_some_and(|changes| self.restyle_scoped(&changes));
+        if !scoped {
+            self.restyle();
+        }
 
         let needs_layout = structural
             || match (&previous, &self.styles) {
@@ -1371,6 +1476,14 @@ impl App {
 
     /// Restyle + rebuild the display list from the existing layout tree — no
     /// geometry change. Used for `:hover` (PLAN.md M6: restyle + repaint only).
+    ///
+    /// Deliberately a **full** restyle, and M11.3 left it that way rather than
+    /// overlooking it: hover moves *between* two elements, and the subtree
+    /// argument in [`style::restyle_subtree`] is about the element being
+    /// entered. The one being left has to lose its `:hover` styling in the same
+    /// pass, and `hover` is not an attribute write — the arena's change list
+    /// knows nothing about it. Narrowing this needs its own reasoning and its
+    /// own measurement, so it is its own task.
     fn restyle_and_repaint(&mut self) {
         self.restyle();
         self.recolour_and_repaint();
@@ -4771,6 +4884,122 @@ mod tests {
         assert_eq!(app.styles_run, styled, "a resize restyled");
     }
 
+    // ---- scoped restyle (M11.3) -------------------------------------------
+
+    /// Nodes styled by one tick, and the whole document's size for comparison.
+    fn tick_styled(app: &mut App, id: FetchId) -> (usize, usize) {
+        let before = app.nodes_styled;
+        app.update(Msg::RunScripts { id });
+        (
+            app.nodes_styled - before,
+            app.dom.as_ref().unwrap().node_count(),
+        )
+    }
+
+    #[test]
+    fn a_class_toggle_on_a_leaf_styles_a_handful_of_nodes_not_the_document() {
+        // The counter M11.3 exists to move. `styles_run` says a restyle
+        // happened and cannot say how big it was; on this page the difference
+        // between the two answers is 25,599 nodes against three, and 43 ms
+        // against nothing worth measuring (perf.md).
+        let (mut app, id) = scripted_app(&wikipedia_with_script(
+            ".x-tint { color: #c00 }",
+            "document.getElementById('x11-3-leaf').className = 'x-tint';",
+        ));
+        let styled_before = app.styles_run;
+        let (styled, document) = tick_styled(&mut app, id);
+
+        assert!(document > 25_000, "the fixture shrank: {document} nodes");
+        assert_eq!(
+            app.styles_run,
+            styled_before + 1,
+            "the tick must still restyle exactly once"
+        );
+        assert_eq!(
+            styled, 2,
+            "a class toggle on a leaf must style the leaf and its text node, \
+             not the document's {document}"
+        );
+    }
+
+    #[test]
+    fn a_structural_edit_still_restyles_the_whole_document() {
+        // The narrowing is for attribute writes only, and deliberately so: a
+        // new node has no computed values to inherit from and no slot in the
+        // dense `Vec`, so there is nothing for a subtree pass to write into.
+        let (mut app, id) = scripted_app(
+            "<div id=host><p>a</p></div><script>\
+             document.getElementById('host').appendChild(document.createElement('p'));</script>",
+        );
+        let (styled, document) = tick_styled(&mut app, id);
+        assert_eq!(styled, document, "a structural edit narrowed its restyle");
+    }
+
+    #[test]
+    fn a_node_created_beside_an_attribute_write_falls_back_to_a_full_pass() {
+        // `createElement` without an insert is an `Edit::Detached`: it bumps
+        // the edit count but not the structure count, so the tick still looks
+        // attribute-only — while the arena has grown past the styled `Vec` it
+        // would be written into. The size check is what catches it.
+        let (mut app, id) = scripted_app(
+            "<p id=t>text</p><script>\
+             document.createElement('span');\
+             document.getElementById('t').className = 'x';</script>",
+        );
+        let (styled, document) = tick_styled(&mut app, id);
+        assert_eq!(
+            styled,
+            document - 1,
+            "a tick that grew the arena narrowed its restyle anyway — the one \
+             node short of the arena is the detached `span`, which no walk reaches"
+        );
+    }
+
+    #[test]
+    fn more_writes_than_the_arena_tracks_restyle_the_document() {
+        // Past the cap the subtrees add up to the document anyway, so the
+        // fallback costs nothing and the list stays bounded (M10.13).
+        let count = crate::dom::MAX_TRACKED_ATTR_CHANGES + 1;
+        let rows: String = (0..count).map(|i| format!("<p id=r{i}>row</p>")).collect();
+        let (mut app, id) = scripted_app(&format!(
+            "<div>{rows}</div><script>\
+             var all = document.querySelectorAll('p');\
+             for (var i = 0; i < all.length; i++) all[i].className = 'x';</script>",
+        ));
+        let (styled, document) = tick_styled(&mut app, id);
+        assert_eq!(
+            styled, document,
+            "{count} attribute writes must fall back to a full pass"
+        );
+    }
+
+    #[test]
+    fn a_scoped_restyle_still_paints_what_it_changed() {
+        // The narrowing must not become a page that does not update: the same
+        // turn, end to end, with the screen as the witness rather than a
+        // counter. `Styles::layout_eq` sees a paint-only change here, so this
+        // is the recolour path — and the words still have to move.
+        let (mut app, id) = scripted_app(
+            "<style>.wide { margin-left: 3em }</style>\
+             <p id=t>shifted</p><script>\
+             document.getElementById('t').className = 'wide';</script>",
+        );
+        let indent = |app: &mut App| {
+            screen(app, 40, 8)
+                .lines()
+                .find(|l| l.contains("shifted"))
+                .map(|l| l.find("shifted").unwrap())
+                .expect("the page never rendered its paragraph")
+        };
+        let before = indent(&mut app);
+        app.update(Msg::RunScripts { id });
+        assert_eq!(
+            indent(&mut app),
+            before + 6,
+            "the 3em (= 6 cells) the scoped pass computed never reached the screen"
+        );
+    }
+
     /// A Wikipedia-sized page with its own scripts neutralised, plus `script`.
     ///
     /// The fixture's inline scripts are retyped so the source walk skips them
@@ -4786,8 +5015,12 @@ mod tests {
         // Both appended at the end, never prepended: a `<style>` before the
         // fixture's own doctype opens the head early and parses a *different*
         // document, which would make the two paths below incomparable.
+        //
+        // The paragraph is M11.3's target: an ordinary leaf element deep in a
+        // real page, which is the shape a click's `classList.add` has. Two
+        // nodes out of 25,599, so the page it is measuring is still the page.
         format!(
-            "{}<style>{css}</style><script>{script}</script>",
+            "{}<p id=x11-3-leaf>leaf</p><style>{css}</style><script>{script}</script>",
             fixture.replace("<script", "<script type=\"text/x-not-run\"")
         )
     }
@@ -4808,6 +5041,98 @@ mod tests {
         started.elapsed()
     }
 
+    /// The attribute-write turns M11.3 is measured by, as (label, css, script).
+    ///
+    /// Two writes, not one, and the pair is the whole point: the write on
+    /// `<body>` is the one M10.6 measured, and `<body>`'s subtree **is** the
+    /// document — so the narrowing has nothing to narrow and the number must
+    /// not move. The write on an ordinary leaf is the shape a click has, and is
+    /// the case the narrowing exists for. Reporting only the second would be a
+    /// narrowed benchmark meeting a budget.
+    const ATTRIBUTE_TURNS: [(&str, &str, &str); 4] = [
+        (
+            "<body> class, paint only ",
+            ".x-tint p { color: #c00 }",
+            "document.body.classList.add('x-tint');",
+        ),
+        (
+            "<body> class, relayouting",
+            ".x-move p { margin-left: 1px }",
+            "document.body.classList.add('x-move');",
+        ),
+        (
+            "leaf class,   paint only ",
+            ".x-tint { color: #c00 }",
+            "document.getElementById('x11-3-leaf').className = 'x-tint';",
+        ),
+        (
+            "leaf class,   relayouting",
+            ".x-move { margin-left: 1px }",
+            "document.getElementById('x11-3-leaf').className = 'x-move';",
+        ),
+    ];
+
+    /// Mean and range of a set of samples — the spread is reported because on
+    /// this machine it is several percent wide, and a difference smaller than
+    /// it is not a difference.
+    fn summarize(samples: &[Duration]) -> String {
+        let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+        let lo = samples.iter().min().unwrap();
+        let hi = samples.iter().max().unwrap();
+        format!("{mean:.2?} ({lo:.2?}-{hi:.2?})")
+    }
+
+    /// Every turn in [`ATTRIBUTE_TURNS`], with the narrowing off and then on,
+    /// alternating within each round on the same page: A/B interleaved, in one
+    /// process, because this machine drifts several percent between runs and a
+    /// before-commit/after-commit pair would be measuring the drift.
+    fn measure_attribute_turns(label: &str, page: impl Fn(&str, &str) -> String) {
+        const ROUNDS: usize = 5;
+        let mut before = vec![Vec::new(); ATTRIBUTE_TURNS.len()];
+        let mut after = vec![Vec::new(); ATTRIBUTE_TURNS.len()];
+        let mut nodes = 0;
+
+        // Round 0 is thrown away. The very first turn in the process pays for
+        // pages the allocator has not touched and code the CPU has not seen,
+        // and on Wikipedia it came in three times the mean — recording it would
+        // hand the first case measured a penalty the others do not pay.
+        for round in 0..=ROUNDS {
+            for (i, (_, css, script)) in ATTRIBUTE_TURNS.iter().enumerate() {
+                let source = page(css, script);
+                let (mut app, id) = scripted_app(&source);
+                app.full_restyle_only = true;
+                let full = timed_js_turn(&mut app, id);
+
+                let (mut app, id) = scripted_app(&source);
+                let scoped = timed_js_turn(&mut app, id);
+                nodes = app.dom.as_ref().map_or(0, |d| d.node_count());
+
+                if round > 0 {
+                    before[i].push(full);
+                    after[i].push(scoped);
+                }
+            }
+        }
+
+        eprintln!("M11.3 turns on {label} ({nodes} nodes), mean of {ROUNDS} interleaved rounds:");
+        for (i, (what, _, _)) in ATTRIBUTE_TURNS.iter().enumerate() {
+            eprintln!(
+                "  {what}  full {}  ->  scoped {}",
+                summarize(&before[i]),
+                summarize(&after[i]),
+            );
+        }
+    }
+
+    /// The first element carrying `id="x11-3-leaf"` — the paragraph
+    /// `wikipedia_with_script` appends, and the leaf the turns above write to.
+    fn probe_leaf(dom: &Dom) -> NodeId {
+        (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&id| dom.attr(id, "id") == Some("x11-3-leaf"))
+            .expect("the fixture lost its probe leaf")
+    }
+
     /// A measurement, not an assertion: it asserts nothing and prints numbers,
     /// so it is `#[ignore]`d out of the default loop it would otherwise make
     /// ten times slower. Run it the way the numbers in `perf.md` were taken:
@@ -4818,18 +5143,19 @@ mod tests {
     #[test]
     #[ignore]
     fn measure_the_invalidation_paths_on_a_wikipedia_sized_page() {
-        // Deliverables 2, 5 and 7. Interleaved A/B/C: this machine drifts
-        // several percent between runs of the same thing, so a single
-        // before-then-after pair proves nothing.
+        // M10.6's deliverables 2, 5 and 7, and M11.3's deliverable 6.
+        // Interleaved: this machine drifts several percent between runs of the
+        // same thing, so a single before-then-after pair proves nothing.
         const ROUNDS: u32 = 5;
-        let (mut noop, mut paint_only, mut relayouting) =
-            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let mut noop = Duration::ZERO;
         let (mut compare, mut layout_alone) = (Duration::ZERO, Duration::ZERO);
-        let mut restyle_alone = Duration::ZERO;
+        let (mut restyle_alone, mut scoped_alone, mut clone_alone) =
+            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
         let mut nodes = 0;
 
         for _ in 0..ROUNDS {
-            // A: a tick that changes nothing at all.
+            // A tick that changes nothing at all: no stage runs, so this is the
+            // floor every other turn is measured against.
             let (mut app, id) = scripted_app(&wikipedia_with_script(
                 "",
                 "document.querySelectorAll('a').length;",
@@ -4837,33 +5163,23 @@ mod tests {
             noop += timed_js_turn(&mut app, id);
             nodes = app.dom.as_ref().map_or(0, |d| d.node_count());
 
-            // B: an attribute write whose only effect is colour — the
-            // narrowing's path.
-            let (mut app, id) = scripted_app(&wikipedia_with_script(
-                ".x-tint p { color: #c00 }",
-                "document.body.classList.add('x-tint');",
-            ));
-            paint_only += timed_js_turn(&mut app, id);
-
-            // C: the same write, but the page's own rules make it move boxes.
-            // The rule shifts every paragraph rather than hiding it, so this
-            // measures the *same* page as B — hiding the content would make
-            // the relayout cheap by having less to lay out.
-            let (mut app, id) = scripted_app(&wikipedia_with_script(
-                ".x-move p { margin-left: 1px }",
-                "document.body.classList.add('x-move');",
-            ));
-            relayouting += timed_js_turn(&mut app, id);
-
-            // The stages themselves, so the turns above can be read as a
-            // breakdown rather than three opaque numbers.
-            let (mut app, _) = scripted_app(&wikipedia_with_script("", "1;"));
+            // The stages themselves, so the turns can be read as a breakdown
+            // rather than as opaque numbers.
+            let (mut app, _) =
+                scripted_app(&wikipedia_with_script(".x-tint { color: #c00 }", "1;"));
             let dom = app.dom.as_ref().unwrap();
             let styles = app.styles.as_ref().unwrap();
 
             let started = Instant::now();
             assert!(styles.layout_eq(styles));
             compare += started.elapsed();
+
+            // What M11.3 added to the path: the styled tree is cloned so the
+            // comparison above still has the values the page was laid out with.
+            let started = Instant::now();
+            let copy = styles.clone();
+            clone_alone += started.elapsed();
+            assert_eq!(copy.node_count(), styles.node_count());
 
             let started = Instant::now();
             let _ = layout::layout_document_with(
@@ -4875,26 +5191,37 @@ mod tests {
             );
             layout_alone += started.elapsed();
 
+            // The two restyles, back to back on the same page: the document
+            // pass, and the subtree pass for a class written on one leaf.
+            let leaf = probe_leaf(app.dom.as_ref().unwrap());
+            let dom = app.dom.as_mut().unwrap();
+            dom.set_attr(leaf, "class", "x-tint");
+            let changes = dom.take_attr_changes();
+            let started = Instant::now();
+            assert!(app.restyle_scoped(&changes));
+            scoped_alone += started.elapsed();
+
             let started = Instant::now();
             app.restyle();
             restyle_alone += started.elapsed();
         }
 
         eprintln!(
-            "M10.6 on {nodes} nodes, mean of {ROUNDS} interleaved rounds:\n  \
+            "M11.3 stages on {nodes} nodes, mean of {ROUNDS} interleaved rounds:\n  \
              turn: tick that changes nothing   {:?}\n  \
-             turn: attribute write, paint only {:?}\n  \
-             turn: attribute write, relayout   {:?}\n  \
-             stage: restyle alone              {:?}\n  \
-             stage: one layout alone           {:?}\n  \
-             stage: Styles::layout_eq alone    {:?}",
+             stage: full restyle               {:?}\n  \
+             stage: scoped restyle, one leaf   {:?}\n  \
+             stage: Styles::clone              {:?}\n  \
+             stage: Styles::layout_eq          {:?}\n  \
+             stage: one layout                 {:?}",
             noop / ROUNDS,
-            paint_only / ROUNDS,
-            relayouting / ROUNDS,
             restyle_alone / ROUNDS,
-            layout_alone / ROUNDS,
+            scoped_alone / ROUNDS,
+            clone_alone / ROUNDS,
             compare / ROUNDS,
+            layout_alone / ROUNDS,
         );
+        measure_attribute_turns("en.wikipedia.org", wikipedia_with_script);
     }
 
     /// A measurement, not an assertion: it asserts nothing and prints numbers,
@@ -4981,7 +5308,7 @@ mod tests {
     #[test]
     #[ignore]
     fn measure_the_invalidation_paths_on_an_ordinary_page() {
-        // The same three turns on a page the size most of the web is, so the
+        // The same turns on a page the size most of the web is, so the
         // keypress→screen number can say *where* the budget holds rather than
         // only that the largest page on the ladder blows it.
         const ROUNDS: u32 = 5;
@@ -4991,41 +5318,21 @@ mod tests {
         ));
         let page = |css: &str, script: &str| {
             format!(
-                "{}<style>{css}</style><script>{script}</script>",
+                "{}<p id=x11-3-leaf>leaf</p><style>{css}</style><script>{script}</script>",
                 fixture.replace("<script", "<script type=\"text/x-not-run\"")
             )
         };
 
-        let (mut noop, mut paint_only, mut relayouting) =
-            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
-        let mut nodes = 0;
+        let mut noop = Duration::ZERO;
         for _ in 0..ROUNDS {
             let (mut app, id) = scripted_app(&page("", "document.querySelectorAll('a').length;"));
-            nodes = app.dom.as_ref().map_or(0, |d| d.node_count());
             noop += timed_js_turn(&mut app, id);
-
-            let (mut app, id) = scripted_app(&page(
-                ".x-tint p { color: #c00 }",
-                "document.body.classList.add('x-tint');",
-            ));
-            paint_only += timed_js_turn(&mut app, id);
-
-            let (mut app, id) = scripted_app(&page(
-                ".x-move p { margin-left: 1px }",
-                "document.body.classList.add('x-move');",
-            ));
-            relayouting += timed_js_turn(&mut app, id);
         }
-
         eprintln!(
-            "M10.6 on {nodes} nodes (danluu), mean of {ROUNDS} interleaved rounds:\n  \
-             turn: tick that changes nothing   {:?}\n  \
-             turn: attribute write, paint only {:?}\n  \
-             turn: attribute write, relayout   {:?}",
-            noop / ROUNDS,
-            paint_only / ROUNDS,
-            relayouting / ROUNDS,
+            "M11.3 turn: tick that changes nothing (danluu) {:?}",
+            noop / ROUNDS
         );
+        measure_attribute_turns("danluu.com", page);
     }
 
     #[test]

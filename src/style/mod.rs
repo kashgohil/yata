@@ -202,13 +202,39 @@ impl ComputedStyle {
 /// Computed values for every node, indexed by `NodeId`. Dense rather than a
 /// map because the arena is dense: one slot per node, text nodes included, so
 /// paint can ask any node what it looks like without a lookup that can miss.
+///
+/// `Clone` exists for M11.3: the invalidation cycle keeps the values the page
+/// was laid out with so it can compare them against the new ones, and a scoped
+/// restyle writes in place rather than producing a second tree to compare.
+#[derive(Clone)]
 pub struct Styles {
     computed: Vec<ComputedStyle>,
+    /// How many nodes have had their values resolved into this tree — one per
+    /// node for a full pass, one per subtree node for a scoped one (M11.3).
+    /// Test-only, like M10.6's three counters and for the same reason:
+    /// `styles_run` counts restyles and cannot tell a subtree from a document,
+    /// so nothing else can say whether the narrowing actually narrowed.
+    #[cfg(test)]
+    nodes_styled: usize,
 }
 
 impl Styles {
     pub fn get(&self, id: NodeId) -> &ComputedStyle {
         &self.computed[id.0 as usize]
+    }
+
+    /// How many nodes this tree has room for. Equal to the arena's
+    /// `node_count` when it was built — and *not* equal any more once a script
+    /// has created a node, which is what M11.3's scoped path checks before it
+    /// writes into a `Vec` that may be a slot short.
+    pub fn node_count(&self) -> usize {
+        self.computed.len()
+    }
+
+    /// Nodes resolved into this tree so far. See the field.
+    #[cfg(test)]
+    pub fn nodes_styled(&self) -> usize {
+        self.nodes_styled
     }
 
     /// Whether every node still computes to the same values **layout reads**
@@ -249,6 +275,8 @@ pub fn style_tree_with(dom: &Dom, sheets: &[&Stylesheet], ctx: &StyleContext<'_>
     let author = RuleIndex::build(sheets);
     let mut styles = Styles {
         computed: vec![ComputedStyle::default(); dom.node_count()],
+        #[cfg(test)]
+        nodes_styled: 0,
     };
     // One pre-order walk: a node's parent is always resolved before it, which
     // is the whole of inheritance. No second pass, no fixpoint.
@@ -264,6 +292,95 @@ pub fn style_tree_with(dom: &Dom, sheets: &[&Stylesheet], ctx: &StyleContext<'_>
     styles
 }
 
+/// Recompute `roots` and everything under them, in place, leaving every other
+/// node's computed values exactly as they were (M11.3). The same pre-order
+/// walk [`style_tree_with`] runs, started somewhere other than the document
+/// root and seeded from the parent values already in `styles`.
+///
+/// # Why a subtree is the whole answer, and when it stops being
+///
+/// An attribute write on `N` can change the computed values of `N` and of `N`'s
+/// descendants, and of **nothing else** — but only because of what this
+/// engine's selectors can express:
+///
+/// - Descendant and child combinators look *up* the tree ([`css::Combinator`]
+///   has exactly those two), so only nodes under `N` can newly match, or stop
+///   matching, because of something about `N`.
+/// - Inheritance flows down, so a change to `N`'s own values reaches its
+///   subtree and no further.
+/// - **Sibling combinators (`+`, `~`) do not exist**, and they are the
+///   construct that would break this: `N + p` makes `N`'s *next sibling*
+///   depend on `N`. Neither does `:has()`, which would make its ancestors
+///   depend on it.
+///
+/// **The day a sibling combinator is added to [`css::Combinator`], this
+/// narrowing is wrong** and the caller in `App::apply_dom_changes` has to go
+/// back to a full pass — or this function has to grow the sibling's subtree
+/// into its walk. That is not a nicety: the failure mode is a page that
+/// silently does not update, which is the one bug M10.6's classification was
+/// built to make impossible. Whoever implements `+` starts here.
+///
+/// Roots are handled in any order and may nest: the final write to any node
+/// comes from the pass of the last root that is an ancestor-or-self of it, and
+/// that root's parent is always resolved by then. Roots covered by another
+/// root are skipped rather than styled twice for the same answer.
+///
+/// `styles` must be the tree that was resolved from this `dom`, at this size —
+/// a script that created a node grew the arena past it, and the caller checks
+/// [`Styles::node_count`] before calling.
+pub fn restyle_subtree(
+    dom: &Dom,
+    sheets: &[&Stylesheet],
+    ctx: &StyleContext<'_>,
+    styles: &mut Styles,
+    roots: &[NodeId],
+) {
+    debug_assert_eq!(styles.node_count(), dom.node_count());
+    // Built once for the whole call rather than once per root: on Wikipedia's
+    // sheets the index costs more than a small subtree does.
+    let ua = RuleIndex::build(&[ua_stylesheet()]);
+    let author = RuleIndex::build(sheets);
+    for &root in roots {
+        if roots
+            .iter()
+            .any(|&other| other != root && is_ancestor(dom, other, root))
+        {
+            continue;
+        }
+        // A detached node is never reached by a full pass, so its slot holds
+        // the initial values; styling it here would make the scoped answer
+        // differ from the full one for a node nothing can see. It can only
+        // become visible through an insert, which is a structural edit and
+        // restyles the document anyway.
+        let Some(parent) = inherited_from(dom, styles, root) else {
+            continue;
+        };
+        resolve(dom, root, &parent, &ua, &author, ctx, styles);
+    }
+}
+
+/// The already-computed values `root` inherits from, or `None` when `root` is
+/// not in the document.
+fn inherited_from(dom: &Dom, styles: &Styles, root: NodeId) -> Option<ComputedStyle> {
+    if root == dom.root {
+        return Some(ComputedStyle::default());
+    }
+    let parent = dom.node(root).parent?;
+    is_ancestor(dom, dom.root, root).then(|| *styles.get(parent))
+}
+
+/// Whether `ancestor` is a strict ancestor of `id`.
+fn is_ancestor(dom: &Dom, ancestor: NodeId, id: NodeId) -> bool {
+    let mut walk = dom.node(id).parent;
+    while let Some(current) = walk {
+        if current == ancestor {
+            return true;
+        }
+        walk = dom.node(current).parent;
+    }
+    false
+}
+
 fn resolve(
     dom: &Dom,
     node: NodeId,
@@ -273,6 +390,10 @@ fn resolve(
     ctx: &StyleContext<'_>,
     out: &mut Styles,
 ) {
+    #[cfg(test)]
+    {
+        out.nodes_styled += 1;
+    }
     let computed = match &dom.node(node).data {
         NodeData::Element { .. } => cascade(dom, node, parent, ua, author, ctx),
         // Text, comments and the document root match no selector; they carry
@@ -1296,6 +1417,352 @@ mod ladder {
             sheet.rules.len() > 20,
             "recovery dropped too much: {} rules",
             sheet.rules.len()
+        );
+    }
+}
+
+/// M11.3's equivalence oracle: a scoped restyle must produce **byte-identical**
+/// computed values to a full one, on every page of the ladder and under a
+/// seeded fuzz. This is the deliverable the narrowing lives or dies by — a
+/// subtree pass that gets one node wrong is a page that silently stops
+/// updating, which is exactly the failure M10.6's classification was built to
+/// rule out.
+#[cfg(test)]
+mod scoped {
+    use super::*;
+    use crate::dom::AttrChanges;
+    use crate::html;
+
+    macro_rules! fixture {
+        ($name:literal) => {
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/",
+                $name
+            ))
+        };
+    }
+
+    /// Rules that *react* to the writes below, so the comparison has something
+    /// to disagree about: a scoped pass that wrote nothing at all would match a
+    /// full one on a page whose sheets never mention the attributes touched.
+    ///
+    /// Deliberately every shape the subtree argument rests on — inherited and
+    /// non-inherited properties, descendant and child combinators, and M11.2's
+    /// attribute selectors.
+    const PROBE: &str = "
+        .x-probe { color: #c00; margin-left: 3px; display: flex }
+        .x-probe p { font-weight: bold }
+        .x-probe > * { padding-left: 1px }
+        body .x-probe span { text-align: right }
+        [data-probe] { border-left-width: 2px }
+        [data-probe='deep'] em { font-style: normal }
+    ";
+
+    fn sheets_for(dom: &Dom) -> Vec<Stylesheet> {
+        fn collect(dom: &Dom, id: NodeId, out: &mut Vec<Stylesheet>) {
+            if matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "style") {
+                let mut text = String::new();
+                for child in dom.children(id) {
+                    if let NodeData::Text(t) = &dom.node(child).data {
+                        text.push_str(t);
+                    }
+                }
+                out.push(css::parse(&text));
+                return;
+            }
+            for child in dom.children(id) {
+                collect(dom, child, out);
+            }
+        }
+        let mut out = Vec::new();
+        collect(dom, dom.root, &mut out);
+        out.push(css::parse(PROBE));
+        out
+    }
+
+    fn elements(dom: &Dom) -> Vec<NodeId> {
+        (0..dom.node_count() as u32)
+            .map(NodeId)
+            .filter(|&id| matches!(dom.node(id).data, NodeData::Element { .. }))
+            .collect()
+    }
+
+    fn depth(dom: &Dom, id: NodeId) -> usize {
+        let mut depth = 0;
+        let mut walk = dom.node(id).parent;
+        while let Some(up) = walk {
+            depth += 1;
+            walk = dom.node(up).parent;
+        }
+        depth
+    }
+
+    /// The four nodes the task names: a shallow one, a deep one, one with
+    /// children and one without. They exercise the two halves of the argument
+    /// separately — a leaf can only change itself, an ancestor changes a whole
+    /// subtree through both inheritance and its descendants' selectors.
+    fn sampled_victims(dom: &Dom) -> Vec<NodeId> {
+        let els = elements(dom);
+        let mut victims = vec![
+            *els.iter().min_by_key(|&&id| depth(dom, id)).unwrap(),
+            *els.iter().max_by_key(|&&id| depth(dom, id)).unwrap(),
+            *els.iter()
+                .max_by_key(|&&id| dom.children(id).count())
+                .unwrap(),
+            *els.iter()
+                .find(|&&id| dom.children(id).next().is_none())
+                .unwrap(),
+        ];
+        victims.dedup();
+        victims
+    }
+
+    /// Every node, compared value by value. `Styles` holds `ComputedStyle`s
+    /// that are `PartialEq` in full, so this is the byte-identical claim and
+    /// not a claim about the properties someone remembered to check.
+    fn assert_identical(scoped: &Styles, full: &Styles, dom: &Dom, what: &str) {
+        assert_eq!(scoped.node_count(), full.node_count(), "{what}: tree size");
+        for id in (0..full.node_count() as u32).map(NodeId) {
+            assert_eq!(
+                scoped.get(id),
+                full.get(id),
+                "{what}: node {} (<{}>) diverged",
+                id.0,
+                match &dom.node(id).data {
+                    NodeData::Element { tag, .. } => tag.as_str(),
+                    _ => "non-element",
+                }
+            );
+        }
+    }
+
+    /// Apply `write` to `dom`, then compare a scoped restyle of `current`
+    /// against a full pass. Returns the full pass, which becomes the next
+    /// comparison's starting point — so the writes compound rather than each
+    /// starting from a clean page.
+    fn compare_after(dom: &mut Dom, current: &Styles, what: &str) -> Styles {
+        let sheets = sheets_for(dom);
+        let refs: Vec<&Stylesheet> = sheets.iter().collect();
+        let ctx = StyleContext::default();
+
+        let AttrChanges::Nodes(roots) = dom.take_attr_changes() else {
+            panic!("{what}: the write overflowed the arena's list");
+        };
+        let mut scoped = current.clone();
+        restyle_subtree(dom, &refs, &ctx, &mut scoped, &roots);
+
+        let full = style_tree_with(dom, &refs, &ctx);
+        assert_identical(&scoped, &full, dom, what);
+        full
+    }
+
+    /// The ladder proof: on a real page, an attribute write on each sampled
+    /// node — set, then unset — must leave the scoped tree identical to a full
+    /// one. Unset matters as much as set: a subtree that gained a rule and
+    /// never gave it back is the other half of the bug.
+    fn ladder_page(source: &str, label: &str, pick: impl Fn(&Dom) -> Vec<NodeId>) {
+        let mut dom = html::parse(source);
+        let sheets = sheets_for(&dom);
+        let mut current = style_tree_with(
+            &dom,
+            &sheets.iter().collect::<Vec<_>>(),
+            &StyleContext::default(),
+        );
+        drop(sheets);
+
+        for victim in pick(&dom) {
+            let tag = match &dom.node(victim).data {
+                NodeData::Element { tag, .. } => tag.clone(),
+                _ => unreachable!("victims are elements"),
+            };
+            let at = format!("{label} <{tag}> #{}", victim.0);
+
+            dom.set_attr(victim, "class", "x-probe");
+            current = compare_after(&mut dom, &current, &format!("{at}: class added"));
+
+            dom.set_attr(victim, "data-probe", "deep");
+            current = compare_after(&mut dom, &current, &format!("{at}: attribute added"));
+
+            dom.remove_attr(victim, "class");
+            current = compare_after(&mut dom, &current, &format!("{at}: class removed"));
+
+            dom.remove_attr(victim, "data-probe");
+            current = compare_after(&mut dom, &current, &format!("{at}: attribute removed"));
+        }
+    }
+
+    #[test]
+    fn example_com_scoped_restyle_equals_a_full_one() {
+        ladder_page(fixture!("example.com.html"), "example.com", sampled_victims);
+    }
+
+    #[test]
+    fn motherfuckingwebsite_com_scoped_restyle_equals_a_full_one() {
+        ladder_page(
+            fixture!("motherfuckingwebsite.com.html"),
+            "motherfuckingwebsite.com",
+            sampled_victims,
+        );
+    }
+
+    #[test]
+    fn danluu_com_scoped_restyle_equals_a_full_one() {
+        ladder_page(fixture!("danluu.com.html"), "danluu.com", sampled_victims);
+    }
+
+    #[test]
+    fn news_ycombinator_com_scoped_restyle_equals_a_full_one() {
+        ladder_page(
+            fixture!("news.ycombinator.com.html"),
+            "news.ycombinator.com",
+            sampled_victims,
+        );
+    }
+
+    #[test]
+    fn en_wikipedia_org_scoped_restyle_equals_a_full_one() {
+        // The shallow and deep victims only. Every comparison costs a *full*
+        // restyle of 25,599 nodes, which is a second of an unoptimized build
+        // each; the two victims this page has that no other does are its
+        // extremes of depth, and the children/leaf pair is covered four times
+        // over above. Trading the redundant half for a `cargo test` that stays
+        // in its current wall clock.
+        ladder_page(
+            fixture!("en.wikipedia.org.html"),
+            "en.wikipedia.org",
+            |dom| sampled_victims(dom)[..2].to_vec(),
+        );
+    }
+
+    /// The same generator `dom::mutation_fuzz` uses.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    #[test]
+    fn mutation_fuzz_keeps_a_scoped_restyle_equal_to_a_full_one() {
+        // Shaped like `dom::mutation_fuzz`: random attribute writes on random
+        // nodes, comparing scoped against full after each. The cheapest
+        // insurance in M11 — the sampled victims above test the cases someone
+        // thought of, and this tests the ones nobody did.
+        //
+        // Several writes per round on purpose: one root is the easy case, and
+        // the interesting ones are two roots where one is inside the other's
+        // subtree, and a write that lands on a node no walk reaches.
+        const ROUNDS: usize = 150;
+
+        let mut dom = html::parse(fixture!("motherfuckingwebsite.com.html"));
+        // A node the tree does not contain: a full pass never reaches it, so
+        // its slot must stay at the initial values however often it is written.
+        let detached = dom.create_element("div", vec![]);
+        let sheets = sheets_for(&dom);
+        let mut current = style_tree_with(
+            &dom,
+            &sheets.iter().collect::<Vec<_>>(),
+            &StyleContext::default(),
+        );
+        drop(sheets);
+        dom.take_attr_changes();
+
+        let all = elements(&dom);
+        let mut rng = Lcg(0x0113);
+        for round in 0..ROUNDS {
+            for _ in 0..1 + rng.below(3) {
+                let victim = match rng.below(16) {
+                    0 => detached,
+                    _ => all[rng.below(all.len())],
+                };
+                match rng.below(4) {
+                    0 => dom.set_attr(victim, "class", "x-probe"),
+                    1 => dom.set_attr(victim, "data-probe", "deep"),
+                    2 => dom.remove_attr(victim, "class"),
+                    _ => dom.remove_attr(victim, "data-probe"),
+                };
+            }
+            current = compare_after(&mut dom, &current, &format!("fuzz round {round}"));
+        }
+    }
+
+    #[test]
+    fn a_scoped_pass_styles_the_subtree_and_not_the_document() {
+        // The scope itself, at the stage rather than through `App`: the walk
+        // must reach the subtree's nodes and stop.
+        let mut dom = html::parse("<div id=a><p><em>deep</em></p></div><div id=b><p>x</p></div>");
+        let sheets = [css::parse(PROBE)];
+        let refs: Vec<&Stylesheet> = sheets.iter().collect();
+        let ctx = StyleContext::default();
+        let mut styles = style_tree_with(&dom, &refs, &ctx);
+        let whole_document = styles.nodes_styled();
+        assert_eq!(whole_document, dom.node_count());
+
+        let em = elements(&dom)
+            .into_iter()
+            .find(|&id| matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "em"))
+            .unwrap();
+        dom.set_attr(em, "class", "x-probe");
+        let AttrChanges::Nodes(roots) = dom.take_attr_changes() else {
+            unreachable!()
+        };
+        restyle_subtree(&dom, &refs, &ctx, &mut styles, &roots);
+        assert_eq!(
+            styles.nodes_styled() - whole_document,
+            2,
+            "restyling <em> must reach <em> and its text node, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_root_inside_another_roots_subtree_is_not_styled_twice() {
+        // Overlapping roots are the case a per-node loop gets quadratic on:
+        // <body> and something under it both written to in one tick.
+        let mut dom = html::parse("<div id=outer><p id=inner>text</p></div>");
+        let sheets = [css::parse(PROBE)];
+        let refs: Vec<&Stylesheet> = sheets.iter().collect();
+        let ctx = StyleContext::default();
+        let mut styles = style_tree_with(&dom, &refs, &ctx);
+        let before = styles.nodes_styled();
+
+        let by_id = |dom: &Dom, want: &str| {
+            elements(dom)
+                .into_iter()
+                .find(|&id| dom.attr(id, "id") == Some(want))
+                .unwrap()
+        };
+        let (outer, inner) = (by_id(&dom, "outer"), by_id(&dom, "inner"));
+        dom.set_attr(inner, "class", "x-probe");
+        dom.set_attr(outer, "class", "x-probe");
+        let AttrChanges::Nodes(roots) = dom.take_attr_changes() else {
+            unreachable!()
+        };
+        assert_eq!(roots, vec![inner, outer], "both, in write order");
+
+        restyle_subtree(&dom, &refs, &ctx, &mut styles, &roots);
+        assert_eq!(
+            styles.nodes_styled() - before,
+            3,
+            "<div>, <p> and the text once each — the inner root is covered by \
+             the outer one"
+        );
+        // ...and covered means *correct*, not merely skipped: the inner node's
+        // values still come out identical to a full pass.
+        assert_identical(
+            &styles,
+            &style_tree_with(&dom, &refs, &ctx),
+            &dom,
+            "overlapping roots",
         );
     }
 }

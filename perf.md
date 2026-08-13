@@ -645,3 +645,101 @@ produces no message while a ten-second deadline is outstanding
 exactly `n` messages, and the event loop's only wait remains a blocking
 `recv`. The measurement someone with a terminal should make is two readings of
 `top` — one with a script-heavy page idle, one with a long timer pending.
+
+## M11.3 — scoped restyle: the subtree, not the document (2026-08-14)
+
+Machine A, release build, mean of 5 **interleaved** rounds after one discarded
+warm-up round. Before and after run in the same process, on the same page,
+alternating case by case — this machine drifts several percent between runs, so
+a before-commit/after-commit pair would be measuring the drift. The `before`
+column is the M10.6 path, reached through a test-only `App::full_restyle_only`
+that nothing else sets.
+
+    cargo test --release --lib measure_the_invalidation -- --ignored --nocapture --test-threads=1
+
+### The turn, before and after
+
+Two attribute writes, and the pair is the point. `document.body.classList.add`
+is the write M10.6 measured — and `<body>`'s subtree **is** the document, so
+there is nothing to narrow. The write on an ordinary leaf is the shape a click
+has, and is the case the narrowing exists for.
+
+**en.wikipedia.org, 25,601 nodes:**
+
+| turn | full restyle | scoped restyle |
+| --- | --- | --- |
+| `<body>` class, paint only | 46.99 ms (46.08–47.52) | 47.00 ms (46.46–47.88) |
+| `<body>` class, relayouting | 53.54 ms (52.36–54.51) | 53.82 ms (52.99–54.98) |
+| **leaf class, paint only** | 47.99 ms (47.15–49.80) | **3.26 ms (2.65–3.70)** |
+| **leaf class, relayouting** | 54.16 ms (53.77–54.77) | **10.61 ms (10.03–11.35)** |
+
+**danluu.com, 1,017 nodes:**
+
+| turn | full restyle | scoped restyle |
+| --- | --- | --- |
+| `<body>` class, paint only | 1.09 ms (1.07–1.12) | 1.08 ms (1.06–1.10) |
+| `<body>` class, relayouting | 1.53 ms (1.50–1.60) | 1.51 ms (1.49–1.54) |
+| leaf class, paint only | 1.07 ms (1.06–1.08) | **0.84 ms (0.82–0.85)** |
+| leaf class, relayouting | 1.53 ms (1.49–1.60) | **1.28 ms (1.25–1.32)** |
+
+### The stages behind them (Wikipedia)
+
+| stage | cost |
+| --- | --- |
+| full restyle | 43.55 ms |
+| **scoped restyle, one leaf** | **39.9 µs** |
+| `Styles::clone` (new in M11.3) | 180 µs |
+| `Styles::layout_eq` | 474 µs |
+| one layout | 5.68 ms |
+| a tick that changes nothing | 7.62 ms |
+
+**The cascade is no longer the cost of an attribute write: 43.55 ms → 0.04 ms,
+a factor of 1,090.** The clone is what M11.3 added — the invalidation path
+keeps the values the page was laid out with so `Styles::layout_eq` can stay the
+comparison that decides on layout, unchanged. It costs 0.18 ms against the
+43 ms it sits beside.
+
+### Does keypress→screen fit the 10 ms budget on Wikipedia?
+
+**Paint-only: yes, and by 3×.** 47.99 → **3.26 ms**, a third of the budget,
+where M10.6 left it at 5× over.
+
+**Relayouting: no — 10.61 ms, missing by 6%.** Where the remaining 10.6 ms
+goes, and none of it is style: **5.68 ms is one layout of the whole document**,
+which is M12's incremental layout and not this task's; the rest is the display
+list, the recolour, the frame diff and the present, each of which walks the
+whole page. Restyle is now 0.4% of that turn. The honest statement is that this
+task moved the bottleneck rather than removing it, and the next 5.7 ms is
+named.
+
+**A class written on `<body>` still costs a full restyle, and always will.**
+47 ms, unmoved, because `<body>`'s subtree is the document — the narrowing did
+not fail there, it correctly found nothing to narrow. A page that restyles
+everything pays for restyling everything.
+
+### The `:hover` path was not touched
+
+Hover still restyles the document, deliberately (see `App::restyle_and_repaint`)
+and not by oversight: hover moves *between* two elements and the subtree
+argument is about the one being entered, while the one being left has to lose
+its `:hover` styling in the same pass. It is also not an attribute write, so the
+arena's change list knows nothing about it. Narrowing it needs its own argument
+and its own measurement.
+
+### No regression where the change is not
+
+`cargo bench --bench style`, `restyle en.wikipedia.org` — the full pass, which
+every navigation still runs: **42.2 ms after, 42.3 ms before** (interleaved
+pairs). Unchanged, as it should be: the scoped path is an addition, not a
+rewrite of the cascade.
+
+`cargo bench --bench js`, `querySelectorAll('a') on Wikipedia`, is worth a
+paragraph because it looks like a 10% regression and is not one. Default
+profile: 24.2 ms after (8 runs, one at 21.9), 22.1 ms before (9 runs, all
+within 0.5 ms). The change adds nothing to that path — it is `html::parse` plus
+one JS query, and `benches/parse.rs` is flat. Rebuilding both with
+`CARGO_PROFILE_BENCH_CODEGEN_UNITS=1` **inverts the result**: 22.6 ms after,
+25.4 ms before. So the swing is codegen-unit partitioning and code placement,
+not work done. Recorded here as a property of this bench on this machine, so
+the next task that sees a 10% move on it looks at the CGU count before looking
+at its own diff.
