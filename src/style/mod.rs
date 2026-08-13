@@ -1432,6 +1432,7 @@ mod scoped {
     use super::*;
     use crate::dom::AttrChanges;
     use crate::html;
+    use std::collections::HashSet;
 
     macro_rules! fixture {
         ($name:literal) => {
@@ -1541,18 +1542,22 @@ mod scoped {
     /// against a full pass. Returns the full pass, which becomes the next
     /// comparison's starting point — so the writes compound rather than each
     /// starting from a clean page.
-    fn compare_after(dom: &mut Dom, current: &Styles, what: &str) -> Styles {
+    fn compare_after(
+        dom: &mut Dom,
+        current: &Styles,
+        ctx: &StyleContext<'_>,
+        what: &str,
+    ) -> Styles {
         let sheets = sheets_for(dom);
         let refs: Vec<&Stylesheet> = sheets.iter().collect();
-        let ctx = StyleContext::default();
 
         let AttrChanges::Nodes(roots) = dom.take_attr_changes() else {
             panic!("{what}: the write overflowed the arena's list");
         };
         let mut scoped = current.clone();
-        restyle_subtree(dom, &refs, &ctx, &mut scoped, &roots);
+        restyle_subtree(dom, &refs, ctx, &mut scoped, &roots);
 
-        let full = style_tree_with(dom, &refs, &ctx);
+        let full = style_tree_with(dom, &refs, ctx);
         assert_identical(&scoped, &full, dom, what);
         full
     }
@@ -1579,16 +1584,22 @@ mod scoped {
             let at = format!("{label} <{tag}> #{}", victim.0);
 
             dom.set_attr(victim, "class", "x-probe");
-            current = compare_after(&mut dom, &current, &format!("{at}: class added"));
+            let ctx = StyleContext::default();
+            current = compare_after(&mut dom, &current, &ctx, &format!("{at}: class added"));
 
             dom.set_attr(victim, "data-probe", "deep");
-            current = compare_after(&mut dom, &current, &format!("{at}: attribute added"));
+            current = compare_after(&mut dom, &current, &ctx, &format!("{at}: attribute added"));
 
             dom.remove_attr(victim, "class");
-            current = compare_after(&mut dom, &current, &format!("{at}: class removed"));
+            current = compare_after(&mut dom, &current, &ctx, &format!("{at}: class removed"));
 
             dom.remove_attr(victim, "data-probe");
-            current = compare_after(&mut dom, &current, &format!("{at}: attribute removed"));
+            current = compare_after(
+                &mut dom,
+                &current,
+                &ctx,
+                &format!("{at}: attribute removed"),
+            );
         }
     }
 
@@ -1692,8 +1703,72 @@ mod scoped {
                     _ => dom.remove_attr(victim, "data-probe"),
                 };
             }
-            current = compare_after(&mut dom, &current, &format!("fuzz round {round}"));
+            current = compare_after(
+                &mut dom,
+                &current,
+                &StyleContext::default(),
+                &format!("fuzz round {round}"),
+            );
         }
+    }
+
+    #[test]
+    fn the_dynamic_matching_inputs_survive_a_scoped_pass() {
+        // `:hover`, `:link` and `:visited` are the three matching inputs that
+        // do not come from the DOM, and `href` is the attribute two of them
+        // read — one a script can write, and one the oracle above never writes
+        // because it runs with an empty `StyleContext`. This is the only place
+        // they are compared scoped against full.
+        //
+        // The subtree argument still holds for all three, and this is what
+        // says so rather than only arguing it: `:link`/`:visited` read the
+        // node's own `href`, and `:hover` reads neither attributes nor
+        // anything an attribute write can move.
+        let mut dom = html::parse(
+            "<nav><a href='/seen'>one</a><a href='/fresh'>two</a></nav>\
+             <main><a href='/seen'><span>three</span></a></main>",
+        );
+        let links: Vec<NodeId> = elements(&dom)
+            .into_iter()
+            .filter(|&id| matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "a"))
+            .collect();
+        assert_eq!(links.len(), 3);
+
+        let visited: HashSet<String> = ["http://example.com/seen".to_string()].into();
+        let ctx = StyleContext {
+            // The hovered node is *outside* the subtrees written to below, so
+            // a scoped pass that quietly dropped it would show up here.
+            hover: Some(links[0]),
+            visited: &visited,
+            base_url: Some("http://example.com/page"),
+        };
+
+        let sheets = sheets_for(&dom);
+        let mut current = style_tree_with(&dom, &sheets.iter().collect::<Vec<_>>(), &ctx);
+        drop(sheets);
+        dom.take_attr_changes();
+
+        // Each write flips what the node itself matches — unvisited to
+        // visited, link to not-a-link, and back.
+        for (victim, name, value) in [
+            (links[1], "href", "/seen"),
+            (links[2], "href", "/fresh"),
+            (links[1], "href", "/fresh"),
+            (links[2], "class", "x-probe"),
+        ] {
+            dom.set_attr(victim, name, value);
+            current = compare_after(
+                &mut dom,
+                &current,
+                &ctx,
+                &format!("set {name} on #{}", victim.0),
+            );
+        }
+
+        // And removing `href` entirely: the node stops being a link at all,
+        // which the UA sheet styles and a descendant rule may depend on.
+        dom.remove_attr(links[2], "href");
+        compare_after(&mut dom, &current, &ctx, "href removed");
     }
 
     #[test]
