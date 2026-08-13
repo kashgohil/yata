@@ -57,6 +57,10 @@ pub struct Effect {
     /// document order before any fetch started, so arrival order cannot change
     /// execution order (M10.10).
     pub scripts: Vec<(FetchId, usize, String)>,
+    /// `fetch()` calls this page's script asked for (M10.12), as (page, request
+    /// id, method, url, headers, body) for the loop to spawn. Same discipline
+    /// as everything else: `App` decides, the loop dispatches.
+    pub fetches: Vec<(FetchId, js::FetchAsk)>,
     /// Timer work this page's script asked for (M10.9), for the loop to hand
     /// to the timer thread. Same discipline as `fetch` and `sheets`: `App`
     /// decides, the loop dispatches — nothing in `App` or `src/js/` touches a
@@ -172,6 +176,8 @@ pub struct App {
     /// into the `Effect` the key or mouse path returns. `dispatch_click` runs
     /// inside those paths and cannot return an `Effect` of its own.
     pending_click_navigation: Option<(FetchId, String)>,
+    /// `fetch()` calls a click handler made, carried out the same way.
+    pending_click_fetches: Vec<(FetchId, js::FetchAsk)>,
     /// The page's scripts in document order, with the position execution has
     /// reached (M10.10). External ones are holes until their worker reports;
     /// nothing after a hole runs, because the script that has not arrived may
@@ -303,6 +309,7 @@ impl App {
             timings: Timings::default(),
             timing_visible: false,
             pending_click_navigation: None,
+            pending_click_fetches: Vec::new(),
             script_queue: ScriptQueue::default(),
             storage: Storage::new(),
             console: Console::new(),
@@ -539,6 +546,59 @@ impl App {
                 };
                 self.run_ready_scripts(id, dom)
             }
+            Msg::JsFetch {
+                page,
+                request,
+                result,
+            } => {
+                // The same stale-generation guard every producer's message
+                // gets: a response for a page the reader has left is dropped,
+                // its promise never settles, and the host it belonged to is
+                // gone anyway.
+                if Some(page) != self.current_fetch {
+                    return Effect::default();
+                }
+                let Some(mut dom) = self.dom.take() else {
+                    return Effect::default();
+                };
+                let url = self.current_url().unwrap_or_default();
+                let console = self.console.clone();
+                let storage = self.storage.clone();
+                let Some(host) = self.js_host.as_mut() else {
+                    self.dom = Some(dom);
+                    return Effect::default();
+                };
+
+                let before = (dom.version(), dom.structure_version());
+                let logged_before = console.entries().len();
+                js::settle_fetch(
+                    host,
+                    &mut dom,
+                    &js::PageContext {
+                        page: page.0,
+                        url: &url,
+                        console: &console,
+                        storage: &storage,
+                    },
+                    request,
+                    result,
+                );
+                let after = (dom.version(), dom.structure_version());
+                self.dom = Some(dom);
+
+                // Settling is a tick: one invalidation cycle, whatever the
+                // `.then` chain did inside it.
+                let mut effect = self.apply_dom_changes(before, after);
+                effect.timers = self.take_timer_requests(page);
+                effect.fetches = self.take_fetch_requests(page);
+                self.apply_script_navigation(&mut effect);
+                if self.console.entries().len() != logged_before {
+                    self.console_view_built = false;
+                    self.build_visible_inspector();
+                    effect.dirty = true;
+                }
+                effect
+            }
             Msg::Timer { page, id } => {
                 // The same stale-generation guard every other message uses: a
                 // deadline that came up for a page the user has left is not
@@ -576,6 +636,7 @@ impl App {
 
                 let mut effect = self.apply_dom_changes(before, after);
                 effect.timers = self.take_timer_requests(page);
+                effect.fetches = self.take_fetch_requests(page);
                 self.apply_script_navigation(&mut effect);
                 if self.console.entries().len() != logged_before {
                     self.console_view_built = false;
@@ -1764,6 +1825,7 @@ impl App {
 
         let mut effect = self.apply_dom_changes(before, after);
         effect.timers = self.take_timer_requests(id);
+        effect.fetches = self.take_fetch_requests(id);
         self.apply_script_navigation(&mut effect);
         if logged {
             // A script that only logged changed no box, but it did change what
@@ -1813,6 +1875,7 @@ impl App {
         Effect {
             dirty: true,
             fetch: self.pending_click_navigation.take(),
+            fetches: std::mem::take(&mut self.pending_click_fetches),
             ..Effect::default()
         }
     }
@@ -1858,6 +1921,20 @@ impl App {
         if navigation.fetch.is_some() {
             *effect = navigation;
         }
+    }
+
+    /// The `fetch()` calls a tick asked for, tagged with the generation that
+    /// asked so a response can be matched back to it.
+    fn take_fetch_requests(&mut self, page: FetchId) -> Vec<(FetchId, js::FetchAsk)> {
+        self.js_host
+            .as_ref()
+            .map(|host| {
+                host.take_fetch_requests()
+                    .into_iter()
+                    .map(|ask| (page, ask))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Turn the timer work a tick asked for into requests the loop can hand to
@@ -1926,6 +2003,7 @@ impl App {
         self.dom = Some(dom);
 
         let mut effect = self.apply_dom_changes(before, after);
+        self.pending_click_fetches = self.take_fetch_requests(id);
         self.apply_script_navigation(&mut effect);
         self.pending_click_navigation = effect.fetch.take();
         if self.console.entries().len() != logged_before {
@@ -3549,6 +3627,236 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    // ---- fetch (M10.12) ---------------------------------------------------
+
+    fn json_response(body: &str) -> Result<crate::net::JsResponse, String> {
+        Ok(crate::net::JsResponse {
+            status: 200,
+            status_text: "OK".into(),
+            url: "http://final/data.json".into(),
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: body.to_string(),
+        })
+    }
+
+    #[test]
+    fn a_fetch_leaves_as_an_effect_and_settles_as_a_message() {
+        let (mut app, id) = scripted_app(
+            "<div id=out>loading</div><script>\
+             fetch('/data.json').then(function (r) { return r.json(); })\
+                                .then(function (d) { console.log('got ' + d.n); });</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let (page, ask) = effect
+            .fetches
+            .first()
+            .expect("the fetch must reach the loop");
+        assert_eq!(*page, id);
+        assert_eq!(ask.url, "http://final/data.json");
+        assert_eq!(ask.method, "GET");
+        // Nothing has settled: the promise is still pending.
+        assert!(app.console.is_empty());
+
+        app.update(Msg::JsFetch {
+            page: id,
+            request: ask.request,
+            result: json_response("{\"n\": 7}"),
+        });
+        assert_eq!(
+            app.console
+                .entries()
+                .first()
+                .map(|e| e.text.clone())
+                .as_deref(),
+            Some("got 7")
+        );
+    }
+
+    #[test]
+    fn settling_a_fetch_runs_exactly_one_invalidation_cycle() {
+        // Deliverable 5: resolution is a tick like any other, so a `.then`
+        // that builds a list costs one relayout however much it appends.
+        let (mut app, id) = scripted_app(
+            "<div id=out></div><script>\
+             fetch('/data.json').then(function (r) { return r.json(); }).then(function (d) {\
+               var out = document.getElementById('out');\
+               d.items.forEach(function (i) {\
+                 var p = document.createElement('p'); p.textContent = i; out.appendChild(p);\
+               });\
+             });</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let request = effect.fetches[0].1.request;
+        let (styled, laid_out, painted) = stages(&app);
+
+        let effect = app.update(Msg::JsFetch {
+            page: id,
+            request,
+            result: json_response("{\"items\": [\"a\", \"b\", \"c\", \"d\", \"e\"]}"),
+        });
+        assert!(effect.dirty);
+        assert_eq!(
+            stages(&app),
+            (styled + 1, laid_out + 1, painted + 1),
+            "settling a fetch must cost one cycle"
+        );
+        assert!(screen(&mut app, 40, 10).contains('c'));
+    }
+
+    #[test]
+    fn a_404_resolves_rather_than_rejecting() {
+        // The thing pages get wrong constantly, so we must not: the response
+        // arrived, so the promise resolves with `ok: false`.
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             fetch('/missing').then(function (r) { console.log('ok=' + r.ok + ' status=' + r.status); },\
+                                    function () { console.log('rejected'); });</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let request = effect.fetches[0].1.request;
+        app.update(Msg::JsFetch {
+            page: id,
+            request,
+            result: Ok(crate::net::JsResponse {
+                status: 404,
+                status_text: "Not Found".into(),
+                url: "http://final/missing".into(),
+                headers: vec![],
+                body: "not here".into(),
+            }),
+        });
+        assert_eq!(
+            app.console
+                .entries()
+                .first()
+                .map(|e| e.text.clone())
+                .as_deref(),
+            Some("ok=false status=404")
+        );
+    }
+
+    #[test]
+    fn a_connection_failure_rejects() {
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             fetch('/gone').catch(function (e) { console.log(e.message); });</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let request = effect.fetches[0].1.request;
+        app.update(Msg::JsFetch {
+            page: id,
+            request,
+            result: Err("connection refused".into()),
+        });
+        assert_eq!(
+            app.console
+                .entries()
+                .first()
+                .map(|e| e.text.clone())
+                .as_deref(),
+            Some("fetch failed: connection refused")
+        );
+    }
+
+    #[test]
+    fn a_response_arriving_after_navigation_is_dropped() {
+        let (mut app, first) = scripted_app(
+            "<p>x</p><script>fetch('/data').then(function () { console.log('settled'); });</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id: first });
+        let request = effect.fetches[0].1.request;
+
+        let second = app.start_fetch("http://elsewhere/".into());
+        assert_ne!(first, second);
+        assert_eq!(
+            app.update(Msg::JsFetch {
+                page: first,
+                request,
+                result: json_response("{}"),
+            }),
+            Effect::default()
+        );
+        assert!(app.console.is_empty(), "a stale response settled a promise");
+    }
+
+    #[test]
+    fn a_cross_origin_fetch_is_refused_where_the_reader_can_see_it() {
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             fetch('https://elsewhere.example/secret').catch(function () {});</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(
+            effect.fetches.is_empty(),
+            "a cross-origin request left the app"
+        );
+        let entry = app
+            .console
+            .entries()
+            .into_iter()
+            .next()
+            .expect("a console line");
+        assert_eq!(entry.level, crate::js::console::Level::Error);
+        assert!(
+            entry.text.contains("only same-origin requests are allowed"),
+            "{}",
+            entry.text
+        );
+    }
+
+    #[test]
+    fn a_consumed_body_rejects_on_a_second_read() {
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             fetch('/data').then(function (r) {\
+               return r.text().then(function () { return r.text(); });\
+             }).catch(function (e) { console.log(e.message); });</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let request = effect.fetches[0].1.request;
+        app.update(Msg::JsFetch {
+            page: id,
+            request,
+            result: json_response("{}"),
+        });
+        assert_eq!(
+            app.console
+                .entries()
+                .first()
+                .map(|e| e.text.clone())
+                .as_deref(),
+            Some("body has already been consumed")
+        );
+    }
+
+    #[test]
+    fn a_page_that_floods_fetch_finds_a_wall() {
+        // M10.13 will try exactly this. The cap rejects rather than queueing,
+        // so the page finds out and the engine does not grow.
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             for (var i = 0; i < 500; i++) fetch('/x' + i).catch(function () {});</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        assert_eq!(
+            effect.fetches.len(),
+            crate::js::MAX_IN_FLIGHT,
+            "the cap did not hold"
+        );
+        // And the page is told, in the pane a reader can open. Note what is
+        // *not* asserted: a synchronous throw. `fetch` returns a rejected
+        // promise rather than throwing, as a browser does, so a page counting
+        // refusals must do it in a `.catch`.
+        assert!(
+            app.console
+                .entries()
+                .iter()
+                .any(|e| e.text.contains("requests in flight")),
+            "the refusal was not reported: {:?}",
+            app.console.entries().last()
+        );
     }
 
     // ---- location (M10.11) ------------------------------------------------

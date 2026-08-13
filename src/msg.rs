@@ -5,7 +5,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::css::Stylesheet;
 use crate::dom::Dom;
 use crate::image::DecodedImage;
-use crate::net::FetchId;
+use crate::net::{FetchId, JsResponse};
 use crate::timers::TimerId;
 
 /// Everything the UI thread reacts to arrives as one of these over the single
@@ -87,6 +87,19 @@ pub enum Msg {
         id: FetchId,
         slot: usize,
         source: Option<String>,
+    },
+    /// One `fetch()` finished (M10.12), from its own worker. `request` is the
+    /// id the page's promise is waiting on; `page` is the generation that
+    /// asked, so a response for a page the reader has left is dropped and its
+    /// promise simply never settles — which is what a browser does when it
+    /// tears down a document too.
+    ///
+    /// `Err` means the request never completed. A 404 is `Ok` with
+    /// `ok: false`, because that is what `fetch` resolves to.
+    JsFetch {
+        page: FetchId,
+        request: u64,
+        result: Result<JsResponse, String>,
     },
     /// A timer's deadline came up (M10.9), sent by the timer thread — one
     /// more producer on the one channel, which is the whole of what PLAN.md

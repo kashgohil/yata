@@ -100,32 +100,61 @@ fn run_scripts_from(
             }
         }
     }
-    drop(tx);
+    // `tx` stays alive: a tick may still ask for `fetch()`, and the loop below
+    // needs a sender to hand those workers. `rx.recv()` therefore never ends on
+    // its own — the loop leaves when nothing is in flight, which it counts.
 
     let mut runs = Vec::new();
+    let mut settled = 0usize;
+    let mut scripts_done = false;
     loop {
-        let ready = queue.take_ready_prefix();
-        let finished = queue.is_finished();
-        if !ready.is_empty() || finished {
-            runs.extend(js::run_prefix(
-                &mut host,
-                dom,
-                &js::PageContext {
-                    page: HEADLESS_PAGE,
-                    url: base_url.unwrap_or_default(),
-                    console: &console,
-                    storage: &storage,
-                },
-                ready,
-                finished,
-            ));
+        if !scripts_done {
+            let ready = queue.take_ready_prefix();
+            let finished = queue.is_finished();
+            if !ready.is_empty() || finished {
+                runs.extend(js::run_prefix(
+                    &mut host,
+                    dom,
+                    &js::PageContext {
+                        page: HEADLESS_PAGE,
+                        url: base_url.unwrap_or_default(),
+                        console: &console,
+                        storage: &storage,
+                    },
+                    ready,
+                    finished,
+                ));
+            }
+            scripts_done = finished;
         }
-        if finished || in_flight == 0 {
+
+        // A tick may have asked for `fetch()`. On the fetching path we perform
+        // them, so a page that renders from data actually renders; otherwise
+        // they are simply never answered, and the promise never settles.
+        if fetch_externals {
+            for ask in host
+                .as_ref()
+                .map(js::Host::take_fetch_requests)
+                .unwrap_or_default()
+            {
+                net::spawn_js_fetch(
+                    FetchId(1),
+                    ask.request,
+                    ask.url,
+                    ask.method,
+                    ask.headers,
+                    ask.body,
+                    tx.clone(),
+                );
+                in_flight += 1;
+            }
+        }
+
+        if in_flight == 0 || (scripts_done && settled >= MAX_HEADLESS_FETCHES) {
             break;
         }
-        // Block for the next body. The worker always answers — success or
-        // `None` — so this cannot hang on a slow server any longer than the
-        // fetch itself takes.
+        // Block for the next answer. Every worker always replies, so this
+        // cannot wait longer than the requests themselves take.
         match rx.recv() {
             Ok(Msg::Script { slot, source, .. }) => {
                 if source.is_none() {
@@ -139,6 +168,26 @@ fn run_scripts_from(
                 queue.fill(slot, source);
                 in_flight -= 1;
             }
+            Ok(Msg::JsFetch {
+                request, result, ..
+            }) => {
+                in_flight -= 1;
+                settled += 1;
+                if let Some(engine) = host.as_mut() {
+                    js::settle_fetch(
+                        engine,
+                        dom,
+                        &js::PageContext {
+                            page: HEADLESS_PAGE,
+                            url: base_url.unwrap_or_default(),
+                            console: &console,
+                            storage: &storage,
+                        },
+                        request,
+                        result,
+                    );
+                }
+            }
             _ => break,
         }
     }
@@ -148,6 +197,11 @@ fn run_scripts_from(
     let pending = host.as_mut().map_or(0, js::Host::pending_timers);
     (runs, console, pending)
 }
+
+/// How many `fetch()` calls one headless run will answer. A page that fetches
+/// in a loop must not make a dump run forever; the count is generous enough
+/// that an honest page rendering from data finishes.
+const MAX_HEADLESS_FETCHES: usize = 64;
 
 /// The page generation headless runs use. Only its constancy matters.
 const HEADLESS_PAGE: u64 = 1;

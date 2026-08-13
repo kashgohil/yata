@@ -155,6 +155,100 @@ pub fn spawn_script(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) {
     });
 }
 
+/// The largest response body `fetch()` will hand to a page. A script that
+/// asks for a video and calls `text()` on it must find a wall, not the
+/// process's memory limit.
+pub const MAX_FETCH_BYTES: usize = 8 * 1024 * 1024;
+
+/// What a page's `fetch()` got back. Plain owned data — no engine types, no
+/// `reqwest` types — because it travels inside a `Msg`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct JsResponse {
+    pub status: u16,
+    pub status_text: String,
+    /// The URL after redirects, which is what `response.url` reports.
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// Perform one `fetch()` on a detached worker (M10.12), and send the result
+/// back as a message. The same discipline as every other producer: the UI
+/// thread never waits, and the promise settles in a later turn.
+///
+/// A non-success status is **not** an error: `fetch` resolves with `ok: false`
+/// for a 404, which pages get wrong constantly and so must we not. `Err` here
+/// means the request never completed at all.
+pub fn spawn_js_fetch(
+    page: FetchId,
+    request: u64,
+    url: String,
+    method: String,
+    headers: Vec<(String, String)>,
+    body: Option<String>,
+    tx: Sender<Msg>,
+) {
+    thread::spawn(move || {
+        let result = js_request(&url, &method, &headers, body.as_deref());
+        let _ = tx.send(Msg::JsFetch {
+            page,
+            request,
+            result,
+        });
+    });
+}
+
+fn js_request(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<JsResponse, String> {
+    let client = client()?;
+    let mut req = match method {
+        "POST" => client.post(url),
+        _ => client.get(url),
+    };
+    for (name, value) in headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    if let Some(body) = body {
+        req = req.body(body.to_string());
+    }
+
+    let mut resp = req.send().map_err(describe)?;
+    let status = resp.status();
+    let final_url = resp.url().to_string();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect();
+
+    let mut bytes = Vec::new();
+    resp.read_to_end(&mut bytes).map_err(describe)?;
+    if bytes.len() > MAX_FETCH_BYTES {
+        return Err(format!(
+            "response is {} bytes, over the {MAX_FETCH_BYTES}-byte limit",
+            bytes.len()
+        ));
+    }
+
+    Ok(JsResponse {
+        status: status.as_u16(),
+        status_text: status.canonical_reason().unwrap_or_default().to_string(),
+        url: final_url,
+        headers,
+        // The same lossy-UTF-8 seam every other body decode uses.
+        body: crate::html::decode_body(&bytes),
+    })
+}
+
 /// Fetch and decode one `<img>` on a detached worker (M8). One `Msg::Image`
 /// goes out — success or soft failure. Never an error page: a broken image is
 /// a degraded page, not a navigation failure.

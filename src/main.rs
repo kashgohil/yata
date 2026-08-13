@@ -119,6 +119,19 @@ fn main() -> io::Result<()> {
         for request in effect.timers {
             timers.apply(request);
         }
+        // One worker per `fetch()` (M10.12), like every other producer. The UI
+        // thread never waits: the promise settles in a later turn.
+        for (page, ask) in effect.fetches {
+            net::spawn_js_fetch(
+                page,
+                ask.request,
+                ask.url,
+                ask.method,
+                ask.headers,
+                ask.body,
+                tx.clone(),
+            );
+        }
         // One worker per linked stylesheet, all spawned before this turn's
         // render: they run in parallel with each other and with the page the
         // user is already reading (PLAN.md M4, UX §3.2).
@@ -451,6 +464,7 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         // request its own, and stale generations are dropped by the `FetchId`
         // guard in `App`, not here.
         effect.scripts.extend(e.scripts);
+        effect.fetches.extend(e.fetches);
         effect.timers.extend(e.timers);
         if e.yank.is_some() {
             effect.yank = e.yank;

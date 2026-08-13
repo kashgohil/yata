@@ -1,7 +1,8 @@
 mod fetch;
 
 pub use fetch::{
-    MAX_SCRIPT_BYTES, is_document, spawn_fetch, spawn_image, spawn_script, spawn_stylesheet,
+    JsResponse, MAX_FETCH_BYTES, MAX_SCRIPT_BYTES, is_document, spawn_fetch, spawn_image,
+    spawn_js_fetch, spawn_script, spawn_stylesheet,
 };
 
 /// Default a bare URL to `https://`. The single place scheme defaulting lives,

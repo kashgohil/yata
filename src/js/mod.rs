@@ -77,6 +77,10 @@
 // into it from Rust. Keeping the module closed is what stops `DomSlot::lend`
 // from becoming an API somebody outside the engine can hand a tree to.
 mod bindings;
+
+// The one type from the bindings that crosses out: what a `fetch()` asked for,
+// which `App` hands to the loop. Everything else in that module stays closed.
+pub use bindings::{FetchAsk, MAX_IN_FLIGHT};
 pub mod console;
 pub mod queue;
 pub mod sources;
@@ -94,9 +98,10 @@ use rquickjs::{
 };
 
 use crate::dom::Dom;
-use crate::js::bindings::{NavQueue, NavRequest, TimerAsk, TimerQueue};
+use crate::js::bindings::{FetchQueue, NavQueue, NavRequest, TimerAsk, TimerQueue};
 use crate::js::console::{Console, Level};
 use crate::js::storage::Storage;
+use crate::net::JsResponse;
 use crate::timers::TimerId;
 
 /// What one script did: the name it was known by, and its completion value or
@@ -106,6 +111,51 @@ use crate::timers::TimerId;
 pub struct ScriptRun {
     pub name: String,
     pub outcome: Result<JsValue, JsError>,
+}
+
+/// Settle one `fetch()` as its own tick (M10.12).
+///
+/// Resolution is a tick like any other: the budget is armed, the DOM is lent
+/// so a `.then` can mutate, microtasks are pumped to quiescence — which is
+/// what actually runs the page's continuation — and the caller applies one
+/// invalidation cycle after.
+pub fn settle_fetch(
+    host: &mut Host,
+    dom: &mut Dom,
+    ctx: &PageContext<'_>,
+    request: u64,
+    result: Result<JsResponse, String>,
+) {
+    host.dom.lend(
+        std::mem::replace(dom, Dom::new_document()),
+        ctx.page,
+        ctx.url,
+    );
+    if let Err(error) = host.settle_fetch(request, result) {
+        ctx.console.push(
+            Level::Error,
+            Some(error.source.clone()),
+            error.line,
+            &error.message,
+        );
+    }
+    host.pump_microtasks(ctx.console);
+    if let Some(returned) = host.dom.take() {
+        *dom = returned;
+    }
+}
+
+/// Response headers as the flat JSON object the prelude parses.
+fn header_json(headers: &[(String, String)]) -> String {
+    let mut out = String::from("{");
+    for (i, (name, value)) in headers.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("{:?}:{:?}", name, value));
+    }
+    out.push('}');
+    out
 }
 
 /// What a tick needs to know about the page it runs for: which generation it
@@ -365,6 +415,8 @@ pub struct Host {
     /// A navigation the page asked for during a tick (M10.11), drained the
     /// same way. JS never touches the network.
     navigation: NavQueue,
+    /// `fetch()` calls the page asked for (M10.12), drained the same way.
+    fetches: FetchQueue,
     /// The engine handle. `Context` keeps the runtime alive on its own, so
     /// this is not what makes the host valid — it is how the limits get set
     /// and how the tests read the heap back. Holding it is deliberate: it is
@@ -414,8 +466,9 @@ impl Host {
         let dom = Rc::new(bindings::DomSlot::default());
         let timers = TimerQueue::default();
         let navigation = NavQueue::default();
+        let fetches = FetchQueue::default();
         let entries = context.with(|ctx| {
-            bindings::install(&ctx, &dom, console, &timers, &navigation, storage)
+            bindings::install(&ctx, &dom, console, &timers, &navigation, storage, &fetches)
                 .map(|entry_points| Persistent::save(&ctx, entry_points))
                 .catch(&ctx)
                 .map_err(|caught| JsError::from_caught("<bindings>", &caught))
@@ -427,6 +480,7 @@ impl Host {
             entries,
             timers,
             navigation: navigation.clone(),
+            fetches: fetches.clone(),
             runtime,
             context,
             budget,
@@ -554,6 +608,40 @@ impl Host {
     /// Timer work the page asked for during the tick that just ended.
     pub fn take_timer_requests(&self) -> Vec<TimerAsk> {
         self.timers.drain()
+    }
+
+    /// `fetch()` calls the tick that just ended asked for.
+    pub fn take_fetch_requests(&self) -> Vec<FetchAsk> {
+        self.fetches.drain()
+    }
+
+    /// Settle one `fetch()` promise (M10.12). Unknown ids do nothing: a
+    /// response whose promise is already gone is not an error.
+    fn settle_fetch(
+        &mut self,
+        request: u64,
+        result: Result<JsResponse, String>,
+    ) -> Result<(), JsError> {
+        self.fetches.settled();
+        let entries = self.entries.clone();
+        self.under_budget("fetch", move |ctx| {
+            let settle = entries.restore(ctx)?.get::<_, Function>("settleFetch")?;
+            match result {
+                Ok(response) => {
+                    let headers = header_json(&response.headers);
+                    settle.call::<_, ()>((
+                        request as f64,
+                        rquickjs::Value::new_null(ctx.clone()),
+                        response.status,
+                        response.status_text.as_str(),
+                        response.url.as_str(),
+                        headers.as_str(),
+                        response.body.as_str(),
+                    ))
+                }
+                Err(error) => settle.call::<_, ()>((request as f64, error.as_str())),
+            }
+        })
     }
 
     /// The navigation the tick that just ended asked for, if any. At most one:

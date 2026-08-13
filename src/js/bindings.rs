@@ -159,6 +159,44 @@ impl NavQueue {
     }
 }
 
+/// How many `fetch()` calls one page may have outstanding. A page that loops
+/// issuing requests must find a wall rather than a queue that grows until the
+/// process does — M10.13 will try exactly that.
+pub const MAX_IN_FLIGHT: usize = 32;
+
+/// A `fetch()` the page asked for (M10.12), collected for the event loop.
+///
+/// Same discipline as navigation and timers: JS never touches the network, the
+/// binding records what was asked, and the loop spawns the worker.
+#[derive(Clone, Default)]
+pub struct FetchQueue {
+    requests: Rc<RefCell<Vec<FetchAsk>>>,
+    /// How many are outstanding for this page, for the concurrency cap.
+    in_flight: Rc<Cell<usize>>,
+}
+
+/// One request: the id its promise is waiting on, and what to send.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FetchAsk {
+    pub request: u64,
+    pub url: String,
+    pub method: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Option<String>,
+}
+
+impl FetchQueue {
+    /// Take everything asked for since the last drain.
+    pub fn drain(&self) -> Vec<FetchAsk> {
+        std::mem::take(&mut *self.requests.borrow_mut())
+    }
+
+    /// One outstanding request has settled.
+    pub fn settled(&self) {
+        self.in_flight.set(self.in_flight.get().saturating_sub(1));
+    }
+}
+
 /// Whether `name` is one the serializer could write and the tokenizer read
 /// back as the same attribute.
 ///
@@ -209,6 +247,7 @@ pub fn install<'js>(
     timers: &TimerQueue,
     navigation: &NavQueue,
     storage: &Storage,
+    fetches: &FetchQueue,
 ) -> JsResult<Object<'js>> {
     let api = Object::new(ctx.clone())?;
 
@@ -697,6 +736,72 @@ pub fn install<'js>(
         )?,
     )?;
 
+    // ---- fetch (M10.12) ----
+
+    let (queue, s, log) = (fetches.clone(), Rc::clone(slot), console.clone());
+    api.set(
+        "startFetch",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>,
+                  request: f64,
+                  url: String,
+                  method: String,
+                  headers: String,
+                  body: Option<String>| {
+                let page_url = s.url.borrow().clone();
+                let Some(resolved) = crate::net::resolve_url(&page_url, &url) else {
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("TypeError: '{url}' is not a URL this page can fetch"),
+                    ));
+                };
+
+                // **Same origin only.** A browser would send the request and
+                // let CORS decide who may *read* the answer; we have no CORS
+                // implementation, and `fetch` reads bodies — so allowing this
+                // would let any page pull whatever the reader's network
+                // position can reach and post it back out. The cost is pages
+                // that call an API on another host; see `DEVIATIONS.md`.
+                if origin_of(&resolved) != origin_of(&page_url) {
+                    let message = format!(
+                        "refused to fetch {resolved}: only same-origin requests are allowed"
+                    );
+                    log.push(console::Level::Error, None, None, &message);
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("TypeError: {message}"),
+                    ));
+                }
+
+                if queue.in_flight.get() >= MAX_IN_FLIGHT {
+                    let message = format!(
+                        "refused to fetch {resolved}: this page already has {MAX_IN_FLIGHT} \
+                         requests in flight"
+                    );
+                    log.push(console::Level::Error, None, None, &message);
+                    return Err(Exception::throw_message(
+                        &ctx,
+                        &format!("TypeError: {message}"),
+                    ));
+                }
+
+                // Headers cross as JSON: one string is a simpler boundary than
+                // a shape, and this is the only place that needs it.
+                let headers: Vec<(String, String)> = serde_pairs(&headers);
+                queue.in_flight.set(queue.in_flight.get() + 1);
+                queue.requests.borrow_mut().push(FetchAsk {
+                    request: request as u64,
+                    url: resolved,
+                    method,
+                    headers,
+                    body,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
     ctx.globals().set("__dom", api)?;
     // Named, so a stack frame from inside the object model says where it came
     // from instead of the engine's anonymous `eval_script`.
@@ -707,6 +812,41 @@ pub fn install<'js>(
     // The prelude's value is its entry-point object (see the end of
     // `PRELUDE`): `dispatch`, `fireTimer`, `pending`.
     ctx.eval_with_options::<Object<'js>, _>(PRELUDE, options)
+}
+
+/// Parse the prelude's header JSON — a flat object of string values — without
+/// a JSON crate. The only producer is our own prelude, which builds it with
+/// `JSON.stringify` from strings it has already coerced, so this handles the
+/// shape it emits and nothing more.
+fn serde_pairs(json: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    let mut current = String::new();
+    let mut strings = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+    for ch in json.chars() {
+        match (in_string, escaped, ch) {
+            (true, true, _) => {
+                current.push(ch);
+                escaped = false;
+            }
+            (true, false, '\\') => escaped = true,
+            (true, false, '"') => {
+                strings.push(std::mem::take(&mut current));
+                in_string = false;
+            }
+            (true, false, _) => current.push(ch),
+            (false, _, '"') => in_string = true,
+            _ => {}
+        }
+    }
+    // Alternating key, value — the shape `JSON.stringify` gives a flat object.
+    for pair in strings.chunks(2) {
+        if let [name, value] = pair {
+            pairs.push((name.clone(), value.clone()));
+        }
+    }
+    pairs
 }
 
 /// Which store a `session` flag from the prelude names.
@@ -1439,6 +1579,101 @@ const PRELUDE: &str = r#"
     userAgent: "yata (terminal browser; +https://github.com/yata)",
   };
 
+  // ---- fetch (M10.12) ----
+
+  // Requests waiting on the network, by id. The promise's resolvers live here
+  // until the loop brings an answer back; nothing else can settle them.
+  const inFlight = new Map();
+  let nextRequestId = 1;
+
+  // Options a browser honours and we do not. Logged once each rather than
+  // ignored silently: quietly dropping a caller's option is how a page ends up
+  // mystifyingly wrong.
+  const IGNORED = ['mode', 'credentials', 'cache', 'redirect', 'referrer',
+                   'integrity', 'signal', 'keepalive'];
+  const warned = {};
+
+  globalThis.fetch = function (input, init) {
+    const url = String(input);
+    const options = init || {};
+    for (const name of IGNORED) {
+      if (options[name] !== undefined && !warned[name]) {
+        warned[name] = true;
+        console.warn('fetch: the `' + name + '` option is ignored by this browser');
+      }
+    }
+
+    const method = String(options.method || 'GET').toUpperCase();
+    const headers = {};
+    if (options.headers) {
+      for (const key of Object.keys(options.headers)) {
+        headers[String(key)] = String(options.headers[key]);
+      }
+    }
+    const body = options.body === undefined || options.body === null
+      ? undefined
+      : String(options.body);
+
+    const id = nextRequestId++;
+    return new Promise(function (resolve, reject) {
+      inFlight.set(id, { resolve: resolve, reject: reject });
+      try {
+        raw.startFetch(id, url, method, JSON.stringify(headers), body);
+      } catch (error) {
+        // Refused before it left: same origin, a bad URL, or too many in
+        // flight. The promise rejects like a browser's would.
+        inFlight.delete(id);
+        reject(error);
+      }
+    });
+  };
+
+  function makeResponse(status, statusText, url, headerJson, body) {
+    const headers = JSON.parse(headerJson);
+    let consumed = false;
+    function take() {
+      if (consumed) {
+        // A browser rejects a second read of the same body, and a page that
+        // does it by accident should find out.
+        return Promise.reject(new TypeError('body has already been consumed'));
+      }
+      consumed = true;
+      return Promise.resolve(body);
+    }
+    return {
+      // `ok` is false for a 404 — the response arrived, so the promise
+      // *resolves*. Pages get this wrong constantly; we must not.
+      ok: status >= 200 && status < 300,
+      status: status,
+      statusText: statusText,
+      url: url,
+      headers: {
+        get: function (name) {
+          const wanted = String(name).toLowerCase();
+          for (const key of Object.keys(headers)) {
+            if (key.toLowerCase() === wanted) return headers[key];
+          }
+          return null;
+        },
+      },
+      text: take,
+      json: function () { return take().then(function (t) { return JSON.parse(t); }); },
+    };
+  }
+
+  // Called by the engine when a response comes back. `error` non-null means
+  // the request never completed.
+  function settleFetch(id, error, status, statusText, url, headerJson, body) {
+    const pending = inFlight.get(id);
+    if (pending === undefined) return;
+    inFlight.delete(id);
+    if (error !== null && error !== undefined) {
+      pending.reject(new TypeError('fetch failed: ' + error));
+    } else {
+      pending.resolve(makeResponse(status, statusText, url, headerJson, body));
+    }
+  }
+
   // `window`, `globalThis` and the global scope are one object: pages branch
   // on `typeof window` and read `window.x` for a top-level `var x`.
   globalThis.window = globalThis;
@@ -1452,7 +1687,12 @@ const PRELUDE: &str = r#"
   delete globalThis.__dom;
   // Two entry points for the engine: one to dispatch an event, one to fire a
   // timer. Rust holds them as `Persistent`s, so a page can reach neither.
-  return { dispatch: dispatch, fireTimer: fireTimer, pending: function () { return timers.size; } };
+  return {
+    dispatch: dispatch,
+    fireTimer: fireTimer,
+    settleFetch: settleFetch,
+    pending: function () { return timers.size; },
+  };
 })(__dom)
 "#;
 
