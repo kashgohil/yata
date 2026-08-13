@@ -183,6 +183,12 @@ pub struct App {
     /// nothing after a hole runs, because the script that has not arrived may
     /// define what the next one calls.
     script_queue: ScriptQueue,
+    /// The generation `script_queue` was built for, so it is built **once** per
+    /// page. Rebuilding would re-run every script the page has, and the only
+    /// thing preventing a second `Msg::RunScripts` today is that one call site
+    /// produces it — a guard that vanishes the moment anything else wants a
+    /// script pass.
+    script_queue_page: Option<FetchId>,
     /// Every origin's `localStorage`/`sessionStorage` for this session
     /// (M10.11). Lives here rather than in the host because a host is dropped
     /// on every navigation and two pages on one origin must see the same data.
@@ -311,6 +317,7 @@ impl App {
             pending_click_navigation: None,
             pending_click_fetches: Vec::new(),
             script_queue: ScriptQueue::default(),
+            script_queue_page: None,
             storage: Storage::new(),
             console: Console::new(),
             console_view: Viewport::default(),
@@ -374,6 +381,7 @@ impl App {
         self.console.clear();
         self.console_view_built = false;
         self.script_queue = ScriptQueue::default();
+        self.script_queue_page = None;
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -663,12 +671,19 @@ impl App {
                     return Effect::default();
                 };
 
-                // The queue is built once, here, from the parsed document:
-                // every slot exists before any fetch starts.
-                let (queue, externals) =
-                    ScriptQueue::new(js::sources::sources(&dom), &self.console);
-                self.script_queue = queue;
-                let scripts = self.resolve_script_urls(id, externals);
+                // Built once per page, from the parsed document: every slot
+                // exists before any fetch starts. A second pass for the same
+                // generation must not rebuild it — that would run every script
+                // again — so the queue remembers whose it is.
+                let scripts = if self.script_queue_page == Some(id) {
+                    Vec::new()
+                } else {
+                    let (queue, externals) =
+                        ScriptQueue::new(js::sources::sources(&dom), &self.console);
+                    self.script_queue = queue;
+                    self.script_queue_page = Some(id);
+                    self.resolve_script_urls(id, externals)
+                };
 
                 let mut effect = self.run_ready_scripts(id, dom);
                 effect.scripts = scripts;
@@ -3954,6 +3969,28 @@ mod tests {
         let (mut app, id) = scripted_app(html);
         let effect = app.update(Msg::RunScripts { id });
         (app, id, effect)
+    }
+
+    #[test]
+    fn a_second_script_pass_for_one_page_runs_nothing_twice() {
+        // Only `Msg::Parsed` asks for a pass today, so a duplicate cannot be
+        // produced — but the guard against re-running a page's scripts should
+        // be structural rather than "nothing happens to send it twice".
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>window.runs = (window.runs || 0) + 1;\
+             console.log('run ' + window.runs);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(Msg::RunScripts { id });
+        app.update(Msg::RunScripts { id });
+
+        let runs: Vec<String> = app
+            .console
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect();
+        assert_eq!(runs, ["run 1"], "the page's script ran more than once");
     }
 
     #[test]
