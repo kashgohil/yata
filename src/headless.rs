@@ -12,6 +12,7 @@
 use crate::browser::inspector;
 use crate::dom::Dom;
 use crate::image::{self, ImageCache, ImageContext};
+use crate::js::console::Console;
 use crate::js::{self, ScriptRun};
 use crate::layout;
 use crate::style;
@@ -28,11 +29,13 @@ use crate::style;
 ///
 /// The host is created and dropped inside this call: nothing headless outlives
 /// one page.
-pub fn run_scripts(dom: &mut Dom) -> Vec<ScriptRun> {
+pub fn run_scripts(dom: &mut Dom) -> (Vec<ScriptRun>, Console) {
     let mut host = None;
+    let console = Console::new();
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
-    js::run_pass(&mut host, dom, HEADLESS_PAGE)
+    let runs = js::run_pass(&mut host, dom, HEADLESS_PAGE, &console);
+    (runs, console)
 }
 
 /// The page generation headless runs use. Only its constancy matters.
@@ -49,7 +52,7 @@ pub fn box_dump(dom: &mut Dom, base_url: Option<&str>, width: u16) -> String {
     // Scripts first, and through the shared rule above: the boxes a golden
     // pins must be the boxes a reader would see, which means after the page's
     // own script has had its one pass at the tree.
-    run_scripts(dom);
+    let _ = run_scripts(dom);
     let sheets = style::sources::inline_sheets(dom);
     let styles = style::style_tree(dom, &sheets.iter().collect::<Vec<_>>());
     let imgs = image::discover(dom, base_url);

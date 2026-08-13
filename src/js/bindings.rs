@@ -45,6 +45,7 @@ use rquickjs::{Ctx, Exception, Function, Object, Result as JsResult};
 use crate::css;
 use crate::dom::{Dom, DomError, NodeData, NodeId};
 use crate::html;
+use crate::js::console::{self, Console};
 use crate::style::{StyleContext, matching};
 
 /// The tree the current tick is working on, shared between the host and every
@@ -130,10 +131,44 @@ fn throw_dom_error(ctx: &Ctx<'_>, error: DomError) -> rquickjs::Error {
     }
 }
 
+/// How deep the console formatter descends. One level, as M10.7 specifies:
+/// `{a: 1, b: "x"}` is useful, a whole object graph is a wall of text.
+const CONSOLE_MAX_DEPTH: u32 = 2;
+
+/// How many entries of an array or object the formatter shows before saying
+/// how many it left out.
+const CONSOLE_MAX_ITEMS: u32 = 20;
+
 /// Install the primitives and evaluate the prelude that builds the object
 /// model on top of them. Called once per host.
-pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>) -> JsResult<()> {
+pub fn install(ctx: &Ctx<'_>, slot: &Rc<DomSlot>, console: &Console) -> JsResult<()> {
     let api = Object::new(ctx.clone())?;
+
+    // The console's caps, read by the formatter in the prelude, so the numbers
+    // live in Rust where a reviewer greps for them.
+    api.set("consoleMaxDepth", CONSOLE_MAX_DEPTH)?;
+    api.set("consoleMaxItems", CONSOLE_MAX_ITEMS)?;
+    api.set("consoleMaxText", console::MAX_TEXT as u32)?;
+
+    // One primitive for all five levels: the prelude has already formatted the
+    // arguments into a line, so nothing here has to know about JS values.
+    let log = console.clone();
+    api.set(
+        "consoleWrite",
+        Function::new(ctx.clone(), move |level: String, text: String| {
+            let level = match level.as_str() {
+                "debug" => console::Level::Debug,
+                "info" => console::Level::Info,
+                "warn" => console::Level::Warn,
+                "error" => console::Level::Error,
+                _ => console::Level::Log,
+            };
+            // No source or line: a browser gets those from a stack walk we do
+            // not do. An uncaught exception carries them; a `console.log` does
+            // not, and inventing one would be worse than admitting it.
+            log.push(level, None, None, &text);
+        })?,
+    )?;
 
     // Which page the slot holds. The prelude compares a handle's page against
     // this on every read.
@@ -787,6 +822,84 @@ const PRELUDE: &str = r#"
     querySelectorAll: function (sel) { return raw.querySelectorAll(String(sel)).map(wrap); },
   };
 
+  // ---- console (M10.7) ----
+
+  function clip(text) {
+    return text.length > raw.consoleMaxText
+      ? text.slice(0, raw.consoleMaxText) + "…"
+      : text;
+  }
+
+  // Format one value for the pane. `seen` is the cycle guard: without it
+  // `console.log(window)` walks the global object into itself and the tick
+  // spends its whole budget building a string nobody can read.
+  function show(value, depth, seen) {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+
+    const kind = typeof value;
+    if (kind === "string") {
+      // Bare at the top level, quoted inside a structure — the only way to
+      // tell the number 42 from the string "42" once it is nested.
+      return depth === 0 ? clip(value) : JSON.stringify(clip(value));
+    }
+    if (kind === "number" || kind === "boolean" || kind === "bigint") return String(value);
+    if (kind === "symbol") return value.toString();
+    if (kind === "function") return "[function]";
+
+    // A DOM handle prints as the element it stands for. `{}` would be true —
+    // the handle has no own properties — and useless.
+    if (handles.has(value)) {
+      const id = raw.getAttribute(idOf(value), "id");
+      const tag = (raw.tagName(idOf(value)) || "node").toLowerCase();
+      return id === undefined ? "<" + tag + ">" : "<" + tag + " id=\"" + id + "\">";
+    }
+
+    if (seen.indexOf(value) !== -1) return "[circular]";
+    if (depth >= raw.consoleMaxDepth) return Array.isArray(value) ? "[…]" : "{…}";
+
+    seen.push(value);
+    try {
+      if (Array.isArray(value)) {
+        const shown = value.slice(0, raw.consoleMaxItems)
+          .map(function (item) { return show(item, depth + 1, seen); });
+        if (value.length > raw.consoleMaxItems) {
+          shown.push("… " + (value.length - raw.consoleMaxItems) + " more");
+        }
+        return "[" + shown.join(", ") + "]";
+      }
+      if (value instanceof Error) {
+        return value.name + ": " + value.message;
+      }
+      const keys = Object.keys(value);
+      const shown = keys.slice(0, raw.consoleMaxItems).map(function (key) {
+        return key + ": " + show(value[key], depth + 1, seen);
+      });
+      if (keys.length > raw.consoleMaxItems) {
+        shown.push("… " + (keys.length - raw.consoleMaxItems) + " more");
+      }
+      return "{" + shown.join(", ") + "}";
+    } finally {
+      seen.pop();
+    }
+  }
+
+  function writer(level) {
+    return function () {
+      const parts = [];
+      for (const value of arguments) parts.push(show(value, 0, []));
+      raw.consoleWrite(level, clip(parts.join(" ")));
+    };
+  }
+
+  globalThis.console = {
+    log: writer("log"),
+    info: writer("info"),
+    warn: writer("warn"),
+    error: writer("error"),
+    debug: writer("debug"),
+  };
+
   // `window`, `globalThis` and the global scope are one object: pages branch
   // on `typeof window` and read `window.x` for a top-level `var x`.
   globalThis.window = globalThis;
@@ -802,6 +915,7 @@ mod tests {
 
     use super::*;
     use crate::html;
+    use crate::js::console::Console;
     use crate::js::{self, Host, JsValue};
 
     /// Run `script` against `page` and return the script's completion value,
@@ -809,7 +923,7 @@ mod tests {
     fn eval_on(page: &str, script: &str) -> String {
         let mut dom = html::parse(&format!("{page}<script>{script}</script>"));
         let mut host = None;
-        let runs = js::run_pass(&mut host, &mut dom, 7);
+        let runs = js::run_pass(&mut host, &mut dom, 7, &Console::new());
         assert_eq!(runs.len(), 1, "expected exactly one script");
         runs[0].dump_line()
     }
@@ -972,7 +1086,7 @@ mod tests {
         dom.remove(gone);
 
         let mut host = None;
-        let runs = js::run_pass(&mut host, &mut dom, 7);
+        let runs = js::run_pass(&mut host, &mut dom, 7, &Console::new());
         assert_eq!(runs[0].dump_line(), "inline#1 ok \"keep,no-gone\"");
     }
 
@@ -986,7 +1100,7 @@ mod tests {
         let mut first = html::parse(
             "<p id=one>first page</p><script>globalThis.kept = document.getElementById('one');</script>",
         );
-        let runs = js::run_pass(&mut host, &mut first, 1);
+        let runs = js::run_pass(&mut host, &mut first, 1, &Console::new());
         assert_eq!(runs[0].dump_line(), "inline#1 ok object");
         assert!(host.is_some());
 
@@ -996,7 +1110,7 @@ mod tests {
             "<p id=two>second page</p><script>\
              try { kept.tagName } catch (e) { 'refused: ' + e.message }</script>",
         );
-        let runs = js::run_pass(&mut host, &mut second, 2);
+        let runs = js::run_pass(&mut host, &mut second, 2, &Console::new());
         assert_eq!(
             runs[0].dump_line(),
             "inline#1 ok \"refused: stale node handle: it belongs to a page that is no longer loaded\""
@@ -1012,10 +1126,10 @@ mod tests {
         let mut dom = html::parse(
             "<p id=one>text</p><script>globalThis.kept = document.getElementById('one');</script>",
         );
-        js::run_pass(&mut host, &mut dom, 3);
+        js::run_pass(&mut host, &mut dom, 3, &Console::new());
 
         let mut again = html::parse("<p id=one>text</p><script>kept.tagName</script>");
-        let runs = js::run_pass(&mut host, &mut again, 3);
+        let runs = js::run_pass(&mut host, &mut again, 3, &Console::new());
         assert_eq!(runs[0].dump_line(), "inline#1 ok \"P\"");
     }
 
@@ -1025,7 +1139,7 @@ mod tests {
         // be the first — gets an exception, not a stale read.
         let slot = DomSlot::default();
         assert!(slot.take().is_none());
-        let mut host = Host::new().expect("host starts");
+        let mut host = Host::new(&Console::new()).expect("host starts");
         // Nothing has been lent, so the bindings have no tree to read.
         let error = host.eval("probe.js", "document.body").unwrap_err();
         assert!(
@@ -1037,7 +1151,7 @@ mod tests {
         // And the host is still usable once one is lent.
         let mut dom = html::parse("<p>after</p><script>document.body.tagName</script>");
         let mut host = Some(host);
-        let runs = js::run_pass(&mut host, &mut dom, 9);
+        let runs = js::run_pass(&mut host, &mut dom, 9, &Console::new());
         assert_eq!(runs[0].dump_line(), "inline#1 ok \"BODY\"");
     }
 
@@ -1094,7 +1208,7 @@ mod tests {
         let script = format!("var box = document.getElementById('box');\n{script}");
         let mut dom = html::parse(&format!("{page}<script>{script}</script>"));
         let mut host = None;
-        let runs = js::run_pass(&mut host, &mut dom, 7);
+        let runs = js::run_pass(&mut host, &mut dom, 7, &Console::new());
         crate::dom::check_links(&dom);
         let line = runs.last().expect("the script ran").dump_line();
         (line, dom)
@@ -1550,6 +1664,143 @@ mod tests {
         );
     }
 
+    // ---- console (M10.7) --------------------------------------------------
+
+    /// What `page`'s script logged, as `--dump-js` and the `F5` pane show it.
+    fn logged(page: &str, script: &str) -> Vec<String> {
+        let mut dom = html::parse(&format!("{page}<script>{script}</script>"));
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 7, &console);
+        console.entries().iter().map(ToString::to_string).collect()
+    }
+
+    fn only(script: &str) -> String {
+        let lines = logged("<p id=box>t</p>", script);
+        assert_eq!(lines.len(), 1, "expected one entry, got {lines:?}");
+        lines.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn every_level_reaches_the_console_in_order() {
+        assert_eq!(
+            logged(
+                "",
+                "console.debug('d'); console.log('l'); console.info('i');\
+                 console.warn('w'); console.error('e');"
+            ),
+            ["debug d", "log   l", "info  i", "warn  w", "error e",]
+        );
+    }
+
+    #[test]
+    fn values_format_so_a_reader_can_tell_them_apart() {
+        // Strings bare at the top level, quoted once nested: the only way to
+        // tell the number 42 from the string "42" inside a structure.
+        assert_eq!(only("console.log('plain')"), "log   plain");
+        assert_eq!(
+            only("console.log(42, true, null, undefined)"),
+            "log   42 true null undefined"
+        );
+        assert_eq!(only("console.log(['a', 1])"), "log   [\"a\", 1]");
+        assert_eq!(
+            only("console.log({a: 1, b: 'x'})"),
+            "log   {a: 1, b: \"x\"}"
+        );
+        assert_eq!(only("console.log(function f() {})"), "log   [function]");
+        assert_eq!(only("console.log(new Error('boom'))"), "log   Error: boom");
+        // One level deep, as specified: deeper structures say so rather than
+        // unrolling a whole object graph into the pane.
+        assert_eq!(only("console.log({a: {b: {c: 1}}})"), "log   {a: {b: {…}}}");
+        // A DOM handle prints as the element it stands for. `{}` would be
+        // true — the handle has no own properties — and useless.
+        assert_eq!(
+            only("console.log(document.getElementById('box'))"),
+            "log   <p id=\"box\">"
+        );
+        assert_eq!(only("console.log(document.body)"), "log   <body>");
+    }
+
+    #[test]
+    fn a_cyclic_value_terminates_instead_of_hanging_the_tick() {
+        // `console.log(window)` is the real-world shape of this: the global
+        // object refers to itself, and without the guard the formatter walks
+        // it until the budget runs out.
+        assert_eq!(
+            only("var a = {}; a.self = a; console.log(a)"),
+            "log   {self: [circular]}"
+        );
+        assert_eq!(
+            only("var a = []; a.push(a); console.log(a)"),
+            "log   [[circular]]"
+        );
+        // The one that matters: this must return, not spend 100 ms.
+        let entry = only("console.log(window)");
+        assert!(entry.starts_with("log   {"), "{entry}");
+    }
+
+    #[test]
+    fn a_long_message_is_clipped_before_it_reaches_the_pane() {
+        let entry = only("console.log('x'.repeat(10 * 1024 * 1024))");
+        assert!(
+            entry.len() < console::MAX_TEXT + 64,
+            "a 10 MB string put {} bytes in the pane",
+            entry.len()
+        );
+    }
+
+    #[test]
+    fn a_long_collection_says_how_much_it_left_out() {
+        let entry = only("console.log(Array.from({length: 100}, (_, i) => i))");
+        assert!(entry.contains("… 80 more"), "{entry}");
+    }
+
+    #[test]
+    fn an_uncaught_exception_lands_in_the_console_with_its_line() {
+        assert_eq!(
+            logged("", "\nnull.x;"),
+            ["error inline#1:2: cannot read property 'x' of null"]
+        );
+    }
+
+    #[test]
+    fn logs_and_throws_interleave_in_the_order_they_happened() {
+        // The interleaving is the information: "it logged twice and then
+        // threw" is a different story from "it threw and then logged twice".
+        let mut dom = html::parse(
+            "<script>console.log('first'); null.x;</script>\
+             <script>console.warn('second');</script>",
+        );
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass(&mut host, &mut dom, 7, &console);
+        assert_eq!(
+            console
+                .entries()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "log   first",
+                "error inline#1:1: cannot read property 'x' of null",
+                "warn  second",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_script_skipped_for_its_type_says_so() {
+        // "Nothing happened" and "we ignored what the page asked for" look
+        // identical to a reader otherwise.
+        assert_eq!(
+            logged("", "1;")
+                .into_iter()
+                .chain(logged("<script type=module>x()</script>", "1;"))
+                .collect::<Vec<_>>(),
+            ["warn  <script type=module>: not run: `module` is not a classic script"]
+        );
+    }
+
     #[test]
     fn query_selector_all_on_the_wikipedia_fixture() {
         // The cost number the PR reports. Selector matching is on CLAUDE.md's
@@ -1576,7 +1827,7 @@ mod tests {
             let mut page = html::parse(&format!("{fixture}<script>{probe}</script>"));
             let mut host = None;
             let started = std::time::Instant::now();
-            let runs = js::run_pass(&mut host, &mut page, 1);
+            let runs = js::run_pass(&mut host, &mut page, 1, &Console::new());
             (started.elapsed(), runs)
         };
         let (mut baseline, mut queried, mut twice) =
@@ -1627,17 +1878,17 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/en.wikipedia.org.html"
         ));
-        let mut host = Some(Host::new().expect("host starts"));
+        let mut host = Some(Host::new(&Console::new()).expect("host starts"));
 
         let mut warm = html::parse("<p>x</p><script>1</script>");
-        js::run_pass(&mut host, &mut warm, 1);
+        js::run_pass(&mut host, &mut warm, 1, &Console::new());
         let before = host.as_ref().unwrap().heap_bytes();
 
         // Same page generation, so the handle cache is not cleared.
         let mut page = html::parse(&format!(
             "{fixture}<script>globalThis.all = document.querySelectorAll('a'); all.length</script>"
         ));
-        let runs = js::run_pass(&mut host, &mut page, 1);
+        let runs = js::run_pass(&mut host, &mut page, 1, &Console::new());
         let after = host.as_ref().unwrap().heap_bytes();
 
         let Ok(JsValue::Num(count)) = runs.last().expect("the probe ran").outcome else {
@@ -1665,7 +1916,7 @@ mod tests {
         let mut dom =
             html::parse("<p id=x>t</p><script>document.getElementById('x').tagName</script>");
         let mut host = None;
-        let runs = js::run_pass(&mut host, &mut dom, 1);
+        let runs = js::run_pass(&mut host, &mut dom, 1, &Console::new());
         assert_eq!(runs[0].outcome, Ok(JsValue::Str("P".into())));
     }
 }

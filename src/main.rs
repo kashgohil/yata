@@ -287,9 +287,17 @@ fn run_dump_js(url: &str) -> i32 {
     let rx = headless_fetch(url);
     match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
         Ok((mut dom, _)) => {
+            let (runs, console) = yata::headless::run_scripts(&mut dom);
             let mut text = String::new();
-            for run in yata::headless::run_scripts(&mut dom) {
+            for run in runs {
                 text.push_str(&run.dump_line());
+                text.push('\n');
+            }
+            // Then the console pane's contents, in order (M10.7). This is the
+            // assertion surface the rest of M10 tests against, so the two
+            // sections are always both present and always in this order.
+            for entry in console.entries() {
+                text.push_str(&entry.to_string());
                 text.push('\n');
             }
             let mut out = io::stdout();

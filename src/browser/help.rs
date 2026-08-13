@@ -23,6 +23,7 @@ pub fn action_help(action: Action) -> &'static str {
         Action::ToggleDom => "DOM inspector",
         Action::ToggleStyles => "styles inspector",
         Action::ToggleBoxes => "box inspector",
+        Action::ToggleConsole => "javascript console",
         Action::ToggleTiming => "timing overlay",
         Action::Commit => "confirm",
         Action::Cancel => "cancel",

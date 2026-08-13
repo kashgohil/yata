@@ -18,6 +18,7 @@ pub enum Action {
     ToggleStyles,
     ToggleBoxes,
     ToggleTiming,
+    ToggleConsole,
     Commit,
     Cancel,
     DeleteChar,
@@ -126,6 +127,7 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::F(2), NONE), Action::ToggleStyles),
     browse(None, chord(KeyCode::F(3), NONE), Action::ToggleBoxes),
     browse(None, chord(KeyCode::F(4), NONE), Action::ToggleTiming),
+    browse(None, chord(KeyCode::F(5), NONE), Action::ToggleConsole),
     // M6 interaction.
     browse(None, chord(KeyCode::Char('f'), NONE), Action::HintFollow),
     browse(None, chord(KeyCode::Char('F'), NONE), Action::HintYank),

@@ -21,6 +21,12 @@ pub enum Script {
     /// A `<script src>`'s URL, exactly as the page wrote it. Recognised so its
     /// slot exists; M10.10 fetches and runs it.
     External { src: String },
+    /// A `<script>` this engine does not run, and why. Reported rather than
+    /// dropped silently: to a reader, "nothing happened" and "we ignored what
+    /// the page asked for" look identical, and M10.7's console pane is where
+    /// the difference belongs. It takes no execution slot, so the `inline#N`
+    /// names either side of it are unchanged.
+    Skipped { name: String, reason: String },
 }
 
 impl Script {
@@ -32,6 +38,7 @@ impl Script {
         match self {
             Script::Inline { name, .. } => name,
             Script::External { src } => src,
+            Script::Skipped { name, .. } => name,
         }
     }
 }
@@ -76,18 +83,30 @@ fn collect(dom: &Dom, node: NodeId, out: &mut Vec<Script>) {
             // rule) *and* run the script inside it: the worst of both.
             "template" | "noscript" => return,
             "script" => {
-                if runs_as_classic_script(dom, node) {
-                    match dom.attr(node, "src").filter(|src| !src.trim().is_empty()) {
+                match script_type(dom, node) {
+                    Some(unrun) => out.push(Script::Skipped {
+                        name: format!("<script type={unrun}>"),
+                        reason: format!("not run: `{unrun}` is not a classic script"),
+                    }),
+                    None => match dom.attr(node, "src").filter(|src| !src.trim().is_empty()) {
                         // `src` wins: a script element with one ignores its own
                         // inline text, exactly as the HTML spec says.
                         Some(src) => out.push(Script::External {
                             src: src.to_string(),
                         }),
                         None => out.push(Script::Inline {
-                            name: format!("inline#{}", out.len() + 1),
+                            // Skipped scripts hold no slot, so this counts the
+                            // ones that can actually run.
+                            name: format!(
+                                "inline#{}",
+                                out.iter()
+                                    .filter(|s| !matches!(s, Script::Skipped { .. }))
+                                    .count()
+                                    + 1
+                            ),
                             source: text_of(dom, node),
                         }),
-                    }
+                    },
                 }
                 // A script's children are its text, never more elements.
                 return;
@@ -112,18 +131,18 @@ fn text_of(dom: &Dom, node: NodeId) -> String {
     source
 }
 
-/// An absent or empty `type` means JavaScript; otherwise the value must be a
-/// JavaScript MIME type, compared without its parameters
+/// The `type` this engine will not run, or `None` when the element is a
+/// classic script. An absent or empty `type` means JavaScript; otherwise the
+/// value must be a JavaScript MIME type, compared without its parameters
 /// (`text/javascript; charset=utf-8`) and case-insensitively.
-fn runs_as_classic_script(dom: &Dom, node: NodeId) -> bool {
-    let Some(ty) = dom.attr(node, "type") else {
-        return true;
-    };
+fn script_type(dom: &Dom, node: NodeId) -> Option<String> {
+    let ty = dom.attr(node, "type")?;
     let essence = ty.split(';').next().unwrap_or("").trim();
-    essence.is_empty()
+    let classic = essence.is_empty()
         || CLASSIC_TYPES
             .iter()
-            .any(|known| essence.eq_ignore_ascii_case(known))
+            .any(|known| essence.eq_ignore_ascii_case(known));
+    (!classic).then(|| essence.to_string())
 }
 
 #[cfg(test)]
@@ -145,6 +164,13 @@ mod tests {
     fn external(src: &str) -> Script {
         Script::External {
             src: src.to_string(),
+        }
+    }
+
+    fn skipped(ty: &str) -> Script {
+        Script::Skipped {
+            name: format!("<script type={ty}>"),
+            reason: format!("not run: `{ty}` is not a classic script"),
         }
     }
 
@@ -205,11 +231,25 @@ mod tests {
             vec![inline("inline#1", "a()")]
         );
 
-        // Not classic scripts: data, templates, and modules.
-        assert_eq!(of("<script type=module>a()</script>"), vec![]);
-        assert_eq!(of("<script type='application/json'>{}</script>"), vec![]);
-        assert_eq!(of("<script type='text/template'><p>x</p></script>"), vec![]);
-        assert_eq!(of("<script type='importmap'>{}</script>"), vec![]);
+        // Not classic scripts: data, templates, and modules. They are
+        // *reported* rather than dropped — M10.7 shows them in the console, so
+        // a page whose script never ran can say why.
+        assert_eq!(
+            of("<script type=module>a()</script>"),
+            vec![skipped("module")]
+        );
+        assert_eq!(
+            of("<script type='application/json'>{}</script>"),
+            vec![skipped("application/json")]
+        );
+        assert_eq!(
+            of("<script type='text/template'><p>x</p></script>"),
+            vec![skipped("text/template")]
+        );
+        assert_eq!(
+            of("<script type='importmap'>{}</script>"),
+            vec![skipped("importmap")]
+        );
     }
 
     #[test]
@@ -218,7 +258,7 @@ mod tests {
         // in the document: a JSON blob is not a script, so it takes no slot.
         assert_eq!(
             of("<script type='application/json'>{}</script><script>a()</script>"),
-            vec![inline("inline#1", "a()")]
+            vec![skipped("application/json"), inline("inline#1", "a()")]
         );
     }
 

@@ -14,7 +14,7 @@ use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::{Dom, NodeId};
 use crate::image::ImageSession;
-use crate::js;
+use crate::js::{self, console::Console};
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
 use crate::net::{self, FetchId};
@@ -114,6 +114,8 @@ enum Surface {
     Dom,
     Styles,
     Boxes,
+    /// The JS console (M10.7): what the page's script logged and threw.
+    Console,
     /// Keybinding help (M7), scrollable list generated from `keys::BINDINGS`.
     Help,
 }
@@ -153,6 +155,15 @@ pub struct App {
     /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
     /// stays up while the URL bar is open.
     timing_visible: bool,
+    /// Everything this page's JavaScript had to say (M10.7): console calls,
+    /// uncaught exceptions, scripts skipped for their type — one ordered list,
+    /// shown by `F5`. Page-local like the host: cleared on navigation, because
+    /// the previous page's complaints are not this page's.
+    console: Console,
+    /// The `F5` console pane's lines, built the moment it is about to be seen
+    /// and scrolled like every other inspector.
+    console_view: Viewport,
+    console_view_built: bool,
     /// This page generation's JavaScript host, created by its first script
     /// pass and dropped by the next navigation (`start_fetch`). One host per
     /// page generation is the rule `src/js` documents: a page's globals,
@@ -264,6 +275,9 @@ impl App {
             spinner: 0,
             timings: Timings::default(),
             timing_visible: false,
+            console: Console::new(),
+            console_view: Viewport::default(),
+            console_view_built: false,
             js_host: None,
             dom: None,
             dom_view: Viewport::default(),
@@ -318,6 +332,10 @@ impl App {
         // (from M10.8) listeners go with it. Dropping the host is the whole
         // mechanism — there is nowhere for that state to survive.
         self.js_host = None;
+        // The console is page-local for the same reason: the last page's
+        // errors on this page's pane would be a lie about this page.
+        self.console.clear();
+        self.console_view_built = false;
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -490,10 +508,12 @@ impl App {
                 // The arena counts its own edits, so what the tick changed is
                 // answered by two comparisons rather than a flag to plumb.
                 let before = (dom.version(), dom.structure_version());
-                // The per-script results have no home in the TUI until M10.7's
-                // console pane; `--dump-js` is where they are visible today.
-                let _runs = js::run_pass(&mut self.js_host, &mut dom, id.0);
+                // The per-script results are data; what a reader sees of them
+                // is the console (M10.7), which `run_pass` appends to directly.
+                let logged_before = self.console.entries().len();
+                let _runs = js::run_pass(&mut self.js_host, &mut dom, id.0, &self.console);
                 let after = (dom.version(), dom.structure_version());
+                let logged = self.console.entries().len() != logged_before;
                 // The DOM comes straight back: the host borrowed it for the
                 // tick and holds nothing now.
                 self.dom = Some(dom);
@@ -504,7 +524,17 @@ impl App {
                 self.timings.script = Some(started.elapsed());
 
                 // One cycle per tick, whatever the script did inside it.
-                self.apply_dom_changes(before, after)
+                let mut effect = self.apply_dom_changes(before, after);
+                if logged {
+                    // A script that only logged changed no box, but it did
+                    // change what the console pane holds and what the
+                    // statusline says about the page — so the frame is stale
+                    // even though the pipeline had nothing to do.
+                    self.console_view_built = false;
+                    self.build_visible_inspector();
+                    effect.dirty = true;
+                }
+                effect
             }
             Msg::Image { id, url, result } => {
                 if Some(id) != self.current_fetch {
@@ -664,6 +694,7 @@ impl App {
             Action::ToggleDom => self.toggle_surface(Surface::Dom),
             Action::ToggleStyles => self.toggle_surface(Surface::Styles),
             Action::ToggleBoxes => self.toggle_surface(Surface::Boxes),
+            Action::ToggleConsole => self.toggle_surface(Surface::Console),
             Action::ToggleTiming => {
                 self.timing_visible = !self.timing_visible;
                 redraw()
@@ -748,6 +779,10 @@ impl App {
 
     fn boxes_active(&self) -> bool {
         self.surface == Surface::Boxes && self.layout_tree.is_some()
+    }
+
+    fn console_active(&self) -> bool {
+        self.surface == Surface::Console
     }
 
     fn help_active(&self) -> bool {
@@ -1269,6 +1304,24 @@ impl App {
         }
     }
 
+    /// The console pane's lines, built when it is about to be seen and never
+    /// on the scroll path — the same deferred-build rule as `F1`–`F3`.
+    fn build_console_view(&mut self) {
+        if self.console_view_built {
+            return;
+        }
+        let text = self
+            .console
+            .entries()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.console_view
+            .set_content(&text, self.size.0, self.page());
+        self.console_view_built = true;
+    }
+
     /// Refresh whichever inspector is on screen, and only that one. Called when
     /// a surface opens and when its input changes underneath it (a parse, an
     /// arriving stylesheet).
@@ -1278,6 +1331,7 @@ impl App {
             Surface::Dom => self.build_dom_view(),
             Surface::Styles => self.build_styles_view(),
             Surface::Boxes => self.build_boxes_view(),
+            Surface::Console => self.build_console_view(),
             Surface::Help => self.build_help_view(),
         }
     }
@@ -1301,6 +1355,8 @@ impl App {
             &mut self.styles_view
         } else if self.boxes_active() {
             &mut self.boxes_view
+        } else if self.console_active() {
+            &mut self.console_view
         } else if self.help_active() {
             &mut self.help_view
         } else {
@@ -1664,6 +1720,7 @@ impl App {
             Surface::Dom => self.draw_dom(frame),
             Surface::Styles => self.draw_styles(frame),
             Surface::Boxes => self.draw_boxes(frame),
+            Surface::Console => self.draw_console(frame),
             Surface::Help => self.draw_help(frame),
         }
         // Over the page area, after the body and before the bottom row.
@@ -1847,6 +1904,16 @@ impl App {
         }
     }
 
+    fn draw_console(&self, frame: &mut Frame) {
+        if self.console.is_empty() {
+            frame.put_str(0, 0, "no console output on this page", Style::default());
+            return;
+        }
+        for (row, line) in self.console_view.visible().iter().enumerate() {
+            paint_line(frame, 0, row as u16, line);
+        }
+    }
+
     /// The statusline (PLAN.md §3): URL · fetch progress · scroll % and frame
     /// time. Composition is pure and pre-padded to the row width, so one
     /// `put_str` paints every cell reversed.
@@ -1916,6 +1983,7 @@ impl App {
             Surface::Dom => format!("[dom] {base}"),
             Surface::Styles => format!("[styles] {base}"),
             Surface::Boxes => format!("[boxes] {base}"),
+            Surface::Console => format!("[console] {base}"),
             Surface::Help => format!("[help] {base}"),
         }
     }
@@ -1935,6 +2003,18 @@ impl App {
             && !session.matches.is_empty()
         {
             return format!("{}/{}", session.current + 1, session.matches.len());
+        }
+        // A page whose script threw and then rendered nothing is the worst
+        // outcome this milestone can produce; this segment is the cure. It
+        // sits in the existing middle segment rather than a second row, and it
+        // yields to a live fetch — a page still loading has not finished
+        // failing yet.
+        let errors = self.console.error_count();
+        if errors > 0 && matches!(self.fetch, Fetch::Loaded { .. }) {
+            return format!(
+                "{errors} JS error{} · F5",
+                if errors == 1 { "" } else { "s" }
+            );
         }
         match &self.fetch {
             Fetch::Idle => String::new(),
@@ -3171,6 +3251,140 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    // ---- the console pane (M10.7) -----------------------------------------
+
+    fn f5() -> Msg {
+        key(KeyCode::F(5), KeyModifiers::NONE)
+    }
+
+    /// Every visible row of the frame, joined — what a reader sees.
+    fn screen(app: &mut App, w: u16, h: u16) -> String {
+        let mut frame = Frame::new(w, h);
+        app.draw(&mut frame);
+        (0..h)
+            .map(|y| row_text(&frame, y))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn f5_shows_what_the_page_logged_and_toggles_back() {
+        let (mut app, id) = scripted_app(
+            "<p>page</p><script>console.log('hello from the page'); console.warn('careful');</script>",
+        );
+        app.update(Msg::RunScripts { id });
+
+        assert_eq!(app.update(f5()), redraw());
+        let pane = screen(&mut app, 60, 8);
+        assert!(pane.contains("log   hello from the page"), "{pane}");
+        assert!(pane.contains("warn  careful"), "{pane}");
+        // The surface says which one it is, like every other inspector.
+        assert!(pane.contains("[console]"), "{pane}");
+
+        // And back to the page.
+        assert_eq!(app.update(f5()), redraw());
+        let page = screen(&mut app, 60, 8);
+        assert!(page.contains("page"), "{page}");
+        assert!(!page.contains("hello from the page"), "{page}");
+    }
+
+    #[test]
+    fn an_empty_console_is_a_placeholder_not_a_panic() {
+        let (mut app, id) = scripted_app("<p>page</p><script>1;</script>");
+        app.update(Msg::RunScripts { id });
+        app.update(f5());
+        assert!(
+            screen(&mut app, 60, 8).contains("no console output"),
+            "{}",
+            screen(&mut app, 60, 8)
+        );
+    }
+
+    #[test]
+    fn the_console_clears_on_navigation() {
+        // Page-local, like the host and every other per-page thing: the last
+        // page's complaints on this page's pane would be a lie about it.
+        let (mut app, id) =
+            scripted_app("<p>a</p><script>console.log('from the first page');</script>");
+        app.update(Msg::RunScripts { id });
+        app.update(f5());
+        assert!(screen(&mut app, 60, 8).contains("from the first page"));
+
+        let next = app.start_fetch("http://second/".into());
+        load(&mut app, next, b"<p>b</p>".to_vec());
+        app.update(parsed(next, "<p>b</p>"));
+        app.update(Msg::RunScripts { id: next });
+        assert!(
+            !screen(&mut app, 60, 8).contains("from the first page"),
+            "{}",
+            screen(&mut app, 60, 8)
+        );
+    }
+
+    #[test]
+    fn scrolling_the_console_never_rebuilds_it() {
+        // The same rule as F1–F3: lines are built when the pane is about to be
+        // seen, and scrolling is offset arithmetic over them.
+        let (mut app, id) = scripted_app(
+            "<p>page</p><script>for (var i = 0; i < 200; i++) console.log('line ' + i);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(f5());
+        assert!(app.console_view_built);
+
+        for _ in 0..30 {
+            app.update(key(KeyCode::Char('j'), KeyModifiers::NONE));
+            assert!(
+                app.console_view_built,
+                "scrolling the console rebuilt its lines"
+            );
+        }
+        assert!(app.console_view.offset() > 0, "the pane did not scroll");
+    }
+
+    #[test]
+    fn a_page_whose_script_threw_says_so_in_the_statusline() {
+        // The cure for the worst outcome this milestone can produce: a page
+        // that threw and then rendered nothing, silently.
+        let (mut app, id) = scripted_app("<p>page</p><script>null.x;</script>");
+        app.update(Msg::RunScripts { id });
+        let status = screen(&mut app, 60, 8);
+        assert!(status.contains("1 JS error · F5"), "{status}");
+
+        // Plural, and only errors count — a warning is not a failure.
+        let (mut app, id) = scripted_app(
+            "<p>p</p><script>console.warn('w'); null.x; </script><script>undefined.y;</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        assert!(screen(&mut app, 60, 8).contains("2 JS errors · F5"));
+    }
+
+    #[test]
+    fn a_tick_that_only_logs_still_reaches_the_screen() {
+        // It changed no box, so M10.6's classification runs no stage — but the
+        // pane and the statusline are stale, and a frame that never redraws
+        // would hide the one thing the reader needs.
+        let (mut app, id) =
+            scripted_app("<p>page</p><script>console.error('something broke');</script>");
+        let before = stages(&app);
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(effect.dirty, "a tick that only logged did not redraw");
+        assert_eq!(stages(&app), before, "logging ran a pipeline stage");
+        assert!(screen(&mut app, 60, 8).contains("1 JS error · F5"));
+    }
+
+    #[test]
+    fn the_help_overlay_lists_f5_because_it_comes_from_the_table() {
+        // `keys::BINDINGS` is the one source of truth (CLAUDE.md); the overlay
+        // is generated from it, so a new binding appears here for free or it
+        // was not added to the table at all.
+        let mut app = App::new(60, 20);
+        app.update(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        let overlay = screen(&mut app, 60, 20);
+        assert!(overlay.contains("javascript console"), "{overlay}");
+        assert!(overlay.contains("F5"), "{overlay}");
     }
 
     // ---- invalidation (M10.6) ---------------------------------------------

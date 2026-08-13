@@ -77,6 +77,7 @@
 // into it from Rust. Keeping the module closed is what stops `DomSlot::lend`
 // from becoming an API somebody outside the engine can hand a tree to.
 mod bindings;
+pub mod console;
 pub mod sources;
 
 use std::fmt;
@@ -89,6 +90,7 @@ use rquickjs::context::EvalOptions;
 use rquickjs::{CatchResultExt, CaughtError, Context, Runtime, Type, Value};
 
 use crate::dom::Dom;
+use crate::js::console::{Console, Level};
 use crate::js::sources::Script;
 
 /// What one script did: the name it was known by, and its completion value or
@@ -120,7 +122,12 @@ pub struct ScriptRun {
 /// `host` is the page generation's host, created here on first use: a page
 /// with no script never starts an engine at all, which is why this takes the
 /// slot rather than a live `Host`.
-pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom, page: u64) -> Vec<ScriptRun> {
+pub fn run_pass(
+    host: &mut Option<Host>,
+    dom: &mut Dom,
+    page: u64,
+    console: &Console,
+) -> Vec<ScriptRun> {
     let scripts = sources::sources(dom);
     if scripts.is_empty() {
         return Vec::new();
@@ -128,7 +135,7 @@ pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom, page: u64) -> Vec<Script
 
     let host = match host {
         Some(host) => host,
-        None => match Host::new() {
+        None => match Host::new(console) {
             Ok(new) => host.insert(new),
             // The engine itself would not start. The page is degraded, not
             // broken — and the failure is reported rather than swallowed.
@@ -153,7 +160,25 @@ pub fn run_pass(host: &mut Option<Host>, dom: &mut Dom, page: u64) -> Vec<Script
         .filter_map(|script| match script {
             Script::Inline { name, source } => {
                 let outcome = host.eval(&name, &source);
+                // Uncaught exceptions join the console in the order they
+                // happened, interleaved with whatever the script logged before
+                // throwing — that interleaving is most of the story.
+                if let Err(error) = &outcome {
+                    console.push(
+                        Level::Error,
+                        Some(error.source.clone()),
+                        error.line,
+                        &error.message,
+                    );
+                }
                 Some(ScriptRun { name, outcome })
+            }
+            // Not an error, but the reader deserves to know the page asked for
+            // something we do not run — "nothing happened" is otherwise
+            // indistinguishable from "we ignored it".
+            Script::Skipped { name, reason } => {
+                console.push(Level::Warn, Some(name), None, &reason);
+                None
             }
             // M10.10 fetches these. The slot exists so document order is
             // already right when it does; running nothing is not an error.
@@ -243,7 +268,7 @@ pub struct Host {
 impl Host {
     /// Build a host with the budget, memory and stack limits armed. Fails only
     /// if the engine cannot allocate its runtime or context.
-    pub fn new() -> Result<Self, JsError> {
+    pub fn new(console: &Console) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(|e| JsError::internal(&e.to_string()))?;
         runtime.set_memory_limit(MEMORY_LIMIT);
         runtime.set_max_stack_size(STACK_LIMIT);
@@ -270,7 +295,7 @@ impl Host {
 
         let dom = Rc::new(bindings::DomSlot::default());
         let installed = context.with(|ctx| {
-            bindings::install(&ctx, &dom)
+            bindings::install(&ctx, &dom, console)
                 .catch(&ctx)
                 .map_err(|caught| JsError::from_caught("<bindings>", &caught))
         });
@@ -563,7 +588,7 @@ fn frame_location(frame: &str) -> Option<(&str, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Host, JsValue, SCRIPT_BUDGET, line_from_stack, run_pass};
+    use super::{Console, Host, JsValue, SCRIPT_BUDGET, line_from_stack, run_pass};
     use std::time::Instant;
 
     /// The document-order pass over a parsed page, as `App` and the headless
@@ -571,7 +596,7 @@ mod tests {
     fn pass(html: &str) -> Vec<String> {
         let mut dom = crate::html::parse(html);
         let mut host = None;
-        run_pass(&mut host, &mut dom, 1)
+        run_pass(&mut host, &mut dom, 1, &Console::new())
             .iter()
             .map(super::ScriptRun::dump_line)
             .collect()
@@ -618,7 +643,7 @@ mod tests {
     fn a_page_with_no_script_starts_no_engine() {
         let mut dom = crate::html::parse("<p>just prose</p>");
         let mut host = None;
-        assert!(run_pass(&mut host, &mut dom, 1).is_empty());
+        assert!(run_pass(&mut host, &mut dom, 1, &Console::new()).is_empty());
         assert!(
             host.is_none(),
             "an engine was started for a page with no script"
@@ -665,7 +690,7 @@ mod tests {
         // anything in `src/js` had kept a reference to it.
         let mut dom = crate::html::parse("<script>1</script>");
         let mut host = None;
-        let runs = run_pass(&mut host, &mut dom, 1);
+        let runs = run_pass(&mut host, &mut dom, 1, &Console::new());
         assert_eq!(runs.len(), 1);
         let fresh = dom.create_element("p", vec![]);
         dom.append(dom.root, fresh).unwrap();
@@ -673,7 +698,7 @@ mod tests {
     }
 
     fn host() -> Host {
-        Host::new().expect("engine starts")
+        Host::new(&Console::new()).expect("engine starts")
     }
 
     #[test]

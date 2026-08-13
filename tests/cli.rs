@@ -295,7 +295,14 @@ fn dump_js_runs_the_page_scripts_in_document_order() {
     );
     let dumped = String::from_utf8(out.stdout).unwrap();
     let lines: Vec<&str> = dumped.lines().collect();
-    assert_eq!(lines.len(), 3, "one line per script, got:\n{dumped}");
+    // Two sections: one line per script, then the console pane in order
+    // (M10.7). The thrown exception appears in both — once as the script's
+    // outcome, once as the console entry a reader would see on `F5`.
+    assert_eq!(
+        lines.len(),
+        4,
+        "script results then console, got:\n{dumped}"
+    );
     assert_eq!(lines[0], "inline#1 ok undefined");
     assert!(
         lines[1].starts_with("inline#2 error 1: "),
@@ -303,6 +310,11 @@ fn dump_js_runs_the_page_scripts_in_document_order() {
         lines[1]
     );
     assert_eq!(lines[2], "inline#3 ok 42");
+    assert!(
+        lines[3].starts_with("error inline#2:1: "),
+        "the console entry must carry level, source and line, got {:?}",
+        lines[3]
+    );
     assert!(
         out.stderr.is_empty(),
         "stderr: {:?}",
