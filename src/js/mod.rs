@@ -80,6 +80,7 @@ mod bindings;
 pub mod console;
 pub mod queue;
 pub mod sources;
+pub mod storage;
 
 use std::fmt;
 use std::rc::Rc;
@@ -93,8 +94,9 @@ use rquickjs::{
 };
 
 use crate::dom::Dom;
-use crate::js::bindings::{TimerAsk, TimerQueue};
+use crate::js::bindings::{NavQueue, NavRequest, TimerAsk, TimerQueue};
 use crate::js::console::{Console, Level};
+use crate::js::storage::Storage;
 use crate::timers::TimerId;
 
 /// What one script did: the name it was known by, and its completion value or
@@ -104,6 +106,22 @@ use crate::timers::TimerId;
 pub struct ScriptRun {
     pub name: String,
     pub outcome: Result<JsValue, JsError>,
+}
+
+/// What a tick needs to know about the page it runs for: which generation it
+/// belongs to, where the page came from, and the two session-scoped things a
+/// script can reach.
+///
+/// One struct rather than four parameters repeated across three entry points —
+/// the three ticks differ in *what they run*, never in this.
+pub struct PageContext<'a> {
+    /// The page generation, carried by every handle minted during the tick.
+    pub page: u64,
+    /// The post-redirect URL `location` is parsed from and storage is scoped
+    /// by.
+    pub url: &'a str,
+    pub console: &'a Console,
+    pub storage: &'a Storage,
 }
 
 /// Run a ready prefix of the page's script queue — one tick (M10.10).
@@ -132,11 +150,11 @@ pub struct ScriptRun {
 pub fn run_prefix(
     host: &mut Option<Host>,
     dom: &mut Dom,
-    page: u64,
-    console: &Console,
+    ctx: &PageContext<'_>,
     scripts: Vec<(String, String)>,
     finished: bool,
 ) -> Vec<ScriptRun> {
+    let (page, url, console, storage) = (ctx.page, ctx.url, ctx.console, ctx.storage);
     if scripts.is_empty() && !finished {
         return Vec::new();
     }
@@ -149,7 +167,7 @@ pub fn run_prefix(
             if scripts.is_empty() {
                 return Vec::new();
             }
-            match Host::new(console) {
+            match Host::new(console, storage) {
                 Ok(new) => host.insert(new),
                 // The engine itself would not start. The page is degraded, not
                 // broken — and the failure is reported rather than swallowed.
@@ -174,7 +192,7 @@ pub fn run_prefix(
     // one-node placeholder standing in the caller's variable meanwhile — the
     // caller cannot observe it, because it holds a `&mut` for the whole call.
     host.dom
-        .lend(std::mem::replace(dom, Dom::new_document()), page);
+        .lend(std::mem::replace(dom, Dom::new_document()), page, url);
 
     let runs: Vec<ScriptRun> = scripts
         .into_iter()
@@ -243,13 +261,36 @@ pub fn run_pass(
     page: u64,
     console: &Console,
 ) -> Vec<ScriptRun> {
+    run_pass_at(host, dom, page, "https://fixture.test/page", console)
+}
+
+/// `run_pass`, with the page URL `location` and storage are scoped by.
+#[cfg(test)]
+pub fn run_pass_at(
+    host: &mut Option<Host>,
+    dom: &mut Dom,
+    page: u64,
+    url: &str,
+    console: &Console,
+) -> Vec<ScriptRun> {
     let (mut queue, externals) = queue::ScriptQueue::new(sources::sources(dom), console);
     for external in externals {
         queue.fill(external.slot, None);
     }
     let ready = queue.take_ready_prefix();
     let finished = queue.is_finished();
-    run_prefix(host, dom, page, console, ready, finished)
+    run_prefix(
+        host,
+        dom,
+        &PageContext {
+            page,
+            url,
+            console,
+            storage: &Storage::new(),
+        },
+        ready,
+        finished,
+    )
 }
 
 /// Wall clock a single script gets before the interrupt handler stops it.
@@ -321,6 +362,9 @@ pub struct Host {
     /// Timer work the page asked for during a tick, drained by `App` and
     /// handed to the timer thread by the event loop.
     timers: TimerQueue,
+    /// A navigation the page asked for during a tick (M10.11), drained the
+    /// same way. JS never touches the network.
+    navigation: NavQueue,
     /// The engine handle. `Context` keeps the runtime alive on its own, so
     /// this is not what makes the host valid — it is how the limits get set
     /// and how the tests read the heap back. Holding it is deliberate: it is
@@ -342,7 +386,7 @@ pub struct Host {
 impl Host {
     /// Build a host with the budget, memory and stack limits armed. Fails only
     /// if the engine cannot allocate its runtime or context.
-    pub fn new(console: &Console) -> Result<Self, JsError> {
+    pub fn new(console: &Console, storage: &Storage) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(|e| JsError::internal(&e.to_string()))?;
         runtime.set_memory_limit(MEMORY_LIMIT);
         runtime.set_max_stack_size(STACK_LIMIT);
@@ -369,8 +413,9 @@ impl Host {
 
         let dom = Rc::new(bindings::DomSlot::default());
         let timers = TimerQueue::default();
+        let navigation = NavQueue::default();
         let entries = context.with(|ctx| {
-            bindings::install(&ctx, &dom, console, &timers)
+            bindings::install(&ctx, &dom, console, &timers, &navigation, storage)
                 .map(|entry_points| Persistent::save(&ctx, entry_points))
                 .catch(&ctx)
                 .map_err(|caught| JsError::from_caught("<bindings>", &caught))
@@ -381,6 +426,7 @@ impl Host {
         Ok(Host {
             entries,
             timers,
+            navigation: navigation.clone(),
             runtime,
             context,
             budget,
@@ -510,6 +556,12 @@ impl Host {
         self.timers.drain()
     }
 
+    /// The navigation the tick that just ended asked for, if any. At most one:
+    /// a script assigning `location` in a loop navigates once, last wins.
+    pub fn take_navigation(&self) -> Option<NavRequest> {
+        self.navigation.take()
+    }
+
     /// Run `body` inside the context with the execution budget armed, and turn
     /// whatever it produces into plain data. The one place the deadline is set
     /// and cleared, so every way into JS — a script, a listener, and M10.9's
@@ -559,17 +611,17 @@ impl Host {
 pub fn dispatch(
     host: &mut Option<Host>,
     dom: &mut Dom,
-    page: u64,
-    console: &Console,
+    ctx: &PageContext<'_>,
     target: Target,
     kind: &str,
 ) -> bool {
+    let (page, url, console) = (ctx.page, ctx.url, ctx.console);
     let Some(host) = host.as_mut() else {
         return false;
     };
 
     host.dom
-        .lend(std::mem::replace(dom, Dom::new_document()), page);
+        .lend(std::mem::replace(dom, Dom::new_document()), page, url);
     // Which events bubble, as the DOM says. It matters more than it looks:
     // `DOMContentLoaded` bubbles, which is the only reason a listener put on
     // `window` for it ever runs, and `load` does not.
@@ -610,12 +662,12 @@ const MAX_MICROTASKS: usize = 10_000;
 pub fn fire_timer(
     host: &mut Host,
     dom: &mut Dom,
-    page: u64,
-    console: &Console,
+    ctx: &PageContext<'_>,
     id: TimerId,
 ) -> Result<(), JsError> {
+    let (page, url, console) = (ctx.page, ctx.url, ctx.console);
     host.dom
-        .lend(std::mem::replace(dom, Dom::new_document()), page);
+        .lend(std::mem::replace(dom, Dom::new_document()), page, url);
     let outcome = host.fire_timer(id);
     if let Err(error) = &outcome {
         console.push(
@@ -876,7 +928,7 @@ fn frame_location(frame: &str) -> Option<(&str, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Console, Host, JsValue, SCRIPT_BUDGET, line_from_stack, run_pass};
+    use super::{Console, Host, JsValue, SCRIPT_BUDGET, Storage, line_from_stack, run_pass};
     use std::time::Instant;
 
     /// The document-order pass over a parsed page, as `App` and the headless
@@ -986,7 +1038,7 @@ mod tests {
     }
 
     fn host() -> Host {
-        Host::new(&Console::new()).expect("engine starts")
+        Host::new(&Console::new(), &Storage::new()).expect("engine starts")
     }
 
     #[test]

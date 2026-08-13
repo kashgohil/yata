@@ -257,11 +257,13 @@ fn run_dump_dom(url: &str) -> i32 {
 /// the same everywhere. Parse and layout, but no TUI.
 fn run_dump_text(url: &str) -> i32 {
     let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
-        Ok((mut dom, _)) => {
+    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l.0, p))) {
+        Ok((final_url, (mut dom, _))) => {
             // Scripts run before the dump, under the headless rule (one pass,
-            // no timers) that `headless::run_scripts` documents.
-            let _ = yata::headless::run_scripts(&mut dom);
+            // no timers) that `headless::run_scripts` documents. The URL is
+            // handed over so `location` is real; external scripts are still
+            // not fetched on this path.
+            let _ = yata::headless::run_scripts(&mut dom, Some(&final_url));
             // No worker to fetch <link> sheets in a headless run, so the page
             // is styled by the UA sheet plus its own inline blocks.
             let sheets = style::sources::inline_sheets(&dom);
@@ -307,7 +309,7 @@ fn run_dump_js(url: &str) -> i32 {
             // Pointed at a real URL, so external scripts are fetched here —
             // the one headless path that does; see `headless::run_scripts_from`.
             let (runs, console, pending) =
-                yata::headless::run_scripts_from(&mut dom, Some(&final_url));
+                yata::headless::run_scripts_fetching(&mut dom, &final_url);
             let mut text = String::new();
             for run in runs {
                 text.push_str(&run.dump_line());

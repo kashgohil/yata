@@ -15,6 +15,7 @@ use crate::css::Stylesheet;
 use crate::dom::{Dom, NodeId};
 use crate::image::ImageSession;
 use crate::js::queue::ScriptQueue;
+use crate::js::storage::Storage;
 use crate::js::{self, console::Console};
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
@@ -167,11 +168,20 @@ pub struct App {
     /// Whether the `F4` timing overlay is drawn. Independent of the mode: it
     /// stays up while the URL bar is open.
     timing_visible: bool,
+    /// A navigation a click handler asked for (M10.11), waiting to be folded
+    /// into the `Effect` the key or mouse path returns. `dispatch_click` runs
+    /// inside those paths and cannot return an `Effect` of its own.
+    pending_click_navigation: Option<(FetchId, String)>,
     /// The page's scripts in document order, with the position execution has
     /// reached (M10.10). External ones are holes until their worker reports;
     /// nothing after a hole runs, because the script that has not arrived may
     /// define what the next one calls.
     script_queue: ScriptQueue,
+    /// Every origin's `localStorage`/`sessionStorage` for this session
+    /// (M10.11). Lives here rather than in the host because a host is dropped
+    /// on every navigation and two pages on one origin must see the same data.
+    /// In memory only — see `js::storage` for why that is a decision.
+    storage: Storage,
     /// Everything this page's JavaScript had to say (M10.7): console calls,
     /// uncaught exceptions, scripts skipped for their type — one ordered list,
     /// shown by `F5`. Page-local like the host: cleared on navigation, because
@@ -292,7 +302,9 @@ impl App {
             spinner: 0,
             timings: Timings::default(),
             timing_visible: false,
+            pending_click_navigation: None,
             script_queue: ScriptQueue::default(),
+            storage: Storage::new(),
             console: Console::new(),
             console_view: Viewport::default(),
             console_view_built: false,
@@ -537,6 +549,9 @@ impl App {
                 let Some(mut dom) = self.dom.take() else {
                     return Effect::default();
                 };
+                let url = self.current_url().unwrap_or_default();
+                let console = self.console.clone();
+                let storage = self.storage.clone();
                 let Some(host) = self.js_host.as_mut() else {
                     self.dom = Some(dom);
                     return Effect::default();
@@ -544,13 +559,24 @@ impl App {
 
                 let before = (dom.version(), dom.structure_version());
                 let logged_before = self.console.entries().len();
-                let outcome = js::fire_timer(host, &mut dom, page.0, &self.console, id);
+                let outcome = js::fire_timer(
+                    host,
+                    &mut dom,
+                    &js::PageContext {
+                        page: page.0,
+                        url: &url,
+                        console: &console,
+                        storage: &storage,
+                    },
+                    id,
+                );
                 let after = (dom.version(), dom.structure_version());
                 self.dom = Some(dom);
                 let _ = outcome;
 
                 let mut effect = self.apply_dom_changes(before, after);
                 effect.timers = self.take_timer_requests(page);
+                self.apply_script_navigation(&mut effect);
                 if self.console.entries().len() != logged_before {
                     self.console_view_built = false;
                     self.build_visible_inspector();
@@ -1617,7 +1643,7 @@ impl App {
                     ..Effect::default()
                 }
             } else if self.dispatch_click(link.node) {
-                redraw()
+                self.take_click_navigation()
             } else {
                 self.follow_href(&href)
             };
@@ -1676,7 +1702,7 @@ impl App {
         };
         let href = href.to_string();
         if self.dispatch_click(focus) {
-            return redraw();
+            return self.take_click_navigation();
         }
         self.follow_href(&href)
     }
@@ -1711,11 +1737,16 @@ impl App {
         let started = Instant::now();
         let before = (dom.version(), dom.structure_version());
         let logged_before = self.console.entries().len();
+        let url = self.current_url().unwrap_or_default();
         let _runs = js::run_prefix(
             &mut self.js_host,
             &mut dom,
-            id.0,
-            &self.console,
+            &js::PageContext {
+                page: id.0,
+                url: &url,
+                console: &self.console,
+                storage: &self.storage,
+            },
             ready,
             finished,
         );
@@ -1733,6 +1764,7 @@ impl App {
 
         let mut effect = self.apply_dom_changes(before, after);
         effect.timers = self.take_timer_requests(id);
+        self.apply_script_navigation(&mut effect);
         if logged {
             // A script that only logged changed no box, but it did change what
             // the console pane holds and what the statusline says about the
@@ -1773,6 +1805,59 @@ impl App {
             }
         }
         out
+    }
+
+    /// The `Effect` for a click whose handler cancelled the default action:
+    /// a redraw, plus the navigation the handler asked for if it asked for one.
+    fn take_click_navigation(&mut self) -> Effect {
+        Effect {
+            dirty: true,
+            fetch: self.pending_click_navigation.take(),
+            ..Effect::default()
+        }
+    }
+
+    /// Act on the navigation a tick asked for, if any (M10.11).
+    ///
+    /// JS never touches the network: the binding recorded a request, and this
+    /// turns it into the *same* `Effect::fetch` the URL bar and a link click
+    /// produce, through the same `navigate` that already models push-versus-
+    /// replace and same-document fragments. At most one per tick — a script
+    /// assigning `location` in a loop navigates once, because the queue holds
+    /// one request and the last assignment wins.
+    fn apply_script_navigation(&mut self, effect: &mut Effect) {
+        let Some(request) = self.js_host.as_ref().and_then(js::Host::take_navigation) else {
+            return;
+        };
+        let Some(url) = self.resolve_href(&request.url) else {
+            self.console.push(
+                crate::js::console::Level::Warn,
+                None,
+                None,
+                "a script asked to navigate to a URL that could not be resolved",
+            );
+            return;
+        };
+        // A pure fragment change is a same-document move: no fetch, exactly
+        // what a link to `#x` already does. Checked here rather than left to
+        // `navigate`, which only consults `same_document` on the push-history
+        // path — a `location.replace('#x')` would otherwise refetch the page.
+        //
+        // It does not *scroll* to the target either, because following a link
+        // to a fragment does not: fragment scrolling is unimplemented for both
+        // (M11), and having script do something links cannot would be the
+        // wrong kind of difference.
+        if let Some(current) = self.current_url()
+            && same_document(&current, &url)
+        {
+            return;
+        }
+        // `assign` pushes history, `replace` does not — M6's distinction,
+        // carried through rather than reinvented.
+        let navigation = self.navigate(url, !request.replace);
+        if navigation.fetch.is_some() {
+            *effect = navigation;
+        }
     }
 
     /// Turn the timer work a tick asked for into requests the loop can hand to
@@ -1824,18 +1909,25 @@ impl App {
 
         let before = (dom.version(), dom.structure_version());
         let logged_before = self.console.entries().len();
+        let url = self.current_url().unwrap_or_default();
         let prevented = js::dispatch(
             &mut self.js_host,
             &mut dom,
-            id.0,
-            &self.console,
+            &js::PageContext {
+                page: id.0,
+                url: &url,
+                console: &self.console,
+                storage: &self.storage,
+            },
             js::Target::Node(node.0),
             "click",
         );
         let after = (dom.version(), dom.structure_version());
         self.dom = Some(dom);
 
-        self.apply_dom_changes(before, after);
+        let mut effect = self.apply_dom_changes(before, after);
+        self.apply_script_navigation(&mut effect);
+        self.pending_click_navigation = effect.fetch.take();
         if self.console.entries().len() != logged_before {
             self.console_view_built = false;
             self.build_visible_inspector();
@@ -1882,8 +1974,10 @@ impl App {
         };
         if self.dispatch_click(node) {
             // `preventDefault()`: the page handled the click itself. Whatever
-            // its listeners changed has already been drawn.
-            return redraw();
+            // its listeners changed has already been drawn — unless one of
+            // them navigated, which is a page handling a click by going
+            // somewhere else.
+            return self.take_click_navigation();
         }
         self.follow_href(&href)
     }
@@ -3455,6 +3549,92 @@ mod tests {
                 "{what} asked for another script pass"
             );
         }
+    }
+
+    // ---- location (M10.11) ------------------------------------------------
+
+    #[test]
+    fn assigning_location_navigates_through_the_same_path_a_link_does() {
+        let (mut app, id) = scripted_app("<p>page</p><script>location.href = '/next';</script>");
+        let effect = app.update(Msg::RunScripts { id });
+        let (fetch_id, url) = effect.fetch.expect("the script must navigate");
+        assert_eq!(url, "http://final/next");
+        assert_ne!(fetch_id, id, "a navigation starts a new generation");
+    }
+
+    #[test]
+    fn a_script_assigning_location_in_a_loop_navigates_once() {
+        // The named case: one fetch, not a thousand. The queue holds one
+        // request and the last assignment wins, the same rule `apply_batch`
+        // applies to URL-bar commits.
+        let (mut app, id) = scripted_app(
+            "<p>page</p><script>\
+             for (var i = 0; i < 1000; i++) location.href = '/page' + i;</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let (_, url) = effect.fetch.expect("the script must navigate");
+        assert_eq!(url, "http://final/page999", "last assignment wins");
+    }
+
+    #[test]
+    fn assign_pushes_history_and_replace_does_not() {
+        let (mut app, id) = scripted_app("<p>a</p><script>location.assign('/b');</script>");
+        app.update(Msg::RunScripts { id });
+        assert!(app.history.can_back(), "assign must push history");
+
+        let (mut app, id) = scripted_app("<p>a</p><script>location.replace('/b');</script>");
+        app.update(Msg::RunScripts { id });
+        assert!(!app.history.can_back(), "replace must not push history");
+    }
+
+    #[test]
+    fn a_fragment_change_does_not_fetch() {
+        // `same_document` already decides this for links; a script assigning
+        // `location.hash` takes the same path and must reach the same answer.
+        let (mut app, id) = scripted_app("<p>page</p><script>location.hash = 'part2';</script>");
+        let effect = app.update(Msg::RunScripts { id });
+        assert_eq!(effect.fetch, None, "a fragment change fetched");
+    }
+
+    #[test]
+    fn a_click_handler_can_navigate() {
+        // The flagship shape: a script-built button that goes somewhere. It
+        // must work through the keyboard path too, not only the mouse.
+        let page = "<p><a href='#'>go</a></p><script>\
+             document.querySelector('a').addEventListener('click', function (e) {\
+               e.preventDefault();\
+               location.href = '/from-the-handler';\
+             });</script>";
+
+        let (mut app, _) = live_page(80, 12, page);
+        let effect = app.update(click_first_link(&app));
+        let (_, url) = effect.fetch.expect("the handler's navigation was lost");
+        assert_eq!(url, "http://final/from-the-handler");
+
+        let (mut app, _) = live_page(80, 12, page);
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            effect.fetch.map(|(_, url)| url).as_deref(),
+            Some("http://final/from-the-handler"),
+            "the keyboard path lost the handler's navigation"
+        );
+    }
+
+    #[test]
+    fn a_timer_can_navigate() {
+        let (mut app, id) = scripted_app(
+            "<p>page</p><script>setTimeout(function () { location.href = '/later'; }, 5);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert_eq!(
+            effect.fetch.map(|(_, url)| url).as_deref(),
+            Some("http://final/later")
+        );
     }
 
     // ---- external scripts (M10.10) ----------------------------------------

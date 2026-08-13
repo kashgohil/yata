@@ -33,8 +33,14 @@ use crate::style;
 ///
 /// The host is created and dropped inside this call: nothing headless outlives
 /// one page.
-pub fn run_scripts(dom: &mut Dom) -> (Vec<ScriptRun>, Console, usize) {
-    run_scripts_from(dom, None)
+pub fn run_scripts(dom: &mut Dom, url: Option<&str>) -> (Vec<ScriptRun>, Console, usize) {
+    run_scripts_from(dom, url, false)
+}
+
+/// The pass **with** external `<script src>` fetched. See below for why only
+/// `--dump-js` does this.
+pub fn run_scripts_fetching(dom: &mut Dom, url: &str) -> (Vec<ScriptRun>, Console, usize) {
+    run_scripts_from(dom, Some(url), true)
 }
 
 /// The same pass, but **fetching** `<script src>` from `base_url`.
@@ -49,9 +55,15 @@ pub fn run_scripts(dom: &mut Dom) -> (Vec<ScriptRun>, Console, usize) {
 /// ladder runs almost no script, which is an artefact rather than a finding.
 ///
 /// Still no timers, on either path.
-pub fn run_scripts_from(dom: &mut Dom, base_url: Option<&str>) -> (Vec<ScriptRun>, Console, usize) {
+fn run_scripts_from(
+    dom: &mut Dom,
+    base_url: Option<&str>,
+    fetch_externals: bool,
+) -> (Vec<ScriptRun>, Console, usize) {
     let mut host = None;
     let console = Console::new();
+    // One page, one session: storage is created and dropped with this call.
+    let storage = crate::js::storage::Storage::new();
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
     // The queue, headless: external scripts are never fetched here (no worker
@@ -65,7 +77,10 @@ pub fn run_scripts_from(dom: &mut Dom, base_url: Option<&str>) -> (Vec<ScriptRun
     let (tx, rx) = mpsc::channel();
     let mut in_flight = 0;
     for external in externals {
-        match base_url.and_then(|base| net::resolve_url(base, &external.url)) {
+        match base_url
+            .filter(|_| fetch_externals)
+            .and_then(|base| net::resolve_url(base, &external.url))
+        {
             Some(url) => {
                 net::spawn_script(FetchId(1), external.slot, url, tx.clone());
                 in_flight += 1;
@@ -75,9 +90,10 @@ pub fn run_scripts_from(dom: &mut Dom, base_url: Option<&str>) -> (Vec<ScriptRun
                     js::console::Level::Warn,
                     Some(external.url.clone()),
                     None,
-                    match base_url {
-                        Some(_) => "could not resolve this script's URL",
-                        None => "external scripts are not fetched on this headless path",
+                    if fetch_externals {
+                        "could not resolve this script's URL"
+                    } else {
+                        "external scripts are not fetched on this headless path"
                     },
                 );
                 queue.fill(external.slot, None);
@@ -94,8 +110,12 @@ pub fn run_scripts_from(dom: &mut Dom, base_url: Option<&str>) -> (Vec<ScriptRun
             runs.extend(js::run_prefix(
                 &mut host,
                 dom,
-                HEADLESS_PAGE,
-                &console,
+                &js::PageContext {
+                    page: HEADLESS_PAGE,
+                    url: base_url.unwrap_or_default(),
+                    console: &console,
+                    storage: &storage,
+                },
                 ready,
                 finished,
             ));
@@ -143,7 +163,7 @@ pub fn box_dump(dom: &mut Dom, base_url: Option<&str>, width: u16) -> String {
     // Scripts first, and through the shared rule above: the boxes a golden
     // pins must be the boxes a reader would see, which means after the page's
     // own script has had its one pass at the tree.
-    let _ = run_scripts(dom);
+    let _ = run_scripts(dom, base_url);
     let sheets = style::sources::inline_sheets(dom);
     let styles = style::style_tree(dom, &sheets.iter().collect::<Vec<_>>());
     let imgs = image::discover(dom, base_url);

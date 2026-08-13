@@ -47,6 +47,7 @@ use crate::css;
 use crate::dom::{Dom, DomError, NodeData, NodeId};
 use crate::html;
 use crate::js::console::{self, Console};
+use crate::js::storage::{Area, Storage, origin_of};
 use crate::style::{StyleContext, matching};
 
 /// The tree the current tick is working on, shared between the host and every
@@ -54,6 +55,10 @@ use crate::style::{StyleContext, matching};
 #[derive(Default)]
 pub struct DomSlot {
     dom: RefCell<Option<Dom>>,
+    /// The page's post-redirect URL, which `location` is parsed from. Lent
+    /// with the tree, because it belongs to the same page and changes only
+    /// when the tree does.
+    url: RefCell<String>,
     /// The page generation the slot currently holds. Kept when the tree is
     /// taken back out, because handles minted this page stay valid between
     /// ticks — it is the *next page* that must invalidate them.
@@ -62,8 +67,9 @@ pub struct DomSlot {
 
 impl DomSlot {
     /// Lend the tree to the bindings for one tick.
-    pub fn lend(&self, dom: Dom, page: u64) {
+    pub fn lend(&self, dom: Dom, page: u64, url: &str) {
         self.page.set(page);
+        *self.url.borrow_mut() = url.to_string();
         *self.dom.borrow_mut() = Some(dom);
     }
 
@@ -123,6 +129,36 @@ impl TimerQueue {
     }
 }
 
+/// A navigation a script asked for (M10.11), collected for the event loop.
+///
+/// JS never touches the network: `location.href = …` records this, `App`
+/// turns it into the same `Effect::fetch` the URL bar and a link click
+/// produce, and the loop performs it. One per tick, last assignment wins —
+/// a script that assigns in a loop navigates once.
+#[derive(Clone, Default)]
+pub struct NavQueue {
+    request: Rc<RefCell<Option<NavRequest>>>,
+}
+
+/// Where a script asked to go, and whether it should replace the current
+/// history entry rather than push one.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NavRequest {
+    pub url: String,
+    pub replace: bool,
+}
+
+impl NavQueue {
+    fn set(&self, url: String, replace: bool) {
+        *self.request.borrow_mut() = Some(NavRequest { url, replace });
+    }
+
+    /// Take the navigation this tick asked for, if any.
+    pub fn take(&self) -> Option<NavRequest> {
+        self.request.borrow_mut().take()
+    }
+}
+
 /// Whether `name` is one the serializer could write and the tokenizer read
 /// back as the same attribute.
 ///
@@ -171,6 +207,8 @@ pub fn install<'js>(
     slot: &Rc<DomSlot>,
     console: &Console,
     timers: &TimerQueue,
+    navigation: &NavQueue,
+    storage: &Storage,
 ) -> JsResult<Object<'js>> {
     let api = Object::new(ctx.clone())?;
 
@@ -562,6 +600,103 @@ pub fn install<'js>(
         })?,
     )?;
 
+    // ---- location and storage (M10.11) ----
+
+    // The page's URL, for `location` to take apart. Parsed in JS from this one
+    // string, using the same value `net::` produced — there is no second URL
+    // parser here, and there must not be.
+    let s = Rc::clone(slot);
+    api.set(
+        "pageUrl",
+        Function::new(ctx.clone(), move || s.url.borrow().clone())?,
+    )?;
+
+    // A navigation the script asked for. JS never touches the network: this
+    // records what was asked, `App` turns it into the same `Effect::fetch` a
+    // link click produces, and the loop performs it.
+    let nav = navigation.clone();
+    api.set(
+        "navigate",
+        Function::new(ctx.clone(), move |url: String, replace: bool| {
+            nav.set(url, replace);
+        })?,
+    )?;
+
+    // Storage, per origin. The origin is derived here rather than in JS so a
+    // page cannot spoof it by rewriting `location`.
+    let (store, s) = (storage.clone(), Rc::clone(slot));
+    api.set(
+        "storageGet",
+        Function::new(
+            ctx.clone(),
+            move |session: bool, key: String| -> Option<String> {
+                let origin = origin_of(&s.url.borrow())?;
+                store.get(&origin, area(session), &key)
+            },
+        )?,
+    )?;
+
+    let (store, s) = (storage.clone(), Rc::clone(slot));
+    api.set(
+        "storageSet",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'_>, session: bool, key: String, value: String| {
+                let Some(origin) = origin_of(&s.url.borrow()) else {
+                    return Ok(());
+                };
+                if store.set(&origin, area(session), &key, &value) {
+                    Ok(())
+                } else {
+                    Err(Exception::throw_message(
+                        &ctx,
+                        "QuotaExceededError: this origin's storage is full",
+                    ))
+                }
+            },
+        )?,
+    )?;
+
+    let (store, s) = (storage.clone(), Rc::clone(slot));
+    api.set(
+        "storageRemove",
+        Function::new(ctx.clone(), move |session: bool, key: String| {
+            if let Some(origin) = origin_of(&s.url.borrow()) {
+                store.remove(&origin, area(session), &key);
+            }
+        })?,
+    )?;
+
+    let (store, s) = (storage.clone(), Rc::clone(slot));
+    api.set(
+        "storageClear",
+        Function::new(ctx.clone(), move |session: bool| {
+            if let Some(origin) = origin_of(&s.url.borrow()) {
+                store.clear(&origin, area(session));
+            }
+        })?,
+    )?;
+
+    let (store, s) = (storage.clone(), Rc::clone(slot));
+    api.set(
+        "storageLength",
+        Function::new(ctx.clone(), move |session: bool| {
+            origin_of(&s.url.borrow()).map_or(0, |origin| store.len(&origin, area(session)) as u32)
+        })?,
+    )?;
+
+    let (store, s) = (storage.clone(), Rc::clone(slot));
+    api.set(
+        "storageKey",
+        Function::new(
+            ctx.clone(),
+            move |session: bool, index: u32| -> Option<String> {
+                let origin = origin_of(&s.url.borrow())?;
+                store.key_at(&origin, area(session), index as usize)
+            },
+        )?,
+    )?;
+
     ctx.globals().set("__dom", api)?;
     // Named, so a stack frame from inside the object model says where it came
     // from instead of the engine's anonymous `eval_script`.
@@ -572,6 +707,11 @@ pub fn install<'js>(
     // The prelude's value is its entry-point object (see the end of
     // `PRELUDE`): `dispatch`, `fireTimer`, `pending`.
     ctx.eval_with_options::<Object<'js>, _>(PRELUDE, options)
+}
+
+/// Which store a `session` flag from the prelude names.
+fn area(session: bool) -> Area {
+    if session { Area::Session } else { Area::Local }
 }
 
 fn id_of(node: NodeId) -> u32 {
@@ -1203,6 +1343,102 @@ const PRELUDE: &str = r#"
   globalThis.clearTimeout = cancel;
   globalThis.clearInterval = cancel;
 
+  // ---- location and storage (M10.11) ----
+
+  // `location` is parsed from the one string Rust hands over, which is the
+  // page's post-redirect URL as `net::` produced it. The parsing is small and
+  // lives here so there is no second URL parser in the engine.
+  function parts() {
+    const href = raw.pageUrl();
+    const scheme = href.indexOf("://");
+    // A page with no URL — a dump with nothing to resolve against — still has
+    // to answer every property. Returning a partial object would make
+    // `location.pathname` `undefined`, which a page cannot tell from a bug.
+    if (scheme === -1) {
+      return {
+        href: href, protocol: "", host: "", hostname: "", port: "",
+        pathname: href, search: "", hash: "", origin: "",
+      };
+    }
+    const protocol = href.slice(0, scheme) + ":";
+    let rest = href.slice(scheme + 3);
+    let hash = "";
+    const hashAt = rest.indexOf('#');
+    if (hashAt !== -1) { hash = rest.slice(hashAt); rest = rest.slice(0, hashAt); }
+    let search = "";
+    const queryAt = rest.indexOf("?");
+    if (queryAt !== -1) { search = rest.slice(queryAt); rest = rest.slice(0, queryAt); }
+    const slash = rest.indexOf("/");
+    const host = slash === -1 ? rest : rest.slice(0, slash);
+    const path = slash === -1 ? "/" : rest.slice(slash);
+    const colon = host.lastIndexOf(":");
+    return {
+      href: href,
+      protocol: protocol,
+      host: host,
+      hostname: colon === -1 ? host : host.slice(0, colon),
+      port: colon === -1 ? "" : host.slice(colon + 1),
+      pathname: path,
+      search: search,
+      hash: hash,
+      origin: protocol + "//" + host,
+    };
+  }
+
+  const location = {
+    get href() { return parts().href; },
+    set href(value) { raw.navigate(String(value), false); },
+    get protocol() { return parts().protocol; },
+    get host() { return parts().host; },
+    get hostname() { return parts().hostname; },
+    get port() { return parts().port; },
+    get pathname() { return parts().pathname; },
+    get search() { return parts().search; },
+    get hash() { return parts().hash; },
+    set hash(value) {
+      // An assignment, not a replacement: a browser pushes a history entry
+      // for a fragment change, so `H` goes back to where the reader was.
+      const to = String(value);
+      raw.navigate(to.charAt(0) === '#' ? to : '#' + to, false);
+    },
+    get origin() { return parts().origin; },
+    assign: function (url) { raw.navigate(String(url), false); },
+    // `replace` does not push history — the distinction M6's `History`
+    // already models, so it is carried through rather than invented here.
+    replace: function (url) { raw.navigate(String(url), true); },
+    reload: function () { raw.navigate(parts().href, true); },
+    toString: function () { return parts().href; },
+  };
+
+  function storageArea(session) {
+    return {
+      getItem: function (key) {
+        const value = raw.storageGet(session, String(key));
+        return value === undefined ? null : value;
+      },
+      setItem: function (key, value) { raw.storageSet(session, String(key), String(value)); },
+      removeItem: function (key) { raw.storageRemove(session, String(key)); },
+      clear: function () { raw.storageClear(session); },
+      key: function (i) {
+        const key = raw.storageKey(session, Number(i) >>> 0);
+        return key === undefined ? null : key;
+      },
+      get length() { return raw.storageLength(session); },
+    };
+  }
+
+  globalThis.location = location;
+  document.location = location;
+  globalThis.localStorage = storageArea(false);
+  globalThis.sessionStorage = storageArea(true);
+
+  // Enough that feature detection does not crash, and no more: every field is
+  // a promise about behaviour, and a browser string we do not honour is worse
+  // than an honest one nobody recognises.
+  globalThis.navigator = {
+    userAgent: "yata (terminal browser; +https://github.com/yata)",
+  };
+
   // `window`, `globalThis` and the global scope are one object: pages branch
   // on `typeof window` and read `window.x` for a top-level `var x`.
   globalThis.window = globalThis;
@@ -1450,7 +1686,7 @@ mod tests {
         // be the first — gets an exception, not a stale read.
         let slot = DomSlot::default();
         assert!(slot.take().is_none());
-        let mut host = Host::new(&Console::new()).expect("host starts");
+        let mut host = Host::new(&Console::new(), &Storage::new()).expect("host starts");
         // Nothing has been lent, so the bindings have no tree to read.
         let error = host.eval("probe.js", "document.body").unwrap_err();
         assert!(
@@ -1975,6 +2211,196 @@ mod tests {
         );
     }
 
+    // ---- location and storage (M10.11) ------------------------------------
+
+    /// Run `script` on a page served from `url` and return what it logged.
+    fn at(url: &str, script: &str) -> Vec<String> {
+        let mut dom = html::parse(&format!("<p>x</p><script>{script}</script>"));
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass_at(&mut host, &mut dom, 1, url, &console);
+        console.entries().iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn location_reports_the_pages_own_url_in_pieces() {
+        assert_eq!(
+            at(
+                "https://example.com:8443/docs/a?q=1&r=2#frag",
+                "console.log([location.protocol, location.host, location.hostname,\
+                              location.port, location.pathname, location.search,\
+                              location.hash, location.origin].join(' | '));"
+            ),
+            [
+                "log   https: | example.com:8443 | example.com | 8443 | /docs/a | ?q=1&r=2 | #frag | https://example.com:8443"
+            ]
+        );
+        assert_eq!(
+            at(
+                "https://example.com/",
+                "console.log(location.href + ' ' + location);"
+            ),
+            ["log   https://example.com/ https://example.com/"]
+        );
+        // No port, no query, no fragment: the empty cases a page tests for.
+        assert_eq!(
+            at(
+                "http://example.com/",
+                "console.log([location.port, location.search, location.hash, location.pathname].join('|'));"
+            ),
+            ["log   |||/"]
+        );
+        // `document.location` is the same object a page can read either way.
+        assert_eq!(
+            at(
+                "https://example.com/",
+                "console.log(document.location === location);"
+            ),
+            ["log   true"]
+        );
+    }
+
+    #[test]
+    fn local_storage_round_trips_and_coerces_to_strings() {
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "localStorage.setItem('k', 42);\
+                 console.log(typeof localStorage.getItem('k'), localStorage.getItem('k'));"
+            ),
+            ["log   string 42"]
+        );
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "console.log(localStorage.getItem('absent'));"
+            ),
+            ["log   null"]
+        );
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "localStorage.setItem('a', '1'); localStorage.setItem('b', '2');\
+                 var keys = []; for (var i = 0; i < localStorage.length; i++) keys.push(localStorage.key(i));\
+                 localStorage.removeItem('a');\
+                 console.log(keys.join(',') + ' then ' + localStorage.length);\
+                 localStorage.clear();\
+                 console.log('after clear ' + localStorage.length);"
+            ),
+            ["log   a,b then 1", "log   after clear 0"]
+        );
+    }
+
+    #[test]
+    fn local_and_session_storage_are_separate() {
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "localStorage.setItem('k', 'local'); sessionStorage.setItem('k', 'session');\
+                 console.log(localStorage.getItem('k') + ' / ' + sessionStorage.getItem('k'));"
+            ),
+            ["log   local / session"]
+        );
+    }
+
+    #[test]
+    fn two_origins_never_see_each_others_storage() {
+        // One session, two origins: the isolation test the task asks for. The
+        // store outlives each page, so this is the shape a real session has.
+        let storage = Storage::new();
+        let console = Console::new();
+
+        let run = |url: &str, script: &str| {
+            let mut dom = html::parse(&format!("<p>x</p><script>{script}</script>"));
+            let mut host = None;
+            let (mut queue, _) =
+                crate::js::queue::ScriptQueue::new(crate::js::sources::sources(&dom), &console);
+            let ready = queue.take_ready_prefix();
+            js::run_prefix(
+                &mut host,
+                &mut dom,
+                &js::PageContext {
+                    page: 1,
+                    url,
+                    console: &console,
+                    storage: &storage,
+                },
+                ready,
+                true,
+            );
+        };
+
+        run(
+            "https://a.test/one",
+            "localStorage.setItem('who', 'from a');",
+        );
+        // A second page on the *same* origin sees it.
+        run(
+            "https://a.test/two",
+            "console.log('same origin reads: ' + localStorage.getItem('who'));",
+        );
+        // A different origin does not.
+        run(
+            "https://b.test/one",
+            "console.log('other origin reads: ' + localStorage.getItem('who'));",
+        );
+        // Nor does the same host on a different scheme.
+        run(
+            "http://a.test/one",
+            "console.log('other scheme reads: ' + localStorage.getItem('who'));",
+        );
+
+        assert_eq!(
+            console
+                .entries()
+                .iter()
+                .map(|e| e.text.clone())
+                .collect::<Vec<_>>(),
+            [
+                "same origin reads: from a",
+                "other origin reads: null",
+                "other scheme reads: null",
+            ]
+        );
+    }
+
+    #[test]
+    fn exceeding_the_quota_throws_the_way_a_browser_does() {
+        let entries = at(
+            "https://a.test/",
+            "try { localStorage.setItem('k', 'x'.repeat(2 * 1024 * 1024)); }\
+             catch (e) { console.log(e.message.split(':')[0]); }",
+        );
+        assert_eq!(entries, ["log   QuotaExceededError"]);
+    }
+
+    #[test]
+    fn navigator_says_what_we_are_and_nothing_else() {
+        // Every field is a promise about behaviour; the only one worth making
+        // is what this is.
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "console.log(navigator.userAgent.indexOf('yata') === 0, Object.keys(navigator).length);"
+            ),
+            ["log   true 1"]
+        );
+    }
+
+    #[test]
+    fn cookies_and_the_history_api_are_absent_rather_than_stubbed() {
+        // A stub that lies is worse than a name that is not there: a page can
+        // feature-detect an absence, but it cannot detect a `pushState` that
+        // silently does nothing.
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "console.log(document.cookie === undefined, typeof history);"
+            ),
+            ["log   true undefined"]
+        );
+    }
+
     // ---- timers and microtasks (M10.9) ------------------------------------
 
     /// Run `script`, then fire whatever timers it scheduled, in the order the
@@ -2013,7 +2439,17 @@ mod tests {
             let (due, _, id) = queue.remove(0);
             now = due;
             let engine = host.as_mut().expect("the page ran script");
-            let _ = js::fire_timer(engine, &mut dom, 1, &console, crate::timers::TimerId(id));
+            let _ = js::fire_timer(
+                engine,
+                &mut dom,
+                &js::PageContext {
+                    page: 1,
+                    url: "https://fixture.test/page",
+                    console: &console,
+                    storage: &Storage::new(),
+                },
+                crate::timers::TimerId(id),
+            );
             drain(&host, &mut queue, &mut seq, now);
         }
         console.entries().iter().map(ToString::to_string).collect()
@@ -2222,8 +2658,12 @@ mod tests {
         let prevented = js::dispatch(
             &mut host,
             &mut dom,
-            1,
-            &console,
+            &js::PageContext {
+                page: 1,
+                url: "https://fixture.test/page",
+                console: &console,
+                storage: &Storage::new(),
+            },
             js::Target::Node(target.0),
             "click",
         );
@@ -2503,7 +2943,7 @@ mod tests {
         // divided into it.
         const NODES: usize = 500;
         let console = Console::new();
-        let mut host = Some(Host::new(&console).expect("the engine starts"));
+        let mut host = Some(Host::new(&console, &Storage::new()).expect("the engine starts"));
 
         let mut warm = html::parse("<p>x</p><script>1</script>");
         js::run_pass(&mut host, &mut warm, 1, &console);
@@ -2758,7 +3198,7 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/en.wikipedia.org.html"
         ));
-        let mut host = Some(Host::new(&Console::new()).expect("host starts"));
+        let mut host = Some(Host::new(&Console::new(), &Storage::new()).expect("host starts"));
 
         let mut warm = html::parse("<p>x</p><script>1</script>");
         js::run_pass(&mut host, &mut warm, 1, &Console::new());
