@@ -71,7 +71,34 @@ pub struct Compound {
     pub tag: Option<String>,
     pub id: Option<String>,
     pub classes: Vec<String>,
+    /// `[attr]`, `[attr=v]`, `[attr~=v]` … (M11.2). A compound may carry
+    /// several; all must match.
+    pub attributes: Vec<AttributeTest>,
     pub pseudo: Vec<PseudoClass>,
+}
+
+/// One `[…]` test. The name is matched ASCII-case-insensitively (HTML
+/// attribute names are); the value is not.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AttributeTest {
+    pub name: String,
+    /// `None` for a bare `[attr]` — presence alone.
+    pub match_: Option<(AttributeMatch, String)>,
+}
+
+/// How `[attr<op>value]` compares.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AttributeMatch {
+    /// `=` — the whole value.
+    Exact,
+    /// `~=` — one whitespace-separated word of it.
+    Word,
+    /// `|=` — the value, or the value followed by a hyphen (`lang="en-GB"`).
+    Hyphen,
+    /// `^=`, `$=`, `*=`.
+    Prefix,
+    Suffix,
+    Substring,
 }
 
 /// PLAN.md M4 asks for `:hover`/`:visited` stubs; `:link` is here because
@@ -93,7 +120,8 @@ pub enum PseudoClass {
 }
 
 impl Selector {
-    /// CSS specificity as (ids, classes + pseudo-classes, type selectors),
+    /// CSS specificity as (ids, classes + attributes + pseudo-classes, type
+    /// selectors),
     /// compared lexicographically by the cascade. `*` contributes nothing.
     /// Saturating, because a selector with 65 536 classes is someone's fuzzer,
     /// not a page, and wrapping there would silently invert a comparison.
@@ -101,9 +129,12 @@ impl Selector {
         let mut spec = (0u16, 0u16, 0u16);
         for (_, compound) in &self.parts {
             spec.0 = spec.0.saturating_add(u16::from(compound.id.is_some()));
-            spec.1 = spec
-                .1
-                .saturating_add(clamp_u16(compound.classes.len() + compound.pseudo.len()));
+            spec.1 = spec.1.saturating_add(clamp_u16(
+                // An attribute selector weighs the same as a class, which
+                // is what CSS says and what makes `[href]` and `.link`
+                // tie rather than one silently winning.
+                compound.classes.len() + compound.attributes.len() + compound.pseudo.len(),
+            ));
             spec.2 = spec.2.saturating_add(u16::from(compound.tag.is_some()));
         }
         spec

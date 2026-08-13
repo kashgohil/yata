@@ -12,7 +12,10 @@
 //! not in M4. Same for `@supports`; `@import` is skipped without fetching.
 
 use super::tokenizer::{Token, Tokenizer};
-use super::{Combinator, Compound, Declaration, PseudoClass, Rule, Selector, Stylesheet};
+use super::{
+    AttributeMatch, AttributeTest, Combinator, Compound, Declaration, PseudoClass, Rule, Selector,
+    Stylesheet,
+};
 
 /// Parse a whole stylesheet. Never panics and never loops: every path consumes
 /// a token or reaches `Eof`.
@@ -97,6 +100,53 @@ impl<'a> Parser<'a> {
     /// Skip an at-rule whose keyword is already consumed: either to the `;` that
     /// ends a statement (`@import url(x);`) or past the balanced block that ends
     /// a nested one (`@media ... { ... }`).
+    /// `[name]`, `[name=value]`, `[name~=value]`, … with the closing bracket
+    /// consumed. `None` when the syntax is not one this engine evaluates.
+    ///
+    /// Values may be quoted or bare; a bare value is an identifier, which is
+    /// what a page writes for `[type=text]`.
+    fn attribute_test(&mut self) -> Option<AttributeTest> {
+        self.skip_ws();
+        let Token::Ident(name) = self.next().tok else {
+            return None;
+        };
+        self.skip_ws();
+
+        let operator = match self.next().tok {
+            Token::RBracket => {
+                return Some(AttributeTest {
+                    name: name.to_ascii_lowercase(),
+                    match_: None,
+                });
+            }
+            Token::Delim('=') => AttributeMatch::Exact,
+            Token::Delim('~') => AttributeMatch::Word,
+            Token::Delim('|') => AttributeMatch::Hyphen,
+            Token::Delim('^') => AttributeMatch::Prefix,
+            Token::Delim('$') => AttributeMatch::Suffix,
+            Token::Delim('*') => AttributeMatch::Substring,
+            _ => return None,
+        };
+        // Every operator but `=` is two characters.
+        if operator != AttributeMatch::Exact && !matches!(self.next().tok, Token::Delim('=')) {
+            return None;
+        }
+
+        self.skip_ws();
+        let value = match self.next().tok {
+            Token::Ident(value) | Token::Str(value) => value,
+            _ => return None,
+        };
+        self.skip_ws();
+        if !matches!(self.next().tok, Token::RBracket) {
+            return None;
+        }
+        Some(AttributeTest {
+            name: name.to_ascii_lowercase(),
+            match_: Some((operator, value)),
+        })
+    }
+
     fn skip_at_rule(&mut self) {
         let mut depth = 0i32;
         loop {
@@ -201,6 +251,19 @@ impl<'a> Parser<'a> {
                 },
                 Token::Delim('*') => {
                     compound.get_or_insert_with(Compound::default);
+                }
+                Token::LBracket => {
+                    match self.attribute_test() {
+                        Some(test) => compound
+                            .get_or_insert_with(Compound::default)
+                            .attributes
+                            .push(test),
+                        // An attribute selector this engine cannot evaluate
+                        // invalidates the rule, like any other unparseable
+                        // prelude — the alternative is applying declarations
+                        // to a set the author did not write.
+                        None => bad = true,
+                    }
                 }
                 Token::Colon => {
                     let pseudo = self.pseudo_class();
@@ -414,6 +477,7 @@ mod tests {
 
     fn compound(tag: Option<&str>, id: Option<&str>, classes: &[&str]) -> Compound {
         Compound {
+            attributes: Vec::new(),
             tag: tag.map(str::to_string),
             id: id.map(str::to_string),
             classes: classes.iter().map(|c| c.to_string()).collect(),
@@ -554,9 +618,12 @@ mod tests {
 
     #[test]
     fn a_bad_selector_costs_only_its_rule() {
-        // Attribute selectors and sibling combinators are out of scope for M4;
-        // the rules that use them are dropped whole, and the next rule parses.
-        for bad in ["a[href]", "h1 + p", "p ~ span", "p,"] {
+        // Sibling combinators are still out of scope; the rules that use them
+        // are dropped whole, and the next rule parses. `a[href]` used to be on
+        // this list and is not any more — M11.2 implemented it, and a
+        // malformed *attribute* selector takes its place, since the point of
+        // the test is that one bad rule costs only itself.
+        for bad in ["h1 + p", "p ~ span", "p,", "a[href", "a[=v]", "a[href!=v]"] {
             let sheet = parse(&format!("{bad} {{ color: red }} h1 {{ color: blue }}"));
             assert_eq!(sheet.rules.len(), 1, "{bad}");
             assert_eq!(
@@ -597,7 +664,7 @@ mod tests {
         assert_eq!(parse("@").rules.len(), 0);
         assert_eq!(parse("/* unterminated").rules.len(), 0);
         // A dropped rule in the middle does not desynchronize the sheet.
-        let sheet = parse("h1 { color: a } p[x] { color: b } h2 { color: c }");
+        let sheet = parse("h1 { color: a } p[ { color: b } h2 { color: c }");
         assert_eq!(sheet.rules.len(), 2);
     }
 
@@ -735,8 +802,10 @@ mod ladder {
         let counts: Vec<usize> = blocks.iter().map(|b| parse(b).rules.len()).collect();
         assert_eq!(
             counts,
+            // Block 12 went 9 → 14 at M11.2: five rules whose selectors carry
+            // an attribute test were being dropped *whole*, and now parse.
             vec![
-                3, 8, 3, 16, 24, 4, 5, 8, 2, 2, 5, 5, 9, 15, 7, 0, 13, 17, 1, 12, 1
+                3, 8, 3, 16, 24, 4, 5, 8, 2, 2, 5, 5, 14, 15, 7, 0, 13, 17, 1, 12, 1
             ]
         );
         // Block 15 is two `@media` blocks and nothing else: zero rules is the

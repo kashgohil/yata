@@ -145,6 +145,39 @@ impl<'a> RuleIndex<'a> {
 /// Does `selector` match `node`? Evaluated right to left — the rightmost
 /// compound is the cheapest thing to reject on, which is the whole reason
 /// selectors are indexed by it.
+/// One `[attr…]` test against a node (M11.2).
+///
+/// The empty-value cases are the ones always got wrong: `[a^=""]`, `[a$=""]`
+/// and `[a*=""]` match **nothing**, where a naive `starts_with("")` would
+/// match everything — the difference between hiding one element and hiding the
+/// page.
+fn attribute_matches(dom: &Dom, node: NodeId, test: &crate::css::AttributeTest) -> bool {
+    use crate::css::AttributeMatch;
+
+    // `Dom::attr` already compares names ASCII-case-insensitively, which is
+    // the HTML rule; values keep their case.
+    let Some(actual) = dom.attr(node, &test.name) else {
+        return false;
+    };
+    let Some((operator, want)) = &test.match_ else {
+        return true;
+    };
+    match operator {
+        AttributeMatch::Exact => actual == want,
+        AttributeMatch::Word => actual.split_whitespace().any(|word| word == want),
+        // `|=` is the language-subtag rule: `en` matches `en` and `en-GB`.
+        AttributeMatch::Hyphen => {
+            actual == want
+                || actual
+                    .strip_prefix(want.as_str())
+                    .is_some_and(|rest| rest.starts_with('-'))
+        }
+        AttributeMatch::Prefix => !want.is_empty() && actual.starts_with(want.as_str()),
+        AttributeMatch::Suffix => !want.is_empty() && actual.ends_with(want.as_str()),
+        AttributeMatch::Substring => !want.is_empty() && actual.contains(want.as_str()),
+    }
+}
+
 pub fn matches(dom: &Dom, node: NodeId, selector: &Selector, ctx: &StyleContext<'_>) -> bool {
     matches_parts(dom, node, &selector.parts, ctx)
 }
@@ -219,6 +252,11 @@ fn compound_matches(dom: &Dom, node: NodeId, compound: &Compound, ctx: &StyleCon
             }
         }
     }
+    for test in &compound.attributes {
+        if !attribute_matches(dom, node, test) {
+            return false;
+        }
+    }
     compound.pseudo.iter().all(|pseudo| match pseudo {
         PseudoClass::Link => is_link(dom, tag, node) && !is_visited(dom, node, ctx),
         PseudoClass::Visited => is_link(dom, tag, node) && is_visited(dom, node, ctx),
@@ -267,6 +305,92 @@ fn parent_element(dom: &Dom, node: NodeId) -> Option<NodeId> {
         current = dom.node(id).parent;
     }
     None
+}
+
+#[cfg(test)]
+mod attribute_selectors {
+    use super::matches;
+    use crate::style::StyleContext;
+    use crate::{css, html};
+
+    /// Does `selector` match the element with `id=t` in `page`?
+    fn hits(page: &str, selector: &str) -> bool {
+        let dom = html::parse(page);
+        let sheet = css::parse(&format!("{selector}{{}}"));
+        let Some(rule) = sheet.rules.first() else {
+            panic!("{selector} did not parse");
+        };
+        let target = (0..dom.node_count())
+            .map(|i| crate::dom::NodeId(i as u32))
+            .find(|&n| dom.attr(n, "id") == Some("t"))
+            .expect("the fixture has a target");
+        matches(&dom, target, &rule.selectors[0], &StyleContext::default())
+    }
+
+    const PAGE: &str = r#"<a id=t href="https://example.com/docs/a.html" class="one two"
+        lang="en-GB" data-empty="" title="a b c">x</a>"#;
+
+    #[test]
+    fn presence_and_exact_value() {
+        assert!(hits(PAGE, "[href]"));
+        assert!(hits(PAGE, "a[href]"));
+        assert!(!hits(PAGE, "[nope]"));
+        assert!(hits(PAGE, "[lang=en-GB]"));
+        assert!(hits(PAGE, r#"[lang="en-GB"]"#));
+        assert!(!hits(PAGE, "[lang=en]"));
+        // Names are ASCII-case-insensitive; values are not.
+        assert!(hits(PAGE, "[HREF]"));
+        assert!(!hits(PAGE, "[lang=EN-GB]"));
+    }
+
+    #[test]
+    fn the_word_and_hyphen_operators_follow_css() {
+        assert!(hits(PAGE, "[title~=b]"));
+        assert!(!hits(PAGE, "[title~=a1]"));
+        // `|=` is the language-subtag rule: the value, or the value then `-`.
+        assert!(hits(PAGE, "[lang|=en]"));
+        assert!(hits(PAGE, "[lang|=en-GB]"));
+        assert!(!hits(PAGE, "[lang|=e]"));
+    }
+
+    #[test]
+    fn substring_operators_and_the_empty_value_that_matches_nothing() {
+        // A bare value must be a CSS identifier; anything with a dot or a
+        // slash in it has to be quoted, which is CSS's rule and not ours.
+        assert!(hits(PAGE, "[href^=https]"));
+        // Quoted, because a bare CSS value must be an identifier and
+        // `http://` is not one — the parser is right to refuse it unquoted.
+        assert!(!hits(PAGE, r#"[href^="http://"]"#));
+        assert!(hits(PAGE, r#"[href$=".html"]"#));
+        assert!(!hits(PAGE, r#"[href$=".htm"]"#));
+        assert!(hits(PAGE, r#"[href*="/docs/"]"#));
+        assert!(!hits(PAGE, r#"[href*="/missing/"]"#));
+
+        // The case always got wrong: an empty value matches **nothing**, where
+        // `starts_with("")` would match everything — the difference between
+        // hiding one element and hiding the page.
+        assert!(!hits(PAGE, r#"[href^=""]"#));
+        assert!(!hits(PAGE, r#"[href$=""]"#));
+        assert!(!hits(PAGE, r#"[href*=""]"#));
+        // Presence still matches an attribute whose value *is* empty.
+        assert!(hits(PAGE, "[data-empty]"));
+        assert!(hits(PAGE, r#"[data-empty=""]"#));
+    }
+
+    #[test]
+    fn several_tests_on_one_compound_must_all_match() {
+        assert!(hits(PAGE, "a[href][lang|=en].one"));
+        assert!(!hits(PAGE, "a[href][lang|=fr]"));
+    }
+
+    #[test]
+    fn an_attribute_selector_weighs_the_same_as_a_class() {
+        let spec = |s: &str| css::parse(&format!("{s}{{}}")).rules[0].selectors[0].specificity();
+        assert_eq!(spec("[href]"), spec(".cls"));
+        assert_eq!(spec("a[href]"), spec("a.cls"));
+        assert!(spec("#id") > spec("[href]"));
+        assert!(spec("[href]") > spec("a"));
+    }
 }
 
 #[cfg(test)]
