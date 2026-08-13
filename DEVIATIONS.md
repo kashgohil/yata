@@ -451,10 +451,14 @@ a mutation and expecting the new nodes.
 
 ### There is no `Node` interface, no CSSOM, and no `getComputedStyle`
 
-**We do:** hand JavaScript element handles only. Text and comment nodes are
-never exposed, so `childNodes`, `nodeType`, `firstChild` and `parentNode` do
-not exist; `el.style.color` does not exist (though `setAttribute('style', …)`
-works and reaches computed values); `getComputedStyle` does not exist.
+**We do:** hand out one kind of handle. `document.createTextNode` returns one
+for a text node — so a page can create, append and read text nodes — but
+nothing else ever yields one: no query returns a text node, `children` is
+elements only, and comments are never exposed at all. There is no `Node`
+interface behind the handle, so `childNodes`, `nodeType`, `firstChild` and
+`parentNode` do not exist, and a text-node handle answers `tagName` with
+`null`. `el.style.color` does not exist either (though `setAttribute('style',
+…)` works and reaches computed values), and neither does `getComputedStyle`.
 **A browser does:** all of it.
 **Why:** each is a surface with its own object model, and M10's binding list is
 what the ladder needs rather than what the DOM has.

@@ -1880,7 +1880,8 @@ mod tests {
               document.getElementById('gone') ? 'gone' : 'no-gone'].join(',')\
              </script>",
         );
-        // Removed in Rust (M10.3) — there are no write bindings until M10.5.
+        // Removed through the arena API rather than through `remove()`, so
+        // this test is about the *query* and not about the binding.
         let gone = find_descendant(&dom, dom.root, &mut |dom, node| {
             dom.attr(node, "id") == Some("gone")
         })
@@ -1959,9 +1960,9 @@ mod tests {
 
     #[test]
     fn reads_work_on_a_subtree_that_is_not_in_the_document() {
-        // JS cannot reach a detached node until M10.5 creates one, but the
-        // primitives underneath must already be total over the arena: they are
-        // what M10.5's `createElement` will read through.
+        // The primitives underneath must be total over the arena, because
+        // `createElement` hands a page a node that is in it and in no tree —
+        // this pins that reading one is well-defined before any binding does.
         let mut dom = html::parse("<p>in the tree</p>");
         let orphan = dom.create_element("section", vec![("id".into(), "loose".into())]);
         let text = dom.create_text("detached text");

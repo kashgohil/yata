@@ -5,8 +5,9 @@
 //! owns the engine and the rules that keep a page's script from taking the
 //! browser down with it: the execution budget, the memory and stack caps, and
 //! the boundary that keeps engine types out of the rest of the tree. What a
-//! page can *reach* is `bindings`; a name that module does not define — and
-//! `console.log` is one until M10.7 — is undefined by design, not by accident.
+//! page can *reach* is `bindings`; a name that module does not define is
+//! undefined by design rather than by accident, and a page can tell the
+//! difference by asking.
 //!
 //! ## Where scripts sit in the architecture (M10.2)
 //!
