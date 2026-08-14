@@ -463,6 +463,20 @@ pub fn install<'js>(
 
     let s = Rc::clone(slot);
     api.set(
+        "parentNode",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                // A *node*, not an element: the document is a node too, so
+                // unlike `parentElement` this does not stop at it. The prelude
+                // turns the root into the `document` object; a node with no
+                // parent at all is null there.
+                dom.node(node(dom, id)?).parent.map(id_of)
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
         "children",
         Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
             s.with(&ctx, |dom| {
@@ -1172,6 +1186,17 @@ const PRELUDE: &str = r#"
     };
   }
 
+  // A boolean content attribute: present or absent, its value meaningless.
+  function booleanAttribute(name) {
+    return {
+      get: function () { return raw.getAttribute(idOf(this), name) !== undefined; },
+      set: function (value) {
+        if (value) raw.setAttribute(idOf(this), name, "");
+        else raw.removeAttribute(idOf(this), name);
+      },
+    };
+  }
+
   function Element() {
     throw new TypeError("Illegal constructor");
   }
@@ -1222,6 +1247,34 @@ const PRELUDE: &str = r#"
     },
     remove: { value: function () { raw.remove(idOf(this)); } },
     parentElement: { get: function () { return wrap(raw.parentElement(idOf(this))); } },
+    // A node's parent, which is *not* always an element: `<html>`'s is the
+    // document. A detached node has none. This is the line
+    // motherfuckingwebsite.com's analytics loader threw on (M11.5).
+    parentNode: {
+      get: function () {
+        const parent = raw.parentNode(idOf(this));
+        if (parent === undefined || parent === null) return null;
+        return parent === raw.documentRoot() ? document : wrap(parent);
+      }
+    },
+    // `src` reflects, spelled the way `id` and `className` are: the attribute
+    // *as the page wrote it*, not resolved against the page URL the way a
+    // browser's `.src` getter reports it. The engine resolves it once, where
+    // every other subresource URL is resolved (`App::resolve_script_urls`),
+    // rather than in two places that could disagree.
+    src: {
+      get: function () { return orNull(raw.getAttribute(idOf(this), "src")) || ""; },
+      set: function (value) { raw.setAttribute(idOf(this), "src", String(value)); },
+    },
+    // `async` and `defer` reflect, and reflecting is **all** they do: every
+    // script still runs in the order this engine decided (see `js::queue`),
+    // which is the standing `defer`/`async` deviation and stays one. They are
+    // here because a bootstrap writes `a.async = 1` before it writes `a.src`,
+    // and a property assignment that silently lands on the wrapper object
+    // instead of the element is the kind of thing that makes a page's later
+    // feature detection lie.
+    async: booleanAttribute("async"),
+    defer: booleanAttribute("defer"),
     children: { get: function () { return raw.children(idOf(this)).map(wrap); } },
     firstElementChild: {
       get: function () {
@@ -1494,6 +1547,37 @@ const PRELUDE: &str = r#"
     return state.prevented();
   }
 
+  // `el.onload = fn` — an event-handler *property*, which is what a script
+  // bootstrap chains on (`s.onload = next`) and which `addEventListener`
+  // cannot express: assigning **replaces** whatever was there, and assigning
+  // null removes it. So the entry it makes is marked, and the setter takes the
+  // marked one out before putting the new one in. Everything after that is an
+  // ordinary listener — it runs through the same dispatcher, in registration
+  // order among the others (M10.8).
+  function handlerProperty(type) {
+    return {
+      get: function () {
+        for (const entry of listeners.get(keyOf(this)) || []) {
+          if (entry.type === type && entry.handler) return entry.fn;
+        }
+        return null;
+      },
+      set: function (fn) {
+        const key = keyOf(this);
+        const kept = (listeners.get(key) || []).filter(function (entry) {
+          return !(entry.type === type && entry.handler);
+        });
+        if (typeof fn === "function") {
+          kept.push({
+            type: type, fn: fn, capture: false, once: false,
+            target: this, handler: true,
+          });
+        }
+        listeners.set(key, kept);
+      },
+    };
+  }
+
   Object.defineProperties(Element.prototype, {
     addEventListener: {
       value: function (type, fn, options) { addListener(this, String(type), fn, options); }
@@ -1501,6 +1585,12 @@ const PRELUDE: &str = r#"
     removeEventListener: {
       value: function (type, fn, options) { removeListener(this, String(type), fn, options); }
     },
+    // The two an inserted `<script>` fires (M11.5). `error` is half the point:
+    // a page that chains on `onload` and never hears anything back because a
+    // fetch failed is a page that hangs, and a silent failure is the one
+    // outcome the task refused.
+    onload: handlerProperty("load"),
+    onerror: handlerProperty("error"),
   });
   document.addEventListener = function (type, fn, options) {
     addListener(document, String(type), fn, options);
@@ -2633,17 +2723,107 @@ mod tests {
 
     #[test]
     fn the_analytics_shape_that_started_this_task_now_runs() {
-        // motherfuckingwebsite.com's Google Analytics snippet, reduced to the
-        // line it threw on: `s.getElementsByTagName(o)[0]` where `o` is
-        // 'script' and `s` is `document`.
+        // motherfuckingwebsite.com's Google Analytics loader, every line of
+        // it. M11.1 made `getElementsByTagName` work and this test recorded
+        // how much further the snippet got: `"reached, no parentNode"`. M11.5
+        // is the task that deletes that string — `parentNode`, `.async` and
+        // `.src` all exist now, so the loader runs to its end and leaves a
+        // `<script src>` in the tree where the engine can see it.
+        //
+        // What happens to that element afterwards is `App`'s, and is pinned
+        // there (`the_analytics_loader_fetches_google_analytics_exactly_once`).
         assert_eq!(
             eval_on(
                 "<p>page</p>",
-                "var o = 'script', s = document;\
+                "var o = 'script', s = document, g = '//www.google-analytics.com/analytics.js';\
+                 var a = s.createElement(o);\
                  var m = s.getElementsByTagName(o)[0];\
-                 m.parentNode === undefined ? 'reached, no parentNode' : 'reached'"
+                 a.async = 1; a.src = g;\
+                 m.parentNode.insertBefore(a, m);\
+                 [a.parentNode === m.parentNode, a.async, a.src].join(' ')"
             ),
-            "inline#1 ok \"reached, no parentNode\""
+            "inline#1 ok \"true true //www.google-analytics.com/analytics.js\""
+        );
+    }
+
+    #[test]
+    fn parent_node_reaches_the_document_where_parent_element_stops() {
+        // The difference between the two, which is the whole reason the
+        // snippet above needed this one: `<html>`'s parent is a node but not
+        // an element.
+        assert_eq!(value("document.body.parentNode.tagName"), "\"HTML\"");
+        assert_eq!(value("document.documentElement.parentElement"), "null");
+        assert_eq!(
+            value("document.documentElement.parentNode === document"),
+            "true"
+        );
+        // A node nothing has inserted has no parent of either kind.
+        assert_eq!(value("document.createElement('p').parentNode"), "null");
+    }
+
+    #[test]
+    fn src_async_and_defer_reflect_in_both_directions() {
+        // Reflection, and nothing more: `async`/`defer` change no order (the
+        // standing deviation), they just stop being lost on the wrapper.
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.src = 'a.js'; [box.getAttribute('src'), box.src].join(',')"
+            ),
+            "\"a.js,a.js\""
+        );
+        assert_eq!(
+            wrote(BOX, "[box.async, box.defer].join(',')"),
+            "\"false,false\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.async = 1; box.defer = true;\
+                 [box.async, box.defer, box.getAttribute('async'), box.hasAttribute('defer')]\
+                   .join(',')"
+            ),
+            "\"true,true,,true\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.async = 1; box.async = false; box.hasAttribute('async')"
+            ),
+            "false"
+        );
+        // Set from the markup side, read from the property side.
+        assert_eq!(
+            wrote(
+                "<div id=box async defer></div>",
+                "[box.async, box.defer].join(',')"
+            ),
+            "\"true,true\""
+        );
+    }
+
+    #[test]
+    fn an_event_handler_property_replaces_rather_than_accumulates() {
+        // `s.onload = next` is what a bootstrap chains on, and it is not
+        // `addEventListener`: assigning twice leaves one handler, not two, and
+        // assigning null leaves none.
+        assert_eq!(
+            wrote(
+                BOX,
+                "var log = [];\
+                 box.onload = function () { log.push('first'); };\
+                 box.onload = function () { log.push('second'); };\
+                 box.addEventListener('load', function () { log.push('listener'); });\
+                 [typeof box.onload, log.length].join(',')"
+            ),
+            "\"function,0\""
+        );
+        assert_eq!(
+            wrote(
+                BOX,
+                "box.onload = function () {}; box.onload = null; box.onload"
+            ),
+            "null"
         );
     }
 
