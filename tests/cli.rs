@@ -553,3 +553,140 @@ fn two_headless_flags_together_is_a_usage_error() {
         );
     }
 }
+
+// ---- redirects through the loop (M11.7a) ----------------------------------
+
+/// A login-shaped chain: `/login` answers 302 with a session cookie and points
+/// at `/app`, which echoes the `Cookie:` header it received.
+///
+/// The `Connection: close` on every response is what makes each request its own
+/// accept, which is also what the hop really costs: a fresh connection per hop
+/// instead of one the library reused inside a worker.
+fn serve_login_flow(landing: &'static str) -> std::net::SocketAddr {
+    serve_site(2, move |request| {
+        if request.starts_with("GET /login") {
+            b"HTTP/1.1 302 Found\r\nLocation: /app\r\n\
+              Set-Cookie: sid=abc; Path=/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        } else {
+            let seen = request
+                .lines()
+                .find_map(|line| line.strip_prefix("cookie: "))
+                .unwrap_or("<none>")
+                .trim()
+                .to_string();
+            response_with_body("200 OK", landing.replace("{cookie}", &seen).as_bytes())
+        }
+    })
+}
+
+#[test]
+fn a_redirect_hands_out_a_session_and_the_next_request_carries_it() {
+    // **The round trip this task exists for**, end to end through the real
+    // binary. Before M11.7a the hop happened inside the worker: its
+    // `Set-Cookie` never reached the jar, and the request that followed carried
+    // the header computed for the URL the reader typed. Both halves are here —
+    // the landing page prints what the server actually received.
+    let addr = serve_login_flow("<p>server saw: {cookie}</p>");
+    let out = yata(&["--dump-text", &format!("http://{addr}/login")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        text.lines().next(),
+        Some("server saw: sid=abc"),
+        "the hop's cookie did not reach the request it authorises:\n{text}"
+    );
+}
+
+#[test]
+fn dump_of_a_redirect_is_the_final_body_and_nothing_else() {
+    // `--dump`'s stdout is bytes and only bytes: a hop must not add one, and
+    // the 302's own empty body must not be what lands.
+    let addr = serve_login_flow("landed\n");
+    let out = yata(&["--dump", &format!("http://{addr}/login")]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(out.stdout, b"landed\n");
+    assert!(out.stderr.is_empty());
+}
+
+#[test]
+fn dump_js_shows_a_script_reading_a_cookie_a_hop_set() {
+    // The dumps behave the way the TUI does, hops included: `--dump-js` is what
+    // M11.25's ladder sweep reads, so a cookie set by a 302 the reader never
+    // saw has to be in the jar the page's script asks.
+    let addr = serve_login_flow(
+        "<script>console.log('script sees: ' + document.cookie);</script>\
+         <p>server saw: {cookie}</p>",
+    );
+    let out = yata(&["--dump-js", &format!("http://{addr}/login")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dumped = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        dumped.contains("script sees: sid=abc"),
+        "a hop's cookie never reached the dump's jar:\n{dumped}"
+    );
+}
+
+#[test]
+fn timing_of_a_redirect_reports_the_whole_chain() {
+    // Deliverable 5, where getting it wrong is silent: the fetch row has to be
+    // both hops, not the last one. The server sleeps 40 ms on the redirect, so
+    // a fetch row under it could only have come from timing the landing page
+    // alone.
+    let addr = serve_site(2, |request| {
+        if request.starts_with("GET /login") {
+            thread::sleep(std::time::Duration::from_millis(40));
+            b"HTTP/1.1 302 Found\r\nLocation: /app\r\nContent-Length: 0\r\n\
+              Connection: close\r\n\r\n"
+                .to_vec()
+        } else {
+            response_with_body("200 OK", b"<p>landed</p>")
+        }
+    });
+    let out = yata(&["--timing", &format!("http://{addr}/login")]);
+    assert_eq!(out.status.code(), Some(0));
+    let rows = String::from_utf8(out.stderr).unwrap();
+    let fetch = rows
+        .lines()
+        .find(|row| row.trim_start().starts_with("fetch"))
+        .expect("a fetch row");
+    // `fetch 59.4 ms`
+    let ms: f64 = fetch
+        .split_whitespace()
+        .nth(1)
+        .and_then(|word| word.parse().ok())
+        .unwrap_or_else(|| panic!("no milliseconds in {fetch:?}"));
+    assert!(
+        ms >= 40.0,
+        "the fetch row hid a slow hop inside a fast landing page: {fetch:?}"
+    );
+}
+
+#[test]
+fn a_headless_redirect_loop_stops_at_the_bound_instead_of_hanging() {
+    // The dumps follow the same chain with the same constant the TUI stops at
+    // (`app::MAX_REDIRECTS`), so a page that bounces forever is an exit code
+    // and a reason on stderr rather than a command that never returns.
+    // 21 responses: one more than the bound will ever ask for.
+    let addr = serve_site(21, |_| {
+        b"HTTP/1.1 302 Found\r\nLocation: /again\r\nContent-Length: 0\r\n\
+          Connection: close\r\n\r\n"
+            .to_vec()
+    });
+    let out = yata(&["--dump", &format!("http://{addr}/start")]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(out.stdout.is_empty(), "a loop wrote a body");
+    let reason = String::from_utf8(out.stderr).unwrap();
+    assert!(reason.contains("too many redirects"), "{reason}");
+}

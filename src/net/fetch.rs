@@ -34,6 +34,12 @@ const CHUNK: usize = 16 * 1024;
 pub fn spawn_fetch(id: FetchId, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
         match fetch(id, &request, &tx) {
+            // A hop is terminal for *this* worker: it reports where the
+            // response pointed and stops. Whether to go there — and with which
+            // cookies — is the event loop's to decide (M11.7a).
+            Ok(Some(hop @ Msg::Redirect { .. })) => {
+                let _ = tx.send(hop);
+            }
             Ok(Some(loaded)) => {
                 let Msg::Loaded {
                     body,
@@ -42,7 +48,7 @@ pub fn spawn_fetch(id: FetchId, request: Request, tx: Sender<Msg>) {
                     ..
                 } = &loaded
                 else {
-                    unreachable!("fetch's success message is always Loaded");
+                    unreachable!("fetch's success message is Loaded or Redirect");
                 };
                 let should_parse = is_document(*status, content_type.as_deref());
                 let text = should_parse.then(|| html::decode_body(body));
@@ -315,6 +321,52 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .map_err(describe)
 }
 
+/// The **document** client: identical, except that it does not follow
+/// redirects — each hop comes back as a `Msg::Redirect` and the event loop
+/// decides (M11.7a).
+///
+/// Only the document, and that asymmetry is a decision rather than an
+/// oversight. The document is where a session is established, and it is the
+/// only request whose URL the reader can see: the URL bar, `location`, history,
+/// the fragment and the base every relative href resolves against all have to
+/// agree with where the bytes came from. A subresource has none of that, its
+/// cross-host credential leak is already closed by the library (which strips
+/// `Cookie` on any hop that changes host, port or scheme), and putting four
+/// more request kinds through a hop state machine would buy a `Path`
+/// recomputation no ladder page has asked for. When one turns up, it arrives
+/// then.
+fn document_client() -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(describe)
+}
+
+/// Where a 3xx says to go, resolved against the URL that produced it — or
+/// `None` when this is not a redirect the loop can follow.
+///
+/// The statuses are HTTP's five: 301, 302, 303, 307 and 308. Every request this
+/// engine makes today is a GET, so the distinction between them — 303 rewrites
+/// the method to GET, 307 and 308 preserve it — has nothing to bite on yet.
+/// **M11.11 is where it does**, when a form POST meets a 303 and the difference
+/// is the whole of whether the form is submitted twice.
+///
+/// A 3xx with no `Location`, or one whose `Location` will not resolve, is not a
+/// redirect: it falls through as an ordinary response, which the error-page
+/// path already refuses to render (`is_document` is false for every 3xx).
+fn redirect_target(
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    from: &str,
+) -> Option<String> {
+    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+        return None;
+    }
+    let location = headers.get(reqwest::header::LOCATION)?.to_str().ok()?;
+    // One URL resolver in the engine, and this is not a second one.
+    crate::net::resolve_url(from, location)
+}
+
 /// The whole request, run on the worker. `Ok(Some(Loaded))` on success,
 /// `Ok(None)` if the channel closed mid-stream, `Err((url, reason))` on any
 /// failure (bad URL, DNS, connect, TLS, mid-body disconnect). The error's url
@@ -331,13 +383,16 @@ fn fetch(
     // the whole request — client build → last body byte.
     let started = Instant::now();
     // Built on the worker (see `client`), so the UI thread never touches
-    // reqwest.
-    let client = client().map_err(|reason| (url.to_string(), reason))?;
+    // reqwest. The document's client does not follow redirects: this worker
+    // performs exactly one request and reports what happened (M11.7a).
+    let client = document_client().map_err(|reason| (url.to_string(), reason))?;
     let mut resp = with_cookies(client.get(url), request)
         .send()
         .map_err(|e| (url.to_string(), describe(e)))?;
     let status = resp.status().as_u16();
-    // The final URL, after redirects — what M1.5's URL bar should display.
+    // The URL this response came from. With hops through the loop it is the
+    // one we asked for; reqwest still reports it, so it stays the single
+    // source rather than an echo of the request.
     let final_url = resp.url().to_string();
     let content_type = resp
         .headers()
@@ -360,6 +415,19 @@ fn fetch(
         .filter_map(|value| value.to_str().ok())
         .map(str::to_string)
         .collect();
+
+    // A hop, and the worker's whole part in it: report where the response says
+    // to go and stop. The body of a 3xx is a courtesy page nobody renders, so
+    // it is not read — the connection is dropped with the response.
+    if let Some(to) = redirect_target(status, resp.headers(), &final_url) {
+        return Ok(Some(Msg::Redirect {
+            id,
+            url: final_url,
+            to,
+            elapsed: started.elapsed(),
+            set_cookie,
+        }));
+    }
 
     let mut body = Vec::new();
     let mut buf = [0u8; CHUNK];
@@ -487,36 +555,6 @@ mod tests {
             body.len()
         )
         .into_bytes()
-    }
-
-    /// Serve a redirect from `/start` to `/final`, then `final_response` on
-    /// the follow-up request. `Connection: close` on the redirect forces the
-    /// client onto a second connection, so each request is its own accept.
-    fn serve_redirect_then(final_response: &'static [u8]) -> SocketAddr {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        thread::spawn(move || {
-            for _ in 0..2 {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                let mut req = Vec::new();
-                let mut buf = [0u8; 512];
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => req.extend_from_slice(&buf[..n]),
-                    }
-                }
-                let response: &[u8] = if req.starts_with(b"GET /start") {
-                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                } else {
-                    final_response
-                };
-                let _ = stream.write_all(response);
-            }
-        });
-        addr
     }
 
     /// Collect every message the worker sends, ending when it drops its
@@ -789,17 +827,14 @@ mod tests {
     }
 
     #[test]
-    fn mid_body_failure_reports_the_post_redirect_url() {
+    fn mid_body_failure_reports_the_url_it_was_reading() {
         // Headers promise 100 bytes; the connection dies after 5.
-        let addr = serve_redirect_then(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello",
+        let addr = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello".to_vec(),
         );
+        let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(
-            FetchId(4),
-            Request::bare(format!("http://{addr}/start")),
-            tx,
-        );
+        spawn_fetch(FetchId(4), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         let (last, progress) = msgs.split_last().expect("worker sent nothing");
@@ -812,13 +847,13 @@ mod tests {
             );
         }
         match last {
-            Msg::NetError { id, url, reason } => {
+            Msg::NetError {
+                id,
+                url: reported,
+                reason,
+            } => {
                 assert_eq!(*id, FetchId(4));
-                assert_eq!(
-                    *url,
-                    format!("http://{addr}/final"),
-                    "a failure after redirects must report the final URL"
-                );
+                assert_eq!(*reported, url);
                 assert!(!reason.is_empty(), "reason must be human-readable");
             }
             other => panic!("expected NetError last, got {other:?}"),
@@ -826,10 +861,21 @@ mod tests {
     }
 
     #[test]
-    fn success_after_redirect_reports_the_final_url() {
-        let addr = serve_redirect_then(
-            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
-        );
+    fn a_redirect_is_a_message_and_the_worker_stops_there() {
+        // **M11.7a's whole change on this side.** The document client does not
+        // follow redirects: the worker performs one request, reports where the
+        // response pointed — `Location` resolved against the URL that sent it —
+        // and sends nothing else. No `Loaded`, no `Parsed`, and, crucially, no
+        // second request: the server's second slot is never used.
+        //
+        // A `Set-Cookie` on the hop travels with the message, which is the
+        // thing that was lost before: only the final response's headers ever
+        // reached `App`, so the 302 that hands out a session set nothing.
+        let (addr, seen) = serve_capturing(2, |_| {
+            b"HTTP/1.1 302 Found\r\nLocation: /final\r\nSet-Cookie: sid=abc; Path=/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
             FetchId(5),
@@ -838,23 +884,80 @@ mod tests {
         );
 
         let msgs = drain(rx);
-        let (_, loaded, _) = split_success(&msgs);
-        let Msg::Loaded { elapsed, .. } = loaded else {
-            unreachable!()
-        };
         assert_eq!(
-            *loaded,
-            Msg::Loaded {
-                id: FetchId(5),
-                url: format!("http://{addr}/final"),
-                status: 200,
-                body: b"hello".to_vec(),
-                elapsed: *elapsed,
-                content_type: None,
-                set_cookie: Vec::new(),
-            },
-            "Loaded must carry the post-redirect URL and the final status"
+            msgs.len(),
+            1,
+            "a hop is one message and nothing else: {msgs:?}"
         );
+        let Msg::Redirect {
+            id,
+            url,
+            to,
+            elapsed,
+            set_cookie,
+        } = &msgs[0]
+        else {
+            panic!("expected Redirect, got {:?}", msgs[0]);
+        };
+        assert_eq!(*id, FetchId(5));
+        assert_eq!(*url, format!("http://{addr}/start"));
+        assert_eq!(*to, format!("http://{addr}/final"));
+        assert_eq!(set_cookie, &["sid=abc; Path=/".to_string()]);
+        assert!(*elapsed > Duration::ZERO, "the worker must measure its hop");
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the worker followed the redirect itself"
+        );
+    }
+
+    #[test]
+    fn a_hop_to_a_scheme_this_browser_cannot_fetch_is_an_error_not_a_panic() {
+        // The loop follows a `Location` wherever it points, so the worker is
+        // where a `file:` URL — or any other scheme reqwest will not perform —
+        // has to fail safely. `NetError` becomes an error page with a reason on
+        // it; nothing here may panic or hang (CLAUDE.md).
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(1), Request::bare("file:///etc/hosts"), tx);
+        let msgs = drain(rx);
+        assert!(
+            matches!(msgs.as_slice(), [Msg::NetError { .. }]),
+            "expected one NetError, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn every_redirect_status_hops_and_everything_else_is_a_response() {
+        // HTTP's five, and the two shapes that are *not* a redirect however
+        // much they look like one: a 3xx with no `Location`, and one whose
+        // `Location` will not resolve. Those fall through to `Loaded` with
+        // their 3xx status, which `is_document` refuses — an error page the
+        // reader can act on, rather than a hop into nowhere.
+        let hop = |status: u16, headers: &str| -> Msg {
+            let response = format!(
+                "HTTP/1.1 {status} Moved\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let addr = serve_once(response.into_bytes());
+            let (tx, rx) = mpsc::channel();
+            spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/x")), tx);
+            drain(rx).remove(0)
+        };
+        for status in [301, 302, 303, 307, 308] {
+            assert!(
+                matches!(hop(status, "Location: /next\r\n"), Msg::Redirect { .. }),
+                "{status} did not hop"
+            );
+        }
+        assert!(matches!(hop(302, ""), Msg::Loaded { status: 302, .. }));
+        assert!(matches!(
+            hop(302, "Location: http://[bad\r\n"),
+            Msg::Loaded { status: 302, .. }
+        ));
+        // And a 200 is a 200 even with a `Location` on it.
+        assert!(matches!(
+            hop(200, "Location: /next\r\n"),
+            Msg::Loaded { status: 200, .. }
+        ));
     }
 
     #[test]
@@ -1104,21 +1207,139 @@ mod tests {
         ));
     }
 
+    /// What driving hops through the event loop costs, measured rather than
+    /// asserted. `#[ignore]`d out of the default run because it prints numbers
+    /// and claims nothing:
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_the_hop -- --ignored --nocapture
+    /// ```
+    ///
+    /// **A**: the pre-M11.7a shape — one worker, reqwest's default policy,
+    /// hops followed inside it on a connection it can reuse. **B**: the shape
+    /// this task built — a worker per request, a message back to the loop
+    /// between them, and a fresh connection for the second hop. Interleaved and
+    /// alternating, because this machine drifts 5–10% between runs.
+    ///
+    /// Against loopback, so what the number does *not* include is the honest
+    /// part: on a real network the extra cost is one TCP (and TLS) handshake
+    /// per hop, which no offline benchmark can measure. What it does show is
+    /// that the message round trip itself is not the expensive half.
     #[test]
-    fn a_redirect_to_another_host_does_not_carry_the_first_hosts_cookies() {
-        // **The question this task had to answer rather than assume**
-        // (deliverable 4). Redirects are followed inside the worker, by
-        // reqwest's default policy, so the `Cookie:` header we set for the URL
-        // we asked for travels with the request unless the library strips it.
+    #[ignore]
+    fn measure_the_hop_through_the_loop() {
+        const ROUNDS: usize = 20;
+
+        // A 2-hop chain, served for as many requests as both sides will make.
+        let serve = |count: usize| {
+            serve_capturing(count, |request| {
+                if request.starts_with("GET /start") {
+                    b"HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n"
+                        .to_vec()
+                } else {
+                    ok_body("landed")
+                }
+            })
+        };
+
+        // A: one worker, the library follows.
+        let inside_the_worker = |addr: SocketAddr| -> Duration {
+            let started = Instant::now();
+            let client = client().expect("client");
+            let mut resp = client
+                .get(format!("http://{addr}/start"))
+                .send()
+                .expect("send");
+            let mut body = Vec::new();
+            resp.read_to_end(&mut body).expect("body");
+            started.elapsed()
+        };
+
+        // B: a worker per request, with the loop's decision in between.
+        let through_the_loop = |addr: SocketAddr| -> Duration {
+            let started = Instant::now();
+            let (tx, rx) = mpsc::channel();
+            spawn_fetch(
+                FetchId(1),
+                Request::bare(format!("http://{addr}/start")),
+                tx.clone(),
+            );
+            loop {
+                match rx.recv().expect("a terminal message") {
+                    Msg::Redirect { to, .. } => {
+                        spawn_fetch(FetchId(1), Request::bare(to), tx.clone());
+                    }
+                    Msg::Loaded { .. } => break,
+                    _ => {}
+                }
+            }
+            started.elapsed()
+        };
+
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        for round in 0..=ROUNDS {
+            // Which side goes first alternates, so any residue of running
+            // second cancels across rounds instead of landing on one column.
+            let (one, two) = if round % 2 == 0 {
+                let (addr, _) = serve(2);
+                let one = inside_the_worker(addr);
+                let (addr, _) = serve(2);
+                (one, through_the_loop(addr))
+            } else {
+                let (addr, _) = serve(2);
+                let two = through_the_loop(addr);
+                let (addr, _) = serve(2);
+                (inside_the_worker(addr), two)
+            };
+            if round > 0 {
+                a.push(one);
+                b.push(two);
+            }
+        }
+        let summarize = |samples: &[Duration]| {
+            let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+            let (lo, hi) = (samples.iter().min().unwrap(), samples.iter().max().unwrap());
+            format!("{mean:.2?} ({lo:.2?}-{hi:.2?})")
+        };
+        // How much of the difference is simply building a second client: every
+        // worker in this engine builds its own (see `client`), so a hop that is
+        // a second worker pays for a second one.
+        let builds: Vec<Duration> = (0..ROUNDS)
+            .map(|_| {
+                let started = Instant::now();
+                let _ = client().expect("client");
+                started.elapsed()
+            })
+            .collect();
+        eprintln!(
+            "M11.7a one 2-hop chain over loopback, mean of {ROUNDS} interleaved rounds:\n  \
+             inside the worker {}  ->  through the loop {}\n  \
+             (one client build: {})",
+            summarize(&a),
+            summarize(&b),
+            summarize(&builds),
+        );
+    }
+
+    #[test]
+    fn a_subresource_redirect_to_another_host_still_drops_the_cookie() {
+        // **The alarm, moved to where it still rings.** Since M11.7a the
+        // document does not follow redirects at all — the loop does, and it
+        // asks the jar again for every hop. A *subresource* still follows them
+        // inside the worker on reqwest's default policy, so this engine still
+        // depends on the library stripping `Cookie` (with `Authorization` and
+        // friends) whenever a hop changes host, port or scheme.
         //
-        // It does: reqwest drops `Cookie` (with `Authorization` and the other
-        // credential headers) whenever a hop changes host, port or scheme.
         // `localhost` and `127.0.0.1` are the same machine and different
-        // hosts, which is what makes this checkable without a network.
-        //
-        // If this ever stops being true, it is a cross-origin credential leak
-        // and this test is the alarm, not a documentation exercise.
-        let (elsewhere, seen_elsewhere) = serve_capturing(1, |_| ok_body("elsewhere"));
+        // hosts, which is what makes this checkable without a network. If it
+        // ever stops being true, it is a cross-origin credential leak and this
+        // test is the alarm, not a documentation exercise.
+        let (elsewhere, seen_elsewhere) = serve_capturing(1, |_| {
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/css\r\nContent-Length: 0\r\n\
+              Connection: close\r\n\r\n"
+                .to_vec()
+        });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let start = listener.local_addr().unwrap();
         let port = elsewhere.port();
@@ -1136,7 +1357,7 @@ mod tests {
             }
             let _ = stream.write_all(
                 format!(
-                    "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/final\r\n\
+                    "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/final.css\r\n\
                      Content-Length: 0\r\nConnection: close\r\n\r\n"
                 )
                 .as_bytes(),
@@ -1144,10 +1365,11 @@ mod tests {
         });
 
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(
+        spawn_stylesheet(
             FetchId(1),
+            0,
             Request {
-                url: format!("http://{start}/start"),
+                url: format!("http://{start}/start.css"),
                 cookie: Some("sid=abc".to_string()),
             },
             tx,
@@ -1161,53 +1383,6 @@ mod tests {
             "a cookie for one host followed a redirect to another: {:?}",
             seen[0]
         );
-    }
-
-    #[test]
-    fn a_same_host_redirect_keeps_the_cookie_it_started_with() {
-        // The other half of the redirect decision, and the documented gap:
-        // cookies are computed **once**, for the URL that was asked for, and
-        // the hops inside the worker carry that header unchanged. Same host,
-        // so nothing is being sent anywhere it does not belong; but a hop that
-        // moved to a different *path* is matched against the old one, and a
-        // `Set-Cookie` on the 302 itself is lost — only the final response's
-        // reaches `App`. Driving the hops through the event loop is the fix
-        // and its own task (see the commit message); this test says what
-        // today's behaviour is so that changing it is visible.
-        let (addr, seen) = serve_capturing(2, |request| {
-            if request.starts_with("GET /start") {
-                b"HTTP/1.1 302 Found\r\nLocation: /final\r\nSet-Cookie: hop=lost\r\n\
-                  Content-Length: 0\r\nConnection: close\r\n\r\n"
-                    .to_vec()
-            } else {
-                ok_body("arrived")
-            }
-        });
-        let (tx, rx) = mpsc::channel();
-        spawn_fetch(
-            FetchId(1),
-            Request {
-                url: format!("http://{addr}/start"),
-                cookie: Some("sid=abc".to_string()),
-            },
-            tx,
-        );
-        let msgs = drain(rx);
-        let (_, loaded, _) = split_success(&msgs);
-        let Msg::Loaded {
-            url, set_cookie, ..
-        } = loaded
-        else {
-            unreachable!()
-        };
-        assert_eq!(*url, format!("http://{addr}/final"));
-        assert!(
-            set_cookie.is_empty(),
-            "a Set-Cookie on the 302 hop reached App: {set_cookie:?}"
-        );
-        let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        assert_eq!(cookie_header(&seen[1]), Some("sid=abc"));
     }
 
     #[test]

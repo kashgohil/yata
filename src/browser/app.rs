@@ -123,6 +123,34 @@ enum PendingScroll {
     Fragment(String),
 }
 
+/// How many hops one navigation may take before the reader is told the page is
+/// not coming (M11.7a).
+///
+/// Twenty, which is what Chrome and Firefox stop at, so a chain that works in a
+/// browser works here. It is a bound on the *chain*, not on time: every hop is
+/// a real round trip through the event loop, so a redirect loop costs one
+/// request per hop and no busy waiting at all — the loop is asleep in `recv`
+/// between them exactly as it is between keystrokes.
+/// Public because the headless modes follow the same chain with the same
+/// bound: `--dump` of a redirecting URL has to reach the same page the TUI
+/// reaches, and two numbers would be two browsers.
+pub const MAX_REDIRECTS: u32 = 20;
+
+/// The redirect chain this fetch generation has taken so far (M11.7a).
+///
+/// It lives on `App`, per generation, cleared by `start_fetch`, rather than
+/// travelling in the message: a hop that carried its own count would let two
+/// interleaved chains — a stale generation's and the current one's — each
+/// believe they were short, and the count is a property of the *navigation*,
+/// which is what a generation is.
+#[derive(Clone, Copy, Default)]
+struct Hops {
+    count: u32,
+    /// What the hops before the landing page cost, so `timings.fetch` can be
+    /// the whole chain.
+    elapsed: Duration,
+}
+
 /// Where the current fetch stands. `Loaded` retains the raw body for the
 /// status-row byte count now, and for M2's parser to consume later; the
 /// viewport re-wraps from its own sanitized lines, not from this.
@@ -310,6 +338,8 @@ pub struct App {
     /// Brief statusline message (e.g. "yanked"), cleared by the next non-yank
     /// action (scroll, key binding, navigation, …).
     status_msg: Option<String>,
+    /// The redirect chain this generation has taken (M11.7a).
+    hops: Hops,
     /// Where to scroll after the first layout of a *specific* fetch generation
     /// (history back/forward, reload, a fragment on a cross-document link).
     /// Tied to `FetchId` so a resize while the old page is still on screen
@@ -412,6 +442,7 @@ impl App {
             focus: None,
             hint: None,
             status_msg: None,
+            hops: Hops::default(),
             pending_scroll: None,
             search: None,
             help_view: Viewport::default(),
@@ -470,6 +501,9 @@ impl App {
         // that wants an offset instead writes it after this returns.
         self.pending_scroll =
             fragment_of(&url).map(|fragment| (id, PendingScroll::Fragment(fragment.to_string())));
+        // A chain belongs to the navigation that started it (M11.7a): a page
+        // reached through three hops must not count them against the next one.
+        self.hops = Hops::default();
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -555,8 +589,13 @@ impl App {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
-                // Only an accepted fetch records its duration (PLAN.md §4).
-                self.timings.fetch = Some(elapsed);
+                // Only an accepted fetch records its duration (PLAN.md §4) —
+                // and it is the **whole chain**, not the last hop of one
+                // (M11.7a). A redirect that reported only its landing page
+                // would show `--timing` and `F4` a fast fetch with two slow
+                // ones hidden inside it, which is the kind of wrong number that
+                // is worse than none.
+                self.timings.fetch = Some(self.hops.elapsed + elapsed);
                 // The session, before anything else this response does with
                 // itself (M11.7). Scoped to the URL the response *came from* —
                 // post-redirect, which is what `url` already reports — and not
@@ -613,6 +652,61 @@ impl App {
                 self.hint = None;
                 self.search = None;
                 redraw()
+            }
+            Msg::Redirect {
+                id,
+                url,
+                to,
+                elapsed,
+                set_cookie,
+            } => {
+                if Some(id) != self.current_fetch {
+                    return Effect::default();
+                }
+                // **A hop is not a navigation.** The generation does not
+                // change, so the fragment the reader clicked still lands, the
+                // timers this page scheduled are still its own, and the
+                // stylesheet already in flight is still accepted. Minting a new
+                // `FetchId` here would silently discard all three.
+                self.hops.count += 1;
+                self.hops.elapsed += elapsed;
+                if self.hops.count > MAX_REDIRECTS {
+                    self.apply_error_page(to, error_page::redirect_loop_reason(MAX_REDIRECTS));
+                    return redraw();
+                }
+                // The session first, scoped to the URL that *sent* this
+                // response — the 302 hands out the cookie, and it belongs to
+                // the 302's own host and path, not to wherever the chain ends.
+                if !set_cookie.is_empty() {
+                    js::cookies::apply_set_cookie(
+                        &self.cookies,
+                        &url,
+                        &set_cookie,
+                        js::cookies::now(),
+                        &self.console,
+                    );
+                    self.console_view_built = false;
+                }
+                // Then the page's URL, and only then the next request: the
+                // ordering *is* the task. `App::request` measures the jar
+                // against `current_url`, so moving it to the target first is
+                // what makes the next hop carry the cookies this one just set —
+                // and carry the target host's rather than this host's when the
+                // hop crosses origins.
+                self.set_current_url(to.clone());
+                // A hop may name a fragment of its own, and HTML says it wins
+                // over the one the reader typed (the typed one is only kept
+                // when the target has none — the rule `Loaded` already applies).
+                // A write to the slot, not a new one: the generation is the
+                // same, so `pending_scroll` is still this navigation's.
+                if let Some(fragment) = fragment_of(&to).filter(|f| !f.is_empty()) {
+                    self.pending_scroll = Some((id, PendingScroll::Fragment(fragment.to_string())));
+                }
+                Effect {
+                    dirty: true,
+                    fetch: Some((id, self.request(to))),
+                    ..Effect::default()
+                }
             }
             Msg::Parsed { id, dom, elapsed } => {
                 // Same stale-generation guard as `Loaded`: a slow parse of a
@@ -5678,6 +5772,353 @@ mod tests {
         let overlay = screen(&mut app, 60, 20);
         assert!(overlay.contains("javascript console"), "{overlay}");
         assert!(overlay.contains("F5"), "{overlay}");
+    }
+
+    // ---- redirects through the loop (M11.7a) ------------------------------
+
+    /// One hop, as the worker reports it.
+    fn hop(id: FetchId, from: &str, to: &str, set_cookie: &[&str]) -> Msg {
+        Msg::Redirect {
+            id,
+            url: from.into(),
+            to: to.into(),
+            elapsed: Duration::ZERO,
+            set_cookie: set_cookie.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    /// The request the loop would spawn next, if this effect asks for one.
+    fn next_request(effect: &Effect) -> Option<&net::Request> {
+        effect.fetch.as_ref().map(|(_, request)| request)
+    }
+
+    #[test]
+    fn a_hop_sets_the_session_and_the_next_request_carries_it() {
+        // **The test this task exists for, and the one that was impossible
+        // before it.** A login is a POST-less shape here (M11.11 brings the
+        // POST): `/login` answers 302 with `Set-Cookie: sid=…` and
+        // `Location: /app`, and the request for `/app` has to carry the cookie
+        // the 302 just handed out. Both halves used to fail — the hop's headers
+        // never reached `App` at all, and the header the worker did carry was
+        // computed once, for the URL the reader typed.
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/login".into());
+        let effect = app.update(hop(
+            id,
+            "http://site.test/login",
+            "http://site.test/app",
+            &["sid=abc; Path=/"],
+        ));
+
+        let request = next_request(&effect).expect("a hop asks for the next request");
+        assert_eq!(request.url, "http://site.test/app");
+        assert_eq!(
+            request.cookie.as_deref(),
+            Some("sid=abc"),
+            "the hop's own cookie did not reach the request it authorises"
+        );
+        assert_eq!(
+            effect.fetch.as_ref().map(|(id, _)| *id),
+            Some(id),
+            "a hop is not a navigation"
+        );
+    }
+
+    #[test]
+    fn a_hop_is_the_same_generation_and_the_things_that_would_break_say_so() {
+        // Reading `current_fetch` back would prove nothing; these three would
+        // actually break if a hop minted an id. The fragment the reader typed
+        // is held against the generation, a subresource in flight is dropped
+        // unless its id is current, and the URL the page ends up at is the base
+        // every relative href resolves against.
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/start#part2".into());
+        app.update(hop(
+            id,
+            "http://site.test/start",
+            "http://site.test/final",
+            &[],
+        ));
+
+        let html = "<link rel=stylesheet href=/s.css>".to_string()
+            + &"<p>one</p>".repeat(80)
+            + "<p id=part2>target</p>";
+        app.update(Msg::Loaded {
+            id,
+            url: "http://site.test/final".into(),
+            status: 200,
+            body: html.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        // The landing page is accepted at all only because the generation did
+        // not move: a hop that minted an id would drop its own page as stale.
+        let effect = app.update(parsed(id, &html));
+        assert_eq!(
+            effect.sheets.first().map(|(sheet_id, _, _)| *sheet_id),
+            Some(id),
+            "the landing page's subresources belong to another generation"
+        );
+        assert_eq!(
+            app.update(Msg::Stylesheet {
+                id,
+                slot: 0,
+                sheet: Some(crate::css::parse("p { color: #c00 }")),
+            }),
+            redraw(),
+            "a subresource of the page that landed was dropped as stale"
+        );
+        assert!(
+            app.viewport.offset() > 0,
+            "the fragment the reader typed was lost across the hop"
+        );
+        // The landing page's URL is the page's URL — with the fragment kept,
+        // which is the rule `Loaded` already had for a redirect that drops one.
+        assert_eq!(
+            app.current_url().as_deref(),
+            Some("http://site.test/final#part2")
+        );
+    }
+
+    #[test]
+    fn a_hop_that_names_a_fragment_wins_over_the_one_the_reader_typed() {
+        // HTML's rule, and the reason `pending_scroll` is written rather than
+        // left alone: the typed fragment survives a hop that has none (the
+        // previous test), and loses to one that does.
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/start#typed".into());
+        app.update(hop(
+            id,
+            "http://site.test/start",
+            "http://site.test/final#hop",
+            &[],
+        ));
+        let html =
+            "<p id=hop>hop</p>".to_string() + &"<p>filler</p>".repeat(80) + "<p id=typed>typed</p>";
+        load_at(&mut app, id, "http://site.test/final#hop", &html);
+        assert_eq!(
+            app.viewport.offset(),
+            0,
+            "the reader's fragment beat the redirect's"
+        );
+        assert_eq!(
+            app.current_url().as_deref(),
+            Some("http://site.test/final#hop")
+        );
+    }
+
+    #[test]
+    fn a_3xx_with_nowhere_to_go_is_an_error_page_and_not_a_hop() {
+        // The worker only calls it a redirect when there is a `Location` it can
+        // resolve; anything else arrives as an ordinary response, and a 3xx
+        // body is not a document. The reader gets a page they can act on
+        // instead of a chain into nothing.
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/x".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://site.test/x".into(),
+            status: 302,
+            body: b"<p>moved</p>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        let screen = screen(&mut app, 60, 10);
+        assert!(screen.contains("HTTP 302"), "{screen}");
+        assert!(screen.contains("Press r to retry."), "{screen}");
+    }
+
+    #[test]
+    fn a_cross_host_hop_carries_the_second_hosts_cookies_and_none_of_the_first() {
+        // The new capability, and the reason the loop has to make this
+        // decision: the library could only ever *strip* a cookie on a
+        // cross-host hop. Asking the jar again can substitute — which is what a
+        // browser does, and what an SSO round trip is made of.
+        let mut app = App::new(80, 24);
+        for (host, name) in [("site.test", "first"), ("idp.test", "second")] {
+            app.cookies
+                .insert(
+                    crate::js::cookies::Cookie {
+                        name: name.into(),
+                        value: "1".into(),
+                        host: host.into(),
+                        path: "/".into(),
+                        expires: None,
+                        secure: false,
+                        http_only: false,
+                        same_site: crate::js::cookies::SameSite::Unspecified,
+                    },
+                    crate::js::cookies::now(),
+                )
+                .expect("the jar is empty");
+        }
+        let id = app.start_fetch("http://site.test/login".into());
+        let effect = app.update(hop(
+            id,
+            "http://site.test/login",
+            "http://idp.test/sso",
+            &[],
+        ));
+        assert_eq!(
+            next_request(&effect).and_then(|r| r.cookie.as_deref()),
+            Some("second=1"),
+            "the hop carried the wrong host's jar"
+        );
+    }
+
+    #[test]
+    fn a_hops_cookie_is_scoped_to_the_hop_not_to_where_the_chain_ends() {
+        // The bug the old shape hid: a cookie the 302 set under `/login` was
+        // either lost or (had it been kept) scoped to the landing page's path.
+        // `Path=/app` from a response sent by `/login` is legal and means what
+        // it says.
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/login".into());
+        app.update(hop(
+            id,
+            "http://site.test/login",
+            "http://site.test/app/home",
+            &["scoped=yes; Path=/app"],
+        ));
+        // Asked through the function that decides what a request carries,
+        // rather than by reading the jar: `Path=/app` means the landing page
+        // gets it and a sibling path does not.
+        let carried =
+            |url: &str| js::cookies::header_for(&app.cookies, url, url, js::cookies::now());
+        assert_eq!(
+            carried("http://site.test/app/home").as_deref(),
+            Some("scoped=yes"),
+            "the hop's cookie did not reach the jar at its own scope"
+        );
+        assert_eq!(
+            carried("http://site.test/elsewhere"),
+            None,
+            "the hop's cookie ignored its own Path"
+        );
+    }
+
+    #[test]
+    fn a_redirect_chain_is_one_history_entry() {
+        let mut app = App::new(80, 24);
+        // The page the reader came from.
+        let first = app.start_fetch("http://site.test/one".into());
+        load_at(&mut app, first, "http://site.test/one", "<p>one</p>");
+        // …then a link to a URL that bounces twice before landing.
+        let effect = app.navigate("http://site.test/start".into(), true);
+        let id = effect.fetch.expect("a navigation fetches").0;
+        app.update(hop(
+            id,
+            "http://site.test/start",
+            "http://site.test/mid",
+            &[],
+        ));
+        app.update(hop(
+            id,
+            "http://site.test/mid",
+            "http://site.test/land",
+            &[],
+        ));
+        load_at(&mut app, id, "http://site.test/land", "<p>landed</p>");
+
+        // Back goes to where the reader came from, not to either 302.
+        let effect = app.update(ch('H'));
+        assert_eq!(
+            effect.fetch.map(|(_, request)| request.url),
+            Some("http://site.test/one".to_string()),
+            "a hop pushed itself onto the history stack"
+        );
+    }
+
+    #[test]
+    fn a_redirect_loop_ends_at_the_bound_with_a_page_the_reader_can_act_on() {
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/0".into());
+        // Every hop points at the next; nothing ever lands.
+        for n in 0..MAX_REDIRECTS {
+            let effect = app.update(hop(
+                id,
+                &format!("http://site.test/{n}"),
+                &format!("http://site.test/{}", n + 1),
+                &[],
+            ));
+            assert!(
+                effect.fetch.is_some(),
+                "hop {n} of {MAX_REDIRECTS} was refused early"
+            );
+        }
+        let effect = app.update(hop(
+            id,
+            &format!("http://site.test/{MAX_REDIRECTS}"),
+            "http://site.test/again",
+            &[],
+        ));
+        assert!(
+            effect.fetch.is_none(),
+            "the chain kept going past the bound"
+        );
+        let screen = screen(&mut app, 60, 10);
+        assert!(screen.contains("too many redirects"), "{screen}");
+        assert!(screen.contains("Press r to retry."), "{screen}");
+        // And the next navigation starts from zero hops, because the count
+        // belongs to the navigation.
+        let id = app.start_fetch("http://site.test/fresh".into());
+        assert!(
+            app.update(hop(id, "http://site.test/fresh", "http://site.test/x", &[]))
+                .fetch
+                .is_some(),
+            "the last page's hops were counted against this one"
+        );
+    }
+
+    #[test]
+    fn a_hop_runs_no_pipeline_stage_and_the_fetch_row_is_the_whole_chain() {
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://site.test/start".into());
+        let before = stages(&app);
+        app.update(Msg::Redirect {
+            id,
+            url: "http://site.test/start".into(),
+            to: "http://site.test/mid".into(),
+            elapsed: Duration::from_millis(30),
+            set_cookie: Vec::new(),
+        });
+        app.update(Msg::Redirect {
+            id,
+            url: "http://site.test/mid".into(),
+            to: "http://site.test/land".into(),
+            elapsed: Duration::from_millis(20),
+            set_cookie: Vec::new(),
+        });
+        assert_eq!(stages(&app), before, "a hop ran a pipeline stage");
+
+        app.update(Msg::Loaded {
+            id,
+            url: "http://site.test/land".into(),
+            status: 200,
+            body: b"<p>landed</p>".to_vec(),
+            elapsed: Duration::from_millis(10),
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        // 30 + 20 + 10: the whole chain, not the 10 ms last hop. A reader
+        // looking at `--timing` or `F4` has to see what the page really cost.
+        assert_eq!(app.timings().fetch, Some(Duration::from_millis(60)));
+    }
+
+    /// Load a page at a specific URL, the way a landing page arrives.
+    fn load_at(app: &mut App, id: FetchId, url: &str, html_src: &str) {
+        app.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: html_src.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        app.update(parsed(id, html_src));
     }
 
     // ---- form controls (M11.8) --------------------------------------------

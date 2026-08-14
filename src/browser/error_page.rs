@@ -38,6 +38,17 @@ pub fn http_reason(status: u16) -> String {
     format!("HTTP {status} {label}")
 }
 
+/// Reason string when a navigation ran out of hops (M11.7a).
+///
+/// Names the bound, because "too many redirects" alone tells a reader nothing
+/// they can act on: the page they asked for is bouncing, and the two things
+/// worth knowing are that this browser gave up on purpose and after how many
+/// tries. The error page's own "Press r to retry" is the action — a chain that
+/// loops because a session expired often works on the second attempt.
+pub fn redirect_loop_reason(limit: u32) -> String {
+    format!("too many redirects: the page kept pointing somewhere else after {limit} hops")
+}
+
 /// Reason string when the status is fine but the type is not a document.
 pub fn unsupported_type_reason(content_type: Option<&str>) -> String {
     match content_type {

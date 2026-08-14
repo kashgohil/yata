@@ -51,6 +51,35 @@ pub enum Msg {
         /// structural rather than a rule somebody has to remember.
         set_cookie: Vec<String>,
     },
+    /// One hop of a redirect chain (M11.7a): the response said to go
+    /// somewhere else, and that is all the worker did about it.
+    ///
+    /// **A hop is a thing that happened, so it is a message.** Every other
+    /// decision in this browser is made by the event loop on data a worker sent
+    /// it (PLAN.md §2); a worker that quietly made a second request the loop
+    /// never asked for was the one place that was not true, and it is why a
+    /// `Set-Cookie` on a 302 used to be lost and why the hop after it was sent
+    /// the cookies of the URL the reader typed. `App` applies these lines,
+    /// moves the page URL and asks the jar again — in that order, which is the
+    /// whole point.
+    ///
+    /// `url` is the URL that produced this response (what the `Set-Cookie`
+    /// lines are scoped to); `to` is where it points, already resolved against
+    /// `url` through `net::resolve_url`. A 3xx with no usable `Location` is not
+    /// a redirect at all and arrives as an ordinary `Loaded`, which the error
+    /// page path already refuses.
+    ///
+    /// Only the **document** path produces these — see `net::fetch::client`.
+    Redirect {
+        id: FetchId,
+        url: String,
+        to: String,
+        elapsed: Duration,
+        /// This hop's own `Set-Cookie` lines, for the same reason `Loaded`
+        /// carries them: the 302 that hands out a session cookie and points at
+        /// the landing page is what a login *is*.
+        set_cookie: Vec<String>,
+    },
     /// The parsed tree for a `Loaded` body, sent by the same worker right
     /// after it. Parsing happens off the UI thread (CLAUDE.md: the UI thread
     /// never blocks, not even on a slow parse); the duration is measured on

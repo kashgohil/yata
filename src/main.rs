@@ -6,12 +6,13 @@ use std::{env, iter, panic, process, thread};
 use crossterm::event::{self, Event};
 use crossterm::terminal;
 
-use yata::browser::app::{App, Effect};
-use yata::browser::yank;
+use yata::browser::app::{self, App, Effect};
+use yata::browser::{error_page, yank};
+use yata::js::console::Console;
 use yata::msg::Msg;
 use yata::term::{self, Renderer};
 use yata::timers::{TimerRequest, Timers};
-use yata::{html, layout, net, style};
+use yata::{headless, html, js, layout, net, style};
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -183,37 +184,89 @@ fn usage() -> i32 {
 /// whose output moved with the window would be useless in a test.
 const DUMP_TEXT_WIDTH: u16 = 80;
 
-/// The headless fetch: the *production* path — `net::normalize_url`, then
-/// `net::spawn_fetch` — returning the channel the worker sends into, the
-/// same one the event loop `recv`s on. Each mode drains it exactly as far as
-/// it needs: `--dump` stops at `Loaded` (raw bytes need no parse, and must
-/// not wait on one), `--dump-dom`/`--timing` go on to `Parsed`.
-fn headless_fetch(url: &str) -> mpsc::Receiver<Msg> {
-    let url = net::normalize_url(url);
-    let (tx, rx) = mpsc::channel();
-    // No jar exists yet on this path — a dump's jar is created by the run that
-    // the document's own response seeds (see `headless::run_scripts_from`) —
-    // so the first request carries nothing, which is also all an empty jar
-    // would have given it.
-    net::spawn_fetch(net::FetchId(1), net::Request::bare(url), tx);
-    rx
+/// One hop of a headless navigation (M11.7a) — a `Msg::Redirect` the dump
+/// followed, kept so that `--timing` can replay the chain into `App` exactly as
+/// the event loop saw it.
+struct Hop {
+    url: String,
+    to: String,
+    elapsed: Duration,
+    set_cookie: Vec<String>,
 }
 
-/// What a headless `Loaded` carries, named rather than a tuple because the
-/// fifth element (M11.7's `Set-Cookie` lines) is the point of two of the five
-/// modes and noise in the other three.
+/// What one headless run has instead of an `App`: the jar the chain fills and
+/// the console its warnings land in.
+///
+/// It exists because a redirect chain *is* a session (M11.7a): the 302 hands
+/// out a cookie and the request that follows has to carry it, which needs
+/// somewhere to keep it between two workers. Created per run and dropped with
+/// it — nothing headless outlives one page, which is the rule
+/// `headless::run_scripts_from` already followed with a jar of its own.
+struct Session {
+    cookies: js::cookies::Jar,
+    console: Console,
+}
+
+impl Session {
+    fn new() -> Session {
+        Session {
+            cookies: js::cookies::Jar::new(),
+            console: Console::new(),
+        }
+    }
+
+    /// The request for `url`, with whatever the jar says it may carry — the
+    /// same one function `App::request` and `headless::script_request` ask.
+    fn request(&self, url: String) -> net::Request {
+        let cookie = js::cookies::header_for(&self.cookies, &url, &url, js::cookies::now());
+        net::Request { url, cookie }
+    }
+
+    /// A response's `Set-Cookie` lines, scoped to the URL that sent them.
+    fn apply(&self, url: &str, lines: &[String]) {
+        js::cookies::apply_set_cookie(&self.cookies, url, lines, js::cookies::now(), &self.console);
+    }
+}
+
+/// What a headless navigation ended at, named rather than a tuple because two
+/// of its fields (M11.7's `Set-Cookie` lines, M11.7a's hops) are the point of
+/// two of the five modes and noise in the other three.
 struct Loaded {
     url: String,
     status: u16,
     body: Vec<u8>,
     elapsed: Duration,
     set_cookie: Vec<String>,
+    hops: Vec<Hop>,
 }
 
-/// Block until the worker's `Loaded`, skipping progress messages. `Err` on
-/// `NetError` or a worker that died without a terminal message — an error
-/// exit, never a hang or panic.
-fn recv_loaded(rx: &mpsc::Receiver<Msg>) -> Result<Loaded, String> {
+/// The headless fetch: the *production* path — `net::normalize_url`, then
+/// `net::spawn_fetch` — following redirects the same way the event loop does
+/// (M11.7a), and handing back both what landed and the channel the final
+/// worker is still sending into. Each mode drains that channel exactly as far
+/// as it needs: `--dump` stops here (raw bytes need no parse, and must not wait
+/// on one), `--dump-dom`/`--timing` go on to `Parsed`.
+///
+/// The hop loop is this file's, not `App`'s, and it is the same shape: one
+/// worker per request, a message back, the next request decided here. The bound
+/// is `app::MAX_REDIRECTS` — literally the constant the TUI stops at, because a
+/// dump that gave up sooner or later than the browser would be a second
+/// browser.
+///
+/// The `session` is what makes a login flow work headlessly: each response's
+/// `Set-Cookie` lines go into its jar scoped to the URL that sent them, and the
+/// request for the next hop asks that jar — the same order, through the same
+/// two functions, as `App`'s handler.
+fn headless_fetch(url: &str, session: &Session) -> Result<(Loaded, mpsc::Receiver<Msg>), String> {
+    let (tx, rx) = mpsc::channel();
+    net::spawn_fetch(
+        net::FetchId(1),
+        // The first request of the run, and the jar is empty: it carries no
+        // cookies because there are none, not because this path skips asking.
+        session.request(net::normalize_url(url)),
+        tx.clone(),
+    );
+    let mut hops: Vec<Hop> = Vec::new();
     loop {
         match rx.recv() {
             Ok(Msg::Loaded {
@@ -224,10 +277,43 @@ fn recv_loaded(rx: &mpsc::Receiver<Msg>) -> Result<Loaded, String> {
                 set_cookie,
                 ..
             }) => {
-                return Ok(Loaded {
+                // The last worker keeps its own sender, so a `Parsed` still
+                // arrives; ours goes, so a mode that waits for one that will
+                // never come gets a closed channel rather than a hang.
+                drop(tx);
+                session.apply(&url, &set_cookie);
+                return Ok((
+                    Loaded {
+                        url,
+                        status,
+                        body,
+                        elapsed,
+                        set_cookie,
+                        hops,
+                    },
+                    rx,
+                ));
+            }
+            Ok(Msg::Redirect {
+                url,
+                to,
+                elapsed,
+                set_cookie,
+                ..
+            }) => {
+                if hops.len() as u32 >= app::MAX_REDIRECTS {
+                    return Err(format!(
+                        "{to}: {}",
+                        error_page::redirect_loop_reason(app::MAX_REDIRECTS)
+                    ));
+                }
+                // The session first, then the request that carries it: the
+                // ordering is the task, and it is the same one `App` follows.
+                session.apply(&url, &set_cookie);
+                net::spawn_fetch(net::FetchId(1), session.request(to.clone()), tx.clone());
+                hops.push(Hop {
                     url,
-                    status,
-                    body,
+                    to,
                     elapsed,
                     set_cookie,
                 });
@@ -254,8 +340,8 @@ fn recv_parsed(rx: &mpsc::Receiver<Msg>) -> Result<(yata::dom::Dom, Duration), S
 /// newline. Any HTTP status dumps its body (curl semantics: a 404 page is
 /// still a page). Exit 0, or 1 with the reason on stderr.
 fn run_dump(url: &str) -> i32 {
-    match recv_loaded(&headless_fetch(url)) {
-        Ok(loaded) => {
+    match headless_fetch(url, &Session::new()) {
+        Ok((loaded, _rx)) => {
             let body = loaded.body;
             let mut out = io::stdout();
             if out.write_all(&body).and_then(|()| out.flush()).is_err() {
@@ -274,8 +360,7 @@ fn run_dump(url: &str) -> i32 {
 /// headless, greppable test hook, mirroring what `--dump` is for raw bytes.
 /// The tree printed is the worker's own parse, not a second one.
 fn run_dump_dom(url: &str) -> i32 {
-    let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|_| recv_parsed(&rx)) {
+    match headless_fetch(url, &Session::new()).and_then(|(_, rx)| recv_parsed(&rx)) {
         Ok((dom, _)) => {
             let mut out = io::stdout();
             if out
@@ -299,8 +384,9 @@ fn run_dump_dom(url: &str) -> i32 {
 /// attributes) and the column is fixed at `DUMP_TEXT_WIDTH`, so the output is
 /// the same everywhere. Parse and layout, but no TUI.
 fn run_dump_text(url: &str) -> i32 {
-    let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l.url, p))) {
+    match headless_fetch(url, &Session::new())
+        .and_then(|(l, rx)| recv_parsed(&rx).map(|p| (l.url, p)))
+    {
         Ok((final_url, (mut dom, _))) => {
             // Scripts run before the dump, under the headless rule (one pass,
             // no timers) that `headless::run_scripts` documents. The URL is
@@ -346,8 +432,10 @@ fn run_dump_text(url: &str) -> i32 {
 /// code is still 0. External `<script src>` does not appear until M10.10
 /// fetches it.
 fn run_dump_js(url: &str) -> i32 {
-    let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p))) {
+    // The one mode that keeps its session past the fetch: the jar the chain
+    // filled is the jar the page's scripts read (M11.7, M11.7a).
+    let session = Session::new();
+    match headless_fetch(url, &session).and_then(|(l, rx)| recv_parsed(&rx).map(|p| (l, p))) {
         Ok((loaded, (mut dom, _))) => {
             // Pointed at a real URL, so external scripts are fetched here —
             // the one headless path that does; see `headless::run_scripts_from`.
@@ -355,8 +443,13 @@ fn run_dump_js(url: &str) -> i32 {
             // same way `App` does it — `--dump-js` is what M11.25's ladder
             // sweep reads, so a script that reads a cookie the *server* set
             // has to see it here too (M11.7).
-            let (runs, console, pending) =
-                yata::headless::run_scripts_fetching(&mut dom, &loaded.url, &loaded.set_cookie);
+            let (runs, pending) = headless::run_scripts_fetching(
+                &mut dom,
+                &loaded.url,
+                &session.cookies,
+                &session.console,
+            );
+            let console = &session.console;
             let mut text = String::new();
             for run in runs {
                 text.push_str(&run.dump_line());
@@ -399,8 +492,8 @@ fn run_dump_js(url: &str) -> i32 {
 /// (`inspector::box_lines`): a divergence between them would make the goldens
 /// pin something no one can see on screen.
 fn run_dump_boxes(url: &str) -> i32 {
-    let rx = headless_fetch(url);
-    let loaded = recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p)));
+    let loaded =
+        headless_fetch(url, &Session::new()).and_then(|(l, rx)| recv_parsed(&rx).map(|p| (l, p)));
     match loaded {
         Ok((loaded, (mut dom, _))) => {
             let final_url = loaded.url;
@@ -429,8 +522,8 @@ fn run_dump_boxes(url: &str) -> i32 {
 /// the `Timings` table (exactly the `F4` overlay's rows) on stderr. Stdout
 /// stays empty.
 fn run_timing(url: &str) -> i32 {
-    let rx = headless_fetch(url);
-    let loaded = recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p)));
+    let loaded =
+        headless_fetch(url, &Session::new()).and_then(|(l, rx)| recv_parsed(&rx).map(|p| (l, p)));
     let (loaded, (dom, parse_elapsed)) = match loaded {
         Ok(ok) => ok,
         Err(reason) => {
@@ -444,7 +537,23 @@ fn run_timing(url: &str) -> i32 {
     let caps = term::detect_caps_from_env();
     let mut renderer = Renderer::new(w, h, caps);
     let mut app = App::with_caps(w, h, caps.kitty);
-    let id = app.start_fetch(loaded.url.clone());
+    // The chain that got here, replayed as the messages the event loop saw
+    // (M11.7a). Not decoration: `timings.fetch` is the *whole* chain, and an
+    // App handed only the landing page would print a fast fetch with two slow
+    // hops hidden inside it — which is exactly the number this deliverable
+    // exists to keep honest. Each hop's `Set-Cookie` goes in scoped to the hop,
+    // through the same handler the TUI uses. The `Effect` asking for the next
+    // request is ignored here: this fetch has already happened.
+    let id = app.start_fetch(loaded.hops.first().map_or(&loaded.url, |h| &h.url).clone());
+    for hop in loaded.hops {
+        app.update(Msg::Redirect {
+            id,
+            url: hop.url,
+            to: hop.to,
+            elapsed: hop.elapsed,
+            set_cookie: hop.set_cookie,
+        });
+    }
     app.update(Msg::Loaded {
         id,
         url: loaded.url,

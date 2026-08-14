@@ -34,23 +34,31 @@ use crate::style;
 /// The host is created and dropped inside this call: nothing headless outlives
 /// one page.
 pub fn run_scripts(dom: &mut Dom, url: Option<&str>) -> (Vec<ScriptRun>, Console, usize) {
-    run_scripts_from(dom, url, false, &[])
+    // A session of its own, empty and gone when this returns: a dump's cookies
+    // begin empty and die with the call, so a golden cannot depend on what the
+    // last dump wrote.
+    let console = Console::new();
+    let cookies = crate::js::cookies::Jar::new();
+    let (runs, pending) = run_scripts_from(dom, url, false, &cookies, &console);
+    (runs, console, pending)
 }
 
-/// The pass **with** external `<script src>` fetched, and with the document
-/// response's `Set-Cookie` lines applied first. See below for why only
-/// `--dump-js` does this.
+/// The pass **with** external `<script src>` fetched, against the caller's
+/// session. See below for why only `--dump-js` does this.
 ///
-/// The cookies are the M11.7 half: `--dump-js` is what M11.25's ladder sweep
-/// reads, so a page whose script reads a cookie the *server* set has to show
-/// that here exactly as the TUI would. The other headless paths pass nothing
-/// because they never had a response to take it from.
+/// The jar is the caller's, and that is M11.7a's half of it: the headless
+/// modes follow a redirect chain themselves, so the cookies a hop set are
+/// already in the jar — and were already on the wire for the hop after it —
+/// before any script asks `document.cookie`. `--dump-js` is what M11.25's
+/// ladder sweep reads, so a page whose session was established by a 302 the
+/// reader never saw has to behave here exactly as it does in the TUI.
 pub fn run_scripts_fetching(
     dom: &mut Dom,
     url: &str,
-    set_cookie: &[String],
-) -> (Vec<ScriptRun>, Console, usize) {
-    run_scripts_from(dom, Some(url), true, set_cookie)
+    cookies: &crate::js::cookies::Jar,
+    console: &Console,
+) -> (Vec<ScriptRun>, usize) {
+    run_scripts_from(dom, Some(url), true, cookies, console)
 }
 
 /// The same pass, but **fetching** `<script src>` from `base_url`.
@@ -69,33 +77,19 @@ fn run_scripts_from(
     dom: &mut Dom,
     base_url: Option<&str>,
     fetch_externals: bool,
-    set_cookie: &[String],
-) -> (Vec<ScriptRun>, Console, usize) {
+    cookies: &crate::js::cookies::Jar,
+    console: &Console,
+) -> (Vec<ScriptRun>, usize) {
     let mut host = None;
-    let console = Console::new();
     // One page, one session: storage is created and dropped with this call.
     let storage = crate::js::storage::Storage::new();
-    // Same for the jar: a dump's cookies begin empty and die with the call, so
-    // a golden cannot depend on what the last dump wrote.
-    let cookies = crate::js::cookies::Jar::new();
-    // The response's own cookies go in before any script runs, through the
-    // same function `App` uses — the dumps behave the way the TUI does.
-    if let Some(base) = base_url {
-        crate::js::cookies::apply_set_cookie(
-            &cookies,
-            base,
-            set_cookie,
-            crate::js::cookies::now(),
-            &console,
-        );
-    }
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
     // The queue, headless: external scripts are never fetched here (no worker
     // and no network on this path), so their slots stay holes and everything
     // after one waits — the same rule the TUI follows, with the arrivals that
     // would unblock it simply never coming.
-    let (mut queue, externals) = js::queue::ScriptQueue::new(js::sources::sources(dom), &console);
+    let (mut queue, externals) = js::queue::ScriptQueue::new(js::sources::sources(dom), console);
 
     // Fetch what we were given a base for; settle the rest as unfetchable so
     // the queue can drain instead of waiting forever on a hole.
@@ -110,7 +104,7 @@ fn run_scripts_from(
                 // The jar's answer, on the same terms the TUI's document-order
                 // `<script src>` gets — including nothing at all when the
                 // script comes from another origin.
-                let request = script_request(&cookies, base_url, url);
+                let request = script_request(cookies, base_url, url);
                 net::spawn_script(FetchId(1), external.slot, request, tx.clone());
                 in_flight += 1;
             }
@@ -156,8 +150,8 @@ fn run_scripts_from(
             host.as_ref(),
             dom,
             &mut queue,
-            &console,
-            &cookies,
+            console,
+            cookies,
             base_url.filter(|_| fetch_externals),
             &tx,
             &mut in_flight,
@@ -173,9 +167,9 @@ fn run_scripts_from(
                 &js::PageContext {
                     page: HEADLESS_PAGE,
                     url: base_url.unwrap_or_default(),
-                    console: &console,
+                    console,
                     storage: &storage,
-                    cookies: &cookies,
+                    cookies,
                 },
                 ready,
                 finished,
@@ -195,9 +189,9 @@ fn run_scripts_from(
                 &js::PageContext {
                     page: HEADLESS_PAGE,
                     url: base_url.unwrap_or_default(),
-                    console: &console,
+                    console,
                     storage: &storage,
-                    cookies: &cookies,
+                    cookies,
                 },
                 js::Target::Node(node.0),
                 kind,
@@ -282,9 +276,9 @@ fn run_scripts_from(
                         &js::PageContext {
                             page: HEADLESS_PAGE,
                             url: base_url.unwrap_or_default(),
-                            console: &console,
+                            console,
                             storage: &storage,
-                            cookies: &cookies,
+                            cookies,
                         },
                         request,
                         result,
@@ -298,7 +292,7 @@ fn run_scripts_from(
     // reported, so "the page scheduled work" is distinguishable from "the page
     // did nothing".
     let pending = host.as_mut().map_or(0, js::Host::pending_timers);
-    (runs, console, pending)
+    (runs, pending)
 }
 
 /// The headless half of `App::adopt_inserted_scripts` (M11.5): the `<script>`
@@ -504,7 +498,9 @@ mod tests {
              s.src = 'http://';\
              document.body.appendChild(s);</script>",
         );
-        let (_, console, _) = run_scripts_fetching(&mut dom, "https://fixture.test/page", &[]);
+        let cookies = crate::js::cookies::Jar::new();
+        let console = Console::new();
+        run_scripts_fetching(&mut dom, "https://fixture.test/page", &cookies, &console);
         assert!(
             console
                 .entries()
