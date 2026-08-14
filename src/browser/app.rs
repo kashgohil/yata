@@ -5627,6 +5627,34 @@ mod tests {
     }
 
     #[test]
+    fn a_timer_writes_into_the_jar_the_page_pass_wrote_to() {
+        // A cookie is not tick-local: what the document-order pass wrote, a
+        // callback three turns later reads, and what the callback writes joins
+        // it. This is the whole point of the jar hanging off `App`.
+        //
+        // What it does *not* pin, despite appearances: which jar a later tick's
+        // `PageContext` names. The bindings capture the jar when the host is
+        // built, so `ctx.cookies` is read at host creation and never again —
+        // `a_cookie_survives_the_navigation_that_drops_the_host` is the test
+        // that catches a wrong jar there, and it is the only one that can.
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             document.cookie = 'from=pass; path=/';\
+             setTimeout(function () {\
+               document.cookie = 'and=timer; path=/';\
+               console.log('the timer sees: ' + document.cookie);\
+             }, 0);</script>",
+        );
+        run_turns(&mut app, id);
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        drain_turns(&mut app, effect);
+        assert_eq!(logged(&app), ["the timer sees: from=pass; and=timer"]);
+    }
+
+    #[test]
     fn a_superseded_generations_tick_runs_no_stage() {
         // Deliverable 6's ordering rule: mutations belong to the generation
         // that made them, and a generation change cancels the pending cycle.
