@@ -885,3 +885,30 @@ script it runs costs. What is bounded is the *number* of them —
 `a_script_that_appends_a_script_forever_stops_and_q_still_quits` pins the
 consequence: the chain stops after exactly 32 turns, each turn returns inside
 3× the script budget, and `q` quits both during the chain and after it.
+
+### Review follow-up: what one turn is allowed to cost
+
+The bound above counts turns, and the first version of this task did not bound
+what *one* turn could hold. Each script in a prefix gets its own
+`js::SCRIPT_BUDGET` inside `Host::eval`, and a dispatch costs one too, so a
+turn's cost is the number of scripts and handlers it runs — a number the page
+picks at runtime once it can insert scripts. Two shapes, both measured on
+Machine A, release, as the worst single `App::update` in the run:
+
+| hostile shape | one turn, before | after |
+| --- | --- | --- |
+| 32 `onerror` handlers, each inserting the next unresolvable script | **1.60 s** | **50 ms** |
+| 32 inline scripts appended in one tick | 32 × the burn, in one turn | **50 ms** |
+
+Both handlers/scripts burn 50 ms, so 50 ms is one link — the whole of what a
+turn is now allowed to hold. The first row was a nesting bug as well as a
+batching one: an `error` fired where it was discovered re-entered
+`adopt_inserted_scripts` from inside the dispatch it caused, so the chain
+collapsed into the single `update` that started it and the loop never reached
+`recv`. The fix is one rule in two places — `ScriptQueue::take_ready_prefix`
+hands over one inserted slot per call, and `App::owed_script_errors` fires one
+`error` per turn — which puts the worst case back at one budget, where M10.13
+measured it and where PLAN.md §1.5 needs it.
+
+The tick-that-inserts-nothing table above was re-measured after this change and
+is unmoved: 7.62 → 7.61 ms and 3.04 → 2.98 ms, still inside the noise.

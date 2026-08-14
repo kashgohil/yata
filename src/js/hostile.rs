@@ -448,6 +448,62 @@ mod chain {
         );
     }
 
+    /// The same chain built out of `error` handlers instead of script bodies.
+    /// A script whose `src` will not resolve is owed an `error`, its handler
+    /// inserts the next one, and every link is a *dispatch* rather than a
+    /// script run — so none of it goes through the queue's ready prefix.
+    ///
+    /// Each handler burns wall-clock **after** inserting, which is the shape
+    /// that matters: the insertion is recorded before the budget interrupts
+    /// the handler, so the chain keeps its length whatever the burn costs. If
+    /// an owed `error` were fired at the point of discovery, the whole chain
+    /// would collapse into the one `update` that started it — dispatch nested
+    /// inside dispatch, thirty-two budgets deep, with the loop nowhere near
+    /// `recv` and `q` waiting behind all of it.
+    const ERROR_CHAIN: &str = "<p>still readable</p><script>\
+         window.link = function () {\
+           var s = document.createElement('script');\
+           s.onerror = function () {\
+             link();\
+             var t = Date.now(); while (Date.now() - t < 20) {}\
+           };\
+           s.src = 'http://';\
+           document.body.appendChild(s);\
+         };\
+         link();</script>";
+
+    #[test]
+    fn a_chain_of_error_handlers_costs_a_turn_each_and_q_still_quits() {
+        let (mut app, id) = loaded(ERROR_CHAIN);
+        let mut effect = app.update(Msg::RunScripts { id });
+        let mut turns = 0;
+
+        while let Some(id) = effect.run_scripts {
+            turns += 1;
+            assert!(
+                turns <= MAX_INSERTED_SCRIPTS + 1,
+                "the chain asked for {turns} turns; the bound is {MAX_INSERTED_SCRIPTS}"
+            );
+            let turn = Instant::now();
+            effect = app.update(Msg::RunScripts { id });
+            // One handler's worth of work, not the chain's. The burn is 20 ms
+            // and the budget is the ceiling; a turn that fired every owed
+            // `error` would be seconds rather than milliseconds here.
+            assert!(
+                turn.elapsed() < 3 * SCRIPT_BUDGET,
+                "one link of the chain took {:?}",
+                turn.elapsed()
+            );
+        }
+
+        assert_eq!(turns, MAX_INSERTED_SCRIPTS);
+        assert!(app.update(key('q')).quit, "q did not quit");
+        eprintln!(
+            "HOSTILE {:<44} {turns} turns",
+            "a chain of onerror handlers"
+        );
+    }
+
     #[test]
     fn q_quits_from_inside_the_chain_before_it_has_finished() {
         // Not just at the end: a reader who wants out mid-chain gets out. The

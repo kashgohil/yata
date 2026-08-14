@@ -203,6 +203,17 @@ pub struct App {
     /// bootstrap behind a click is the same shape as one at load.
     pending_click_scripts: Vec<(FetchId, usize, String)>,
     pending_click_run: Option<FetchId>,
+    /// Inserted `<script>` elements owed an `error` because their URL will
+    /// never resolve (M11.5), fired one per turn by `run_ready_scripts`.
+    ///
+    /// A list rather than a dispatch at the point of discovery, and the reason
+    /// is the same one that makes an inserted script run in a later turn: a
+    /// handler is a script, a script costs a budget, and a turn that fired
+    /// every owed `error` would cost as many budgets as the page cared to owe
+    /// itself — while an `onerror` that inserts the next unresolvable script
+    /// would nest one dispatch inside the last, without the loop reaching
+    /// `recv` between them.
+    owed_script_errors: Vec<NodeId>,
     /// The page's scripts in document order, with the position execution has
     /// reached (M10.10). External ones are holes until their worker reports;
     /// nothing after a hole runs, because the script that has not arrived may
@@ -366,6 +377,7 @@ impl App {
             pending_click_fetches: Vec::new(),
             pending_click_scripts: Vec::new(),
             pending_click_run: None,
+            owed_script_errors: Vec::new(),
             script_queue: ScriptQueue::default(),
             script_queue_page: None,
             storage: Storage::new(),
@@ -438,6 +450,10 @@ impl App {
         self.console_view_built = false;
         self.script_queue = ScriptQueue::default();
         self.script_queue_page = None;
+        // An `error` owed to the last page's element is owed to nothing now:
+        // the host that would have run its handler is gone, and the node id
+        // names a tree this generation does not have.
+        self.owed_script_errors.clear();
         // A fragment on a cross-document navigation (`href="/other#x"`, and a
         // URL typed or passed on the command line): the node it names does not
         // exist yet, so the *text* is held against this generation and turned
@@ -2157,6 +2173,14 @@ impl App {
     /// prefix that completes late goes through exactly the same path as the
     /// first one.
     fn run_ready_scripts(&mut self, id: FetchId, mut dom: Dom) -> Effect {
+        // Taken before anything runs, so that an `error` this turn *discovers*
+        // is fired by the next one rather than inside this one (M11.5). One
+        // per turn: a handler costs a budget, and the reader's keys are served
+        // between turns.
+        let owed = match self.owed_script_errors.is_empty() {
+            true => None,
+            false => Some(self.owed_script_errors.remove(0)),
+        };
         let ready = self.script_queue.take_ready_prefix();
         // Once per page (M11.5): an inserted script can finish a queue that
         // had already finished, and `DOMContentLoaded`/`load` are not events
@@ -2194,6 +2218,15 @@ impl App {
         effect.timers = self.take_timer_requests(id);
         effect.fetches = self.take_fetch_requests(id);
         self.adopt_inserted_scripts(id, &mut effect);
+        if let Some(node) = owed {
+            self.fire_script_event(id, node, "error", &mut effect);
+        }
+        // Whatever is left over asks for the turn it will be done in: one more
+        // inserted body to run, or one more `error` to fire — including the
+        // ones the dispatch just above owed us.
+        if self.script_queue.has_ready_insertion() || !self.owed_script_errors.is_empty() {
+            effect.run_scripts = Some(id);
+        }
         self.apply_script_navigation(&mut effect);
         if self.console.entries().len() != logged_before {
             // A script that only logged changed no box, but it did change what
@@ -2258,13 +2291,21 @@ impl App {
         let mut ready = false;
         // The descriptions first, while the tree is borrowed once; the queue
         // and the console are `&mut self` from here on.
+        //
+        // Numbered by the ones that survive, not by the candidates: a `src`
+        // written on a script the page never connects is a candidate and not a
+        // script, and a name that skipped a number would be a name that lies
+        // about how many scripts the page inserted. The document walk numbers
+        // its inline scripts the same way, by the ones that can run.
+        let mut surviving = 0;
         let described: Vec<(NodeId, js::sources::Script)> = candidates
             .into_iter()
-            .enumerate()
-            .filter_map(|(nth, candidate)| {
+            .filter_map(|candidate| {
                 let node = NodeId(candidate);
-                let name = format!("inserted#{}", self.script_queue.inserted() + nth + 1);
-                js::sources::connected_script(dom, node, &name).map(|script| (node, script))
+                let name = format!("inserted#{}", self.script_queue.inserted() + surviving + 1);
+                let script = js::sources::connected_script(dom, node, &name)?;
+                surviving += 1;
+                Some((node, script))
             })
             .collect();
 
@@ -2288,15 +2329,21 @@ impl App {
             }
         }
 
-        // Only ask for a turn when something can actually run in it. An
+        // Only ask for a turn when something can actually happen in it. An
         // insertion that is still fetching is unblocked by its own
         // `Msg::Script`, which goes through `run_ready_scripts` anyway.
-        if ready {
+        if ready || !failed.is_empty() {
             effect.run_scripts = Some(id);
         }
-        for node in failed {
-            self.fire_script_event(id, node, "error", effect);
-        }
+        // **Owed, not fired.** An `error` handler is a script and costs a
+        // budget, so firing every owed one here would put as many budgets in
+        // this turn as the page cared to owe itself — and a handler that
+        // inserts the next unresolvable script would re-enter this function
+        // from inside the dispatch it caused, nesting turns' worth of work
+        // into one `update` with the loop nowhere near `recv`. They are fired
+        // one per turn by `run_ready_scripts`, which is where an inserted
+        // script's body runs too, and for the same reason.
+        self.owed_script_errors.extend(failed);
     }
 
     /// Fire `load` or `error` at an inserted `<script>` element (M11.5
@@ -4997,6 +5044,78 @@ mod tests {
         });
         drain_turns(&mut app, effect);
         assert_eq!(logged(&app), ["once"], "a moved script ran twice");
+    }
+
+    #[test]
+    fn scripts_inserted_in_one_tick_run_one_per_turn() {
+        // The bound that keeps a turn worth one execution budget. Each script
+        // in a prefix gets its own `js::SCRIPT_BUDGET` inside `Host::eval`, so
+        // a turn that ran all five would be five budgets with the loop away
+        // from `recv` for every one of them — and five is a number the page
+        // chooses at runtime, not one a reader can see in the markup.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             for (var i = 1; i <= 5; i++) {\
+               var s = document.createElement('script');\
+               s.textContent = \"console.log('ran');\";\
+               document.body.appendChild(s);\
+             }</script>",
+        );
+        let mut effect = app.update(Msg::RunScripts { id });
+        assert!(logged(&app).is_empty(), "the inserting tick ran one");
+        for expected in 1..=5 {
+            let id = effect.run_scripts.expect("a turn was not asked for");
+            effect = app.update(Msg::RunScripts { id });
+            assert_eq!(
+                logged(&app).len(),
+                expected,
+                "a turn ran more than one inserted script"
+            );
+        }
+        assert_eq!(
+            effect.run_scripts, None,
+            "a turn was asked for with nothing to do"
+        );
+    }
+
+    #[test]
+    fn an_error_is_fired_in_a_later_turn_than_the_one_that_discovered_it() {
+        // A handler is a script and costs a budget, so an `error` fired at the
+        // point of discovery would let an `onerror` that inserts the next
+        // unresolvable script nest one dispatch inside the last — turns' worth
+        // of work inside one `update`, with no `recv` between them. One per
+        // turn instead, and the chain is a chain of turns like any other.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             window.link = function () {\
+               var s = document.createElement('script');\
+               s.onerror = function () { console.log('error'); link(); };\
+               s.src = 'http://';\
+               document.body.appendChild(s);\
+             };\
+             link();</script>",
+        );
+        // The handler's own line, not the resolver's report of the bad URL.
+        let fired = |app: &App| logged(app).iter().filter(|line| *line == "error").count();
+
+        let mut effect = app.update(Msg::RunScripts { id });
+        assert_eq!(
+            fired(&app),
+            0,
+            "the error fired inside the tick that discovered it"
+        );
+        let mut turns = 0;
+        while let Some(id) = effect.run_scripts {
+            turns += 1;
+            assert!(
+                turns <= js::queue::MAX_INSERTED_SCRIPTS + 1,
+                "the chain never stopped"
+            );
+            effect = app.update(Msg::RunScripts { id });
+            assert_eq!(fired(&app), turns, "a turn fired more than one error");
+        }
+        // It stopped where the page bound says, and every link cost one turn.
+        assert_eq!(fired(&app), js::queue::MAX_INSERTED_SCRIPTS);
     }
 
     // ---- timers (M10.9) ---------------------------------------------------

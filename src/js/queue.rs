@@ -138,6 +138,11 @@ impl ScriptQueue {
                 }
             }
         }
+        debug_assert_eq!(
+            started.len(),
+            slots.len(),
+            "`element` reads a slot index as an index into `started`: the two grow together"
+        );
         (
             ScriptQueue {
                 document_len: slots.len(),
@@ -204,7 +209,7 @@ impl ScriptQueue {
         }
         self.started.push(node);
         let slot = self.slots.len();
-        match script {
+        let outcome = match script {
             Script::Inline { name, source } => {
                 self.slots.push(Slot::Ready { name, source });
                 Inserted::Ready
@@ -221,7 +226,13 @@ impl ScriptQueue {
                 self.slots.push(Slot::Settled);
                 Inserted::Nothing
             }
-        }
+        };
+        debug_assert_eq!(
+            self.started.len(),
+            self.slots.len(),
+            "`element` reads a slot index as an index into `started`: the two grow together"
+        );
+        outcome
     }
 
     /// The element an inserted slot belongs to, so its `load`/`error` can be
@@ -261,11 +272,22 @@ impl ScriptQueue {
     /// at the first hole. Repeated calls resume where the last stopped, so a
     /// script arriving late unblocks everything queued behind it in one go.
     ///
-    /// Then every inserted slot that is ready, whatever the document run is
-    /// doing — see [`ScriptQueue::insert`] for why a hole does not hold one.
-    /// They come after the document's within a call because a page's own
-    /// order is the one it wrote down; between calls, they run the moment
-    /// they arrive.
+    /// Then **one** inserted slot, if one is ready — whatever the document run
+    /// is doing, since a hole does not hold one (see [`ScriptQueue::insert`]).
+    /// It comes after the document's within a call because a page's own order
+    /// is the one it wrote down.
+    ///
+    /// One, and not every ready one, because each script in a prefix gets its
+    /// own execution budget (`js::SCRIPT_BUDGET`, spent inside `Host::eval`),
+    /// so the length of a prefix is the number of budgets one turn of the
+    /// event loop can cost. A document's prefix is as long as its markup — the
+    /// page author wrote it and a reader can see it. An *inserted* prefix is as
+    /// long as a script decides at runtime, and thirty-two scripts appended in
+    /// one tick would be thirty-two budgets in one turn, with the loop away
+    /// from `recv` for all of them: PLAN.md §1.5 says `q` still quits, and
+    /// M10.13 measured the worst case at one budget. So an insertion costs a
+    /// turn each, and [`ScriptQueue::has_ready_insertion`] is how the caller
+    /// knows to ask for the next one.
     pub fn take_ready_prefix(&mut self) -> Vec<(String, String)> {
         let mut ready = Vec::new();
         while self.next < self.document_len {
@@ -281,13 +303,28 @@ impl ScriptQueue {
         }
         // Taking an inserted slot settles it: there is no cursor to walk past
         // it, so `Settled` is what stops it running twice.
-        for slot in &mut self.slots[self.document_len..] {
-            if let Slot::Ready { name, source } = slot {
-                ready.push((std::mem::take(name), std::mem::take(source)));
-                *slot = Slot::Settled;
-            }
+        if let Some(slot) = self.first_ready_insertion() {
+            let Slot::Ready { name, source } = &mut self.slots[slot] else {
+                unreachable!("`first_ready_insertion` returns a ready slot");
+            };
+            ready.push((std::mem::take(name), std::mem::take(source)));
+            self.slots[slot] = Slot::Settled;
         }
         ready
+    }
+
+    /// Whether an inserted slot could run right now — which is the caller's
+    /// cue to ask the loop for another turn, since [`ScriptQueue::take_ready_prefix`]
+    /// hands over one per call.
+    pub fn has_ready_insertion(&self) -> bool {
+        self.first_ready_insertion().is_some()
+    }
+
+    fn first_ready_insertion(&self) -> Option<usize> {
+        self.slots[self.document_len..]
+            .iter()
+            .position(|slot| matches!(slot, Slot::Ready { .. }))
+            .map(|at| self.document_len + at)
     }
 
     /// Whether every slot has run or settled — the moment `DOMContentLoaded`
@@ -573,7 +610,16 @@ mod tests {
                 &console,
             );
         }
-        assert_eq!(queue.take_ready_prefix().len(), MAX_INSERTED_SCRIPTS);
+        // One per call, so one per turn of the event loop: thirty-two accepted
+        // insertions are thirty-two turns, never one turn of thirty-two
+        // execution budgets (see `take_ready_prefix`).
+        let mut taken = 0;
+        while !queue.take_ready_prefix().is_empty() {
+            taken += 1;
+            assert!(taken <= MAX_INSERTED_SCRIPTS, "the bound did not hold");
+        }
+        assert_eq!(taken, MAX_INSERTED_SCRIPTS);
+        assert!(!queue.has_ready_insertion());
         assert_eq!(
             console
                 .entries()
@@ -582,6 +628,32 @@ mod tests {
                 .count(),
             5
         );
+    }
+
+    #[test]
+    fn a_turn_takes_one_inserted_script_however_many_are_ready() {
+        // The bound that keeps a turn worth one execution budget. A page that
+        // appends three scripts in a single tick has them run in three turns,
+        // in insertion order, with the loop back at `recv` between them.
+        let (mut queue, _) = ScriptQueue::new_for_test(vec![]);
+        for n in 0..3u32 {
+            queue.insert(
+                fresh(n),
+                Script::Inline {
+                    name: format!("inserted#{}", n + 1),
+                    source: "x".into(),
+                },
+                &Console::new(),
+            );
+        }
+        assert!(queue.has_ready_insertion());
+        assert_eq!(names(queue.take_ready_prefix()), ["inserted#1"]);
+        assert_eq!(names(queue.take_ready_prefix()), ["inserted#2"]);
+        assert!(queue.has_ready_insertion());
+        assert_eq!(names(queue.take_ready_prefix()), ["inserted#3"]);
+        assert!(!queue.has_ready_insertion());
+        assert!(queue.take_ready_prefix().is_empty());
+        assert!(queue.is_finished());
     }
 
     #[test]
