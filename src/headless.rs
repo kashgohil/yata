@@ -106,16 +106,24 @@ fn run_scripts_from(
 
     let mut runs = Vec::new();
     let mut settled = 0usize;
-    // The `load`/`error` an inserted script's element is owed once its body
-    // has actually run (M11.5).
-    let mut owed_event: Option<(crate::dom::NodeId, &'static str)> = None;
+    // The `load`/`error` an inserted script's element is owed: once its body
+    // has actually run, or once its URL turns out to be unusable (M11.5).
+    let mut owed_events: Vec<(crate::dom::NodeId, &'static str)> = Vec::new();
     loop {
+        // One per round, taken before anything runs, which is exactly what
+        // `App::run_ready_scripts` does with a turn — an event owed by *this*
+        // round is fired by the next one, and a handler never nests inside the
+        // dispatch that caused it.
+        let owed = match owed_events.is_empty() {
+            true => None,
+            false => Some(owed_events.remove(0)),
+        };
         // Scripts a previous tick inserted (M11.5) join the queue before this
         // round's prefix is taken, which is what makes them run in a *later*
         // turn — the same rule the TUI follows, with this loop standing in for
         // the event loop. The page bound in `js::queue` is what stops a script
         // that appends a script from making this loop endless.
-        adopt_inserted_scripts(
+        owed_events.extend(adopt_inserted_scripts(
             host.as_ref(),
             dom,
             &mut queue,
@@ -123,7 +131,7 @@ fn run_scripts_from(
             base_url.filter(|_| fetch_externals),
             &tx,
             &mut in_flight,
-        );
+        ));
 
         let ready = queue.take_ready_prefix();
         let finished = queue.take_finished();
@@ -149,7 +157,7 @@ fn run_scripts_from(
         // is when it executed. `--dump-js` is what M11.25's ladder sweep
         // reads, so a page that chains on `onload` has to behave here the way
         // it behaves in the TUI.
-        if let Some((node, kind)) = owed_event.take() {
+        if let Some((node, kind)) = owed {
             js::dispatch(
                 &mut host,
                 dom,
@@ -189,7 +197,10 @@ fn run_scripts_from(
             }
         }
 
-        if in_flight == 0 && !ran {
+        // An owed event is work left to do, so it keeps the loop alive even
+        // when this round ran nothing: the round that discovers an unusable
+        // URL fires nothing itself.
+        if in_flight == 0 && !ran && owed_events.is_empty() {
             break;
         }
         if settled >= MAX_HEADLESS_FETCHES && queue.is_finished() {
@@ -217,9 +228,11 @@ fn run_scripts_from(
                 // Only an *inserted* slot names an element; a document-order
                 // `<script src>` has none, because nothing could have put a
                 // listener on it before the page ran.
-                owed_event = queue
-                    .element(slot)
-                    .map(|node| (node, if failed { "error" } else { "load" }));
+                owed_events.extend(
+                    queue
+                        .element(slot)
+                        .map(|node| (node, if failed { "error" } else { "load" })),
+                );
                 queue.fill(slot, source);
                 in_flight -= 1;
             }
@@ -269,7 +282,8 @@ fn adopt_inserted_scripts(
     base_url: Option<&str>,
     tx: &mpsc::Sender<Msg>,
     in_flight: &mut usize,
-) {
+) -> Vec<(crate::dom::NodeId, &'static str)> {
+    let mut owed = Vec::new();
     for candidate in host.map(js::Host::take_script_inserts).unwrap_or_default() {
         let node = crate::dom::NodeId(candidate);
         let name = format!("inserted#{}", queue.inserted() + 1);
@@ -290,10 +304,21 @@ fn adopt_inserted_scripts(
                         "this inserted script's URL was not fetched",
                     );
                     queue.fill(external.slot, None);
+                    // Only when we *tried*: a `base_url` here means this path
+                    // fetches, so a URL that will not resolve against it is
+                    // one that can never arrive, and its element is owed an
+                    // `error` exactly as it would be in the TUI. When the
+                    // caller passed no base, nothing was attempted — inventing
+                    // an `error` would put a console line in the dump that the
+                    // TUI never produces, which is the same lie in reverse.
+                    if base_url.is_some() {
+                        owed.push((node, "error"));
+                    }
                 }
             }
         }
     }
+    owed
 }
 
 /// How many `fetch()` calls one headless run will answer. A page that fetches
@@ -403,6 +428,31 @@ mod tests {
                 .iter()
                 .any(|e| e.text.contains("as many as this browser will run")),
             "the chain stopped for some reason other than the bound: {:?}",
+            console.entries()
+        );
+    }
+
+    #[test]
+    fn an_inserted_script_whose_url_will_not_resolve_fires_error_in_a_dump() {
+        // The TUI fires `error` at an element whose script can never arrive
+        // (`App::adopt_inserted_scripts`), and `--dump-js` is what M11.25's
+        // ladder sweep reads — so a page that chains on `onerror` must not
+        // look like a page that hangs here. `http://` resolves against
+        // nothing, so no worker is spawned and no test touches the network.
+        let mut dom = html::parse(
+            "<p>parsed</p><script>\
+             var s = document.createElement('script');\
+             s.onerror = function () { console.log('error fired'); };\
+             s.src = 'http://';\
+             document.body.appendChild(s);</script>",
+        );
+        let (_, console, _) = run_scripts_fetching(&mut dom, "https://fixture.test/page");
+        assert!(
+            console
+                .entries()
+                .iter()
+                .any(|e| e.text.contains("error fired")),
+            "{:?}",
             console.entries()
         );
     }
