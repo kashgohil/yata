@@ -323,6 +323,39 @@ fn dump_js_runs_the_page_scripts_in_document_order() {
 }
 
 #[test]
+fn dump_js_shows_the_cookies_a_page_sets_and_reads() {
+    // M11.6: the dump has to behave the way the TUI does, or `--dump-js` — what
+    // the M11.25 ladder sweep reads — would report that a page's cookies do
+    // nothing. The jar is the dump's own and dies with the process, so what one
+    // script writes the next one reads and nothing survives the run.
+    let addr = serve_once(response_with_body(
+        "200 OK",
+        b"<script>document.cookie = 'a=1; path=/'; document.cookie = 'rubbish';</script>\
+          <script>document.cookie;</script>",
+    ));
+    let out = yata(&["--dump-js", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dumped = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<&str> = dumped.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            // An assignment evaluates to what was assigned, even the one that
+            // was ignored — the warning below is where the ignoring shows.
+            "inline#1 ok \"rubbish\"",
+            "inline#2 ok \"a=1\"",
+            "warn  ignored document.cookie = \"rubbish\": it has no name=value pair",
+        ],
+        "the dump does not show what the TUI would:\n{dumped}"
+    );
+}
+
+#[test]
 fn dump_js_of_a_page_without_script_prints_nothing() {
     let addr = serve_once(response_with_body("200 OK", b"<p>just prose</p>"));
     let out = yata(&["--dump-js", &format!("http://{addr}/")]);

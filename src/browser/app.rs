@@ -15,6 +15,7 @@ use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::{AttrChanges, Dom, NodeId};
 use crate::image::ImageSession;
+use crate::js::cookies::Jar;
 use crate::js::queue::ScriptQueue;
 use crate::js::storage::Storage;
 use crate::js::{self, console::Console};
@@ -230,6 +231,11 @@ pub struct App {
     /// on every navigation and two pages on one origin must see the same data.
     /// In memory only — see `js::storage` for why that is a decision.
     storage: Storage,
+    /// The session's cookies (M11.6), here for the same reason `storage` is:
+    /// one jar for every page, outliving the host that reads it. In memory
+    /// only, host-only, and reachable by nothing but `document.cookie` until
+    /// M11.7 puts one on the wire — see `js::cookies`.
+    cookies: Jar,
     /// Everything this page's JavaScript had to say (M10.7): console calls,
     /// uncaught exceptions, scripts skipped for their type — one ordered list,
     /// shown by `F5`. Page-local like the host: cleared on navigation, because
@@ -381,6 +387,7 @@ impl App {
             script_queue: ScriptQueue::default(),
             script_queue_page: None,
             storage: Storage::new(),
+            cookies: Jar::new(),
             console: Console::new(),
             console_view: Viewport::default(),
             console_view_built: false,
@@ -676,6 +683,7 @@ impl App {
                 let url = self.current_url().unwrap_or_default();
                 let console = self.console.clone();
                 let storage = self.storage.clone();
+                let cookies = self.cookies.clone();
                 let Some(host) = self.js_host.as_mut() else {
                     self.dom = Some(dom);
                     return Effect::default();
@@ -691,6 +699,7 @@ impl App {
                         url: &url,
                         console: &console,
                         storage: &storage,
+                        cookies: &cookies,
                     },
                     request,
                     result,
@@ -725,6 +734,7 @@ impl App {
                 let url = self.current_url().unwrap_or_default();
                 let console = self.console.clone();
                 let storage = self.storage.clone();
+                let cookies = self.cookies.clone();
                 let Some(host) = self.js_host.as_mut() else {
                     self.dom = Some(dom);
                     return Effect::default();
@@ -740,6 +750,7 @@ impl App {
                         url: &url,
                         console: &console,
                         storage: &storage,
+                        cookies: &cookies,
                     },
                     id,
                 );
@@ -2199,6 +2210,7 @@ impl App {
                 url: &url,
                 console: &self.console,
                 storage: &self.storage,
+                cookies: &self.cookies,
             },
             ready,
             finished,
@@ -2371,6 +2383,7 @@ impl App {
                 url: &url,
                 console: &self.console,
                 storage: &self.storage,
+                cookies: &self.cookies,
             },
             js::Target::Node(node.0),
             kind,
@@ -2543,6 +2556,7 @@ impl App {
                 url: &url,
                 console: &self.console,
                 storage: &self.storage,
+                cookies: &self.cookies,
             },
             js::Target::Node(node.0),
             "click",
@@ -5555,6 +5569,53 @@ mod tests {
             stages(&app),
             before,
             "a read-only tick ran a stage (styles, layouts, paints)"
+        );
+    }
+
+    #[test]
+    fn a_tick_that_only_touches_cookies_runs_no_stage_either() {
+        // M11.6 deliverable 9, under M10.6's discipline: `document.cookie` is
+        // read by the first inline script of a page, so it is on the load path
+        // — and it is a map lookup and a string build, not a stage. A cookie
+        // write changes no box either, so neither half of the property may
+        // restyle, relayout or repaint.
+        let (mut app, id) = scripted_app(
+            "<p>text</p><script>\
+             document.cookie = 'a=1';\
+             document.cookie.length + document.cookie.indexOf('a=1');</script>",
+        );
+        let before = stages(&app);
+        assert_eq!(app.update(Msg::RunScripts { id }), Effect::default());
+        assert_eq!(
+            stages(&app),
+            before,
+            "reading or writing a cookie ran a pipeline stage"
+        );
+    }
+
+    #[test]
+    fn a_cookie_survives_the_navigation_that_drops_the_host() {
+        // The jar lives in `App`, not in the engine: the second page runs on a
+        // host that has never seen the first page's globals and still reads its
+        // cookie. Both pages are `http://final/` — one host, one jar.
+        let (mut app, first) =
+            scripted_app("<p>one</p><script>document.cookie = 'who=first; path=/';</script>");
+        app.update(Msg::RunScripts { id: first });
+
+        let second = app.start_fetch("http://x/two".into());
+        let page = "<p>two</p><script>console.log('read back: ' + document.cookie);</script>";
+        load(&mut app, second, page.as_bytes().to_vec());
+        app.update(parsed(second, page));
+        app.update(Msg::RunScripts { id: second });
+
+        assert_eq!(
+            app.console
+                .entries()
+                .iter()
+                .map(|entry| entry.text.clone())
+                .collect::<Vec<_>>(),
+            ["read back: who=first"],
+            "the jar was dropped with the page's host"
         );
     }
 

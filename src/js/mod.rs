@@ -83,6 +83,7 @@ mod bindings;
 // which `App` hands to the loop. Everything else in that module stays closed.
 pub use bindings::{FetchAsk, MAX_IN_FLIGHT};
 pub mod console;
+pub mod cookies;
 mod hostile;
 pub mod queue;
 pub mod sources;
@@ -102,6 +103,7 @@ use rquickjs::{
 use crate::dom::Dom;
 use crate::js::bindings::{FetchQueue, InsertQueue, NavQueue, NavRequest, TimerAsk, TimerQueue};
 use crate::js::console::{Console, Level};
+use crate::js::cookies::Jar;
 use crate::js::storage::Storage;
 use crate::net::JsResponse;
 use crate::timers::TimerId;
@@ -161,19 +163,23 @@ fn header_json(headers: &[(String, String)]) -> String {
 }
 
 /// What a tick needs to know about the page it runs for: which generation it
-/// belongs to, where the page came from, and the two session-scoped things a
+/// belongs to, where the page came from, and the session-scoped things a
 /// script can reach.
 ///
-/// One struct rather than four parameters repeated across three entry points —
+/// One struct rather than five parameters repeated across three entry points —
 /// the three ticks differ in *what they run*, never in this.
 pub struct PageContext<'a> {
     /// The page generation, carried by every handle minted during the tick.
     pub page: u64,
-    /// The post-redirect URL `location` is parsed from and storage is scoped
-    /// by.
+    /// The post-redirect URL `location` is parsed from, storage is scoped by,
+    /// and cookies take their host, path and scheme from.
     pub url: &'a str,
     pub console: &'a Console,
     pub storage: &'a Storage,
+    /// The session's cookies (M11.6), scoped by the page's host and path — one
+    /// jar for every page, like `storage`, because a host is dropped on every
+    /// navigation and a cookie outlives the page that set it.
+    pub cookies: &'a Jar,
 }
 
 /// Run a ready prefix of the page's script queue — one tick (M10.10).
@@ -206,7 +212,7 @@ pub fn run_prefix(
     scripts: Vec<(String, String)>,
     finished: bool,
 ) -> Vec<ScriptRun> {
-    let (page, url, console, storage) = (ctx.page, ctx.url, ctx.console, ctx.storage);
+    let (page, url, console) = (ctx.page, ctx.url, ctx.console);
     if scripts.is_empty() && !finished {
         return Vec::new();
     }
@@ -219,7 +225,7 @@ pub fn run_prefix(
             if scripts.is_empty() {
                 return Vec::new();
             }
-            match Host::new(console, storage) {
+            match Host::new(console, ctx.storage, ctx.cookies) {
                 Ok(new) => host.insert(new),
                 // The engine itself would not start. The page is degraded, not
                 // broken — and the failure is reported rather than swallowed.
@@ -316,7 +322,7 @@ pub fn run_pass(
     run_pass_at(host, dom, page, "https://fixture.test/page", console)
 }
 
-/// `run_pass`, with the page URL `location` and storage are scoped by.
+/// `run_pass`, with the page URL `location`, storage and cookies are scoped by.
 #[cfg(test)]
 pub fn run_pass_at(
     host: &mut Option<Host>,
@@ -324,6 +330,20 @@ pub fn run_pass_at(
     page: u64,
     url: &str,
     console: &Console,
+) -> Vec<ScriptRun> {
+    run_pass_with(host, dom, page, url, console, &Jar::new())
+}
+
+/// `run_pass_at` against a jar the test can seed — the only reason a caller
+/// needs to name one, since a fresh jar is what every other pass wants.
+#[cfg(test)]
+pub fn run_pass_with(
+    host: &mut Option<Host>,
+    dom: &mut Dom,
+    page: u64,
+    url: &str,
+    console: &Console,
+    cookies: &Jar,
 ) -> Vec<ScriptRun> {
     let (mut queue, externals) = queue::ScriptQueue::new(sources::sources(dom), console);
     for external in externals {
@@ -339,6 +359,7 @@ pub fn run_pass_at(
             url,
             console,
             storage: &Storage::new(),
+            cookies,
         },
         ready,
         finished,
@@ -444,7 +465,7 @@ pub struct Host {
 impl Host {
     /// Build a host with the budget, memory and stack limits armed. Fails only
     /// if the engine cannot allocate its runtime or context.
-    pub fn new(console: &Console, storage: &Storage) -> Result<Self, JsError> {
+    pub fn new(console: &Console, storage: &Storage, cookies: &Jar) -> Result<Self, JsError> {
         let runtime = Runtime::new().map_err(|e| JsError::internal(&e.to_string()))?;
         runtime.set_memory_limit(MEMORY_LIMIT);
         runtime.set_max_stack_size(STACK_LIMIT);
@@ -482,6 +503,7 @@ impl Host {
                 &timers,
                 &navigation,
                 storage,
+                cookies,
                 &fetches,
                 &inserts,
             )
@@ -1051,7 +1073,7 @@ fn frame_location(frame: &str) -> Option<(&str, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Console, Host, JsValue, SCRIPT_BUDGET, Storage, line_from_stack, run_pass};
+    use super::{Console, Host, Jar, JsValue, SCRIPT_BUDGET, Storage, line_from_stack, run_pass};
     use std::time::Instant;
 
     /// The document-order pass over a parsed page, as `App` and the headless
@@ -1161,7 +1183,7 @@ mod tests {
     }
 
     fn host() -> Host {
-        Host::new(&Console::new(), &Storage::new()).expect("engine starts")
+        Host::new(&Console::new(), &Storage::new(), &Jar::new()).expect("engine starts")
     }
 
     #[test]

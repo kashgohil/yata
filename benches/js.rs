@@ -10,24 +10,26 @@ use std::hint::black_box;
 
 use yata::dom::NodeId;
 use yata::js::console::Console;
+use yata::js::cookies::Jar;
 use yata::js::storage::Storage;
 use yata::js::{self, PageContext, Target};
 use yata::{html, layout, style};
 
 const WIKIPEDIA: &str = include_str!("../tests/fixtures/en.wikipedia.org.html");
 
-fn context<'a>(console: &'a Console, storage: &'a Storage) -> PageContext<'a> {
+fn context<'a>(console: &'a Console, storage: &'a Storage, cookies: &'a Jar) -> PageContext<'a> {
     PageContext {
         page: 1,
         url: "https://bench.test/page",
         console,
         storage,
+        cookies,
     }
 }
 
-fn run(page: &str) -> (yata::dom::Dom, Option<js::Host>, Console, Storage) {
+fn run(page: &str) -> (yata::dom::Dom, Option<js::Host>, Console, Storage, Jar) {
     let mut dom = html::parse(page);
-    let (console, storage) = (Console::new(), Storage::new());
+    let (console, storage, cookies) = (Console::new(), Storage::new(), Jar::new());
     let mut host = None;
     let (mut queue, _) = js::queue::ScriptQueue::new(js::sources::sources(&dom), &console);
     let ready = queue.take_ready_prefix();
@@ -35,19 +37,19 @@ fn run(page: &str) -> (yata::dom::Dom, Option<js::Host>, Console, Storage) {
     js::run_prefix(
         &mut host,
         &mut dom,
-        &context(&console, &storage),
+        &context(&console, &storage, &cookies),
         ready,
         finished,
     );
-    (dom, host, console, storage)
+    (dom, host, console, storage, cookies)
 }
 
 fn js_benches(c: &mut Criterion) {
     // Starting an engine: what a page with any script at all pays once, and
     // what a page with none must never pay.
     c.bench_function("engine startup", |b| {
-        let (console, storage) = (Console::new(), Storage::new());
-        b.iter(|| black_box(js::Host::new(&console, &storage).expect("starts")));
+        let (console, storage, cookies) = (Console::new(), Storage::new(), Jar::new());
+        b.iter(|| black_box(js::Host::new(&console, &storage, &cookies).expect("starts")));
     });
 
     // A document-order pass over a script-heavy page: the tick M10.2 added.
@@ -83,7 +85,7 @@ fn js_benches(c: &mut Criterion) {
     c.bench_function("click, mutate, restyle and relayout", |b| {
         b.iter_batched(
             || run(clickable),
-            |(mut dom, mut host, console, storage)| {
+            |(mut dom, mut host, console, storage, cookies)| {
                 let target = (0..dom.node_count())
                     .map(|i| NodeId(i as u32))
                     .find(|&n| dom.attr(n, "id") == Some("t"))
@@ -91,7 +93,7 @@ fn js_benches(c: &mut Criterion) {
                 js::dispatch(
                     &mut host,
                     &mut dom,
-                    &context(&console, &storage),
+                    &context(&console, &storage, &cookies),
                     Target::Node(target.0),
                     "click",
                 );

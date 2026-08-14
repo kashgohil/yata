@@ -64,6 +64,9 @@ fn run_scripts_from(
     let console = Console::new();
     // One page, one session: storage is created and dropped with this call.
     let storage = crate::js::storage::Storage::new();
+    // Same for the jar: a dump's cookies begin empty and die with the call, so
+    // a golden cannot depend on what the last dump wrote.
+    let cookies = crate::js::cookies::Jar::new();
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
     // The queue, headless: external scripts are never fetched here (no worker
@@ -145,6 +148,7 @@ fn run_scripts_from(
                     url: base_url.unwrap_or_default(),
                     console: &console,
                     storage: &storage,
+                    cookies: &cookies,
                 },
                 ready,
                 finished,
@@ -166,6 +170,7 @@ fn run_scripts_from(
                     url: base_url.unwrap_or_default(),
                     console: &console,
                     storage: &storage,
+                    cookies: &cookies,
                 },
                 js::Target::Node(node.0),
                 kind,
@@ -250,6 +255,7 @@ fn run_scripts_from(
                             url: base_url.unwrap_or_default(),
                             console: &console,
                             storage: &storage,
+                            cookies: &cookies,
                         },
                         request,
                         result,

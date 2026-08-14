@@ -47,6 +47,7 @@ use crate::css;
 use crate::dom::{Dom, DomError, NodeData, NodeId};
 use crate::html;
 use crate::js::console::{self, Console};
+use crate::js::cookies::{self, Jar, Scope};
 use crate::js::storage::{Area, Storage, origin_of};
 use crate::style::{StyleContext, matching};
 
@@ -317,9 +318,10 @@ const CONSOLE_MAX_ITEMS: u32 = 20;
 
 /// Install the primitives and evaluate the prelude that builds the object
 /// model on top of them. Called once per host.
-// Eight arguments, and each is a distinct thing the page can reach: the tree,
-// the console, and the four queues a tick fills for the loop to drain. Bundling
-// them would name a group that has no other use and no other caller.
+// Nine arguments, and each is a distinct thing the page can reach: the tree,
+// the console, the two session-scoped stores, and the four queues a tick fills
+// for the loop to drain. Bundling them would name a group that has no other
+// use and no other caller.
 #[allow(clippy::too_many_arguments)]
 pub fn install<'js>(
     ctx: &Ctx<'js>,
@@ -328,6 +330,7 @@ pub fn install<'js>(
     timers: &TimerQueue,
     navigation: &NavQueue,
     storage: &Storage,
+    cookies: &Jar,
     fetches: &FetchQueue,
     inserts: &InsertQueue,
 ) -> JsResult<Object<'js>> {
@@ -913,6 +916,52 @@ pub fn install<'js>(
         )?,
     )?;
 
+    // ---- document.cookie (M11.6) ----
+
+    // The host, path and scheme a cookie is scoped by are derived here, from
+    // the URL `net::` produced, for the same reason storage's origin is: a
+    // page that could name its own host could read anybody's cookies.
+    //
+    // A page with no host — a dump with nothing to resolve against — has no
+    // jar to reach: reading answers `""` and writing does nothing. That is the
+    // honest answer, and it is not an exception, because the first thing many
+    // pages do with the result is call `.match` on it.
+    let (jar, s) = (cookies.clone(), Rc::clone(slot));
+    api.set(
+        "cookieRead",
+        Function::new(ctx.clone(), move || -> String {
+            match Scope::of(&s.url.borrow()) {
+                Some(scope) => jar.read_for_script(&scope, cookies::now()),
+                None => String::new(),
+            }
+        })?,
+    )?;
+
+    let (jar, s, log) = (cookies.clone(), Rc::clone(slot), console.clone());
+    api.set(
+        "cookieWrite",
+        Function::new(ctx.clone(), move |assignment: String| {
+            let Some(scope) = Scope::of(&s.url.borrow()) else {
+                return;
+            };
+            // Never an exception: a page that writes rubbish to
+            // `document.cookie` gets a console line and keeps rendering. This
+            // is the one place the reason is visible, so it says which
+            // assignment was dropped and why.
+            if let Err(reject) = jar.write_from_script(&assignment, &scope, cookies::now()) {
+                log.push(
+                    console::Level::Warn,
+                    None,
+                    None,
+                    &format!(
+                        "ignored document.cookie = {assignment:?}: {}",
+                        reject.message()
+                    ),
+                );
+            }
+        })?,
+    )?;
+
     // ---- fetch (M10.12) ----
 
     let (queue, s, log) = (fetches.clone(), Rc::clone(slot), console.clone());
@@ -1421,6 +1470,12 @@ const PRELUDE: &str = r#"
     },
     querySelector: function (sel) { return wrap(raw.querySelector(String(sel))); },
     querySelectorAll: function (sel) { return raw.querySelectorAll(String(sel)).map(wrap); },
+    // Cookies (M11.6). It reads like a string and it is a pair of accessors:
+    // an assignment adds or replaces *one* cookie and leaves the rest of the
+    // jar alone. Every rule about who may see what is in Rust, in `js::cookies`
+    // — this is only the property.
+    get cookie() { return raw.cookieRead(); },
+    set cookie(value) { raw.cookieWrite(String(value)); },
   };
 
   // ---- console (M10.7) ----
@@ -2227,7 +2282,8 @@ mod tests {
         // be the first — gets an exception, not a stale read.
         let slot = DomSlot::default();
         assert!(slot.take().is_none());
-        let mut host = Host::new(&Console::new(), &Storage::new()).expect("host starts");
+        let mut host =
+            Host::new(&Console::new(), &Storage::new(), &Jar::new()).expect("host starts");
         // Nothing has been lent, so the bindings have no tree to read.
         let error = host.eval("probe.js", "document.body").unwrap_err();
         assert!(
@@ -3043,6 +3099,7 @@ mod tests {
                     url,
                     console: &console,
                     storage: &storage,
+                    cookies: &Jar::new(),
                 },
                 ready,
                 true,
@@ -3107,16 +3164,204 @@ mod tests {
     }
 
     #[test]
-    fn cookies_and_the_history_api_are_absent_rather_than_stubbed() {
+    fn the_history_api_is_absent_rather_than_stubbed() {
         // A stub that lies is worse than a name that is not there: a page can
         // feature-detect an absence, but it cannot detect a `pushState` that
-        // silently does nothing.
+        // silently does nothing. (`document.cookie` was in this test until
+        // M11.6 gave it a jar — it is now a string, and an empty one is the
+        // honest answer for a page with no cookies.)
         assert_eq!(
             at(
                 "https://a.test/",
-                "console.log(document.cookie === undefined, typeof history);"
+                "console.log(typeof history, typeof document.cookie, document.cookie === '');"
             ),
-            ["log   true undefined"]
+            ["log   undefined string true"]
+        );
+    }
+
+    // ---- document.cookie (M11.6) ------------------------------------------
+
+    /// Run `script` on a page served from `url` against a jar the test owns,
+    /// so a cookie can be seeded before the page runs or inspected after.
+    fn with_jar(jar: &Jar, url: &str, script: &str) -> Vec<String> {
+        let mut dom = html::parse(&format!("<p>x</p><script>{script}</script>"));
+        let mut host = None;
+        let console = Console::new();
+        js::run_pass_with(&mut host, &mut dom, 1, url, &console, jar);
+        console.entries().iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_script_reads_back_the_cookies_it_sets() {
+        assert_eq!(
+            at(
+                "https://a.test/docs/page",
+                "document.cookie = 'a=1';\
+                 document.cookie = 'b=2; path=/';\
+                 console.log(document.cookie);"
+            ),
+            // Longest path first: `b` was set for `/` and `a` defaulted to the
+            // page's directory, which is longer.
+            ["log   a=1; b=2"]
+        );
+        // The assignment is one cookie, not the whole string: `a` is still
+        // there after `b` is written, and `b` after `a` is rewritten.
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "document.cookie = 'a=1'; document.cookie = 'b=2';\
+                 document.cookie = 'a=one';\
+                 console.log(document.cookie);\
+                 document.cookie = 'a=; Max-Age=0';\
+                 console.log(document.cookie);"
+            ),
+            ["log   a=one; b=2", "log   b=2"]
+        );
+        // The assigned value is coerced to a string, as every other setter in
+        // the object model does — including an object with a `toString`.
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "document.cookie = { toString: function () { return 'a=1'; } };\
+                 console.log(document.cookie);"
+            ),
+            ["log   a=1"]
+        );
+    }
+
+    #[test]
+    fn a_cookie_outlives_the_page_that_set_it() {
+        // The jar is the session's, not the host's: a navigation drops the
+        // engine and every global in it, and the cookie is still there. This is
+        // why it lives in `App` beside `Storage`.
+        let jar = Jar::new();
+        assert_eq!(
+            with_jar(
+                &jar,
+                "https://a.test/one",
+                "document.cookie = 'who=first; path=/';"
+            ),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            with_jar(&jar, "https://a.test/two", "console.log(document.cookie);"),
+            ["log   who=first"]
+        );
+        // And it is still the host's alone.
+        assert_eq!(
+            with_jar(
+                &jar,
+                "https://b.test/two",
+                "console.log('[' + document.cookie + ']');"
+            ),
+            ["log   []"]
+        );
+    }
+
+    #[test]
+    fn rubbish_written_to_document_cookie_is_a_console_line_not_an_exception() {
+        // A page that stores nonsense keeps rendering: the assignment is a
+        // no-op, the reason is in the console, and the script runs on.
+        assert_eq!(
+            at(
+                "https://a.test/",
+                "document.cookie = 'nonsense';\
+                 document.cookie = 'ok=1';\
+                 console.log(document.cookie);"
+            ),
+            [
+                "warn  ignored document.cookie = \"nonsense\": it has no name=value pair",
+                "log   ok=1"
+            ]
+        );
+        // The flags a script may not use say which rule it hit.
+        assert_eq!(
+            at(
+                "http://a.test/",
+                "document.cookie = 'a=1; HttpOnly'; document.cookie = 'b=1; Secure';"
+            ),
+            [
+                "warn  ignored document.cookie = \"a=1; HttpOnly\": \
+                 a script cannot set an HttpOnly cookie",
+                "warn  ignored document.cookie = \"b=1; Secure\": \
+                 a Secure cookie cannot be set from an http: page"
+            ]
+        );
+    }
+
+    /// The fixture's root element class list, after its scripts have run
+    /// against `jar`.
+    fn wikipedia_root_class(jar: &Jar) -> String {
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        let mut dom = html::parse(fixture);
+        let mut host = None;
+        let console = Console::new();
+        let runs = js::run_pass_with(
+            &mut host,
+            &mut dom,
+            1,
+            "https://en.wikipedia.org/wiki/Cat",
+            &console,
+            jar,
+        );
+        // Nothing threw. This is the assertion the whole task exists for: the
+        // page's *first* script called `.match` on `document.cookie`, and until
+        // M11.6 that was `undefined.match` — an exception that took the class
+        // list of the root element with it.
+        for run in &runs {
+            assert!(run.outcome.is_ok(), "{} threw: {:?}", run.name, run.outcome);
+        }
+        let root = element_children(&dom, dom.root)
+            .first()
+            .copied()
+            .expect("the fixture has an <html>");
+        dom.attr(root, "class").unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn the_wikipedia_fixtures_first_script_runs_and_sets_the_root_class() {
+        // With an empty jar the script still runs: `document.cookie` is `""`,
+        // `.match` returns null, and the class list it builds is assigned.
+        let classes = wikipedia_root_class(&Jar::new());
+        assert!(
+            classes.starts_with("client-js "),
+            "the script's class list never reached <html>: {classes}"
+        );
+        assert!(
+            !classes.contains("client-nojs"),
+            "the parser's class list is still there: {classes}"
+        );
+        // The cascade now sees the document the page describes: the sixteen
+        // classes Wikipedia's own stylesheets are written against, not the
+        // fifteen-plus-`nojs` the parser saw.
+        assert_eq!(classes.split_whitespace().count(), 16, "{classes}");
+        assert!(classes.contains("skin-theme-clientpref-day"), "{classes}");
+    }
+
+    #[test]
+    fn a_seeded_preference_cookie_rewrites_the_class_the_page_would_have_had() {
+        // The difference between "the script no longer throws" and "the cookie
+        // is read": this preference only reaches the class list through
+        // `document.cookie`.
+        let jar = Jar::new();
+        jar.write_from_script(
+            "enwikimwclientpreferences=skin-theme-clientpref-night; path=/",
+            &Scope::of("https://en.wikipedia.org/wiki/Cat").expect("a host"),
+            cookies::now(),
+        )
+        .expect("the preference cookie is ordinary");
+
+        let classes = wikipedia_root_class(&jar);
+        assert!(
+            classes.contains("skin-theme-clientpref-night"),
+            "the cookie's preference did not reach the class list: {classes}"
+        );
+        assert!(
+            !classes.contains("skin-theme-clientpref-day"),
+            "the default was left in place beside the preference: {classes}"
         );
     }
 
@@ -3166,6 +3411,7 @@ mod tests {
                     url: "https://fixture.test/page",
                     console: &console,
                     storage: &Storage::new(),
+                    cookies: &Jar::new(),
                 },
                 crate::timers::TimerId(id),
             );
@@ -3382,6 +3628,7 @@ mod tests {
                 url: "https://fixture.test/page",
                 console: &console,
                 storage: &Storage::new(),
+                cookies: &Jar::new(),
             },
             js::Target::Node(target.0),
             "click",
@@ -3662,7 +3909,8 @@ mod tests {
         // divided into it.
         const NODES: usize = 500;
         let console = Console::new();
-        let mut host = Some(Host::new(&console, &Storage::new()).expect("the engine starts"));
+        let mut host =
+            Some(Host::new(&console, &Storage::new(), &Jar::new()).expect("the engine starts"));
 
         let mut warm = html::parse("<p>x</p><script>1</script>");
         js::run_pass(&mut host, &mut warm, 1, &console);
@@ -3917,7 +4165,8 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/en.wikipedia.org.html"
         ));
-        let mut host = Some(Host::new(&Console::new(), &Storage::new()).expect("host starts"));
+        let mut host =
+            Some(Host::new(&Console::new(), &Storage::new(), &Jar::new()).expect("host starts"));
 
         let mut warm = html::parse("<p>x</p><script>1</script>");
         js::run_pass(&mut host, &mut warm, 1, &Console::new());

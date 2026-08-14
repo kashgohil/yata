@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use crate::dom::Dom;
 use crate::html;
 use crate::js::console::Console;
+use crate::js::cookies::Jar;
 use crate::js::storage::Storage;
 use crate::js::{self, Host, PageContext, SCRIPT_BUDGET, Target};
 use crate::timers::TimerId;
@@ -36,6 +37,7 @@ struct Page {
     host: Option<Host>,
     console: Console,
     storage: Storage,
+    cookies: Jar,
 }
 
 impl Page {
@@ -48,18 +50,24 @@ impl Page {
             host: None,
             console: Console::new(),
             storage: Storage::new(),
+            cookies: Jar::new(),
         };
         let (mut queue, _) =
             js::queue::ScriptQueue::new(js::sources::sources(&page.dom), &page.console);
         let ready = queue.take_ready_prefix();
         // Borrowed pieces rather than `&page`, so the context does not hold a
         // shared borrow across the mutable one `run_prefix` needs.
-        let (console, storage) = (page.console.clone(), page.storage.clone());
+        let (console, storage, cookies) = (
+            page.console.clone(),
+            page.storage.clone(),
+            page.cookies.clone(),
+        );
         let ctx = PageContext {
             page: 1,
             url: "https://hostile.test/page",
             console: &console,
             storage: &storage,
+            cookies: &cookies,
         };
         js::run_prefix(
             &mut page.host,
@@ -81,6 +89,7 @@ impl Page {
             url: "https://hostile.test/page",
             console: &self.console,
             storage: &self.storage,
+            cookies: &self.cookies,
         };
         js::dispatch(
             &mut self.host,
@@ -97,6 +106,7 @@ impl Page {
             url: "https://hostile.test/page",
             console: &self.console,
             storage: &self.storage,
+            cookies: &self.cookies,
         };
         if let Some(host) = self.host.as_mut() {
             let _ = js::fire_timer(host, &mut self.dom, &ctx, TimerId(id));
