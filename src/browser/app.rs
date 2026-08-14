@@ -1746,7 +1746,13 @@ impl App {
             // rather than inside it, because `location.replace('#x')` is a
             // fragment jump that happens not to push, and the two callers must
             // reach the same place (M11.4).
-            if same_document(&cur, &url) {
+            //
+            // A fragment jump is a navigation that *has* a fragment. Going to
+            // the same document **without** one is a reload (HTML), not a jump
+            // to the top: it is what the URL bar does when the reader re-enters
+            // the page's own URL, and what `location.reload()` has always been
+            // spelled as. Both fall through to the fetch below.
+            if url.contains('#') && same_document(&cur, &url) {
                 return self.jump_to_fragment(url, push_history);
             }
             if push_history {
@@ -5704,8 +5710,22 @@ mod tests {
         // Wikipedia and is invisible on screen, which is exactly why the test
         // asserts on counters rather than on appearance alone.
         let mut app = anchored_page(80, 10);
-        let before = stages(&app);
         assert!(!top_row(&app).contains("the target"));
+
+        // A search session open across the jump. The document it points into
+        // is the same document, so it survives — unlike a real navigation,
+        // which replaces the document and clears it. `jump_to_fragment` says
+        // so in a comment; this is what holds it to that.
+        app.update(ch('/'));
+        for c in "before".chars() {
+            app.update(ch(c));
+        }
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let matches = app.search.as_ref().map(|s| s.matches.len());
+        assert!(matches.is_some_and(|n| n > 0), "the fixture needs matches");
+        app.update(ch('g'));
+        app.update(ch('g'));
+        let before = stages(&app);
 
         let effect = app.update(click_first_link(&app));
         assert!(
@@ -5720,6 +5740,11 @@ mod tests {
         );
         assert_eq!(top_row(&app), "the target");
         assert!(app.viewport.offset() > 0);
+        assert_eq!(
+            app.search.as_ref().map(|s| s.matches.len()),
+            matches,
+            "a fragment jump cleared the search session"
+        );
     }
 
     #[test]
@@ -5786,6 +5811,49 @@ mod tests {
         app.follow_href("#");
         assert_eq!(app.viewport.offset(), 0, "a bare # must go to the top");
         assert_eq!(app.current_url().as_deref(), Some("http://final/#"));
+    }
+
+    #[test]
+    fn the_same_url_without_a_fragment_reloads_rather_than_jumping() {
+        // M11.4 review. "Same document" is not the same thing as "a fragment
+        // jump": a navigation to the current URL with **no** fragment is a
+        // reload (HTML), and the two ways a reader reaches it are the URL bar
+        // and a page's own `location.reload()`. Deciding those by
+        // `same_document` alone scrolled them to the top of the page and — for
+        // the URL bar — pushed a history entry for a navigation that never
+        // happened.
+        let mut app = anchored_page(80, 10);
+        app.follow_href("#target");
+        let at_target = app.viewport.offset();
+        assert!(at_target > 0);
+
+        // The URL bar, re-entering the page's own URL, fragment and all
+        // stripped by the reader.
+        app.update(ch('o'));
+        for c in "http://final/".chars() {
+            app.update(ch(c));
+        }
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            effect.fetch.map(|(_, url)| url).as_deref(),
+            Some("http://final/"),
+            "re-entering the current URL did not reload"
+        );
+    }
+
+    #[test]
+    fn location_reload_refetches_the_page() {
+        // The other caller of the same rule: `location.reload()` is
+        // `navigate(href, replace)` in the binding, so a fragmentless
+        // same-document navigation has to reach the network or the page's own
+        // reload button does nothing (M10.11) — or, worse, silently scrolls
+        // the reader to the top.
+        let (mut app, id) = scripted_app("<p>page</p><script>location.reload();</script>");
+        let effect = app.update(Msg::RunScripts { id });
+        let (again, url) = effect.fetch.expect("location.reload() did not fetch");
+        assert_eq!(url, "http://final/");
+        assert_ne!(again, id, "a reload is a new generation");
+        assert!(!app.history.can_back(), "a reload is not a history entry");
     }
 
     #[test]
