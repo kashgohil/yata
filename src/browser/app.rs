@@ -6896,6 +6896,161 @@ mod tests {
         );
     }
 
+    /// Turn M11.5's inserted-script detection off — **both halves**: the drain
+    /// after every tick, and the tag comparison the insert bindings make. The
+    /// A side of the measurement below, and its only caller.
+    #[cfg(test)]
+    fn without_insert_detection(app: &mut App) {
+        app.no_insert_detection = true;
+        if let Some(host) = app.js_host.as_ref() {
+            host.disarm_script_inserts();
+        }
+    }
+
+    /// A measurement, not an assertion — the M11.3 shape, A/B interleaved in
+    /// one process because this machine drifts several percent between runs.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_a_tick_that_inserts_no_script -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_a_tick_that_inserts_no_script() {
+        // Deliverable 9. The detection sits on the invalidation path, which is
+        // a keypress→screen path (PLAN.md §4: 10 ms) — and the number that
+        // matters is the one for pages that never insert a script, because
+        // that is every page on the ladder but one.
+        //
+        // Two groups, because the cost has two halves and they live in
+        // different places. The turns are M11.3's, so its table is the
+        // baseline; the tick below isolates the per-call half at a scale where
+        // it could show up at all.
+        const ROUNDS: usize = 5;
+        const TURNS: [(&str, &str, &str); 2] = [
+            (
+                "changes nothing        ",
+                "",
+                "document.querySelectorAll('a').length;",
+            ),
+            (
+                "leaf class, paint only ",
+                ".x-tint { color: #c00 }",
+                "document.getElementById('x11-3-leaf').className = 'x-tint';",
+            ),
+        ];
+
+        // One side of one pair: build the page, run the turn, **drop the app**.
+        // The drop is not tidiness — a Wikipedia `App` is several megabytes of
+        // DOM, styles and boxes, and leaving the first side's alive while the
+        // second runs is a systematic tax on whichever side goes second. It
+        // was worth ~5% here, which is the entire size of the effect being
+        // looked for.
+        let one_turn = |source: &str, detection: bool| -> (Duration, usize) {
+            let (mut app, id) = scripted_app(source);
+            if !detection {
+                without_insert_detection(&mut app);
+            }
+            let elapsed = timed_js_turn(&mut app, id);
+            (elapsed, app.dom.as_ref().map_or(0, |d| d.node_count()))
+        };
+
+        let mut before = vec![Vec::new(); TURNS.len()];
+        let mut after = vec![Vec::new(); TURNS.len()];
+        let mut nodes = 0;
+        // Round 0 is thrown away: the first turn in the process pays for pages
+        // the allocator has not touched and code the CPU has not seen.
+        for round in 0..=ROUNDS {
+            for (i, (_, css, script)) in TURNS.iter().enumerate() {
+                let source = wikipedia_with_script(css, script);
+                // Which side goes first alternates, so any residue of running
+                // second cancels across rounds instead of landing on one
+                // column.
+                let (off, on) = match round % 2 == 0 {
+                    true => {
+                        let (off, _) = one_turn(&source, false);
+                        let (on, count) = one_turn(&source, true);
+                        nodes = count;
+                        (off, on)
+                    }
+                    false => {
+                        let (on, count) = one_turn(&source, true);
+                        let (off, _) = one_turn(&source, false);
+                        nodes = count;
+                        (off, on)
+                    }
+                };
+                if round > 0 {
+                    before[i].push(off);
+                    after[i].push(on);
+                }
+            }
+        }
+        eprintln!(
+            "M11.5 turns on en.wikipedia.org ({nodes} nodes), mean of {ROUNDS} interleaved rounds:"
+        );
+        for (i, (what, _, _)) in TURNS.iter().enumerate() {
+            eprintln!(
+                "  tick that {what}  without detection {}  ->  with {}",
+                summarize(&before[i]),
+                summarize(&after[i]),
+            );
+        }
+
+        // The other half: the tag comparison each `appendChild` makes. It is
+        // paid per call, not per tick, so it is measured on a tick that makes
+        // a great many of them — 4,000, which is as many as fit comfortably
+        // inside one 100 ms budget, since an interrupted tick would time the
+        // budget rather than the work. One call is orders of
+        // magnitude below anything this machine can see.
+        //
+        // Into a **detached** holder on a small page, on purpose. Appending
+        // into the document would make the number a measurement of the
+        // relayout that follows (at 20,000 nodes it was already the whole
+        // 100 ms budget), and the relayout is not what changed. Detached, the
+        // binding runs exactly as it does in the document — `record` does not
+        // care whether the node is connected; `App` decides that later — so
+        // what is left in the number is the calls themselves.
+        //
+        // The detection is turned off *after* the script pass, so the host
+        // exists and the A side runs with the bindings genuinely disarmed.
+        const APPENDS: usize = 4_000;
+        let page = format!(
+            "<p>small page</p><script>setTimeout(function () {{\
+               var host = document.createElement('div');\
+               for (var i = 0; i < {APPENDS}; i++) host.appendChild(document.createElement('p'));\
+             }}, 0);</script>"
+        );
+        let (mut off, mut on) = (Vec::new(), Vec::new());
+        for round in 0..=ROUNDS {
+            let order = match round % 2 == 0 {
+                true => [false, true],
+                false => [true, false],
+            };
+            for armed in order {
+                let (mut app, id) = scripted_app(&page);
+                app.update(Msg::RunScripts { id });
+                if !armed {
+                    without_insert_detection(&mut app);
+                }
+                let started = Instant::now();
+                app.update(Msg::Timer {
+                    page: id,
+                    id: TimerId(1),
+                });
+                let elapsed = started.elapsed();
+                if round > 0 {
+                    if armed { &mut on } else { &mut off }.push(elapsed);
+                }
+            }
+        }
+        eprintln!(
+            "M11.5 tick of {APPENDS} appendChild, mean of {ROUNDS} interleaved rounds:\n  \
+             without detection {}  ->  with {}",
+            summarize(&off),
+            summarize(&on),
+        );
+    }
+
     // ---- F2: the computed-styles surface (M4.5) ---------------------------
 
     #[test]

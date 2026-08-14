@@ -799,3 +799,89 @@ nobody can see.
 The remaining ~130 µs of the turn is the frame diff and present. A jump repaints
 every row (the whole viewport moved); a `j` scroll repaints one row's worth of
 difference, which is the whole of the 32 µs baseline.
+
+## M11.5 — a script inserted by a script: what it costs the pages that never do it (2026-08-14)
+
+Machine A, release build, mean of 5 **interleaved** rounds after one discarded
+warm-up round. The detection is on and off in the same process, on the same
+page, alternating case by case; **which side runs first alternates by round**,
+and each side's `App` is dropped before the other is built. Both matter here —
+a Wikipedia `App` is several megabytes of DOM, styles and boxes, and leaving
+one alive while the other side runs was worth ~5% to whichever went second,
+which is larger than the entire effect being looked for.
+
+    cargo test --release --lib measure_a_tick_that_inserts_no_script -- --ignored --nocapture --test-threads=1
+
+The A side is `App::no_insert_detection`, which turns off **both halves** of the
+detection: the drain after every tick, and the tag comparison the insert
+bindings make (`Host::disarm_script_inserts`, a field that does not exist in a
+release build).
+
+### The turns M11.3 measured, with the detection and without
+
+**en.wikipedia.org, 25,602 nodes:**
+
+| turn | without detection | with |
+| --- | --- | --- |
+| a tick that changes nothing | 7.80 ms (7.63–7.94) | 7.58 ms (7.39–7.74) |
+| leaf class, paint only | 3.20 ms (3.04–3.31) | 3.23 ms (2.89–3.48) |
+
+**No difference, and the sign flips between runs** — over three consecutive
+runs of the pair the "with" column was faster twice and slower once on each
+turn. Against M11.3's table on the same page (`tick that changes nothing`
+10.6 ms, `leaf class, paint only` 4.00 ms) both turns are where that task left
+them; the absolute numbers drift a few percent between sittings, which is what
+the interleaving exists to see through.
+
+**Keypress→screen (PLAN.md §4: 10 ms) is unchanged**, which is the whole claim:
+the paint-only turn still fits by 3×, and nothing on it got slower.
+
+### Why there is nothing to see, structurally
+
+The signal is not a change list in the arena, which is what M11.3's precedent
+would have suggested. It is a queue the *bindings* push to
+(`js::bindings::InsertQueue`), for two reasons, and the cost is the second one:
+
+- `Dom::append` is also how `innerHTML` builds a subtree, so an arena-level
+  signal could not tell an `appendChild` from a fragment parse — and a
+  `<script>` written by `innerHTML` must never run;
+- a tick that inserts nothing **calls nothing**. There is no per-tick read to
+  pay for: `appendChild`, `insertBefore` and a `src` write are the only three
+  places that push, and the drain after a tick is `mem::take` of an empty
+  `Vec`, which does not allocate.
+
+So the only per-tick cost is on ticks that already call an insert binding, and
+it is one tag comparison per call.
+
+### The per-call half, isolated
+
+| tick | without detection | with |
+| --- | --- | --- |
+| 4,000 `appendChild` into a detached holder | 30.70 ms (29.00–32.44) | 30.54 ms (28.62–31.79) |
+
+Also inside the noise, and also sign-flipping across runs. Two notes on how
+this one is set up, because both were got wrong first:
+
+- **Detached, on a small page.** Appending into the document makes the number a
+  measurement of the relayout that follows — at 20,000 nodes that was the whole
+  100 ms script budget — and the relayout is not what changed. `record` does
+  not care whether the node is connected (`App` decides that later), so a
+  detached holder runs the binding exactly as the document does and leaves only
+  the calls in the number.
+- **4,000, not 100,000.** A tick that overruns `SCRIPT_BUDGET` is interrupted,
+  so both sides report 100 ms and the comparison says nothing. 4,000 calls fit
+  inside one budget with room.
+
+**The honest summary: the detection is not measurable on a tick that inserts no
+script, on this machine, at this spread.** That is the number that matters,
+because one ladder page in five injects a script and the other four do not.
+
+### What the pages that *do* insert a script pay
+
+Not measured as a budget case, because it is not a keypress→screen path: an
+insertion asks the loop for a fresh turn, and the turn costs whatever the
+script it runs costs. What is bounded is the *number* of them —
+`js::queue::MAX_INSERTED_SCRIPTS` = 32 per page — and `js::hostile`'s
+`a_script_that_appends_a_script_forever_stops_and_q_still_quits` pins the
+consequence: the chain stops after exactly 32 turns, each turn returns inside
+3× the script budget, and `q` quits both during the chain and after it.
