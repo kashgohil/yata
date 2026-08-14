@@ -106,26 +106,65 @@ fn run_scripts_from(
 
     let mut runs = Vec::new();
     let mut settled = 0usize;
-    let mut scripts_done = false;
+    // The `load`/`error` an inserted script's element is owed once its body
+    // has actually run (M11.5).
+    let mut owed_event: Option<(crate::dom::NodeId, &'static str)> = None;
     loop {
-        if !scripts_done {
-            let ready = queue.take_ready_prefix();
-            let finished = queue.is_finished();
-            if !ready.is_empty() || finished {
-                runs.extend(js::run_prefix(
-                    &mut host,
-                    dom,
-                    &js::PageContext {
-                        page: HEADLESS_PAGE,
-                        url: base_url.unwrap_or_default(),
-                        console: &console,
-                        storage: &storage,
-                    },
-                    ready,
-                    finished,
-                ));
-            }
-            scripts_done = finished;
+        // Scripts a previous tick inserted (M11.5) join the queue before this
+        // round's prefix is taken, which is what makes them run in a *later*
+        // turn — the same rule the TUI follows, with this loop standing in for
+        // the event loop. The page bound in `js::queue` is what stops a script
+        // that appends a script from making this loop endless.
+        adopt_inserted_scripts(
+            host.as_ref(),
+            dom,
+            &mut queue,
+            &console,
+            base_url.filter(|_| fetch_externals),
+            &tx,
+            &mut in_flight,
+        );
+
+        let ready = queue.take_ready_prefix();
+        let finished = queue.take_finished();
+        let mut ran = !ready.is_empty() || finished;
+        if ran {
+            runs.extend(js::run_prefix(
+                &mut host,
+                dom,
+                &js::PageContext {
+                    page: HEADLESS_PAGE,
+                    url: base_url.unwrap_or_default(),
+                    console: &console,
+                    storage: &storage,
+                },
+                ready,
+                finished,
+            ));
+        }
+
+        // An inserted script's `load` or `error` (M11.5), fired **after** the
+        // prefix that ran its body — `load` means "it ran". It is owed from
+        // the previous round, because that is when the body arrived and this
+        // is when it executed. `--dump-js` is what M11.25's ladder sweep
+        // reads, so a page that chains on `onload` has to behave here the way
+        // it behaves in the TUI.
+        if let Some((node, kind)) = owed_event.take() {
+            js::dispatch(
+                &mut host,
+                dom,
+                &js::PageContext {
+                    page: HEADLESS_PAGE,
+                    url: base_url.unwrap_or_default(),
+                    console: &console,
+                    storage: &storage,
+                },
+                js::Target::Node(node.0),
+                kind,
+            );
+            // The handler may have inserted the next link in a chain, which
+            // the top of the next round adopts.
+            ran = true;
         }
 
         // A tick may have asked for `fetch()`. On the fetching path we perform
@@ -150,14 +189,24 @@ fn run_scripts_from(
             }
         }
 
-        if in_flight == 0 || (scripts_done && settled >= MAX_HEADLESS_FETCHES) {
+        if in_flight == 0 && !ran {
             break;
+        }
+        if settled >= MAX_HEADLESS_FETCHES && queue.is_finished() {
+            break;
+        }
+        // A tick that ran but asked for nothing over the wire may still have
+        // inserted a script; go round again rather than blocking on a `recv`
+        // no worker will answer.
+        if in_flight == 0 {
+            continue;
         }
         // Block for the next answer. Every worker always replies, so this
         // cannot wait longer than the requests themselves take.
         match rx.recv() {
             Ok(Msg::Script { slot, source, .. }) => {
-                if source.is_none() {
+                let failed = source.is_none();
+                if failed {
                     console.push(
                         js::console::Level::Warn,
                         None,
@@ -165,6 +214,12 @@ fn run_scripts_from(
                         "a <script src> could not be fetched",
                     );
                 }
+                // Only an *inserted* slot names an element; a document-order
+                // `<script src>` has none, because nothing could have put a
+                // listener on it before the page ran.
+                owed_event = queue
+                    .element(slot)
+                    .map(|node| (node, if failed { "error" } else { "load" }));
                 queue.fill(slot, source);
                 in_flight -= 1;
             }
@@ -196,6 +251,49 @@ fn run_scripts_from(
     // did nothing".
     let pending = host.as_mut().map_or(0, js::Host::pending_timers);
     (runs, console, pending)
+}
+
+/// The headless half of `App::adopt_inserted_scripts` (M11.5): the `<script>`
+/// elements the last tick put into the document join the queue, and the
+/// external ones go out to a worker exactly where the document's own do.
+///
+/// The decisions themselves are not duplicated — `connected_script` and
+/// `ScriptQueue::insert` are the same two calls `App` makes, in the same
+/// order. What differs is only where the worker is spawned from, which is what
+/// differs between the two paths for every other subresource too.
+fn adopt_inserted_scripts(
+    host: Option<&js::Host>,
+    dom: &Dom,
+    queue: &mut js::queue::ScriptQueue,
+    console: &Console,
+    base_url: Option<&str>,
+    tx: &mpsc::Sender<Msg>,
+    in_flight: &mut usize,
+) {
+    for candidate in host.map(js::Host::take_script_inserts).unwrap_or_default() {
+        let node = crate::dom::NodeId(candidate);
+        let name = format!("inserted#{}", queue.inserted() + 1);
+        let Some(script) = js::sources::connected_script(dom, node, &name) else {
+            continue;
+        };
+        if let js::queue::Inserted::Fetch(external) = queue.insert(node, script, console) {
+            match base_url.and_then(|base| net::resolve_url(base, &external.url)) {
+                Some(url) => {
+                    net::spawn_script(FetchId(1), external.slot, url, tx.clone());
+                    *in_flight += 1;
+                }
+                None => {
+                    console.push(
+                        js::console::Level::Warn,
+                        Some(external.url.clone()),
+                        None,
+                        "this inserted script's URL was not fetched",
+                    );
+                    queue.fill(external.slot, None);
+                }
+            }
+        }
+    }
 }
 
 /// How many `fetch()` calls one headless run will answer. A page that fetches
@@ -266,6 +364,47 @@ mod tests {
             "a deferred callback reached a headless dump"
         );
         assert!(with_timer.contains("p"), "{with_timer}");
+    }
+
+    #[test]
+    fn a_script_a_script_inserted_reaches_a_headless_dump() {
+        // M11.5: the dumps have to show what the TUI shows, so the loop above
+        // adopts insertions between rounds the way the event loop adopts them
+        // between turns.
+        let mut dom = html::parse(
+            "<p>parsed</p><script>\
+             var s = document.createElement('script');\
+             s.textContent = \"document.body.appendChild(document.createElement('p'))\
+                              .textContent = 'inserted';\";\
+             document.body.appendChild(s);</script>",
+        );
+        let dump = box_dump(&mut dom, None, 40);
+        assert!(dump.contains("\"inserted\""), "{dump}");
+    }
+
+    #[test]
+    fn a_chain_of_insertions_terminates_a_headless_dump() {
+        // The same bound the TUI has (`js::queue::MAX_INSERTED_SCRIPTS`), doing
+        // the same job in a loop that has no reader to rescue it: without one,
+        // a `--dump-text` of a page like this never returns.
+        let mut dom = html::parse(
+            "<p>parsed</p><script>\
+             window.link = function () {\
+               var s = document.createElement('script');\
+               s.textContent = 'link();';\
+               document.body.appendChild(s);\
+             };\
+             link();</script>",
+        );
+        let (_, console, _) = run_scripts(&mut dom, None);
+        assert!(
+            console
+                .entries()
+                .iter()
+                .any(|e| e.text.contains("as many as this browser will run")),
+            "the chain stopped for some reason other than the bound: {:?}",
+            console.entries()
+        );
     }
 
     #[test]
