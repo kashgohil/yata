@@ -100,7 +100,7 @@ use rquickjs::{
 };
 
 use crate::dom::Dom;
-use crate::js::bindings::{FetchQueue, NavQueue, NavRequest, TimerAsk, TimerQueue};
+use crate::js::bindings::{FetchQueue, InsertQueue, NavQueue, NavRequest, TimerAsk, TimerQueue};
 use crate::js::console::{Console, Level};
 use crate::js::storage::Storage;
 use crate::net::JsResponse;
@@ -419,6 +419,10 @@ pub struct Host {
     navigation: NavQueue,
     /// `fetch()` calls the page asked for (M10.12), drained the same way.
     fetches: FetchQueue,
+    /// `<script>` elements a tick put into the document (M11.5), drained the
+    /// same way. Nothing here decides whether one of them runs — `App` does,
+    /// against the tree, and the fetch happens on a worker.
+    inserts: InsertQueue,
     /// The engine handle. `Context` keeps the runtime alive on its own, so
     /// this is not what makes the host valid — it is how the limits get set
     /// and how the tests read the heap back. Holding it is deliberate: it is
@@ -469,11 +473,21 @@ impl Host {
         let timers = TimerQueue::default();
         let navigation = NavQueue::default();
         let fetches = FetchQueue::default();
+        let inserts = InsertQueue::default();
         let entries = context.with(|ctx| {
-            bindings::install(&ctx, &dom, console, &timers, &navigation, storage, &fetches)
-                .map(|entry_points| Persistent::save(&ctx, entry_points))
-                .catch(&ctx)
-                .map_err(|caught| JsError::from_caught("<bindings>", &caught))
+            bindings::install(
+                &ctx,
+                &dom,
+                console,
+                &timers,
+                &navigation,
+                storage,
+                &fetches,
+                &inserts,
+            )
+            .map(|entry_points| Persistent::save(&ctx, entry_points))
+            .catch(&ctx)
+            .map_err(|caught| JsError::from_caught("<bindings>", &caught))
             // A prelude that will not install is a broken engine, not a broken
             // page: fail here rather than hand every script a DOM-less window.
         })?;
@@ -483,6 +497,7 @@ impl Host {
             timers,
             navigation: navigation.clone(),
             fetches: fetches.clone(),
+            inserts,
             runtime,
             context,
             budget,
@@ -615,6 +630,24 @@ impl Host {
     /// `fetch()` calls the tick that just ended asked for.
     pub fn take_fetch_requests(&self) -> Vec<FetchAsk> {
         self.fetches.drain()
+    }
+
+    /// `<script>` elements the tick that just ended put into the document
+    /// (M11.5), as arena node ids.
+    ///
+    /// **Candidates, not decisions.** The bindings record what was inserted;
+    /// whether any of them is a script this engine runs — connected, not
+    /// inside a `<template>`, not already started — is answered by `App`
+    /// through `sources::connected_script`, against the tree it owns.
+    pub fn take_script_inserts(&self) -> Vec<u32> {
+        self.inserts.drain()
+    }
+
+    /// Turn the inserted-script check off for M11.5's interleaved measurement,
+    /// and nothing else.
+    #[cfg(test)]
+    pub fn disarm_script_inserts(&self) {
+        self.inserts.disarm();
     }
 
     /// Settle one `fetch()` promise (M10.12). Unknown ids do nothing: a

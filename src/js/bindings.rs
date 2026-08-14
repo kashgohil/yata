@@ -197,6 +197,79 @@ impl FetchQueue {
     }
 }
 
+/// `<script>` elements a tick put into the document (M11.5), collected for
+/// `App` to hand to the execution queue.
+///
+/// Same discipline as the timer, navigation and fetch queues: the binding
+/// records *that an element became part of the document*, and `App` decides
+/// what that means — whether the element is connected, whether it sits inside
+/// something inert, whether it has already run. Nothing here reads the queue
+/// or starts a fetch.
+///
+/// **What this costs a tick that inserts no script: nothing.** The list is
+/// only ever pushed to from inside `appendChild`, `insertBefore` and a `src`
+/// write, so a tick that calls none of them does no work at all, and one that
+/// calls them pays a tag comparison per call. That is why the signal is here
+/// and not a change list in the arena like M11.3's: an arena list would have
+/// to be *read* after every tick whether or not anything inserted anything,
+/// and `appendChild` is the only place that knows an insert happened at all —
+/// `Dom::append` is also how `innerHTML` builds a subtree, and a script
+/// written by `innerHTML` must never run.
+#[derive(Clone, Default)]
+pub struct InsertQueue {
+    /// Node ids, in insertion order.
+    nodes: Rc<RefCell<Vec<u32>>>,
+    /// A/B switch for M11.5's measurement, and nothing else: disarmed, the
+    /// whole check — including the tag test at each call site — is skipped,
+    /// which is the code as it was before this task. The field does not exist
+    /// in a release build, so neither does the branch.
+    #[cfg(test)]
+    disarmed: Rc<Cell<bool>>,
+}
+
+impl InsertQueue {
+    /// Take everything recorded since the last drain.
+    pub fn drain(&self) -> Vec<u32> {
+        std::mem::take(&mut *self.nodes.borrow_mut())
+    }
+
+    /// Whether the call sites should look at what they are inserting.
+    #[cfg(test)]
+    fn armed(&self) -> bool {
+        !self.disarmed.get()
+    }
+
+    #[cfg(not(test))]
+    fn armed(&self) -> bool {
+        true
+    }
+
+    /// Turn the check off for the interleaved measurement (see `disarmed`).
+    #[cfg(test)]
+    pub fn disarm(&self) {
+        self.disarmed.set(true);
+    }
+
+    /// Record `node` if it is a `<script>` element and the page still has
+    /// budget. Connectivity is *not* decided here — `App` decides it, against
+    /// the tree, through `js::sources::connected_script`.
+    fn record(&self, dom: &Dom, node: NodeId) {
+        if !self.armed()
+            || !matches!(&dom.node(node).data, NodeData::Element { tag, .. } if tag == "script")
+        {
+            return;
+        }
+        // The page's real bound is `ScriptQueue`'s, which counts insertions
+        // over the page's whole life. This is the matching bound on the
+        // *list*: one tick, so a page appending script elements in a loop
+        // cannot buy memory with attempts the queue is going to refuse anyway.
+        let mut nodes = self.nodes.borrow_mut();
+        if nodes.len() < crate::js::queue::MAX_INSERTED_SCRIPTS {
+            nodes.push(node.0);
+        }
+    }
+}
+
 /// Whether `name` is one the serializer could write and the tokenizer read
 /// back as the same attribute.
 ///
@@ -244,6 +317,10 @@ const CONSOLE_MAX_ITEMS: u32 = 20;
 
 /// Install the primitives and evaluate the prelude that builds the object
 /// model on top of them. Called once per host.
+// Eight arguments, and each is a distinct thing the page can reach: the tree,
+// the console, and the four queues a tick fills for the loop to drain. Bundling
+// them would name a group that has no other use and no other caller.
+#[allow(clippy::too_many_arguments)]
 pub fn install<'js>(
     ctx: &Ctx<'js>,
     slot: &Rc<DomSlot>,
@@ -252,6 +329,7 @@ pub fn install<'js>(
     navigation: &NavQueue,
     storage: &Storage,
     fetches: &FetchQueue,
+    inserts: &InsertQueue,
 ) -> JsResult<Object<'js>> {
     let api = Object::new(ctx.clone())?;
 
@@ -529,31 +607,43 @@ pub fn install<'js>(
         })?,
     )?;
 
-    let s = Rc::clone(slot);
+    // The two insertion routes (M11.5). Each records the node it just put in
+    // the tree *after* the arena accepted the edit — a refused insert has not
+    // inserted anything — and `App` decides what the record means. Note what
+    // is not here: `setInnerHTML` builds its subtree through the same
+    // `Dom::append`, and deliberately records nothing, which is how a
+    // `<script>` written by `innerHTML` stays unrun.
+    let (s, queue) = (Rc::clone(slot), inserts.clone());
     api.set(
         "appendChild",
         Function::new(ctx.clone(), move |ctx: Ctx<'_>, parent: u32, child: u32| {
-            let outcome = s.with_mut(&ctx, |dom| match (node(dom, parent), node(dom, child)) {
-                (Some(parent), Some(child)) => dom.append(parent, child),
-                _ => Err(DomError::NotFound),
+            let outcome = s.with_mut(&ctx, |dom| {
+                let (Some(parent), Some(child)) = (node(dom, parent), node(dom, child)) else {
+                    return Err(DomError::NotFound);
+                };
+                dom.append(parent, child)?;
+                queue.record(dom, child);
+                Ok(())
             })?;
             outcome.map_err(|error| throw_dom_error(&ctx, error))
         })?,
     )?;
 
-    let s = Rc::clone(slot);
+    let (s, queue) = (Rc::clone(slot), inserts.clone());
     api.set(
         "insertBefore",
         Function::new(
             ctx.clone(),
             move |ctx: Ctx<'_>, parent: u32, child: u32, reference: u32| {
                 let outcome = s.with_mut(&ctx, |dom| {
-                    match (node(dom, parent), node(dom, child), node(dom, reference)) {
-                        (Some(parent), Some(child), Some(reference)) => {
-                            dom.insert_before(parent, child, reference)
-                        }
-                        _ => Err(DomError::NotFound),
-                    }
+                    let (Some(parent), Some(child), Some(reference)) =
+                        (node(dom, parent), node(dom, child), node(dom, reference))
+                    else {
+                        return Err(DomError::NotFound);
+                    };
+                    dom.insert_before(parent, child, reference)?;
+                    queue.record(dom, child);
+                    Ok(())
                 })?;
                 outcome.map_err(|error| throw_dom_error(&ctx, error))
             },
@@ -592,7 +682,7 @@ pub fn install<'js>(
         })?,
     )?;
 
-    let s = Rc::clone(slot);
+    let (s, queue) = (Rc::clone(slot), inserts.clone());
     api.set(
         "setAttribute",
         Function::new(
@@ -607,6 +697,19 @@ pub fn install<'js>(
                 s.with_mut(&ctx, |dom| {
                     if let Some(node) = node(dom, id) {
                         dom.set_attr(node, &name, &value);
+                        // The third insertion route (M11.5): a `src` written
+                        // on a script element that is *already* in the tree,
+                        // which is what a page does when it reuses one. It
+                        // arrives as an attribute write rather than an
+                        // insertion, and the two must not disagree — the
+                        // element the GA snippet builds takes **both** routes
+                        // (`a.src = g` while detached, then `insertBefore`),
+                        // so what keeps it from running twice is the queue's
+                        // "already started" list and not a rule here about
+                        // which signal wins.
+                        if name.eq_ignore_ascii_case("src") {
+                            queue.record(dom, node);
+                        }
                     }
                 })
             },
