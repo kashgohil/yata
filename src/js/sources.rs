@@ -60,63 +60,126 @@ const CLASSIC_TYPES: [&str; 6] = [
     "text/jscript",
 ];
 
-/// Every script the document asks for, in the order it asks.
-pub fn sources(dom: &Dom) -> Vec<Script> {
+/// Containers the walk refuses to descend into. Not a matter of *type* — the
+/// elements inside are real `<script>`s — so the walk has to refuse.
+///
+/// `<template>` holds a parse of something the page may clone later; a browser
+/// keeps it in a separate fragment where nothing executes. `<noscript>`, with
+/// scripting enabled, is not parsed as markup at all — it is raw text — so
+/// there is no script element in there to find. Our tokenizer does parse it as
+/// markup, so this is where the same result is reached. Getting this wrong
+/// would make the engine both hide a page's no-JS fallback (M10.2's UA rule)
+/// *and* run the script inside it: the worst of both.
+///
+/// One list, read by both the document walk and [`connected_script`], because
+/// M11.5's dynamic path has to reach the same answer as the parsed one rather
+/// than hold its own opinion about where a script does not run.
+const INERT: [&str; 2] = ["template", "noscript"];
+
+/// Every script the document asks for, in the order it asks, **with the
+/// element that asked**.
+///
+/// The node travels with the description because "this element has already
+/// been accounted for" is the DOM's own rule for never running a script twice
+/// (M11.5), and this walk is the only place that knows which element a slot
+/// came from. Without it a page that moved one of its own `<script>` elements
+/// would re-run it.
+pub fn sources(dom: &Dom) -> Vec<(NodeId, Script)> {
     let mut out = Vec::new();
     collect(dom, dom.root, &mut out);
     out
 }
 
-fn collect(dom: &Dom, node: NodeId, out: &mut Vec<Script>) {
+fn collect(dom: &Dom, node: NodeId, out: &mut Vec<(NodeId, Script)>) {
     if let NodeData::Element { tag, .. } = &dom.node(node).data {
-        match tag.as_str() {
-            // Inert containers. Not a matter of *type* — the elements inside
-            // are real `<script>`s — so the walk has to refuse to descend.
-            //
-            // `<template>` holds a parse of something the page may clone
-            // later; a browser keeps it in a separate fragment where nothing
-            // executes. `<noscript>`, with scripting enabled, is not parsed as
-            // markup at all — it is raw text — so there is no script element
-            // in there to find. Our tokenizer does parse it as markup, so this
-            // is where the same result is reached. Getting this wrong would
-            // make the engine both hide a page's no-JS fallback (M10.2's UA
-            // rule) *and* run the script inside it: the worst of both.
-            "template" | "noscript" => return,
-            "script" => {
-                match script_type(dom, node) {
-                    Some(unrun) => out.push(Script::Skipped {
-                        name: format!("<script type={unrun}>"),
-                        reason: format!("not run: `{unrun}` is not a classic script"),
-                    }),
-                    None => match dom.attr(node, "src").filter(|src| !src.trim().is_empty()) {
-                        // `src` wins: a script element with one ignores its own
-                        // inline text, exactly as the HTML spec says.
-                        Some(src) => out.push(Script::External {
-                            src: src.to_string(),
-                        }),
-                        None => out.push(Script::Inline {
-                            // Skipped scripts hold no slot, so this counts the
-                            // ones that can actually run.
-                            name: format!(
-                                "inline#{}",
-                                out.iter()
-                                    .filter(|s| !matches!(s, Script::Skipped { .. }))
-                                    .count()
-                                    + 1
-                            ),
-                            source: text_of(dom, node),
-                        }),
-                    },
-                }
-                // A script's children are its text, never more elements.
-                return;
-            }
-            _ => {}
+        if INERT.contains(&tag.as_str()) {
+            return;
+        }
+        if tag == "script" {
+            // Skipped scripts hold no slot, so this counts the ones that can
+            // actually run.
+            let position = out
+                .iter()
+                .filter(|(_, s)| !matches!(s, Script::Skipped { .. }))
+                .count()
+                + 1;
+            out.push((node, describe(dom, node, &format!("inline#{position}"))));
+            // A script's children are its text, never more elements.
+            return;
         }
     }
     for child in dom.children(node) {
         collect(dom, child, out);
     }
+}
+
+/// What one `<script>` element asks for. The single place that decision is
+/// made: the document walk above and the dynamic path below must not be able
+/// to disagree about whether an element is a classic script, or about whether
+/// its `src` beats its text.
+///
+/// `name` is what an *inline* script will be called. It is the caller's
+/// business because the two callers number them differently — the document
+/// walk by document position, the queue by insertion order — and neither
+/// numbering is knowable from one element.
+fn describe(dom: &Dom, node: NodeId, name: &str) -> Script {
+    match script_type(dom, node) {
+        Some(unrun) => Script::Skipped {
+            name: format!("<script type={unrun}>"),
+            reason: format!("not run: `{unrun}` is not a classic script"),
+        },
+        None => match dom.attr(node, "src").filter(|src| !src.trim().is_empty()) {
+            // `src` wins: a script element with one ignores its own inline
+            // text, exactly as the HTML spec says.
+            Some(src) => Script::External {
+                src: src.to_string(),
+            },
+            None => Script::Inline {
+                name: name.to_string(),
+                source: text_of(dom, node),
+            },
+        },
+    }
+}
+
+/// What a `<script>` element asks for **now that it is part of the document**
+/// (M11.5) — the dynamic counterpart of [`sources`], for one node the engine
+/// has been told about rather than a tree it walks.
+///
+/// `None` means there is nothing here to run, for one of three reasons that
+/// are deliberately answered in the same place: the node is not a `<script>`
+/// element at all, it is not connected to the document (a page can build a
+/// whole subtree before inserting it, and until then a browser runs nothing
+/// in it), or it sits inside one of [`INERT`]'s containers. That last one is
+/// the reason this function exists rather than a tag check at the call site:
+/// `<template>` and `<noscript>` are decided *here*, once, for both paths.
+///
+/// A `Some(Script::Skipped)` is a `<script>` we will not run and can say why —
+/// the same answer the document walk gives, reported by the same code in the
+/// queue.
+pub fn connected_script(dom: &Dom, node: NodeId, name: &str) -> Option<Script> {
+    let NodeData::Element { tag, .. } = &dom.node(node).data else {
+        return None;
+    };
+    if tag != "script" {
+        return None;
+    }
+    // One walk answers both questions, because they are the same walk: is the
+    // document up there, and is anything inert in between. Bounded by
+    // `dom::MAX_DEPTH`, so this cannot become a long climb.
+    let mut walk = dom.node(node).parent;
+    while let Some(up) = walk {
+        if up == dom.root {
+            return Some(describe(dom, node, name));
+        }
+        if let NodeData::Element { tag, .. } = &dom.node(up).data
+            && INERT.contains(&tag.as_str())
+        {
+            return None;
+        }
+        walk = dom.node(up).parent;
+    }
+    None
 }
 
 /// `<script>` content is raw text to the tokenizer, so this is one text child
@@ -150,8 +213,14 @@ mod tests {
     use super::*;
     use crate::html;
 
+    /// The descriptions alone. The elements they came from are the dynamic
+    /// path's business (M11.5); every test below is about what the document
+    /// asks for and in what order.
     fn of(src: &str) -> Vec<Script> {
         sources(&html::parse(src))
+            .into_iter()
+            .map(|(_, script)| script)
+            .collect()
     }
 
     fn inline(name: &str, source: &str) -> Script {
@@ -298,6 +367,82 @@ mod tests {
         );
     }
 
+    // ---- the dynamic path (M11.5) ----
+
+    /// `connected_script` for the first element with `id`, or for the node id
+    /// given directly when the fixture has no id to name it by.
+    fn connected(html: &str, id: &str) -> Option<Script> {
+        let dom = html::parse(html);
+        let node = (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .expect("the fixture has no such element");
+        connected_script(&dom, node, "inserted#1")
+    }
+
+    #[test]
+    fn a_connected_script_element_asks_for_the_same_thing_the_walk_says_it_does() {
+        assert_eq!(
+            connected("<script id=s>a()</script>", "s"),
+            Some(inline("inserted#1", "a()"))
+        );
+        assert_eq!(
+            connected("<script id=s src=lib.js></script>", "s"),
+            Some(external("lib.js"))
+        );
+        // The same `type` rule, from the same code: a module is reported, not
+        // silently run as a classic script.
+        assert_eq!(
+            connected("<script id=s type=module>a()</script>", "s"),
+            Some(skipped("module"))
+        );
+        // Not a script element at all.
+        assert_eq!(connected("<p id=s>x</p>", "s"), None);
+    }
+
+    #[test]
+    fn a_script_inside_an_inert_container_is_not_a_connected_script() {
+        // The must-not the parsed walk already answers: the dynamic path has
+        // to reach the same answer rather than having its own opinion, so it
+        // reads the same `INERT` list through the same climb.
+        assert_eq!(
+            connected("<template><script id=s>a()</script></template>", "s"),
+            None
+        );
+        assert_eq!(
+            connected("<noscript><script id=s>a()</script></noscript>", "s"),
+            None
+        );
+        // Nested deeper than one level: the climb, not a parent check.
+        assert_eq!(
+            connected(
+                "<template><div><script id=s>a()</script></div></template>",
+                "s"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_script_that_is_not_in_the_document_is_not_a_connected_script() {
+        let mut dom = html::parse("<p>page</p>");
+        let orphan = dom.create_element("script", vec![]);
+        assert_eq!(connected_script(&dom, orphan, "inserted#1"), None);
+
+        // Appended into a *detached* subtree: still nothing to run, because
+        // the climb never reaches the document.
+        let holder = dom.create_element("div", vec![]);
+        dom.append(holder, orphan).unwrap();
+        assert_eq!(connected_script(&dom, orphan, "inserted#1"), None);
+
+        // And the moment the holder joins the document, it is.
+        dom.append(dom.root, holder).unwrap();
+        assert_eq!(
+            connected_script(&dom, orphan, "inserted#1"),
+            Some(inline("inserted#1", ""))
+        );
+    }
+
     #[test]
     fn wikipedia_asks_for_a_pile_of_inline_scripts() {
         let fixture = include_str!(concat!(
@@ -307,11 +452,11 @@ mod tests {
         let found = sources(&html::parse(fixture));
         let inlines = found
             .iter()
-            .filter(|s| matches!(s, Script::Inline { .. }))
+            .filter(|(_, s)| matches!(s, Script::Inline { .. }))
             .count();
         assert!(inlines > 0, "the fixture carries inline script");
         // Whatever the mix, names are unique — they identify a slot.
-        let mut names: Vec<&str> = found.iter().map(Script::name).collect();
+        let mut names: Vec<&str> = found.iter().map(|(_, s)| s.name()).collect();
         let before = names.len();
         names.sort_unstable();
         names.dedup();
