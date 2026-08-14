@@ -2162,17 +2162,15 @@ impl App {
         let Some(dom) = &self.dom else {
             return Effect::default();
         };
-        // Only links the reader can see (M9.3): Tab must not park focus on a
-        // link an `overflow` clip removed from the page, because `Enter` would
-        // then follow something invisible. Same predicate the hint labels use.
+        // Links **and form controls** since M11.8, in document order, and only
+        // what the reader can see (M9.3): Tab must not park focus on something
+        // an `overflow` clip removed from the page, because `Enter` would then
+        // follow a link that is not there. Same predicate the hint labels use.
         // Before layout has run there is no clip to ask about, so the DOM
         // order is all there is.
         let links: Vec<NodeId> = match &self.layout_tree {
-            Some(tree) => layout::collect_links(tree, dom)
-                .into_iter()
-                .map(|l| l.node)
-                .collect(),
-            None => layout::dom_links(dom).into_iter().map(|(n, _)| n).collect(),
+            Some(tree) => layout::focusables(tree, dom),
+            None => layout::dom_focusables(dom),
         };
         if links.is_empty() {
             return Effect::default();
@@ -2203,6 +2201,11 @@ impl App {
         let (Some(focus), Some(dom)) = (self.focus, &self.dom) else {
             return Effect::default();
         };
+        // A focused field has no `href`, so `Enter` on one does nothing — and
+        // that is M11.8's decision rather than an oversight. This task binds no
+        // keys inside a field at all: what `Enter`, `q` and `j` mean once the
+        // caret is in a text box is the mode discipline M11.9 exists to settle,
+        // and deciding one key of it here would decide it by accident.
         let Some(href) = dom.attr(focus, "href") else {
             return Effect::default();
         };
@@ -2668,6 +2671,18 @@ impl App {
         let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
             return Effect::default();
         };
+        // A click on a form control focuses it, and does nothing else (M11.8):
+        // no navigation, no keys bound, no event dispatched — form events are
+        // M11.13's. Asked before the link walk so that a control inside an
+        // anchor takes the click, which is what the reader aimed at.
+        if let Some(node) = layout::hit_test(tree, x, y).and_then(|n| layout::nearest_field(dom, n))
+        {
+            if self.focus == Some(node) {
+                return Effect::default();
+            }
+            self.focus = Some(node);
+            return redraw();
+        }
         let Some((node, href)) = layout::link_at(tree, dom, x, y) else {
             return Effect::default();
         };
@@ -2813,6 +2828,16 @@ impl App {
         // walk would put a focused link's text back on a page that clipped it
         // away — the one surface that can undo the display list's trimming.
         tree.walk_clipped(&mut |_, b, clip| {
+            // A focused *control* is marked differently from a focused link,
+            // and deliberately so (M11.8): reverse video over a run of text
+            // means "Enter follows this", and a field that borrowed the look
+            // would be lying about what Enter does. Its frame reverses — two
+            // cells, not a sentence — and a text field shows a caret where the
+            // next character would go.
+            if matches!(b.kind, BoxKind::Field(_)) && b.node == Some(focus) {
+                self.draw_focused_field(frame, b, clip, left, scroll);
+                return;
+            }
             if b.kind != BoxKind::Text {
                 return;
             }
@@ -2839,6 +2864,56 @@ impl App {
             }
             frame.put_str(screen_x as u16, screen_y as u16, &text, style);
         });
+    }
+
+    /// The focused control's own chrome: its frame reversed, and a caret where
+    /// the next character would go (M11.8).
+    ///
+    /// A frame overlay like the focused link's and the search highlight's, for
+    /// the same reason: focus is UI chrome, not CSS `:focus`, so moving it must
+    /// restyle nothing, relayout nothing and repaint no display list. The cells
+    /// come from `layout::field`, the same function paint drew them with.
+    fn draw_focused_field(
+        &self,
+        frame: &mut Frame,
+        b: &layout::LayoutBox,
+        clip: layout::Clip,
+        left: u16,
+        scroll: i32,
+    ) {
+        let page_h = self.page() as i32;
+        let mut reverse = |x: i32, y: i32| {
+            if !clip.contains(x, y) {
+                return;
+            }
+            let screen_y = y - scroll;
+            let screen_x = left as i32 + x;
+            if screen_y < 0 || screen_y >= page_h || screen_x < 0 {
+                return;
+            }
+            if screen_x >= frame.width() as i32 {
+                return;
+            }
+            let cell = frame.get(screen_x as u16, screen_y as u16);
+            frame.set(
+                screen_x as u16,
+                screen_y as u16,
+                Cell::new(cell.ch, reversed()),
+            );
+        };
+        let rect = b.dimensions.content;
+        for row in 0..rect.height {
+            let y = rect.y + row;
+            if b.dimensions.padding.left > 0 {
+                reverse(rect.x - 1, y);
+            }
+            if b.dimensions.padding.right > 0 {
+                reverse(rect.right(), y);
+            }
+        }
+        if let Some((x, y)) = layout::field::caret(b) {
+            reverse(x, y);
+        }
     }
 
     /// Link-hint labels on top of the page.
@@ -5603,6 +5678,119 @@ mod tests {
         let overlay = screen(&mut app, 60, 20);
         assert!(overlay.contains("javascript console"), "{overlay}");
         assert!(overlay.contains("F5"), "{overlay}");
+    }
+
+    // ---- form controls (M11.8) --------------------------------------------
+
+    /// A page with both kinds of focusable thing, interleaved: a link, a text
+    /// field, a `disabled` field, and a button.
+    const FORM_PAGE: &str = "<p><a href=/one>one</a> <input size=6 value=a> \
+         <input size=6 disabled> <button>Go</button> <a href=/two>two</a></p>";
+
+    /// Which node `Tab` has parked on, as something a test can read.
+    fn focused(app: &App) -> Option<String> {
+        let (focus, dom) = (app.focus?, app.dom.as_ref()?);
+        Some(match &dom.node(focus).data {
+            crate::dom::NodeData::Element { tag, .. } => match dom.attr(focus, "href") {
+                Some(href) => format!("{tag} {href}"),
+                None => match dom.attr(focus, "value") {
+                    Some(value) => format!("{tag} {value}"),
+                    None => tag.clone(),
+                },
+            },
+            other => format!("{other:?}"),
+        })
+    }
+
+    #[test]
+    fn tab_cycles_links_and_fields_together_in_document_order() {
+        let (mut app, _) = scripted_app(FORM_PAGE);
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+            seen.push(focused(&app).unwrap());
+        }
+        // The `disabled` field is not in the cycle: Tab must not park on
+        // something the reader cannot use.
+        assert_eq!(
+            seen,
+            [
+                "a /one".to_string(),
+                "input a".into(),
+                "button".into(),
+                "a /two".into(),
+                "a /one".into(),
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_focus_to_a_field_runs_no_pipeline_stage() {
+        // M6.3's rule, unchanged by fields being focusable: focus is UI chrome
+        // drawn as a frame overlay, so it restyles nothing, relayouts nothing
+        // and rebuilds no display list.
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+        for _ in 0..4 {
+            assert_eq!(app.update(key(KeyCode::Tab, KeyModifiers::NONE)), redraw());
+        }
+        assert_eq!(focused(&app).as_deref(), Some("a /two"));
+        assert_eq!(stages(&app), before, "focusing a field ran a stage");
+    }
+
+    #[test]
+    fn a_click_on_a_field_focuses_it_and_goes_nowhere() {
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+        // The field's own cells: "one " is 4 wide, then the frame at 4 and the
+        // value from 5. Column 6, row 0 — plus the page column's left gutter.
+        let left = column(app.size.0).left;
+        let effect = app.update(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left + 6,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(effect, redraw());
+        assert!(effect.fetch.is_none(), "a click on a field navigated");
+        assert_eq!(focused(&app).as_deref(), Some("input a"));
+        assert_eq!(stages(&app), before);
+    }
+
+    #[test]
+    fn every_browse_binding_still_works_with_a_field_focused() {
+        // The rule this task is most at risk of breaking, and the reason it
+        // binds no keys inside a field at all (M11.9 owns the mode discipline):
+        // a focused field must not swallow the reader's browser.
+        let tall = format!("{FORM_PAGE}{}", "<p>filler</p>".repeat(40));
+        let (mut app, id) = scripted_app(&tall);
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(focused(&app).as_deref(), Some("input a"));
+
+        // `j` scrolls, `gg` goes back to the top, and `Enter` on the field does
+        // nothing at all — there is nothing yet for it to do.
+        app.update(ch('j'));
+        assert!(app.viewport.offset() > 0, "j did not scroll");
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default(),
+            "Enter on a field did something"
+        );
+        app.update(ch('g'));
+        app.update(ch('g'));
+        assert_eq!(app.viewport.offset(), 0, "gg did not reach the top");
+        assert_eq!(
+            focused(&app).as_deref(),
+            Some("input a"),
+            "a key stole focus"
+        );
+
+        // And `q` still quits, which is principle §1.5 and not negotiable.
+        assert!(app.update(ch('q')).quit);
     }
 
     // ---- invalidation (M10.6) ---------------------------------------------

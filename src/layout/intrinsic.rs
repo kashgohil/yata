@@ -31,6 +31,7 @@ use crate::layout::engine::{
     Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_atomic_inline,
     is_block_level, is_column, is_html_space, lays_out_as_flex,
 };
+use crate::layout::field;
 use crate::style::Styles;
 use crate::style::values::{Display, FlexBasis, FlexWrap, Length};
 
@@ -268,6 +269,14 @@ impl<'a> IntrinsicSizer<'a> {
             // context has never heard of generates no box, so it asks for no
             // width.
             Sizes::both(self.image_width(node).unwrap_or(0))
+        } else if let Some(control) = field::control(self.dom, node, tag) {
+            // Replaced too, and the one measurement a terminal gets exactly
+            // right: `size`/`cols` are characters, a character is a cell, so a
+            // control wants neither more nor less than the page said (M11.8).
+            // Both widths are the same number, which is what makes the
+            // shrink-to-fit in `atomic_dims` hand back the field's own width
+            // however much of the line is left.
+            Sizes::both(control.cols)
         } else if lays_out_as_flex(computed) {
             self.flex_sizes(node, computed)
         } else {
@@ -509,6 +518,19 @@ impl<'a> IntrinsicSizer<'a> {
                     }
                     return;
                 }
+                // A form control is one box on the line whatever its `display`
+                // (M11.8), and one that this engine draws as nothing puts
+                // nothing there — the same two rules the engine's inline walk
+                // follows, or a paragraph would be measured against pieces the
+                // breaker never sees.
+                if field::is_control_tag(tag) {
+                    if !field::generates_no_box(self.dom, node, tag) {
+                        let edges = self.outer_edges(node);
+                        let sizes = self.sizes(node).grown_by(edges);
+                        run.atomic(sizes.min, sizes.max);
+                    }
+                    return;
+                }
                 // An atomic inline (M9.11) is one box on the line, so it is one
                 // piece here — and the only piece with two different widths.
                 // It cannot be broken into, which is what makes it a piece at
@@ -575,6 +597,9 @@ impl<'a> IntrinsicSizer<'a> {
                     } else {
                         ChildMode::Inline
                     };
+                }
+                if field::generates_no_box(self.dom, node, tag) {
+                    return ChildMode::Skip;
                 }
                 if display == Display::Inline || is_atomic_inline(display) {
                     ChildMode::Inline

@@ -381,3 +381,176 @@ fn js_page_snapshot() {
 
     assert_snapshot("js", &grid);
 }
+
+// ---- M11.8: form controls ----
+
+/// The page as the **TUI** draws it, with `tabs` presses of Tab delivered
+/// first. Focus is a frame overlay rather than a display-list command (M6.3,
+/// M11.8), so it is the only thing in this file that cannot be seen through
+/// `paint` alone. The last row is the statusline and is cropped away.
+fn render_app(html: &str, width: u16, height: u16, tabs: usize) -> Frame {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::Duration;
+    use yata::browser::app::App;
+    use yata::msg::Msg;
+
+    let dom = html::parse(html);
+    let mut app = App::new(width, height + 1);
+    let id = app.start_fetch("http://fixture/".into());
+    app.update(Msg::Loaded {
+        id,
+        url: "http://fixture/".into(),
+        status: 200,
+        body: html.as_bytes().to_vec(),
+        elapsed: Duration::ZERO,
+        content_type: None,
+        set_cookie: Vec::new(),
+    });
+    app.update(Msg::Parsed {
+        id,
+        dom,
+        elapsed: Duration::ZERO,
+    });
+    for _ in 0..tabs {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    }
+    let mut frame = Frame::new(width, height + 1);
+    app.draw(&mut frame);
+    frame
+}
+
+/// The five states a reader has to be able to tell apart, in one line and in
+/// source order: a field with a value, one showing a placeholder, a masked
+/// password, a `disabled` field, and a button.
+const CONTROLS: &str = r#"<!doctype html>
+<html><head><style>body, p { margin: 0 }</style></head>
+<body><p><input size=8 value=typed><input size=8 placeholder=hint><input type=password size=8 value=secret><input size=8 disabled><button>Search</button></p>
+</body></html>"#;
+
+/// M11.8, deliverable 5: what a control looks like, so a reviewer can see it
+/// rather than read about it.
+///
+/// Everything here has to be legible on a terminal with **no colour**, which is
+/// why the frame is glyphs: brackets for a control the reader can use,
+/// parentheses for one that is `disabled`. An empty field is a run of blanks
+/// between brackets rather than nothing at all, which is the bug this task
+/// exists to fix.
+#[test]
+fn a_control_is_framed_in_the_padding_the_ua_sheet_gives_it() {
+    let grid = render_grid(CONTROLS, 60, 3);
+    assert_eq!(
+        grid.lines().collect::<Vec<_>>(),
+        ["[typed   ][hint    ][******  ](        )[Search]"],
+        "{grid}"
+    );
+    assert_snapshot("form-controls", &grid);
+}
+
+/// The same line, focused. Reverse video over a *run of text* means "Enter
+/// follows this" (M6.3's focused link), so a focused control must not borrow
+/// it: its two frame cells reverse, and a text field shows a caret where the
+/// next character would go. `#` is a reversed cell.
+#[test]
+fn a_focused_control_reverses_its_frame_and_a_text_field_shows_a_caret() {
+    let reversed = |tabs: usize| {
+        let frame = render_app(CONTROLS, 60, 3, tabs);
+        grid_text(&frame, 60, 3, |c| {
+            if c.attrs.contains(yata::term::Attrs::REVERSE) {
+                '#'
+            } else {
+                ' '
+            }
+        })
+    };
+    // Nothing focused: no reversed cell anywhere on the page.
+    assert_eq!(reversed(0).trim_end(), "", "{:?}", reversed(0));
+    // One cell right of the glyph grid above: the TUI centres the page column
+    // and this goes through the real draw path, gutter and all.
+    let row = |tabs| reversed(tabs).lines().next().unwrap().to_string();
+    // The first field: its two frame cells, and a caret one cell past "typed".
+    assert_eq!(row(1), " #     #  #");
+    // The second: the caret sits at the front, because a placeholder is the
+    // page talking and the value behind it is empty.
+    assert_eq!(row(2), "           ##       #");
+    // The third: masked, and the caret is past the mask — a password's caret
+    // must not say less about what is there than its stars do.
+    assert_eq!(row(3), "                     #      # #");
+    // The fourth Tab skips the `disabled` field entirely and lands on the
+    // button: a frame, and no caret, because there is nothing to type into it.
+    assert_eq!(row(4), "                                         #      #");
+    // Four focusables on this line, so the fifth Tab is back at the first.
+    assert_eq!(row(5), row(1));
+    assert_snapshot("form-controls-focused", &reversed(1));
+}
+
+/// The rows around the first one containing `needle` — a window on a page too
+/// tall to commit whole, so that a ladder snapshot is something a reviewer can
+/// actually read.
+fn window(grid: &str, needle: &str, before: usize, after: usize) -> String {
+    let rows: Vec<&str> = grid.lines().collect();
+    let at = rows
+        .iter()
+        .position(|r| r.contains(needle))
+        .unwrap_or_else(|| panic!("no row containing {needle:?} in:\n{grid}"));
+    let start = at.saturating_sub(before);
+    let end = (at + after + 1).min(rows.len());
+    let mut out = rows[start..end].join("\n");
+    out.push('\n');
+    out
+}
+
+/// The ladder's own case, and the whole of this task's happiest accident:
+/// `size="17"` is 17 characters, a character is a cell, and HN's search box
+/// comes out exactly the width HN asked for — no average-glyph-width guess in
+/// sight. It rendered as *nothing at all* before M11.8.
+#[test]
+fn hn_search_box_is_the_width_the_page_asked_for() {
+    let grid = render_grid(&fixture("news.ycombinator.com.html"), 80, 160);
+    let at = window(&grid, "Search:", 1, 1);
+    let field = at
+        .lines()
+        .find(|r| r.contains('['))
+        .expect("the search field");
+    let inside = &field[field.find('[').unwrap() + 1..field.rfind(']').unwrap()];
+    assert_eq!(UnicodeWidthStr::width(inside), 17, "{at}");
+    assert_snapshot("hn-search", &at);
+}
+
+/// Wikipedia's search form: a text field with a placeholder, a button beside
+/// it, and a hidden input that must not take a cell — every case this task has
+/// to answer, on one page.
+///
+/// And the case deliverable 2 exists for: eight of the article's dropdowns are
+/// `<input type="checkbox">` used as CSS-only toggles. HTML says an
+/// unimplemented type falls back to a text field; here it falls back to
+/// nothing, because eight stray empty boxes in the article chrome would serve
+/// no one.
+#[test]
+fn wikipedia_search_form_draws_a_field_a_button_and_no_checkboxes() {
+    let src = fixture("en.wikipedia.org.html");
+    let grid = render_grid(&src, 80, 900);
+    assert_snapshot("wikipedia-search", &window(&grid, "Search Wikipedia", 0, 1));
+
+    // No box was generated for a checkbox, a hidden input, or any other type
+    // M11.12 owns — asked of the tree rather than of the pixels, because "it
+    // is not visible" and "it is not there" are different claims.
+    let dom = html::parse(&src);
+    let sheets = style::sources::inline_sheets(&dom);
+    let refs: Vec<_> = sheets.iter().collect();
+    let styles = style::style_tree(&dom, &refs);
+    let tree = layout::layout_document(&dom, &styles, 80, Hidden::Respect);
+    let mut checkboxes = 0;
+    let mut fields = 0;
+    tree.walk(tree.root, &mut |_, b| {
+        if let layout::BoxKind::Field(_) = b.kind {
+            fields += 1;
+            if b.node
+                .is_some_and(|n| dom.attr(n, "type").is_some_and(|t| t == "checkbox"))
+            {
+                checkboxes += 1;
+            }
+        }
+    });
+    assert!(fields > 0, "the page's own search field lost its box");
+    assert_eq!(checkboxes, 0, "a dropdown toggle became a text box");
+}

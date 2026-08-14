@@ -1,0 +1,61 @@
+# M11.8 — a form's boxes, derived from the spec before the code existed.
+#
+# The UA sheet makes every control an atomic inline (M9.11) with one cell of
+# horizontal padding either side — the cells a terminal draws a control's frame
+# in, outside the content box, so `size` still buys the cells the page asked
+# for. `body, p, form { margin: 0 }` takes the vertical rhythm out of the
+# arithmetic; everything below is the control rules alone.
+#
+# `<p>before</p>`  — row 0.
+#
+# `<form>` — row 1. Three inputs, one box:
+#   `size="17"` is 17 characters and a character is a cell, so the content box
+#   is 17 wide and 1 row tall. Its margin box is 17 + 2 = 19. The newline
+#   between `<form>` and `<input>` is a leading space on the line and is
+#   dropped, so the margin box starts at x=0 and the content box at x=1.
+#   `type=hidden` and `type=checkbox` generate no box at all: hidden because
+#   HTML says so, checkbox because this engine recognizes the type and has not
+#   implemented it (M11.12), and an empty text box would be a worse lie than
+#   nothing.
+#
+# `<p>` with a `<textarea>` and a `<button>` — rows 2-4.
+#   The textarea is `cols=20` × `rows=3`: content 20 × 3, margin box 22 × 3.
+#   Its value is its text content with **one** leading newline stripped
+#   (HTML §4.10.11) and every other space kept — "hello\ntextarea", two rows of
+#   a three-row box. It is a value, not prose: no text box is generated for it
+#   and it never reaches the paragraph's own line.
+#   The button's label is its text content, so its content box is 6 × 1 and its
+#   margin box 8; nothing separates the two elements in the source, so it
+#   starts at x=22 and its content at x=23.
+#   The line is 3 rows: a control's baseline is the row its own text sits on
+#   (the last one), so the textarea contributes 2 rows above the baseline and
+#   the button 0 — 2 + 1 + 0 = 3, baseline on row 4. The textarea therefore
+#   fills rows 2-4 and the button sits on row 4.
+#
+# `<p>` with `width: 40px` — row 5. CSS wins over the attribute, as it does in
+#   a browser: 40px is 5 cells, so `size=17` decides nothing here.
+#
+# `<p>after</p>` — row 6. The page is 7 rows.
+<html>  x=0 y=0 w=40 h=7
+  <body>  x=0 y=0 w=40 h=7
+    <p>  x=0 y=0 w=40 h=1
+      anonymous  x=0 y=0 w=40 h=1
+        line  x=0 y=0 w=40 h=1
+          #text "before"  x=0 y=0 w=6 h=1
+    <form>  x=0 y=1 w=40 h=1
+      anonymous  x=0 y=1 w=40 h=1
+        line  x=0 y=1 w=40 h=1
+          <input …> field value "typed"  x=1 y=1 w=17 h=1
+    <p>  x=0 y=2 w=40 h=3
+      anonymous  x=0 y=2 w=40 h=3
+        line  x=0 y=2 w=40 h=3
+          <textarea …> field value "hello textarea"  x=1 y=2 w=20 h=3
+          <button> field label "Search"  x=23 y=4 w=6 h=1
+    <p>  x=0 y=5 w=40 h=1
+      anonymous  x=0 y=5 w=40 h=1
+        line  x=0 y=5 w=40 h=1
+          <input …> field value ""  x=1 y=5 w=5 h=1
+    <p>  x=0 y=6 w=40 h=1
+      anonymous  x=0 y=6 w=40 h=1
+        line  x=0 y=6 w=40 h=1
+          #text "after"  x=0 y=6 w=5 h=1

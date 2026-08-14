@@ -126,6 +126,80 @@ pub fn visible_links(tree: &LayoutTree, dom: &Dom, top: i32, bottom: i32) -> Vec
         .collect()
 }
 
+/// Everything `Tab` can park on, in the order the reader meets it: links and
+/// form controls together, deduplicated, and only what the clips leave visible
+/// (M11.8).
+///
+/// One walk rather than two lists merged afterwards, because "document order"
+/// for a mixed list is not something two sorted lists can be zipped into
+/// without re-deriving where each node sits — and the tree walk already knows.
+/// A control is checked before the link around it: a click or a `Tab` lands on
+/// the field, not on the anchor it happens to sit inside.
+pub fn focusables(tree: &LayoutTree, dom: &Dom) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    tree.walk_clipped(&mut |_, b, clip| {
+        let Some(node) = b.node else {
+            return;
+        };
+        if !clip.shows(b) {
+            return;
+        }
+        // A `disabled` control is not in the cycle: `Tab` must not park on
+        // something the reader cannot use.
+        let target = match b.kind {
+            crate::layout::BoxKind::Field(paint) if paint.disabled => return,
+            crate::layout::BoxKind::Field(_) => node,
+            _ => match nearest_link(dom, node) {
+                Some((link, _)) => link,
+                None => return,
+            },
+        };
+        if !out.contains(&target) {
+            out.push(target);
+        }
+    });
+    out
+}
+
+/// Walk from `node` up to the nearest form control that has a box and can be
+/// focused — what a click resolves to (M11.8).
+pub fn nearest_field(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if let NodeData::Element { tag, .. } = &dom.node(id).data
+            && let Some(control) = crate::layout::field::control(dom, id, tag)
+            && !control.disabled
+        {
+            return Some(id);
+        }
+        current = dom.node(id).parent;
+    }
+    None
+}
+
+/// Document-order list of everything focusable in the DOM, for the tick before
+/// the first layout has run — [`dom_links`]'s counterpart for [`focusables`].
+pub fn dom_focusables(dom: &Dom) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    walk_dom_focusables(dom, dom.root, &mut out);
+    out
+}
+
+fn walk_dom_focusables(dom: &Dom, id: NodeId, out: &mut Vec<NodeId>) {
+    if let NodeData::Element { tag, .. } = &dom.node(id).data {
+        let focusable = match crate::layout::field::control(dom, id, tag) {
+            Some(control) => !control.disabled,
+            None => tag.eq_ignore_ascii_case("a") && dom.attr(id, "href").is_some(),
+        };
+        if focusable {
+            out.push(id);
+        }
+    }
+    for child in dom.children(id) {
+        walk_dom_focusables(dom, child, out);
+    }
+}
+
 /// Whether `node` is `ancestor` or a descendant of it.
 pub fn is_under(dom: &Dom, node: NodeId, ancestor: NodeId) -> bool {
     let mut current = Some(node);

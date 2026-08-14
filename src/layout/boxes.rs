@@ -8,6 +8,7 @@
 use crate::dom::NodeId;
 use crate::layout::clip::Clip;
 use crate::layout::dimensions::Dimensions;
+use crate::layout::field::FieldPaint;
 use crate::style::ComputedStyle;
 use crate::term::Style;
 
@@ -37,6 +38,14 @@ pub enum BoxKind {
     Inline,
     /// Replaced `<img>`: fixed cell rectangle, painted as half-blocks / Kitty.
     Image,
+    /// A form control (M11.8): a fixed cell rectangle carrying the text it
+    /// shows and no children, sized in *characters* by `size` / `cols` / `rows`.
+    ///
+    /// The payload is what the box draws rather than what it holds — a
+    /// `password`'s value is masked before it ever reaches a box, and a
+    /// `<textarea>`'s content is a value here rather than the prose it looks
+    /// like in the DOM.
+    Field(FieldPaint),
 }
 
 /// One node of the layout tree.

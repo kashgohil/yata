@@ -380,6 +380,28 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
                 let t = b.text.as_deref().unwrap_or("");
                 format!("#text \"{}\"", clip(t, 20))
             }
+            // A control names the element it came from, then what it is showing
+            // — the two questions F3 gets asked about a field are "how wide did
+            // the page make this" and "why is that text in it" (M11.8).
+            BoxKind::Field(paint) => {
+                let name = match b.node {
+                    Some(nid) => match &dom.node(nid).data {
+                        NodeData::Element { tag, attrs } => element_summary(tag, attrs),
+                        _ => "field".into(),
+                    },
+                    None => "field".into(),
+                };
+                let shows = match paint.shows {
+                    crate::layout::Shows::Value => "value",
+                    crate::layout::Shows::Placeholder => "placeholder",
+                    crate::layout::Shows::Label => "label",
+                };
+                let disabled = if paint.disabled { " disabled" } else { "" };
+                format!(
+                    "{name} field {shows} \"{}\"{disabled}",
+                    clip(b.text.as_deref().unwrap_or(""), 16)
+                )
+            }
             BoxKind::Image => {
                 let alt = b.text.as_deref().unwrap_or("");
                 let src = b.image_src.as_deref().unwrap_or("?");

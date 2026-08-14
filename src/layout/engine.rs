@@ -7,6 +7,7 @@
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
+use crate::layout::field::{self, FieldPaint};
 use std::ops::Range;
 
 use crate::layout::dimensions::{Dimensions, EdgeSizes, Rect};
@@ -208,6 +209,13 @@ impl<'a> Engine<'a> {
                 if computed.display == Display::None && self.hidden == Hidden::Reveal {
                     computed.display = Display::Block;
                 }
+                // A control this engine draws as nothing generates no box at
+                // all — not an empty one (M11.8). Asked before `display`,
+                // because `<input type=hidden>` is not hidden by the cascade:
+                // it is a control whose rendering is "none of it".
+                if field::generates_no_box(self.dom, id, tag) {
+                    return None;
+                }
                 match tag.as_str() {
                     "br" => self.layout_br(x, containing_width, y, prev_margin_bottom, computed),
                     "hr" => self.layout_hr(x, containing_width, y, prev_margin_bottom, computed),
@@ -272,7 +280,12 @@ impl<'a> Engine<'a> {
         prev_margin_bottom: &mut i32,
         pre: bool,
     ) -> Option<BoxId> {
-        let mut dims = resolve_block_dims(&computed, containing_width);
+        // CSS 2.1 §10.3.4: a block-level **replaced** box with `width: auto` is
+        // as wide as it intrinsically is, not as wide as its containing block.
+        // A field is `size` characters wide wherever the page puts it, and
+        // `display: block` on a form's inputs is a stylesheet away.
+        let intrinsic = field::control(self.dom, id, tag).map(|c| c.cols);
+        let mut dims = resolve_block_dims(&computed, containing_width, intrinsic);
         // Adjacent-sibling margin collapse: place with max of the two margins.
         // The caller's `prev_margin_bottom` is 0 for the first in-flow child;
         // we still apply this box's own top margin then, except at the very
@@ -340,17 +353,30 @@ impl<'a> Engine<'a> {
         containing_height: Option<i32>,
         pre: bool,
     ) -> (BoxId, i32) {
+        // A form control (M11.8): its box carries what it shows and no
+        // children, so the value of a `<textarea>` stops being prose the moment
+        // the box exists. Derived once, here, because this is the one place
+        // both halves of it — the kind and the height — are needed.
+        let control = field::control(self.dom, id, tag);
         let box_id = self.alloc(LayoutBox {
-            kind: if lays_out_as_flex(&computed) {
-                BoxKind::Flex
-            } else {
-                BoxKind::Block
+            kind: match &control {
+                Some(c) => BoxKind::Field(FieldPaint {
+                    shows: c.shows,
+                    disabled: c.disabled,
+                }),
+                None if lays_out_as_flex(&computed) => BoxKind::Flex,
+                None => BoxKind::Block,
             },
             node: Some(id),
             dimensions: dims,
             children: Vec::new(),
-            text: None,
-            term_style: Style::default(),
+            text: control.as_ref().map(|c| c.text.clone()),
+            // A control draws its own text, so it needs the cascade's colours
+            // and attributes on the box; every other box here draws none.
+            term_style: match &control {
+                Some(_) => term_style(&computed),
+                None => Style::default(),
+            },
             computed,
             image_src: None,
             image_size_firm: false,
@@ -372,7 +398,12 @@ impl<'a> Engine<'a> {
             max: definite_v(computed.max_height, containing_height),
         };
 
-        let auto_height = self.layout_contents(id, tag, computed, box_id, heights, pre);
+        let auto_height = match &control {
+            // `rows` lines, and no children walked: a control's contents are
+            // its value, which the box already carries.
+            Some(c) => c.rows,
+            None => self.layout_contents(id, tag, computed, box_id, heights, pre),
+        };
 
         // Used height: the specified one if there is one, else the content's
         // (an empty div is zero rows), then the min/max clamps. Children keep
@@ -1224,6 +1255,9 @@ impl<'a> Engine<'a> {
         if bx.kind == BoxKind::Line {
             return Some(self.line_baseline_row(b));
         }
+        if let Some(row) = field_baseline_rows(bx) {
+            return Some(row.0);
+        }
         bx.children.iter().find_map(|&c| self.first_line_row(c))
     }
 
@@ -1233,6 +1267,9 @@ impl<'a> Engine<'a> {
         let bx = &self.boxes[b.0 as usize];
         if bx.kind == BoxKind::Line {
             return Some(self.line_baseline_row(b));
+        }
+        if let Some(row) = field_baseline_rows(bx) {
+            return Some(row.1);
         }
         bx.children
             .iter()
@@ -1319,7 +1356,7 @@ impl<'a> Engine<'a> {
                     NodeData::Element { tag, .. } => tag.clone(),
                     _ => String::new(),
                 };
-                let mut dims = resolve_block_dims(&item.computed, container.width);
+                let mut dims = resolve_block_dims(&item.computed, container.width, None);
                 // An `auto` margin on a flex item absorbs the line's free space
                 // rather than centring the box in its containing block (§9.5
                 // step 1) — a different rule with a different answer, so the
@@ -1532,7 +1569,7 @@ impl<'a> Engine<'a> {
                 };
                 let align = cross_align(&c, axis, style);
 
-                let mut dims = resolve_block_dims(&c, content.width);
+                let mut dims = resolve_block_dims(&c, content.width, None);
                 // `resolve_block_dims` centres an `auto` cross margin in the
                 // containing block; a flex item's takes the *line's* free space
                 // instead (§9.6 step 1), a different rule with a different
@@ -1884,7 +1921,7 @@ impl<'a> Engine<'a> {
         prev_margin_bottom: &mut i32,
         computed: ComputedStyle,
     ) -> Option<BoxId> {
-        let mut dims = resolve_block_dims(&computed, width);
+        let mut dims = resolve_block_dims(&computed, width, None);
         let top = dims.margin.top.max(*prev_margin_bottom);
         let y = y - *prev_margin_bottom + top;
         dims.margin.top = top;
@@ -2219,7 +2256,7 @@ impl<'a> Engine<'a> {
     /// apart: its third paragraph is the one that would change.
     fn atomic_dims(&mut self, node: NodeId, containing_width: i32, available: i32) -> Dimensions {
         let computed = *self.styles.get(node);
-        let mut dims = resolve_block_dims(&computed, containing_width);
+        let mut dims = resolve_block_dims(&computed, containing_width, None);
         // An `auto` margin on an inline-level box is zero (CSS 2.1 §10.3.9),
         // not the free space of its containing block: a badge in a sentence
         // does not centre itself in the paragraph.
@@ -2605,6 +2642,11 @@ impl<'a> Engine<'a> {
                 if tag == "br" || tag == "hr" {
                     return ChildMode::Block;
                 }
+                // A control drawn as nothing joins no formatting context at all
+                // (M11.8) — it is not an empty inline, it is absent.
+                if field::generates_no_box(self.dom, id, tag) {
+                    return ChildMode::Skip;
+                }
                 // Block-level `display:block` img goes through layout_node;
                 // default inline img stays in the IFC as an atomic replaced box.
                 if tag == "img" {
@@ -2664,6 +2706,17 @@ impl<'a> Engine<'a> {
                     }
                     return;
                 }
+                // A form control is a *replaced* element, so it goes on the line
+                // whole whatever `display` the page gave it (M11.8) — the UA
+                // sheet says `inline-block`, and a page that says `inline`
+                // still gets a box rather than its `<textarea>`'s value flowing
+                // into the paragraph as prose.
+                if field::is_control_tag(tag) {
+                    if !field::generates_no_box(self.dom, id, tag) {
+                        out.push(InlineItem::Atomic { node: id });
+                    }
+                    return;
+                }
                 let computed = self.styles.get(id);
                 // An atomic inline goes on the line whole, edges and all: its
                 // margins and padding belong to its own box rather than
@@ -2708,6 +2761,23 @@ impl<'a> Engine<'a> {
         self.push_inline(id, pre, containing_width, &mut out);
         out
     }
+}
+
+/// The rows a form control's own text sits on — its first and its last — or
+/// `None` for every other box (M11.8).
+///
+/// A control has no line boxes of its own, and CSS 2.1 §10.8.1's fallback for a
+/// box without one is its bottom margin edge: taken literally, a field would
+/// hang entirely above the sentence naming it and `Search: [        ]` would
+/// print the label a row below the box. A browser lines an input up with the
+/// text beside it by the row its *value* is on, and here that row is a fact the
+/// box already carries.
+fn field_baseline_rows(b: &LayoutBox) -> Option<(i32, i32)> {
+    let BoxKind::Field(_) = b.kind else {
+        return None;
+    };
+    let content = b.dimensions.content;
+    Some((content.y, content.y + (content.height - 1).max(0)))
 }
 
 /// Horizontal length → cells; `auto` is zero for margin edges.
@@ -3483,7 +3553,18 @@ fn definite_v(len: Length, containing_height: Option<i32>) -> Option<i32> {
     }
 }
 
-fn resolve_block_dims(computed: &ComputedStyle, containing_width: i32) -> Dimensions {
+/// The edges and used content width of a block-level box.
+///
+/// `intrinsic` is how wide the box is when its `width` is `auto` and it is a
+/// **replaced** one — a form control's `size` characters (M11.8). `None` is the
+/// ordinary rule, "fill what the containing block leaves"; the clamps and
+/// `box-sizing` below apply to either answer, which is the reason this is a
+/// parameter rather than an overwrite at the call site.
+fn resolve_block_dims(
+    computed: &ComputedStyle,
+    containing_width: i32,
+    intrinsic: Option<i32>,
+) -> Dimensions {
     let pad = EdgeSizes {
         top: computed.padding.top.to_cells_v(containing_width),
         right: computed.padding.right.to_cells_h(containing_width),
@@ -3528,17 +3609,21 @@ fn resolve_block_dims(computed: &ComputedStyle, containing_width: i32) -> Dimens
         box_sizing: computed.box_sizing,
     };
     let tentative = if computed.width.is_auto() {
-        // Fill available: content = containing - margin - border - padding.
-        // Already a content-box size whatever `box-sizing` says — `auto` sizes
-        // the margin box to the containing block either way.
-        (containing_width
-            - margin.left
-            - margin.right
-            - border.left
-            - border.right
-            - pad.left
-            - pad.right)
-            .max(0)
+        match intrinsic {
+            // A replaced box is as wide as it is, wherever it lands.
+            Some(cells) => cells.max(0),
+            // Fill available: content = containing - margin - border - padding.
+            // Already a content-box size whatever `box-sizing` says — `auto`
+            // sizes the margin box to the containing block either way.
+            None => (containing_width
+                - margin.left
+                - margin.right
+                - border.left
+                - border.right
+                - pad.left
+                - pad.right)
+                .max(0),
+        }
     } else {
         axis.content_from(computed.width.to_cells_h(containing_width))
     };

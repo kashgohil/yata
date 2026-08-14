@@ -260,6 +260,52 @@ fn timing_against_a_closed_port_reports_the_reason_and_exits_1() {
 }
 
 #[test]
+fn dump_text_shows_a_form_field_as_a_field() {
+    // M11.8: the headless dumps show what the TUI shows, so a page with a form
+    // has to dump one — a control drawn as nothing at all is what `--dump-text`
+    // used to show for every field on the ladder.
+    let body = r#"<body style="margin: 0"><p style="margin: 0">Search:                   <input type="text" name="q" size="17" value="typed"><button>Go</button>                  <input type="hidden" name="t" value="x"></p></body>"#;
+    let addr = serve_once(response_with_body("200 OK", body.as_bytes()));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    // The frame is glyphs, so a dump of a field reads as a field: 17 cells of
+    // value between brackets, and a bracketed label for the button. The hidden
+    // input takes no cells at all.
+    assert_eq!(
+        text.lines().next(),
+        Some("Search: [typed            ][Go]"),
+        "{text}"
+    );
+}
+
+#[test]
+fn dump_boxes_names_a_field_box_and_its_geometry() {
+    // F3's other half (M11.8): a control's box says which element it came from,
+    // what it is showing, and how many cells the page asked for — `size="17"`
+    // is 17 of them, and the hidden input has no box to name.
+    let body = r#"<body style="margin: 0"><p style="margin: 0">                  <input type="text" name="q" size="17" value="typed">                  <input type="hidden" name="t" value="x"></p></body>"#;
+    let addr = serve_once(response_with_body("200 OK", body.as_bytes()));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(r#"<input …> field value "typed"  x=1 y=0 w=17 h=1"#),
+        "no field box with geometry:\n{text}"
+    );
+    assert_eq!(
+        text.matches("field").count(),
+        1,
+        "the hidden input got a box:\n{text}"
+    );
+}
+
+#[test]
 fn dump_boxes_prints_the_box_tree_to_stdout() {
     // The layout stage's headless hook (M9.1): one line per box with its
     // geometry, indented like the tree — the same text F3 shows and the same

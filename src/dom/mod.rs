@@ -18,6 +18,8 @@
 //!   refused, because the result would not be a wrong page but a layout walk
 //!   that never terminates.
 
+use std::collections::HashMap;
+
 /// Index into `Dom::nodes`. `u32` is plenty — a Wikipedia article is well under
 /// the 4-billion node ceiling and half the width of a pointer.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -146,6 +148,11 @@ pub struct Dom {
     /// flag rather than by letting the `Vec` grow, so a hostile page cannot buy
     /// memory with attribute writes.
     attr_changes_overflowed: bool,
+    /// What a form control currently holds, for the controls whose value has
+    /// diverged from their markup (M11.8) — HTML's dirty value flag, as a map.
+    /// Absent means clean, so the map stays empty on every page nobody has
+    /// typed into, which is every page until M11.9.
+    field_values: HashMap<NodeId, String>,
 }
 
 /// What kind of change an edit was, for `Dom::note_edit`.
@@ -182,6 +189,7 @@ impl Dom {
             structure_version: 0,
             attr_changes: Vec::new(),
             attr_changes_overflowed: false,
+            field_values: HashMap::new(),
         }
     }
 
@@ -398,6 +406,28 @@ impl Dom {
         attrs.remove(at);
         self.note_edit(Edit::Attribute(id));
         true
+    }
+
+    /// What a form control currently holds, if a reader has touched it (M11.8).
+    ///
+    /// `None` means "still whatever the markup said" — the field is *clean*, in
+    /// HTML's terms, and layout falls back to `value` / the `<textarea>`'s
+    /// content. The two only ever diverge once someone types (M11.9), which is
+    /// why this is a map beside the tree rather than a field on every one of
+    /// Wikipedia's 25,599 nodes.
+    pub fn field_value(&self, id: NodeId) -> Option<&str> {
+        self.field_values.get(&id).map(String::as_str)
+    }
+
+    /// Set what a control holds. The attribute is left exactly as the page
+    /// wrote it: `input[value="x"]` must keep matching the markup rather than
+    /// what a reader typed, and a keystroke must not become a cascade edit.
+    ///
+    /// It *is* a text edit, though — the value is what the box draws — so it
+    /// invalidates the way `set_text` does: relayout, then repaint.
+    pub fn set_field_value(&mut self, id: NodeId, value: &str) {
+        self.field_values.insert(id, value.to_string());
+        self.note_edit(Edit::Structure);
     }
 
     /// Replace a text node's content. `false`, and no change, when `id` is not

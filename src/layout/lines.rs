@@ -52,6 +52,16 @@ pub fn from_tree(tree: &LayoutTree) -> Vec<Line> {
                 };
                 rows[y as usize].push((b.dimensions.content.x, label, style));
             }
+            // A form control draws itself into the rows the same way it draws
+            // itself onto the screen (M11.8) — one function, so `--dump-text`
+            // cannot show a reader something the terminal does not.
+            BoxKind::Field(_) => {
+                for run in crate::layout::field::runs(b) {
+                    if run.y >= 0 && (run.y as usize) < height {
+                        rows[run.y as usize].push((run.x, run.text, run.style));
+                    }
+                }
+            }
             _ => {}
         }
     });

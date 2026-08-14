@@ -76,30 +76,21 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
     match b.kind {
         // A flex container paints exactly like a block: a background fills its
         // padding box and a border outlines it, whoever placed what is inside.
-        BoxKind::Block | BoxKind::Flex => {
-            // Background fills the padding box (CSS).
-            if let ColorValue::Rgb(r, g, bcol) = b.computed.background_color {
-                let rect = clip.apply(b.dimensions.padding_box());
-                if rect.width > 0 && rect.height > 0 {
-                    list.commands.push(DisplayCommand::FillRect {
-                        rect,
-                        color: Color::Rgb(r, g, bcol),
+        BoxKind::Block | BoxKind::Flex => paint_decorations(b, list, clip),
+        // A form control is an ordinary box from the outside — its background
+        // and border paint like any other — and then draws its own cells
+        // (M11.8). Its frame lives in the padding, which is why the decorations
+        // go down first.
+        BoxKind::Field(_) => {
+            paint_decorations(b, list, clip);
+            for run in crate::layout::field::runs(b) {
+                if let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) {
+                    list.commands.push(DisplayCommand::Text {
+                        x,
+                        y: run.y,
+                        text,
+                        style: run.style,
                     });
-                }
-            }
-            // Border: any nonzero border edge draws the full rectangle outline.
-            //
-            // Deviation, recorded rather than papered over: a border cut by an
-            // ancestor's clip is emitted as the *intersected* rectangle, so it
-            // closes with corners along the clip edge where a browser would
-            // let it run off. `Border` is one command meaning "outline this
-            // rect", and the honest fix — open-sided borders — would put clip
-            // state into the scroll path, which M9.3 exists to avoid.
-            let border = b.dimensions.border;
-            if border.top > 0 || border.right > 0 || border.bottom > 0 || border.left > 0 {
-                let rect = clip.apply(b.dimensions.border_box());
-                if rect.width > 0 && rect.height > 0 {
-                    list.commands.push(DisplayCommand::Border { rect });
                 }
             }
         }
@@ -177,6 +168,37 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
             }
         }
         BoxKind::AnonymousBlock | BoxKind::Line | BoxKind::Inline => {}
+    }
+}
+
+/// A box's background and border — everything it paints that is not its
+/// content. Shared by blocks, flex containers and form controls, because from
+/// the outside those differ only in what goes *inside* the padding box.
+fn paint_decorations(b: &LayoutBox, list: &mut DisplayList, clip: Clip) {
+    // Background fills the padding box (CSS).
+    if let ColorValue::Rgb(r, g, bcol) = b.computed.background_color {
+        let rect = clip.apply(b.dimensions.padding_box());
+        if rect.width > 0 && rect.height > 0 {
+            list.commands.push(DisplayCommand::FillRect {
+                rect,
+                color: Color::Rgb(r, g, bcol),
+            });
+        }
+    }
+    // Border: any nonzero border edge draws the full rectangle outline.
+    //
+    // Deviation, recorded rather than papered over: a border cut by an
+    // ancestor's clip is emitted as the *intersected* rectangle, so it closes
+    // with corners along the clip edge where a browser would let it run off.
+    // `Border` is one command meaning "outline this rect", and the honest fix —
+    // open-sided borders — would put clip state into the scroll path, which
+    // M9.3 exists to avoid.
+    let border = b.dimensions.border;
+    if border.top > 0 || border.right > 0 || border.bottom > 0 || border.left > 0 {
+        let rect = clip.apply(b.dimensions.border_box());
+        if rect.width > 0 && rect.height > 0 {
+            list.commands.push(DisplayCommand::Border { rect });
+        }
     }
 }
 

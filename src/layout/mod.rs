@@ -8,6 +8,7 @@ mod boxes;
 mod clip;
 mod dimensions;
 mod engine;
+pub(crate) mod field;
 mod flex;
 mod hit;
 pub(crate) mod intrinsic;
@@ -17,9 +18,10 @@ pub use boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
 pub use clip::Clip;
 pub use dimensions::{Dimensions, EdgeSizes, Rect};
 pub use engine::{Hidden, layout_tree, layout_tree_with, term_color, term_style};
+pub use field::{FieldPaint, Shows};
 pub use hit::{
-    LinkHit, collect_links, dom_links, first_y, hit_test, is_under, link_at, nearest_link,
-    nearest_y, visible_links,
+    LinkHit, collect_links, dom_focusables, dom_links, first_y, focusables, hit_test, is_under,
+    link_at, nearest_field, nearest_link, nearest_y, visible_links,
 };
 pub use intrinsic::IntrinsicSizer;
 
@@ -96,7 +98,9 @@ fn has_visible_content(tree: &LayoutTree) -> bool {
     tree.walk(tree.root, &mut |_, b| {
         visible |= match b.kind {
             BoxKind::Text => b.text.as_deref().is_some_and(|t| !t.is_empty()),
-            BoxKind::Image => true,
+            // A form is content: a page that is only a login box must not be
+            // laid out a second time with everything it hid revealed (M11.8).
+            BoxKind::Image | BoxKind::Field(_) => true,
             _ => false,
         };
     });
@@ -2436,6 +2440,191 @@ mod tests {
         // At least three non-empty lines or explicit newlines between.
         let non_empty = content.iter().filter(|l| !l.is_empty()).count();
         assert!(non_empty >= 3, "{content:?}");
+    }
+
+    // ---- M11.8: form controls, and the four things they must never do ------
+
+    /// The five lines from the task's own Context, whose `--dump-text` showed
+    /// three separate faults: an `<input>` with no box at all, a `<textarea>`
+    /// whose value leaked into the page as whitespace-collapsed prose, and a
+    /// `<button>` label running straight into it.
+    const CONTEXT_FIXTURE: &str = "<p>before</p><form><input type=\"text\" name=\"q\" \
+         size=\"17\" value=\"typed\">\n<textarea rows=3 cols=20>hello\ntextarea</textarea>\
+         <button>Search</button>\n<input type=hidden name=t value=x></form><p>after</p>";
+
+    #[test]
+    fn a_textareas_value_is_a_value_and_never_page_prose() {
+        let page = plain(&lines(CONTEXT_FIXTURE, 60)).join("\n");
+        // The regression: the collapsed run the IFC used to make of it.
+        assert!(
+            !page.contains("hello textareaSearch"),
+            "the textarea leaked into the page as prose:\n{page}"
+        );
+        // It is in the field instead, on its own two rows, with the whitespace
+        // it was written with — a value, laid out by the box that holds it.
+        assert!(page.contains("[hello               ]"), "{page}");
+        assert!(page.contains("[textarea            ]"), "{page}");
+        // And the rest of the form is there, which is the other half of the
+        // Context's three faults: a 17-cell input and a labelled button.
+        assert!(page.contains("[typed            ]"), "{page}");
+        assert!(page.contains("[Search]"), "{page}");
+    }
+
+    #[test]
+    fn a_control_this_engine_does_not_draw_occupies_no_cells() {
+        // Byte-identical rows, not "looks empty": a hidden input and a type
+        // M11.12 owns must generate no box, so the page has to lay out exactly
+        // as it does without them.
+        let bare = plain(&lines("<p>a<span>b</span></p>", 40));
+        for src in [
+            "<p>a<input type=hidden value=x><span>b</span></p>",
+            "<p>a<input type=checkbox><span>b</span></p>",
+            "<p>a<input type=radio><input type=file><span>b</span></p>",
+        ] {
+            assert_eq!(plain(&lines(src, 40)), bare, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_value_wider_than_the_field_is_clipped_in_cells_and_never_wrapped() {
+        // Ten cells of CJK in a field five characters wide. Clipped by *width*
+        // — `chars().count()` would keep five glyphs and paint ten cells, which
+        // is how a field runs over the text beside it.
+        let rows = plain(&lines("<p><input size=5 value='漢字漢字漢'>|</p>", 40));
+        assert_eq!(rows[0], "[漢字 ]|", "{rows:?}");
+        // One row, not two: a value is clipped, never wrapped.
+        assert_eq!(
+            rows.iter().filter(|r| r.contains('漢')).count(),
+            1,
+            "{rows:?}"
+        );
+        // And the start of the value is what shows, which is what a browser
+        // shows before the field is focused (M11.9 owns everything after).
+        let rows = plain(&lines("<p><input size=6 value=abcdefghij></p>", 40));
+        assert_eq!(rows[0], "[abcdef]", "{rows:?}");
+    }
+
+    #[test]
+    fn a_field_is_as_wide_as_the_page_asked_wherever_it_is_laid_out() {
+        // The same control through the three paths that can build one: an
+        // atomic inline (the UA sheet's `inline-block`), a block-level replaced
+        // box, and a flex item. A `size=17` field is 17 cells in all three —
+        // `width: auto` on a replaced box is its intrinsic width, never its
+        // containing block's.
+        let field_widths = |css: &str| -> Vec<i32> {
+            let (dom, styles) = styled_dom("<div><input size=17></div>", css);
+            let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+            let mut out = Vec::new();
+            tree.walk(tree.root, &mut |_, b| {
+                if matches!(b.kind, BoxKind::Field(_)) {
+                    out.push(b.dimensions.content.width);
+                }
+            });
+            out
+        };
+        assert_eq!(field_widths(""), [17]);
+        assert_eq!(field_widths("input { display: block }"), [17]);
+        assert_eq!(field_widths("div { display: flex }"), [17]);
+        // CSS wins when the page states one, as it does in a browser.
+        assert_eq!(field_widths("input { width: 40px }"), [5]);
+    }
+
+    #[test]
+    fn what_a_reader_typed_is_what_layout_draws() {
+        // M11.9's foundation: the value is state beside the tree, so layout
+        // reads it and the attribute stays the default it started as.
+        let (mut dom, _) = styled_dom("<p><input size=8 value=default></p>", "");
+        let input = (0..dom.node_count() as u32)
+            .map(crate::dom::NodeId)
+            .find(|&n| dom.attr(n, "size") == Some("8"))
+            .expect("the field");
+        dom.set_field_value(input, "typed");
+        let styles = style::style_tree(&dom, &[]);
+        let rows = plain(&lines_from_tree(&layout_document(
+            &dom,
+            &styles,
+            40,
+            Hidden::Respect,
+        )));
+        assert_eq!(rows[0], "[typed   ]", "{rows:?}");
+    }
+
+    /// A measurement, not an assertion: it asserts nothing and prints numbers,
+    /// so it is `#[ignore]`d out of the default loop. Run it the way the
+    /// numbers in the PR were taken:
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_the_field_work -- --ignored --nocapture
+    /// ```
+    ///
+    /// M11.8's deliverable 8: a box kind on the layout path is a cost every
+    /// page pays, including the four ladder pages that have no fields at all.
+    /// Both sides run **in the same process, interleaved**, with control
+    /// detection switched off for the A side — this machine drifts 5–10%
+    /// between runs, so a before-commit/after-commit pair would be measuring
+    /// the drift (CLAUDE.md).
+    #[test]
+    #[ignore]
+    fn measure_the_field_work_on_the_ladder() {
+        use std::time::{Duration, Instant};
+
+        const ROUNDS: usize = 5;
+        const PAGES: [&str; 4] = [
+            "motherfuckingwebsite.com.html",
+            "danluu.com.html",
+            "news.ycombinator.com.html",
+            "en.wikipedia.org.html",
+        ];
+        let summarize = |samples: &[Duration]| {
+            let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+            let (lo, hi) = (samples.iter().min().unwrap(), samples.iter().max().unwrap());
+            format!("{mean:.2?} ({lo:.2?}-{hi:.2?})")
+        };
+
+        eprintln!("M11.8 layout at 80 cells, mean of {ROUNDS} interleaved rounds:");
+        for page in PAGES {
+            let src = std::fs::read_to_string(format!(
+                "{}/tests/fixtures/{page}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("committed fixture");
+            let dom = html::parse(&src);
+            let sheets = style::sources::inline_sheets(&dom);
+            let refs: Vec<_> = sheets.iter().collect();
+            let styles = style::style_tree(&dom, &refs);
+            let once = || {
+                let started = Instant::now();
+                let tree = layout_document(&dom, &styles, 80, Hidden::Respect);
+                let elapsed = started.elapsed();
+                (elapsed, tree.boxes.len())
+            };
+
+            let (mut off, mut on) = (Vec::new(), Vec::new());
+            let mut boxes = (0, 0);
+            for round in 0..=ROUNDS {
+                // Which side goes first alternates, so any residue of running
+                // second cancels across rounds instead of landing on a column.
+                let (a, b) = if round % 2 == 0 {
+                    let a = field::without_detection(once);
+                    (a, once())
+                } else {
+                    let b = once();
+                    (field::without_detection(once), b)
+                };
+                if round > 0 {
+                    off.push(a.0);
+                    on.push(b.0);
+                }
+                boxes = (a.1, b.1);
+            }
+            eprintln!(
+                "  {page:<28} detection off {} ({} boxes)  ->  on {} ({} boxes)",
+                summarize(&off),
+                boxes.0,
+                summarize(&on),
+                boxes.1,
+            );
+        }
     }
 
     mod ladder {

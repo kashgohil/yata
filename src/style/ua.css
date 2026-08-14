@@ -64,3 +64,20 @@ a:hover { color: #87afff; text-decoration: underline }
    content column's lines inside their boxes, which is correct CSS and what
    M5's text-align implements. */
 center { text-align: center }
+
+/* Form controls (M11.8). `inline-block` is what makes a field an *atomic
+   inline* (M9.11), so it sits in the line beside the label that names it,
+   moves to the next line whole when it does not fit, and takes its `rows` when
+   it is a <textarea>. `select` is listed with them because the display type is
+   a property of the element rather than of M11.12's implementation of it — a
+   UA sheet revisited once per control is the wrong shape. */
+input, textarea, button, select { display: inline-block }
+
+/* The one cell either side that a terminal draws a control's frame in — the
+   brackets `layout::field` paints, which are this renderer's border. Padding
+   rather than border because it must be *outside* the content box: `size="17"`
+   has to buy 17 cells of value, and a frame eating two of them would make the
+   engine disagree with the page about how much a reader can see. A page that
+   zeroes it gets a flush field, exactly as it gets a browser field with no
+   border. */
+input, textarea, button { padding-left: 8px; padding-right: 8px }
