@@ -45,6 +45,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::js::console::{self, Console};
+use crate::js::storage::origin_of;
+
 /// The most a single cookie's name and value may weigh. Browsers land at
 /// 4 KB and pages are written against that number; the point of having one is
 /// that a script cannot grow the jar until PLAN.md §4's 100 MB page budget is
@@ -55,11 +58,14 @@ pub const MAX_COOKIE_BYTES: usize = 4096;
 /// 4 KB × 50 bounds a host at ~200 KB.
 ///
 /// A page that reaches the cap has its **write refused**, and the jar evicts
-/// nothing. Eviction is the other defensible answer and browsers pick it, but
-/// it hands a page a way to push somebody else's cookie out of the jar by
-/// writing 50 of its own — and with no wire yet, the only cookies here are
-/// ones a page put there itself. Refusing costs the hostile page and nothing
-/// else. The refusal is a console line, never an exception (see `Reject`).
+/// nothing — and M11.7 re-made that decision with a server on the other end,
+/// where a `Set-Cookie` can be refused too. Eviction is the other defensible
+/// answer and browsers pick it, but it hands a page a way to push somebody
+/// else's cookie out of the jar by writing 50 of its own, and "somebody else"
+/// is now the server's `HttpOnly` session cookie — the one thing the flag
+/// exists to keep a script's hands off. Refusing costs the page that filled
+/// the jar; evicting would cost the reader their session. The refusal is a
+/// console line, never an exception (see `Reject`).
 pub const MAX_PER_HOST: usize = 50;
 
 /// Seconds since the Unix epoch. Signed, because a deletion is an expiry in
@@ -90,6 +96,21 @@ pub enum SameSite {
     Lax,
     Strict,
     None,
+}
+
+/// Who is asking the jar for cookies.
+///
+/// The **only** thing the two readers differ on, and the whole point of
+/// `HttpOnly`: the wire gets those cookies, `document.cookie` does not.
+/// Expiry, `Path`, `Secure` and the host are identical for both, which is why
+/// they are decided once (`in_scope`, and `Jar::live` above it) rather than
+/// copied per reader.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reach {
+    /// `document.cookie`.
+    Script,
+    /// A `Cookie:` header on a request this engine is about to make.
+    Wire,
 }
 
 /// One cookie: what it is called, what it says, and every attribute that
@@ -127,8 +148,8 @@ pub enum Reject {
     /// `=value`, or a name that is only whitespace.
     EmptyName,
     /// A control character in the name or the value. Rejected here rather than
-    /// escaped later: the moment M11.7 puts this string in a `Cookie:` header,
-    /// a newline in it is header injection.
+    /// escaped later: this string goes into a `Cookie:` header (M11.7), and a
+    /// newline in it there is header injection.
     ControlCharacter,
     /// Over `MAX_COOKIE_BYTES`.
     TooLarge,
@@ -241,32 +262,56 @@ impl Jar {
     /// regex depends on it: longest `Path` first, and for equal paths the
     /// oldest first. That is what browsers do and what RFC 6265 §5.4 asks for.
     pub fn read_for_script(&self, scope: &Scope, now: Secs) -> String {
-        let inner = self.hosts.borrow();
-        let Some(entries) = inner.hosts.get(&scope.host) else {
-            return String::new();
-        };
-        let mut visible: Vec<&Entry> = entries
-            .iter()
-            .filter(|entry| {
-                let cookie = &entry.cookie;
-                !cookie.http_only
-                    && !cookie.expired(now)
-                    && (!cookie.secure || scope.secure)
-                    && path_matches(&cookie.path, &scope.path)
-            })
-            .collect();
-        visible.sort_by(|a, b| {
-            b.cookie
-                .path
-                .len()
-                .cmp(&a.cookie.path.len())
-                .then(a.created.cmp(&b.created))
+        self.pairs(scope, now, Reach::Script)
+    }
+
+    /// Every cookie in scope, as `name=value` joined with `"; "` — the one
+    /// serializer both readers use, so the `Cookie:` header a request carries
+    /// and the string a script reads cannot come out in different orders.
+    fn pairs(&self, scope: &Scope, now: Secs, reach: Reach) -> String {
+        // `(path length, creation order, pair)`: the sort key is copied out
+        // during the walk because the borrow of the jar ends with it.
+        let mut visible: Vec<(usize, u64, String)> = self.live(&scope.host, now, |entries| {
+            entries
+                .filter(|entry| in_scope(&entry.cookie, scope, reach))
+                .map(|entry| {
+                    (
+                        entry.cookie.path.len(),
+                        entry.created,
+                        format!("{}={}", entry.cookie.name, entry.cookie.value),
+                    )
+                })
+                .collect()
         });
+        visible.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         visible
-            .iter()
-            .map(|entry| format!("{}={}", entry.cookie.name, entry.cookie.value))
+            .into_iter()
+            .map(|(_, _, pair)| pair)
             .collect::<Vec<_>>()
             .join("; ")
+    }
+
+    /// The one walk over a host's cookies, and the one place expiry is
+    /// applied. Every reader goes through it — the getter, the wire, `holds`
+    /// and `all` — which is what stops the next one from forgetting that an
+    /// expired cookie is *gone*. M11.6's review found exactly that bug: `holds`
+    /// kept its own idea of "is there a cookie here" and a long-dead `HttpOnly`
+    /// cookie went on refusing a page's write while the getter reported the
+    /// slot empty.
+    ///
+    /// A closure rather than a returned iterator because the entries live
+    /// behind a `RefCell`, and the borrow may not outlive the call.
+    fn live<R>(&self, host: &str, now: Secs, read: impl FnOnce(Live<'_>) -> R) -> R {
+        let inner = self.hosts.borrow();
+        read(Live {
+            entries: inner
+                .hosts
+                .get(host)
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter(),
+            now,
+        })
     }
 
     /// One assignment, one cookie: `document.cookie = "a=1; path=/"` adds or
@@ -347,44 +392,131 @@ impl Jar {
     /// matching `predicate`. Only the flags a script is not allowed to walk
     /// over are asked about.
     ///
-    /// `now` is not decoration: an **expired** cookie holds nothing. Without it
-    /// a server's long-gone `HttpOnly` session cookie would refuse a script's
-    /// write forever, while the getter — which does filter by expiry — reported
-    /// the slot as empty. Two answers to "is there a cookie here" is one too
-    /// many.
+    /// `now` is not decoration: an **expired** cookie holds nothing. It comes
+    /// from `live`, which is the point — this reader asks about a *slot*
+    /// (name and exact path) rather than about visibility, so it shares the
+    /// expiry rule and nothing else, and it shares it by calling it rather
+    /// than by repeating it.
     fn holds(&self, cookie: &Cookie, now: Secs, predicate: impl Fn(&Cookie) -> bool) -> bool {
-        self.hosts
-            .borrow()
-            .hosts
-            .get(&cookie.host)
-            .is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry.cookie.name == cookie.name
-                        && entry.cookie.path == cookie.path
-                        && !entry.cookie.expired(now)
-                        && predicate(&entry.cookie)
-                })
+        self.live(&cookie.host, now, |mut entries| {
+            entries.any(|entry| {
+                entry.cookie.name == cookie.name
+                    && entry.cookie.path == cookie.path
+                    && predicate(&entry.cookie)
             })
+        })
     }
 
     /// Every unexpired cookie a host holds, in creation order — including the
     /// `HttpOnly` ones the getter hides, which is why no page-facing path may
-    /// reach it. Tests are its only caller; M11.7's `Cookie:` header will be
-    /// the second, and can drop the attribute then.
+    /// reach it. Tests are its only caller: the `Cookie:` header reads through
+    /// `pairs` instead, so that it cannot order or filter differently from the
+    /// getter it is supposed to differ from in exactly one way.
     #[cfg(test)]
     pub fn all(&self, host: &str, now: Secs) -> Vec<Cookie> {
-        self.hosts
-            .borrow()
-            .hosts
-            .get(host)
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter(|entry| !entry.cookie.expired(now))
-                    .map(|entry| entry.cookie.clone())
-                    .collect()
-            })
-            .unwrap_or_default()
+        self.live(host, now, |entries| {
+            entries.map(|entry| entry.cookie.clone()).collect()
+        })
+    }
+}
+
+/// One host's unexpired cookies, in creation order — the only view of the jar
+/// there is. A named type rather than an iterator chain so that every reader
+/// receives the *same* one: adding a second way in is how the expiry rule got
+/// forgotten once already.
+struct Live<'a> {
+    entries: std::slice::Iter<'a, Entry>,
+    now: Secs,
+}
+
+impl<'a> Iterator for Live<'a> {
+    type Item = &'a Entry;
+
+    fn next(&mut self) -> Option<&'a Entry> {
+        let now = self.now;
+        self.entries.find(|entry| !entry.cookie.expired(now))
+    }
+}
+
+/// Whether a live cookie is *this* reader's to see: the second half of the
+/// filter, applied after `Jar::live` has ruled out the expired ones.
+///
+/// `Reach` is the only parameter, and the only way the wire differs from
+/// `document.cookie`. Everything else here is shared on purpose.
+fn in_scope(cookie: &Cookie, scope: &Scope, reach: Reach) -> bool {
+    (reach == Reach::Wire || !cookie.http_only)
+        && (!cookie.secure || scope.secure)
+        && path_matches(&cookie.path, &scope.path)
+}
+
+/// The `Cookie:` header value for one request, or `None` when it carries
+/// none. **The one function every request in this engine asks**, and the
+/// reason it is one: there are five request paths, the rule is the same on all
+/// five, and `if same_origin` written out five times is five chances to be
+/// wrong.
+///
+/// `None` in three cases, which are one case: the request is not the page's
+/// own origin, either side has no origin to compare (a `file:` page, a URL
+/// that will not parse), or the jar holds nothing that matches. A request
+/// carries cookies only when its origin *is* the page's — the ladder makes a
+/// genuinely cross-origin request (M11.5's second rung pulls a script from
+/// `www.google-analytics.com`), and it gets nothing.
+///
+/// It differs from `document.cookie` in exactly one way, which is the point of
+/// `HttpOnly`: **the wire gets the cookies the script cannot see.** Expiry,
+/// `Path`, `Secure` and the host are the same rules, from the same code.
+///
+/// The jar never leaves the UI thread — it is `Rc<RefCell<…>>` and so `!Send`,
+/// which is not discipline but a compile error. This is where it becomes a
+/// plain `String` a worker can hold.
+pub fn header_for(jar: &Jar, page_url: &str, request_url: &str, now: Secs) -> Option<String> {
+    if origin_of(request_url)? != origin_of(page_url)? {
+        return None;
+    }
+    // The *request's* scope, not the page's: a stylesheet at `/static/x.css`
+    // is matched against `/static`, and a page at `/docs/page` is not.
+    let scope = Scope::of(request_url)?;
+    let pairs = jar.pairs(&scope, now, Reach::Wire);
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// Apply a response's `Set-Cookie` lines to the jar, scoped to the URL the
+/// response actually came from (post-redirect).
+///
+/// The server's half of the setter, and it is `Jar::insert` rather than
+/// `write_from_script` for one reason: a server may set `HttpOnly` and
+/// `Secure`, and a script may not. Everything a script is refused for — the
+/// caps, the control characters, the missing `=` — still applies, because
+/// those are properties of the cookie and not of who asked.
+///
+/// A malformed line is a dropped cookie and a console line, never a failed
+/// navigation. A response that tries to set more than `MAX_PER_HOST` hits
+/// M11.6's refusal, deliberately re-made with a server on the other end: the
+/// alternative is eviction, and eviction would let a page push a server's
+/// `HttpOnly` session cookie out of the jar by writing fifty of its own —
+/// exactly what the flag exists to prevent. A refused cookie costs the page
+/// that filled the jar; an evicted one costs the reader their session.
+///
+/// Takes the `Console` rather than returning messages: both callers (`App` and
+/// the headless dumps) would otherwise format the same line, and a warning
+/// that drifts between the TUI and `--dump-js` is a warning that lies about
+/// one of them.
+pub fn apply_set_cookie(jar: &Jar, url: &str, lines: &[String], now: Secs, console: &Console) {
+    // No host, no cookies — the same answer `Scope::of` gives the getter.
+    let Some(scope) = Scope::of(url) else {
+        return;
+    };
+    for line in lines {
+        if let Err(reject) =
+            parse(line, &scope.host, &scope.path, now).and_then(|cookie| jar.insert(cookie, now))
+        {
+            console.push(
+                console::Level::Warn,
+                None,
+                None,
+                &format!("ignored Set-Cookie: {line:?}: {}", reject.message()),
+            );
+        }
     }
 }
 
@@ -415,9 +547,10 @@ fn default_path(page_path: &str) -> String {
 
 /// One `Set-Cookie`-shaped string in, one cookie or one rejection out.
 ///
-/// Written once here and reused by M11.7 to read a response header, which is
-/// why it takes a host and a path rather than reaching for a page: the two
-/// callers differ only in what they do with the result.
+/// Written once here and used by both setters — a script's assignment and a
+/// response's `Set-Cookie` (`apply_set_cookie`) — which is why it takes a host
+/// and a path rather than reaching for a page: the two callers differ only in
+/// what they are allowed to do with the result.
 ///
 /// `Path`, `Expires`, `Max-Age`, `Secure`, `HttpOnly`, `SameSite` and `Domain`
 /// in any order and any case; unknown attributes are skipped rather than
@@ -771,8 +904,8 @@ mod tests {
         // name today; browsers store it, so we do.
         assert_eq!(parsed("$Version=1").unwrap().name, "$Version");
         // A comma is legal in practice (folding `Set-Cookie` on commas is the
-        // mistake this avoids), a newline is not: it is header injection the
-        // moment M11.7 writes a `Cookie:` header.
+        // mistake this avoids), a newline is not: it is header injection once
+        // this reaches a `Cookie:` header (M11.7).
         assert_eq!(parsed("a=1,2").unwrap().value, "1,2");
         assert_eq!(
             parsed("a=1\r\nSet-Cookie: b=2"),
@@ -1042,6 +1175,325 @@ mod tests {
         let b = scope("https://b.test/");
         jar.write_from_script("only=1", &b, NOW).unwrap();
         assert_eq!(jar.all("b.test", NOW).len(), 1);
+    }
+
+    // ---- M11.7: the wire ---------------------------------------------------
+
+    /// A jar holding one `HttpOnly` cookie and one ordinary one, both live.
+    fn seeded(host: &str) -> Jar {
+        let jar = Jar::new();
+        for (name, http_only) in [("session", true), ("theme", false)] {
+            jar.insert(
+                Cookie {
+                    name: name.into(),
+                    value: "v".into(),
+                    host: host.into(),
+                    path: "/".into(),
+                    expires: None,
+                    secure: false,
+                    http_only,
+                    same_site: SameSite::Unspecified,
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        jar
+    }
+
+    #[test]
+    fn the_wire_gets_the_http_only_cookies_a_script_cannot_see() {
+        // The one way the two readers differ, and the whole point of the flag.
+        let jar = seeded("a.test");
+        let page = "https://a.test/";
+        assert_eq!(
+            header_for(&jar, page, "https://a.test/app.js", NOW).as_deref(),
+            Some("session=v; theme=v")
+        );
+        assert_eq!(
+            jar.read_for_script(&scope(page), NOW),
+            "theme=v",
+            "an HttpOnly cookie became visible to a script"
+        );
+        // The order the two readers produce is the same order, from the same
+        // code: a page parsing `document.cookie` with a regex and a server
+        // parsing the header see the jar the same way.
+        assert_eq!(
+            header_for(&jar, page, page, NOW).as_deref(),
+            Some("session=v; theme=v")
+        );
+    }
+
+    #[test]
+    fn a_cross_origin_request_carries_no_cookie_header() {
+        // The ladder's own case, not a hypothetical: M11.5's second rung
+        // injects a script from `www.google-analytics.com`, and it gets
+        // nothing — the tracker cannot be told who the reader is.
+        let jar = seeded("www.google-analytics.com");
+        jar.insert(
+            Cookie {
+                name: "id".into(),
+                value: "who".into(),
+                host: "motherfuckingwebsite.com".into(),
+                path: "/".into(),
+                expires: None,
+                secure: false,
+                http_only: false,
+                same_site: SameSite::Unspecified,
+            },
+            NOW,
+        )
+        .unwrap();
+        let page = "http://motherfuckingwebsite.com/";
+        assert_eq!(
+            header_for(
+                &jar,
+                page,
+                "https://www.google-analytics.com/analytics.js",
+                NOW
+            ),
+            None,
+            "a cross-origin subresource carried cookies"
+        );
+        // The page's own subresource still does.
+        assert_eq!(
+            header_for(&jar, page, "http://motherfuckingwebsite.com/x.css", NOW).as_deref(),
+            Some("id=who")
+        );
+        // And "origin" is scheme, host *and* port, exactly as `fetch()` reads
+        // it — a jar keyed by host does not make http and https one origin.
+        let jar = seeded("a.test");
+        assert_eq!(
+            header_for(&jar, "https://a.test/", "http://a.test/x", NOW),
+            None
+        );
+        assert_eq!(
+            header_for(&jar, "http://a.test/", "http://a.test:8080/x", NOW),
+            None
+        );
+        // Neither does a subdomain, on the wire or anywhere else.
+        assert_eq!(
+            header_for(&jar, "https://a.test/", "https://sub.a.test/x", NOW),
+            None
+        );
+    }
+
+    #[test]
+    fn a_secure_cookie_is_not_sent_over_http() {
+        let jar = Jar::new();
+        jar.write_from_script("s=1; Secure", &scope("https://a.test/"), NOW)
+            .unwrap();
+        jar.write_from_script("plain=1", &scope("https://a.test/"), NOW)
+            .unwrap();
+        assert_eq!(
+            header_for(&jar, "https://a.test/", "https://a.test/x", NOW).as_deref(),
+            Some("s=1; plain=1")
+        );
+        assert_eq!(
+            header_for(&jar, "http://a.test/", "http://a.test/x", NOW).as_deref(),
+            Some("plain=1"),
+            "a Secure cookie went out over http"
+        );
+    }
+
+    #[test]
+    fn the_header_is_matched_against_the_request_path_not_the_pages() {
+        // A stylesheet at `/static/x.css` is a different path from the page at
+        // `/docs/page`, and `Path` is matched against the *request*.
+        let jar = Jar::new();
+        let page = scope("https://a.test/docs/page");
+        jar.write_from_script("everywhere=1; Path=/", &page, NOW)
+            .unwrap();
+        jar.write_from_script("docs=1; Path=/docs", &page, NOW)
+            .unwrap();
+        jar.write_from_script("static=1; Path=/static", &page, NOW)
+            .unwrap();
+        assert_eq!(
+            header_for(
+                &jar,
+                "https://a.test/docs/page",
+                "https://a.test/static/x.css",
+                NOW
+            )
+            .as_deref(),
+            Some("static=1; everywhere=1")
+        );
+        // Expiry is the same rule as the getter's, applied in the same place.
+        jar.write_from_script("gone=1; Path=/; Max-Age=60", &page, NOW)
+            .unwrap();
+        assert_eq!(
+            header_for(&jar, "https://a.test/docs/page", "https://a.test/", NOW).as_deref(),
+            Some("everywhere=1; gone=1")
+        );
+        assert_eq!(
+            header_for(
+                &jar,
+                "https://a.test/docs/page",
+                "https://a.test/",
+                NOW + 61
+            )
+            .as_deref(),
+            Some("everywhere=1")
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_is_none_rather_than_an_empty_header() {
+        // A `Cookie:` header with nothing in it is a header a server has to
+        // parse for no reason; `None` means the worker sends none at all.
+        let jar = Jar::new();
+        assert_eq!(
+            header_for(&jar, "https://a.test/", "https://a.test/x", NOW),
+            None
+        );
+        // No host on either side is the same answer, not a panic.
+        assert_eq!(header_for(&jar, "", "https://a.test/x", NOW), None);
+        assert_eq!(
+            header_for(&jar, "file:///tmp/p.html", "file:///tmp/x.css", NOW),
+            None
+        );
+        assert_eq!(header_for(&jar, "https://a.test/", "not a url", NOW), None);
+    }
+
+    #[test]
+    fn a_server_sets_what_a_script_may_not_and_a_script_still_cannot_see_it() {
+        let jar = Jar::new();
+        let console = Console::new();
+        apply_set_cookie(
+            &jar,
+            "https://a.test/login",
+            &[
+                "sid=abc; Path=/; HttpOnly; Secure".to_string(),
+                "theme=dark; Path=/".to_string(),
+            ],
+            NOW,
+            &console,
+        );
+        // Both on the wire...
+        assert_eq!(
+            header_for(&jar, "https://a.test/login", "https://a.test/app.js", NOW).as_deref(),
+            Some("sid=abc; theme=dark")
+        );
+        // ...one of them to the page.
+        assert_eq!(
+            jar.read_for_script(&scope("https://a.test/x"), NOW),
+            "theme=dark"
+        );
+        assert!(console.entries().is_empty(), "{:?}", console.entries());
+    }
+
+    #[test]
+    fn a_set_cookie_is_scoped_to_the_url_the_response_came_from() {
+        // Post-redirect: the host and the default path both come from where
+        // the bytes actually arrived, never from what was asked for.
+        let jar = Jar::new();
+        apply_set_cookie(
+            &jar,
+            "https://b.test/app/page",
+            &["where=here".to_string()],
+            NOW,
+            &Console::new(),
+        );
+        assert_eq!(jar.all("b.test", NOW).len(), 1);
+        assert_eq!(jar.all("b.test", NOW)[0].path, "/app");
+        assert!(jar.all("a.test", NOW).is_empty());
+    }
+
+    #[test]
+    fn a_malformed_set_cookie_is_a_dropped_cookie_and_a_console_line() {
+        let jar = Jar::new();
+        let console = Console::new();
+        apply_set_cookie(
+            &jar,
+            "https://a.test/",
+            &[
+                "nonsense".to_string(),
+                "ok=1".to_string(),
+                // Header injection, refused before anything can put this in a
+                // `Cookie:` header. (Leading whitespace *is* trimmed, so the
+                // break has to be where a real one would be — inside the
+                // value, after the byte that made it a value.)
+                "bad=1\r\nSet-Cookie: sneaky=2".to_string(),
+            ],
+            NOW,
+            &console,
+        );
+        assert_eq!(jar.read_for_script(&scope("https://a.test/"), NOW), "ok=1");
+        let entries = console.entries();
+        let lines: Vec<&str> = entries.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("no name=value pair"), "{lines:?}");
+        assert!(lines[1].contains("control character"), "{lines:?}");
+        // And a response with no host to scope to changes nothing.
+        let jar = Jar::new();
+        apply_set_cookie(
+            &jar,
+            "not a url",
+            &["a=1".to_string()],
+            NOW,
+            &Console::new(),
+        );
+        assert!(jar.all("a.test", NOW).is_empty());
+    }
+
+    #[test]
+    fn a_response_that_would_overfill_the_jar_is_refused_not_evicted() {
+        // The M11.6 decision, re-made with a server on the other end: a page
+        // that fills its own jar loses the server's next cookie, and that is
+        // the cheaper failure. Eviction would let the page choose *which*
+        // cookie to lose, and it would choose the session.
+        let jar = Jar::new();
+        let page = scope("https://a.test/");
+        for i in 0..MAX_PER_HOST {
+            jar.write_from_script(&format!("c{i}=1"), &page, NOW)
+                .unwrap();
+        }
+        let console = Console::new();
+        apply_set_cookie(
+            &jar,
+            "https://a.test/",
+            &["sid=abc; HttpOnly".to_string()],
+            NOW,
+            &console,
+        );
+        assert!(
+            header_for(&jar, "https://a.test/", "https://a.test/x", NOW)
+                .is_none_or(|header| !header.contains("sid=")),
+            "the cap did not hold against a server"
+        );
+        assert!(
+            console.entries()[0].text.contains("50 cookies"),
+            "{:?}",
+            console.entries()
+        );
+    }
+
+    #[test]
+    fn nothing_a_cookie_knows_outlives_the_process() {
+        // "Nothing reaches the disk", pinned the only way it can be: a jar is
+        // reachable exactly one way — `Jar::new`, which takes no path — and a
+        // new one is empty however "persistent" the cookies in the last one
+        // claimed to be. There is nowhere a previous run's cookies could come
+        // from because there is no constructor that could load them.
+        let jar = Jar::new();
+        let page = scope("https://a.test/");
+        jar.write_from_script("keep=1; Expires=Sun, 06 Nov 2094 08:49:37 GMT", &page, NOW)
+            .unwrap();
+        apply_set_cookie(
+            &jar,
+            "https://a.test/",
+            &["sid=abc; Expires=Sun, 06 Nov 2094 08:49:37 GMT; HttpOnly".to_string()],
+            NOW,
+            &Console::new(),
+        );
+        assert_eq!(jar.all("a.test", NOW).len(), 2);
+
+        let next_session = Jar::new();
+        assert_eq!(next_session.read_for_script(&page, NOW), "");
+        assert_eq!(
+            header_for(&next_session, "https://a.test/", "https://a.test/x", NOW),
+            None
+        );
     }
 
     #[test]

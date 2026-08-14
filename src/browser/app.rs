@@ -38,27 +38,28 @@ use crate::term::{Attrs, Cell, Frame, Style};
 pub struct Effect {
     pub quit: bool,
     pub dirty: bool,
-    /// A committed navigation: the id and (already normalized) URL for the loop
-    /// to hand to `net::spawn_fetch`. `App` starts the fetch generation; the
-    /// loop owns the worker thread. Keeps `App` pure of the network.
-    pub fetch: Option<(FetchId, String)>,
-    /// Linked stylesheets to fetch, as (fetch id, document slot, absolute URL).
+    /// A committed navigation: the id and the request (already-normalized URL
+    /// plus whatever `Cookie:` header the jar decided on) for the loop to hand
+    /// to `net::spawn_fetch`. `App` starts the fetch generation; the loop owns
+    /// the worker thread. Keeps `App` pure of the network.
+    pub fetch: Option<(FetchId, net::Request)>,
+    /// Linked stylesheets to fetch, as (fetch id, document slot, request).
     /// The loop spawns one worker each, in the same turn — they must not queue
     /// behind one another (PLAN.md M4: fetched in parallel), and the page is
     /// already on screen while they run. Same discipline as `fetch`: `App`
     /// decides, the loop spawns.
-    pub sheets: Vec<(FetchId, usize, String)>,
+    pub sheets: Vec<(FetchId, usize, net::Request)>,
     /// Text to put on the system clipboard via OSC 52 (M6 yank). Written by
     /// the event loop, not through the cell buffer.
     pub yank: Option<String>,
-    /// Absolute image URLs to fetch (page FetchId, url). Parallel workers,
-    /// same discipline as stylesheets (M8).
-    pub images: Vec<(FetchId, String)>,
-    /// External scripts to fetch, as (fetch id, document slot, absolute URL)
-    /// — one worker each, exactly like `sheets`. The slots were allocated in
+    /// Image requests to make (page FetchId, request). Parallel workers, same
+    /// discipline as stylesheets (M8).
+    pub images: Vec<(FetchId, net::Request)>,
+    /// External scripts to fetch, as (fetch id, document slot, request) — one
+    /// worker each, exactly like `sheets`. The slots were allocated in
     /// document order before any fetch started, so arrival order cannot change
     /// execution order (M10.10).
-    pub scripts: Vec<(FetchId, usize, String)>,
+    pub scripts: Vec<(FetchId, usize, net::Request)>,
     /// `fetch()` calls this page's script asked for (M10.12), as (page, request
     /// id, method, url, headers, body) for the loop to spawn. Same discipline
     /// as everything else: `App` decides, the loop dispatches.
@@ -196,13 +197,13 @@ pub struct App {
     /// A navigation a click handler asked for (M10.11), waiting to be folded
     /// into the `Effect` the key or mouse path returns. `dispatch_click` runs
     /// inside those paths and cannot return an `Effect` of its own.
-    pending_click_navigation: Option<(FetchId, String)>,
+    pending_click_navigation: Option<(FetchId, net::Request)>,
     /// `fetch()` calls a click handler made, carried out the same way.
     pending_click_fetches: Vec<(FetchId, js::FetchAsk)>,
     /// External scripts a click handler inserted (M11.5), and whether one of
     /// its insertions can run now — carried out the same way, because a
     /// bootstrap behind a click is the same shape as one at load.
-    pending_click_scripts: Vec<(FetchId, usize, String)>,
+    pending_click_scripts: Vec<(FetchId, usize, net::Request)>,
     pending_click_run: Option<FetchId>,
     /// Inserted `<script>` elements owed an `error` because their URL will
     /// never resolve (M11.5), fired one per turn by `run_ready_scripts`.
@@ -233,8 +234,8 @@ pub struct App {
     storage: Storage,
     /// The session's cookies (M11.6), here for the same reason `storage` is:
     /// one jar for every page, outliving the host that reads it. In memory
-    /// only, host-only, and reachable by nothing but `document.cookie` until
-    /// M11.7 puts one on the wire — see `js::cookies`.
+    /// only and host-only; read by `document.cookie` and, since M11.7, by
+    /// every request this app makes — see `App::request` and `js::cookies`.
     cookies: Jar,
     /// Everything this page's JavaScript had to say (M10.7): console calls,
     /// uncaught exceptions, scripts skipped for their type — one ordered list,
@@ -549,12 +550,33 @@ impl App {
                 body,
                 elapsed,
                 content_type,
+                set_cookie,
             } => {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
                 // Only an accepted fetch records its duration (PLAN.md §4).
                 self.timings.fetch = Some(elapsed);
+                // The session, before anything else this response does with
+                // itself (M11.7). Scoped to the URL the response *came from* —
+                // post-redirect, which is what `url` already reports — and not
+                // to the one that was asked for.
+                //
+                // Before the error-page branch on purpose: a 401 or a 302
+                // landing on a login page is a response that establishes a
+                // session, and a status code is not a reason to throw its
+                // cookies away. No pipeline stage runs for this — the jar is a
+                // map, and nothing downstream of it is styled or laid out.
+                if !set_cookie.is_empty() {
+                    js::cookies::apply_set_cookie(
+                        &self.cookies,
+                        &url,
+                        &set_cookie,
+                        js::cookies::now(),
+                        &self.console,
+                    );
+                    self.console_view_built = false;
+                }
                 // Non-document responses become error pages (M7 / UX §3.7).
                 if !error_page::is_document(status, content_type.as_deref()) {
                     let reason = if !(200..300).contains(&status) {
@@ -1273,7 +1295,7 @@ impl App {
     }
 
     /// Discover `<img>` tags and return absolute URLs that still need a fetch.
-    fn adopt_images(&mut self, id: FetchId) -> Vec<(FetchId, String)> {
+    fn adopt_images(&mut self, id: FetchId) -> Vec<(FetchId, net::Request)> {
         let Some(dom) = &self.dom else {
             return Vec::new();
         };
@@ -1281,7 +1303,13 @@ impl App {
             Fetch::Loaded { url, .. } => Some(url.as_str()),
             _ => None,
         };
-        self.images.adopt(dom, base, id)
+        // Discovery first, then the jar: `adopt` borrows `self.images`
+        // mutably, and `request` reads the whole of `self`.
+        let found = self.images.adopt(dom, base, id);
+        found
+            .into_iter()
+            .map(|(id, url)| (id, self.request(url)))
+            .collect()
     }
 
     /// Rebuild the display list from the existing layout tree after an image
@@ -1386,7 +1414,7 @@ impl App {
     /// here — the round trip to a worker would cost more than the parse. The
     /// measured worst case in the fixtures is Wikipedia's 21 blocks; the
     /// number is in perf.md.
-    fn adopt_sources(&mut self, id: FetchId) -> Vec<(FetchId, usize, String)> {
+    fn adopt_sources(&mut self, id: FetchId) -> Vec<(FetchId, usize, net::Request)> {
         let Some(dom) = &self.dom else {
             return Vec::new();
         };
@@ -1419,7 +1447,12 @@ impl App {
                 }
             })
             .collect();
+        // The jar last, once the slots are settled: `request` reads the whole
+        // of `self`, and the assignment above holds `self.sheets`.
         pending
+            .into_iter()
+            .map(|(id, slot, url)| (id, slot, self.request(url)))
+            .collect()
     }
 
     /// Recompute the styled tree from the tree and whatever sheets have
@@ -1790,6 +1823,26 @@ impl App {
         }
     }
 
+    /// Turn a URL into a request for the loop to spawn: the URL, plus whatever
+    /// `Cookie:` header `cookies::header_for` says it may carry (M11.7).
+    ///
+    /// **`App`'s only cookie call site**, and every request it produces —
+    /// document, stylesheet, script, image — comes through here. The jar is
+    /// `Rc<RefCell<…>>` and so `!Send`; a worker could not hold it if it
+    /// wanted to. This is where it becomes a plain string.
+    ///
+    /// The page the same-origin rule is measured against is `current_url`, and
+    /// that is correct for a top-level navigation too, because `start_fetch`
+    /// has already made the *target* the current URL by the time the `Effect`
+    /// is built. A reader typing a URL is not making a cross-origin request,
+    /// and a page's own cookies have to survive being navigated to from
+    /// somewhere else.
+    fn request(&self, url: String) -> net::Request {
+        let page = self.current_url().unwrap_or_default();
+        let cookie = js::cookies::header_for(&self.cookies, &page, &url, js::cookies::now());
+        net::Request { url, cookie }
+    }
+
     /// Current page URL if one is known (loaded, loading, or failed).
     fn current_url(&self) -> Option<String> {
         match &self.fetch {
@@ -1830,7 +1883,7 @@ impl App {
         let id = self.start_fetch(url.clone());
         Effect {
             dirty: true,
-            fetch: Some((id, url)),
+            fetch: Some((id, self.request(url))),
             ..Effect::default()
         }
     }
@@ -1932,7 +1985,7 @@ impl App {
         self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
         Effect {
             dirty: true,
-            fetch: Some((id, url)),
+            fetch: Some((id, self.request(url))),
             ..Effect::default()
         }
     }
@@ -1991,7 +2044,7 @@ impl App {
         self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
         Effect {
             dirty: true,
-            fetch: Some((id, url)),
+            fetch: Some((id, self.request(url))),
             ..Effect::default()
         }
     }
@@ -2412,7 +2465,7 @@ impl App {
         &mut self,
         id: FetchId,
         externals: Vec<crate::js::queue::External>,
-    ) -> Vec<(FetchId, usize, String)> {
+    ) -> Vec<(FetchId, usize, net::Request)> {
         let base = self.current_url();
         let mut out = Vec::new();
         for external in externals {
@@ -2420,7 +2473,10 @@ impl App {
                 .as_deref()
                 .and_then(|base| net::resolve_url(base, &external.url))
             {
-                Some(url) => out.push((id, external.slot, url)),
+                // The jar's answer, on the same terms every other request
+                // gets: a script from another origin — the ladder's
+                // `www.google-analytics.com` — carries nothing.
+                Some(url) => out.push((id, external.slot, self.request(url))),
                 None => {
                     self.console.push(
                         crate::js::console::Level::Warn,
@@ -3171,6 +3227,7 @@ mod tests {
             body,
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         })
     }
 
@@ -3187,6 +3244,7 @@ mod tests {
             body: html_src.as_bytes().to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         let effect = app.update(Msg::Parsed {
             id,
@@ -3234,8 +3292,8 @@ mod tests {
         assert_eq!(
             effect.sheets,
             vec![
-                (id, 0, "http://site.test/dir/a.css".to_string()),
-                (id, 1, "http://site.test/b.css".to_string()),
+                (id, 0, net::Request::bare("http://site.test/dir/a.css")),
+                (id, 1, net::Request::bare("http://site.test/b.css")),
             ]
         );
         // And the page is on screen already: nothing waited for a round trip.
@@ -3526,7 +3584,7 @@ mod tests {
         }
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         let (id, url) = effect.fetch.expect("commit must return a fetch");
-        assert_eq!(url, "https://danluu.com", "scheme defaulting applied");
+        assert_eq!(url.url, "https://danluu.com", "scheme defaulting applied");
         assert!(effect.dirty);
 
         // The row now shows the new fetch loading.
@@ -3564,6 +3622,7 @@ mod tests {
             body: vec![b'x'; body_len],
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         }
     }
 
@@ -3856,6 +3915,7 @@ mod tests {
             body: b"hi".to_vec(),
             elapsed: Duration::from_micros(12_300),
             content_type: None,
+            set_cookie: Vec::new(),
         });
         assert_eq!(app.timings().fetch, Some(Duration::from_micros(12_300)));
     }
@@ -3871,6 +3931,7 @@ mod tests {
             body: b"hi".to_vec(),
             elapsed: Duration::from_micros(12_300),
             content_type: None,
+            set_cookie: Vec::new(),
         });
         // The overlay shows the last *completed* run (PLAN.md §4): the old
         // number stands until the new fetch lands.
@@ -3898,6 +3959,7 @@ mod tests {
             body: b"hi".to_vec(),
             elapsed: Duration::from_micros(12_300),
             content_type: None,
+            set_cookie: Vec::new(),
         });
         let id = app.start_fetch("http://y/".into());
         app.update(Msg::NetError {
@@ -3926,6 +3988,7 @@ mod tests {
             body: body(50),
             elapsed: Duration::from_micros(12_300),
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.record_frame(Duration::from_micros(2_100));
         app
@@ -4227,7 +4290,7 @@ mod tests {
             .first()
             .expect("the fetch must reach the loop");
         assert_eq!(*page, id);
-        assert_eq!(ask.url, "http://final/data.json");
+        assert_eq!(ask.ask.url, "http://final/data.json");
         assert_eq!(ask.method, "GET");
         // Nothing has settled: the promise is still pending.
         assert!(app.console.is_empty());
@@ -4439,7 +4502,7 @@ mod tests {
         let (mut app, id) = scripted_app("<p>page</p><script>location.href = '/next';</script>");
         let effect = app.update(Msg::RunScripts { id });
         let (fetch_id, url) = effect.fetch.expect("the script must navigate");
-        assert_eq!(url, "http://final/next");
+        assert_eq!(url.url, "http://final/next");
         assert_ne!(fetch_id, id, "a navigation starts a new generation");
     }
 
@@ -4454,7 +4517,7 @@ mod tests {
         );
         let effect = app.update(Msg::RunScripts { id });
         let (_, url) = effect.fetch.expect("the script must navigate");
-        assert_eq!(url, "http://final/page999", "last assignment wins");
+        assert_eq!(url.url, "http://final/page999", "last assignment wins");
     }
 
     #[test]
@@ -4490,13 +4553,13 @@ mod tests {
         let (mut app, _) = live_page(80, 12, page);
         let effect = app.update(click_first_link(&app));
         let (_, url) = effect.fetch.expect("the handler's navigation was lost");
-        assert_eq!(url, "http://final/from-the-handler");
+        assert_eq!(url.url, "http://final/from-the-handler");
 
         let (mut app, _) = live_page(80, 12, page);
         app.update(key(KeyCode::Tab, KeyModifiers::NONE));
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
-            effect.fetch.map(|(_, url)| url).as_deref(),
+            effect.fetch.map(|(_, request)| request.url).as_deref(),
             Some("http://final/from-the-handler"),
             "the keyboard path lost the handler's navigation"
         );
@@ -4513,7 +4576,7 @@ mod tests {
             id: TimerId(1),
         });
         assert_eq!(
-            effect.fetch.map(|(_, url)| url).as_deref(),
+            effect.fetch.map(|(_, request)| request.url).as_deref(),
             Some("http://final/later")
         );
     }
@@ -4559,8 +4622,8 @@ mod tests {
         assert_eq!(
             effect.scripts,
             [
-                (id, 0, "http://final/a.js".to_string()),
-                (id, 2, "http://final/b.js".to_string()),
+                (id, 0, net::Request::bare("http://final/a.js")),
+                (id, 2, net::Request::bare("http://final/b.js")),
             ],
             "slots are allocated in document order, before any fetch starts"
         );
@@ -4844,6 +4907,7 @@ mod tests {
             body: fixture.as_bytes().to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(parsed(id, fixture));
 
@@ -4858,7 +4922,9 @@ mod tests {
         }
         assert_eq!(
             asked,
-            ["https://www.google-analytics.com/analytics.js"],
+            [net::Request::bare(
+                "https://www.google-analytics.com/analytics.js"
+            )],
             "the loader asked for {asked:?}"
         );
 
@@ -4903,7 +4969,10 @@ mod tests {
              document.body.appendChild(s);</script>",
         );
         let effect = app.update(Msg::RunScripts { id });
-        assert_eq!(effect.scripts, [(id, 1, "http://final/lib.js".to_string())]);
+        assert_eq!(
+            effect.scripts,
+            [(id, 1, net::Request::bare("http://final/lib.js"))]
+        );
         assert!(
             logged(&app).is_empty(),
             "load fired before the body arrived"
@@ -5344,7 +5413,7 @@ mod tests {
         );
         let effect = app.update(click_first_link(&app));
         let (_, url) = effect.fetch.expect("the click must still navigate");
-        assert_eq!(url, "http://final/next");
+        assert_eq!(url.url, "http://final/next");
         // The listener's mutation is observable until the new page lands. Note
         // what is *not* asserted: anything the listener logged, because
         // starting a navigation clears the console — it is page-local, and by
@@ -5590,6 +5659,225 @@ mod tests {
             stages(&app),
             before,
             "reading or writing a cookie ran a pipeline stage"
+        );
+    }
+
+    // ---- M11.7: cookies on the wire ---------------------------------------
+
+    /// Load `html` from `url` with the response's `Set-Cookie` lines, and
+    /// parse it — the shape a real navigation has, with the cookies where a
+    /// real response puts them.
+    fn load_with_cookies(app: &mut App, url: &str, html: &str, set_cookie: &[&str]) -> FetchId {
+        let id = app.start_fetch(url.to_string());
+        app.update(Msg::Loaded {
+            id,
+            url: url.to_string(),
+            status: 200,
+            body: html.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: set_cookie.iter().map(|s| s.to_string()).collect(),
+        });
+        app.update(parsed(id, html));
+        id
+    }
+
+    #[test]
+    fn a_server_set_cookie_reaches_the_jar_and_the_page_sees_its_half() {
+        // The round trip in miniature: the response sets two cookies, the
+        // page's own script reads back the one it is allowed to, and the wire
+        // gets both.
+        let mut app = App::new(40, 10);
+        let id = load_with_cookies(
+            &mut app,
+            "http://site.test/app/page",
+            "<p>x</p><script>console.log(document.cookie);</script>",
+            &["sid=abc; Path=/; HttpOnly", "theme=dark; Path=/"],
+        );
+        app.update(Msg::RunScripts { id });
+        assert!(
+            app.console.entries().iter().any(|e| e.text == "theme=dark"),
+            "the script saw {:?}",
+            app.console.entries()
+        );
+        assert_eq!(
+            js::cookies::header_for(
+                &app.cookies,
+                "http://site.test/app/page",
+                "http://site.test/app/x.js",
+                js::cookies::now()
+            )
+            .as_deref(),
+            Some("sid=abc; theme=dark"),
+            "the wire did not get the HttpOnly cookie"
+        );
+    }
+
+    #[test]
+    fn a_pages_subresources_carry_its_cookies_and_a_cross_origin_one_does_not() {
+        // All four of `App`'s request paths in one page, because the rule is
+        // uniform and the way to check a uniform rule is to count call sites:
+        // a stylesheet, an image and a script from the page's own origin carry
+        // the session; the one from another origin carries nothing.
+        let mut app = App::new(40, 10);
+        let effect_id = app.start_fetch("http://site.test/app/page".into());
+        app.update(Msg::Loaded {
+            id: effect_id,
+            url: "http://site.test/app/page".into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: vec!["sid=abc; Path=/".into()],
+        });
+        let html = "<link rel=stylesheet href=/site.css>\
+                    <link rel=stylesheet href=http://cdn.test/other.css>\
+                    <img src=/pic.png><img src=http://cdn.test/pic.png>\
+                    <script src=/app.js></script>\
+                    <script src=https://www.google-analytics.com/analytics.js></script>";
+        let effect = app.update(parsed(effect_id, html));
+
+        let cookie_for = |requests: &[(FetchId, net::Request)], url: &str| {
+            requests
+                .iter()
+                .find(|(_, request)| request.url == url)
+                .unwrap_or_else(|| panic!("no request for {url}"))
+                .1
+                .cookie
+                .clone()
+        };
+        let sheets: Vec<(FetchId, net::Request)> = effect
+            .sheets
+            .iter()
+            .map(|(id, _, request)| (*id, request.clone()))
+            .collect();
+        assert_eq!(
+            cookie_for(&sheets, "http://site.test/site.css").as_deref(),
+            Some("sid=abc")
+        );
+        assert_eq!(cookie_for(&sheets, "http://cdn.test/other.css"), None);
+        assert_eq!(
+            cookie_for(&effect.images, "http://site.test/pic.png").as_deref(),
+            Some("sid=abc")
+        );
+        assert_eq!(cookie_for(&effect.images, "http://cdn.test/pic.png"), None);
+
+        // Scripts are requested by the pass, not by the parse.
+        let effect = app.update(Msg::RunScripts { id: effect_id });
+        let scripts: Vec<(FetchId, net::Request)> = effect
+            .scripts
+            .iter()
+            .map(|(id, _, request)| (*id, request.clone()))
+            .collect();
+        assert_eq!(
+            cookie_for(&scripts, "http://site.test/app.js").as_deref(),
+            Some("sid=abc")
+        );
+        assert_eq!(
+            cookie_for(&scripts, "https://www.google-analytics.com/analytics.js"),
+            None,
+            "the ladder's tracker was told who the reader is"
+        );
+    }
+
+    #[test]
+    fn a_navigation_carries_the_cookies_of_where_it_is_going() {
+        // The page the same-origin rule is measured against is the *target*
+        // for a top-level navigation, not the page being left. Getting this
+        // backwards would mean a reader could never arrive logged in at a site
+        // they reached from somewhere else — which is most of the web.
+        let mut app = App::new(40, 10);
+        load_with_cookies(
+            &mut app,
+            "http://b.test/",
+            "<p>b</p>",
+            &["sid=for-b; Path=/"],
+        );
+        load_with_cookies(&mut app, "http://a.test/", "<p>a</p>", &[]);
+        // On a.test, navigating to b.test: b.test's cookies go out.
+        let effect = app.navigate("http://b.test/again".into(), true);
+        let (_, request) = effect.fetch.expect("a navigation must fetch");
+        assert_eq!(request.url, "http://b.test/again");
+        assert_eq!(
+            request.cookie.as_deref(),
+            Some("sid=for-b"),
+            "the target's own cookies were withheld from a top-level navigation"
+        );
+    }
+
+    #[test]
+    fn applying_a_response_cookie_runs_no_pipeline_stage() {
+        // Deliverable 7's counter half. The jar is on the load path of every
+        // request now; a map insert is not a stage, and the proof is that the
+        // same page with and without cookies costs the same three counters.
+        let mut plain = App::new(40, 10);
+        load_with_cookies(&mut plain, "http://site.test/", "<p>x</p>", &[]);
+        let mut with_cookies = App::new(40, 10);
+        load_with_cookies(
+            &mut with_cookies,
+            "http://site.test/",
+            "<p>x</p>",
+            &["a=1; Path=/", "b=2; HttpOnly", "rubbish"],
+        );
+        assert_eq!(
+            stages(&with_cookies),
+            stages(&plain),
+            "a Set-Cookie ran a pipeline stage"
+        );
+        // The malformed one is still reported — a dropped cookie is a console
+        // line, never a failed navigation.
+        assert!(
+            with_cookies
+                .console
+                .entries()
+                .iter()
+                .any(|e| e.text.contains("ignored Set-Cookie")),
+            "{:?}",
+            with_cookies.console.entries()
+        );
+        assert!(matches!(with_cookies.fetch, Fetch::Loaded { .. }));
+    }
+
+    #[test]
+    fn fetch_honours_credentials_and_omit_is_the_only_one_that_means_anything() {
+        // `credentials` off M10.12's ignored-and-logged list. `include` and
+        // `same-origin` are the same answer because the same-origin check
+        // upstream has already made a same-origin request the only kind this
+        // engine makes at all; `omit` must actually omit.
+        let mut app = App::new(40, 10);
+        let id = load_with_cookies(
+            &mut app,
+            "http://site.test/app/page",
+            "<script>\
+             fetch('/a', {credentials: 'omit'});\
+             fetch('/b', {credentials: 'include'});\
+             fetch('/c', {credentials: 'same-origin'});\
+             fetch('/d');</script>",
+            &["sid=abc; Path=/"],
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let asked: Vec<(&str, Option<&str>)> = effect
+            .fetches
+            .iter()
+            .map(|(_, ask)| (ask.ask.url.as_str(), ask.ask.cookie.as_deref()))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                ("http://site.test/a", None),
+                ("http://site.test/b", Some("sid=abc")),
+                ("http://site.test/c", Some("sid=abc")),
+                ("http://site.test/d", Some("sid=abc")),
+            ]
+        );
+        // And it is no longer warned about as ignored, because it is not.
+        assert!(
+            !app.console
+                .entries()
+                .iter()
+                .any(|e| e.text.contains("`credentials` option is ignored")),
+            "{:?}",
+            app.console.entries()
         );
     }
 
@@ -6068,6 +6356,119 @@ mod tests {
                 summarize(&after[i]),
             );
         }
+    }
+
+    /// M11.7 deliverable 7. The header build is on the load path of **every**
+    /// request, not just the document: a Wikipedia article asks the jar once
+    /// per stylesheet and once per image. It is a map lookup, a filter and a
+    /// join over at most `MAX_PER_HOST` cookies, so the expected answer is
+    /// "nothing measurable" — but this is the first thing M11 has put on every
+    /// request, so it is reported rather than asserted.
+    ///
+    /// A/B interleaved in one process, on the same page, because this machine
+    /// drifts 5–10% between runs. The A side is an empty jar and a response
+    /// with no `Set-Cookie`, which is exactly the code M11.6 shipped; the B
+    /// side is a jar filled to the per-host cap and a response setting two
+    /// more, which is the worst case a same-origin server can produce.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_the_cookie_work -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_the_cookie_work_on_a_page_load() {
+        const ROUNDS: usize = 5;
+        const URL: &str = "https://en.wikipedia.org/wiki/Cat";
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+
+        // One side of one pair: parse outside the clock (the parse is the
+        // worker's job and identical either way), then time the two messages
+        // the load path is made of. Returns how many subresource requests the
+        // page produced, since that is how many times the jar was asked.
+        let one_load = |seeded: bool| -> (Duration, usize) {
+            let dom = crate::html::parse(fixture);
+            let mut app = App::new(80, 24);
+            if seeded {
+                for i in 0..crate::js::cookies::MAX_PER_HOST {
+                    app.cookies
+                        .insert(
+                            crate::js::cookies::Cookie {
+                                name: format!("c{i}"),
+                                value: "x".repeat(40),
+                                host: "en.wikipedia.org".into(),
+                                path: "/".into(),
+                                expires: None,
+                                secure: false,
+                                http_only: i % 2 == 0,
+                                same_site: crate::js::cookies::SameSite::Unspecified,
+                            },
+                            crate::js::cookies::now(),
+                        )
+                        .expect("the cap is exactly MAX_PER_HOST");
+                }
+            }
+            let set_cookie = match seeded {
+                true => vec!["c0=refreshed; Path=/".into(), "sid=abc; HttpOnly".into()],
+                false => Vec::new(),
+            };
+            let id = app.start_fetch(URL.into());
+            let started = Instant::now();
+            app.update(Msg::Loaded {
+                id,
+                url: URL.into(),
+                status: 200,
+                body: fixture.as_bytes().to_vec(),
+                elapsed: Duration::ZERO,
+                content_type: None,
+                set_cookie,
+            });
+            let effect = app.update(Msg::Parsed {
+                id,
+                dom,
+                elapsed: Duration::ZERO,
+            });
+            let elapsed = started.elapsed();
+            (elapsed, effect.sheets.len() + effect.images.len())
+        };
+
+        let (mut without, mut with) = (Vec::new(), Vec::new());
+        let mut requests = 0;
+        // Round 0 is thrown away, as everywhere else here: the first load in
+        // the process pays for pages the allocator has not touched.
+        for round in 0..=ROUNDS {
+            // Which side goes first alternates, so any residue of running
+            // second cancels across rounds instead of landing on one column.
+            let (a, b) = match round % 2 == 0 {
+                true => {
+                    let a = one_load(false);
+                    let b = one_load(true);
+                    (a, b)
+                }
+                false => {
+                    let b = one_load(true);
+                    let a = one_load(false);
+                    (a, b)
+                }
+            };
+            requests = b.1;
+            if round > 0 {
+                without.push(a.0);
+                with.push(b.0);
+            }
+        }
+        eprintln!(
+            "M11.7 load of en.wikipedia.org ({requests} subresource requests, \
+             {} cookies in the jar), mean of {ROUNDS} interleaved rounds:",
+            crate::js::cookies::MAX_PER_HOST
+        );
+        eprintln!(
+            "  Loaded + Parsed  empty jar {}  ->  full jar {}",
+            summarize(&without),
+            summarize(&with),
+        );
     }
 
     /// The first element carrying `id="x11-3-leaf"` — the paragraph
@@ -6579,7 +6980,7 @@ mod tests {
         }
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
-            effect.fetch.map(|(_, url)| url).as_deref(),
+            effect.fetch.map(|(_, request)| request.url).as_deref(),
             Some("http://final/"),
             "re-entering the current URL did not reload"
         );
@@ -6595,7 +6996,7 @@ mod tests {
         let (mut app, id) = scripted_app("<p>page</p><script>location.reload();</script>");
         let effect = app.update(Msg::RunScripts { id });
         let (again, url) = effect.fetch.expect("location.reload() did not fetch");
-        assert_eq!(url, "http://final/");
+        assert_eq!(url.url, "http://final/");
         assert_ne!(again, id, "a reload is a new generation");
         assert!(!app.history.can_back(), "a reload is not a history entry");
     }
@@ -6719,7 +7120,7 @@ mod tests {
         let mut app = page(80, 10, "<p><a href='/other#target'>go</a></p>");
         let effect = app.update(click_first_link(&app));
         let (id, url) = effect.fetch.expect("a cross-document link must fetch");
-        assert_eq!(url, "http://final/other#target");
+        assert_eq!(url.url, "http://final/other#target");
 
         app.update(Msg::Resize(70, 10));
         assert!(
@@ -6745,6 +7146,7 @@ mod tests {
             body: body.clone().into_bytes(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(parsed(id, &body));
         assert_eq!(top_row(&app), "the target");
@@ -6780,6 +7182,7 @@ mod tests {
             body: body.clone().into_bytes(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         assert_eq!(
             app.current_url().as_deref(),
@@ -6812,6 +7215,7 @@ mod tests {
             body: body.clone().into_bytes(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(parsed(id, &body));
         let at_target = app.viewport.offset();
@@ -6830,12 +7234,13 @@ mod tests {
             body: b"<p>elsewhere</p>".to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(parsed(next, "<p>elsewhere</p>"));
 
         let back = app.update(ch('H'));
         let (restored, url) = back.fetch.expect("a different document must fetch");
-        assert_eq!(url, "http://final/other#target");
+        assert_eq!(url.url, "http://final/other#target");
         app.update(Msg::Loaded {
             id: restored,
             url: "http://final/other#target".into(),
@@ -6843,6 +7248,7 @@ mod tests {
             body: body.clone().into_bytes(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(parsed(restored, &body));
         assert_eq!(
@@ -6878,6 +7284,7 @@ mod tests {
             body: body.clone().into_bytes(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(parsed(id, &body));
         assert_eq!(app.viewport.offset(), 0, "nothing named `late` existed yet");
@@ -7852,7 +8259,7 @@ mod tests {
         assert!(effect.dirty);
         let (id, url) = effect.fetch.expect("click must navigate");
         // `page` loads with post-redirect URL `http://final/` (see `load`).
-        assert_eq!(url, "http://final/docs");
+        assert_eq!(url.url, "http://final/docs");
         assert_eq!(id, FetchId(2)); // generation after the initial load
     }
 
@@ -7875,7 +8282,7 @@ mod tests {
         // First visible link is labeled "a" (home-row alphabet).
         let effect = app.update(ch('a'));
         assert_eq!(
-            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            effect.fetch.as_ref().map(|(_, r)| r.url.as_str()),
             Some("http://final/a")
         );
         assert!(app.hint.is_none());
@@ -7923,7 +8330,7 @@ mod tests {
             app.update(key(KeyCode::Enter, KeyModifiers::NONE))
                 .fetch
                 .as_ref()
-                .map(|(_, u)| u.as_str()),
+                .map(|(_, r)| r.url.as_str()),
             Some("http://final/gone")
         );
 
@@ -7942,7 +8349,7 @@ mod tests {
             app.update(key(KeyCode::Enter, KeyModifiers::NONE))
                 .fetch
                 .as_ref()
-                .map(|(_, u)| u.as_str()),
+                .map(|(_, r)| r.url.as_str()),
             Some("http://final/shown")
         );
     }
@@ -7956,7 +8363,7 @@ mod tests {
         app.update(key(KeyCode::Tab, KeyModifiers::NONE));
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(
-            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            effect.fetch.as_ref().map(|(_, r)| r.url.as_str()),
             Some("http://final/2")
         );
     }
@@ -7981,14 +8388,15 @@ mod tests {
         }
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         let (id, url) = effect.fetch.unwrap();
-        assert_eq!(url, "http://y/");
+        assert_eq!(url.url, "http://y/");
         app.update(Msg::Loaded {
             id,
-            url: url.clone(),
+            url: url.url.clone(),
             status: 200,
             body: b"<p>page b</p>".to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(Msg::Parsed {
             id,
@@ -7999,16 +8407,17 @@ mod tests {
         // Back to A (`http://final/` — the Loaded URL of the first page).
         let effect = app.update(key(KeyCode::Char('H'), KeyModifiers::NONE));
         let (id, url) = effect.fetch.unwrap();
-        assert_eq!(url, "http://final/");
+        assert_eq!(url.url, "http://final/");
         app.update(Msg::Loaded {
             id,
-            url: url.clone(),
+            url: url.url.clone(),
             status: 200,
             body:
                 b"<p>a</p><p>b</p><p>c</p><p>d</p><p>e</p><p>f</p><p>g</p><p>h</p><p>i</p><p>j</p>"
                     .to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(Msg::Parsed {
             id,
@@ -8025,7 +8434,7 @@ mod tests {
         let mut app = page(80, 10, "<p>hi</p>");
         let effect = app.update(ch('r'));
         assert_eq!(
-            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            effect.fetch.as_ref().map(|(_, r)| r.url.as_str()),
             Some("http://final/")
         );
 
@@ -8082,14 +8491,15 @@ mod tests {
         let mut app = page(80, 10, "<p><a href='http://visited.test/'>v</a></p>");
         let effect = app.update(click_first_link(&app));
         let (id, url) = effect.fetch.unwrap();
-        assert_eq!(url, "http://visited.test/");
+        assert_eq!(url.url, "http://visited.test/");
         app.update(Msg::Loaded {
             id,
-            url: url.clone(),
+            url: url.url.clone(),
             status: 200,
             body: b"<p>there</p>".to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         assert!(app.visited.contains("http://visited.test/"));
 
@@ -8102,6 +8512,7 @@ mod tests {
             body: b"<p><a href='http://visited.test/'>back</a></p>".to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(Msg::Parsed {
             id: id2,
@@ -8160,6 +8571,7 @@ mod tests {
                     .to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(Msg::Parsed {
             id,
@@ -8227,7 +8639,7 @@ mod tests {
         // Reload still knows the URL.
         let effect = app.update(ch('r'));
         assert_eq!(
-            effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+            effect.fetch.as_ref().map(|(_, r)| r.url.as_str()),
             Some("http://x.test/gone")
         );
     }
@@ -8243,6 +8655,7 @@ mod tests {
             body: b"<html><body>server 404 page</body></html>".to_vec(),
             elapsed: Duration::ZERO,
             content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
         });
         assert!(app.dom.is_none());
         // A late Parsed must not clobber the error page.
@@ -8274,6 +8687,7 @@ mod tests {
             body: b"\x89PNG".to_vec(),
             elapsed: Duration::ZERO,
             content_type: Some("image/png".into()),
+            set_cookie: Vec::new(),
         });
         assert!(app.dom.is_none());
         let mut frame = Frame::new(60, 12);
@@ -8493,7 +8907,7 @@ mod tests {
             effect
                 .images
                 .iter()
-                .any(|(i, u)| *i == id && u == "http://site.test/dir/pic.png"),
+                .any(|(i, r)| *i == id && r.url == "http://site.test/dir/pic.png"),
             "{:?}",
             effect.images
         );
@@ -8501,7 +8915,7 @@ mod tests {
             effect
                 .images
                 .iter()
-                .any(|(_, u)| u == "https://cdn.example/x.jpg"),
+                .any(|(_, r)| r.url == "https://cdn.example/x.jpg"),
             "{:?}",
             effect.images
         );
@@ -8747,7 +9161,7 @@ body { margin: 0 } div, p { margin: 0 }
             let left = column(app.size.0).left;
             let effect = app.update(mouse_down((left as i32 + x) as u16, *y as u16));
             assert_eq!(
-                effect.fetch.as_ref().map(|(_, u)| u.as_str()),
+                effect.fetch.as_ref().map(|(_, r)| r.url.as_str()),
                 Some("http://final/two"),
                 "click at ({x}, {y}) missed the content column's link"
             );

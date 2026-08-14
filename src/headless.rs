@@ -34,13 +34,23 @@ use crate::style;
 /// The host is created and dropped inside this call: nothing headless outlives
 /// one page.
 pub fn run_scripts(dom: &mut Dom, url: Option<&str>) -> (Vec<ScriptRun>, Console, usize) {
-    run_scripts_from(dom, url, false)
+    run_scripts_from(dom, url, false, &[])
 }
 
-/// The pass **with** external `<script src>` fetched. See below for why only
+/// The pass **with** external `<script src>` fetched, and with the document
+/// response's `Set-Cookie` lines applied first. See below for why only
 /// `--dump-js` does this.
-pub fn run_scripts_fetching(dom: &mut Dom, url: &str) -> (Vec<ScriptRun>, Console, usize) {
-    run_scripts_from(dom, Some(url), true)
+///
+/// The cookies are the M11.7 half: `--dump-js` is what M11.25's ladder sweep
+/// reads, so a page whose script reads a cookie the *server* set has to show
+/// that here exactly as the TUI would. The other headless paths pass nothing
+/// because they never had a response to take it from.
+pub fn run_scripts_fetching(
+    dom: &mut Dom,
+    url: &str,
+    set_cookie: &[String],
+) -> (Vec<ScriptRun>, Console, usize) {
+    run_scripts_from(dom, Some(url), true, set_cookie)
 }
 
 /// The same pass, but **fetching** `<script src>` from `base_url`.
@@ -59,6 +69,7 @@ fn run_scripts_from(
     dom: &mut Dom,
     base_url: Option<&str>,
     fetch_externals: bool,
+    set_cookie: &[String],
 ) -> (Vec<ScriptRun>, Console, usize) {
     let mut host = None;
     let console = Console::new();
@@ -67,6 +78,17 @@ fn run_scripts_from(
     // Same for the jar: a dump's cookies begin empty and die with the call, so
     // a golden cannot depend on what the last dump wrote.
     let cookies = crate::js::cookies::Jar::new();
+    // The response's own cookies go in before any script runs, through the
+    // same function `App` uses — the dumps behave the way the TUI does.
+    if let Some(base) = base_url {
+        crate::js::cookies::apply_set_cookie(
+            &cookies,
+            base,
+            set_cookie,
+            crate::js::cookies::now(),
+            &console,
+        );
+    }
     // One page, one host, both gone when this returns, so any page generation
     // will do — nothing here outlives the call to hold a stale handle.
     // The queue, headless: external scripts are never fetched here (no worker
@@ -85,7 +107,11 @@ fn run_scripts_from(
             .and_then(|base| net::resolve_url(base, &external.url))
         {
             Some(url) => {
-                net::spawn_script(FetchId(1), external.slot, url, tx.clone());
+                // The jar's answer, on the same terms the TUI's document-order
+                // `<script src>` gets — including nothing at all when the
+                // script comes from another origin.
+                let request = script_request(&cookies, base_url, url);
+                net::spawn_script(FetchId(1), external.slot, request, tx.clone());
                 in_flight += 1;
             }
             None => {
@@ -131,6 +157,7 @@ fn run_scripts_from(
             dom,
             &mut queue,
             &console,
+            &cookies,
             base_url.filter(|_| fetch_externals),
             &tx,
             &mut in_flight,
@@ -192,7 +219,9 @@ fn run_scripts_from(
                 net::spawn_js_fetch(
                     FetchId(1),
                     ask.request,
-                    ask.url,
+                    // The binding already asked the jar, because
+                    // `credentials` is its option to read (M11.7).
+                    ask.ask,
                     ask.method,
                     ask.headers,
                     ask.body,
@@ -280,11 +309,13 @@ fn run_scripts_from(
 /// `ScriptQueue::insert` are the same two calls `App` makes, in the same
 /// order. What differs is only where the worker is spawned from, which is what
 /// differs between the two paths for every other subresource too.
+#[allow(clippy::too_many_arguments)]
 fn adopt_inserted_scripts(
     host: Option<&js::Host>,
     dom: &Dom,
     queue: &mut js::queue::ScriptQueue,
     console: &Console,
+    cookies: &crate::js::cookies::Jar,
     base_url: Option<&str>,
     tx: &mpsc::Sender<Msg>,
     in_flight: &mut usize,
@@ -299,7 +330,8 @@ fn adopt_inserted_scripts(
         if let js::queue::Inserted::Fetch(external) = queue.insert(node, script, console) {
             match base_url.and_then(|base| net::resolve_url(base, &external.url)) {
                 Some(url) => {
-                    net::spawn_script(FetchId(1), external.slot, url, tx.clone());
+                    let request = script_request(cookies, base_url, url);
+                    net::spawn_script(FetchId(1), external.slot, request, tx.clone());
                     *in_flight += 1;
                 }
                 None => {
@@ -325,6 +357,26 @@ fn adopt_inserted_scripts(
         }
     }
     owed
+}
+
+/// The headless half of `App::request` (M11.7): a script URL plus the
+/// `Cookie:` header the jar decided it may carry, from the same one function.
+///
+/// `base_url` is `None` on the paths that never fetch, and then there is
+/// nothing to compare an origin against — which `header_for` already answers
+/// with `None`, so the empty string is honest rather than a special case.
+fn script_request(
+    cookies: &crate::js::cookies::Jar,
+    base_url: Option<&str>,
+    url: String,
+) -> net::Request {
+    let cookie = crate::js::cookies::header_for(
+        cookies,
+        base_url.unwrap_or_default(),
+        &url,
+        crate::js::cookies::now(),
+    );
+    net::Request { url, cookie }
 }
 
 /// How many `fetch()` calls one headless run will answer. A page that fetches
@@ -452,7 +504,7 @@ mod tests {
              s.src = 'http://';\
              document.body.appendChild(s);</script>",
         );
-        let (_, console, _) = run_scripts_fetching(&mut dom, "https://fixture.test/page");
+        let (_, console, _) = run_scripts_fetching(&mut dom, "https://fixture.test/page", &[]);
         assert!(
             console
                 .entries()

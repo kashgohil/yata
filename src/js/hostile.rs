@@ -400,6 +400,7 @@ mod chain {
             body: html.as_bytes().to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         app.update(Msg::Parsed {
             id,

@@ -180,7 +180,12 @@ pub struct FetchQueue {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct FetchAsk {
     pub request: u64,
-    pub url: String,
+    /// Where to, and the `Cookie:` header the jar decided it may carry
+    /// (M11.7). Decided here rather than in `App` because `credentials` is a
+    /// `fetch()` option and this is where a `fetch()` option is read; the
+    /// answer still comes from `cookies::header_for`, the one function every
+    /// request path in the engine asks.
+    pub ask: crate::net::Request,
     pub method: String,
     pub headers: Vec<(String, String)>,
     pub body: Option<String>,
@@ -964,7 +969,12 @@ pub fn install<'js>(
 
     // ---- fetch (M10.12) ----
 
-    let (queue, s, log) = (fetches.clone(), Rc::clone(slot), console.clone());
+    let (queue, s, log, jar) = (
+        fetches.clone(),
+        Rc::clone(slot),
+        console.clone(),
+        cookies.clone(),
+    );
     api.set(
         "startFetch",
         Function::new(
@@ -974,7 +984,8 @@ pub fn install<'js>(
                   url: String,
                   method: String,
                   headers: String,
-                  body: Option<String>| {
+                  body: Option<String>,
+                  credentials: String| {
                 let page_url = s.url.borrow().clone();
                 let Some(resolved) = crate::net::resolve_url(&page_url, &url) else {
                     return Err(Exception::throw_message(
@@ -1015,10 +1026,22 @@ pub fn install<'js>(
                 // Headers cross as JSON: one string is a simpler boundary than
                 // a shape, and this is the only place that needs it.
                 let headers: Vec<(String, String)> = serde_pairs(&headers);
+                // `credentials`, off M10.12's ignored-and-logged list (M11.7).
+                // `omit` is the only one that means anything here: `include`
+                // and `same-origin` are the same answer, because the check
+                // above has already made a same-origin request the only kind
+                // this engine makes.
+                let cookie = match credentials.as_str() {
+                    "omit" => None,
+                    _ => cookies::header_for(&jar, &page_url, &resolved, cookies::now()),
+                };
                 queue.in_flight.set(queue.in_flight.get() + 1);
                 queue.requests.borrow_mut().push(FetchAsk {
                     request: request as u64,
-                    url: resolved,
+                    ask: crate::net::Request {
+                        url: resolved,
+                        cookie,
+                    },
                     method,
                     headers,
                     body,
@@ -1944,7 +1967,8 @@ const PRELUDE: &str = r#"
   // Options a browser honours and we do not. Logged once each rather than
   // ignored silently: quietly dropping a caller's option is how a page ends up
   // mystifyingly wrong.
-  const IGNORED = ['mode', 'credentials', 'cache', 'redirect', 'referrer',
+  // `credentials` is *not* here since M11.7: it is honoured below.
+  const IGNORED = ['mode', 'cache', 'redirect', 'referrer',
                    'integrity', 'signal', 'keepalive'];
   const warned = {};
 
@@ -1969,11 +1993,17 @@ const PRELUDE: &str = r#"
       ? undefined
       : String(options.body);
 
+    // `omit` means no cookies; `same-origin` (the default) and `include` both
+    // mean the page's own, because a same-origin request is the only kind this
+    // engine makes. Rust decides what that comes to — a page must never be
+    // able to name a cookie it may send.
+    const credentials = String(options.credentials || 'same-origin');
+
     const id = nextRequestId++;
     return new Promise(function (resolve, reject) {
       inFlight.set(id, { resolve: resolve, reject: reject });
       try {
-        raw.startFetch(id, url, method, JSON.stringify(headers), body);
+        raw.startFetch(id, url, method, JSON.stringify(headers), body, credentials);
       } catch (error) {
         // Refused before it left: same origin, a bad URL, or too many in
         // flight. The promise rejects like a browser's would.

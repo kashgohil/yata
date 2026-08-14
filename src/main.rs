@@ -84,7 +84,10 @@ fn main() -> io::Result<()> {
         // worker owns its own Sender clone.
         let url = net::normalize_url(&url);
         let id = app.start_fetch(url.clone());
-        net::spawn_fetch(id, url, tx.clone());
+        // The first request of the session, and the jar is empty: `Request`
+        // carries no cookies because there are none, not because this path
+        // skips the question.
+        net::spawn_fetch(id, net::Request::bare(url), tx.clone());
     }
     // The loop keeps `tx` alive so a URL-bar commit can spawn a fetch (below);
     // the input thread gets its own clone. Because the loop holds a sender,
@@ -109,12 +112,12 @@ fn main() -> io::Result<()> {
         }
         // A committed navigation: `App` already started the generation, the
         // loop's only job is to spawn the worker with its own Sender clone.
-        if let Some((id, url)) = effect.fetch {
+        if let Some((id, request)) = effect.fetch {
             // A new generation: everything the old page scheduled is dead. The
             // `FetchId` guard would drop those messages anyway; cancelling
             // means the thread does not wake for them at all.
             timers.apply(TimerRequest::CancelOthers { keep: id });
-            net::spawn_fetch(id, url, tx.clone());
+            net::spawn_fetch(id, request, tx.clone());
         }
         for request in effect.timers {
             timers.apply(request);
@@ -125,7 +128,9 @@ fn main() -> io::Result<()> {
             net::spawn_js_fetch(
                 page,
                 ask.request,
-                ask.url,
+                // The `Cookie:` header the binding's `credentials` reading
+                // already settled (M11.7).
+                ask.ask,
                 ask.method,
                 ask.headers,
                 ask.body,
@@ -135,17 +140,17 @@ fn main() -> io::Result<()> {
         // One worker per linked stylesheet, all spawned before this turn's
         // render: they run in parallel with each other and with the page the
         // user is already reading (PLAN.md M4, UX §3.2).
-        for (id, slot, url) in effect.sheets {
-            net::spawn_stylesheet(id, slot, url, tx.clone());
+        for (id, slot, request) in effect.sheets {
+            net::spawn_stylesheet(id, slot, request, tx.clone());
         }
         // One worker per external script (M10.10), parallel with everything
         // else — the *fetches* race, the executions do not.
-        for (id, slot, url) in effect.scripts {
-            net::spawn_script(id, slot, url, tx.clone());
+        for (id, slot, request) in effect.scripts {
+            net::spawn_script(id, slot, request, tx.clone());
         }
         // One worker per image URL (M8), parallel with the page and sheets.
-        for (id, url) in effect.images {
-            net::spawn_image(id, url, tx.clone());
+        for (id, request) in effect.images {
+            net::spawn_image(id, request, tx.clone());
         }
         // The script pass (M10.2) goes back through the channel rather than
         // being called here, so it arrives as its own turn — after the render
@@ -186,14 +191,29 @@ const DUMP_TEXT_WIDTH: u16 = 80;
 fn headless_fetch(url: &str) -> mpsc::Receiver<Msg> {
     let url = net::normalize_url(url);
     let (tx, rx) = mpsc::channel();
-    net::spawn_fetch(net::FetchId(1), url, tx);
+    // No jar exists yet on this path — a dump's jar is created by the run that
+    // the document's own response seeds (see `headless::run_scripts_from`) —
+    // so the first request carries nothing, which is also all an empty jar
+    // would have given it.
+    net::spawn_fetch(net::FetchId(1), net::Request::bare(url), tx);
     rx
+}
+
+/// What a headless `Loaded` carries, named rather than a tuple because the
+/// fifth element (M11.7's `Set-Cookie` lines) is the point of two of the five
+/// modes and noise in the other three.
+struct Loaded {
+    url: String,
+    status: u16,
+    body: Vec<u8>,
+    elapsed: Duration,
+    set_cookie: Vec<String>,
 }
 
 /// Block until the worker's `Loaded`, skipping progress messages. `Err` on
 /// `NetError` or a worker that died without a terminal message — an error
 /// exit, never a hang or panic.
-fn recv_loaded(rx: &mpsc::Receiver<Msg>) -> Result<(String, u16, Vec<u8>, Duration), String> {
+fn recv_loaded(rx: &mpsc::Receiver<Msg>) -> Result<Loaded, String> {
     loop {
         match rx.recv() {
             Ok(Msg::Loaded {
@@ -201,8 +221,17 @@ fn recv_loaded(rx: &mpsc::Receiver<Msg>) -> Result<(String, u16, Vec<u8>, Durati
                 status,
                 body,
                 elapsed,
+                set_cookie,
                 ..
-            }) => return Ok((url, status, body, elapsed)),
+            }) => {
+                return Ok(Loaded {
+                    url,
+                    status,
+                    body,
+                    elapsed,
+                    set_cookie,
+                });
+            }
             Ok(Msg::NetError { url, reason, .. }) => return Err(format!("{url}: {reason}")),
             Ok(_) => {}
             Err(_) => return Err("fetch worker exited without a result".into()),
@@ -226,7 +255,8 @@ fn recv_parsed(rx: &mpsc::Receiver<Msg>) -> Result<(yata::dom::Dom, Duration), S
 /// still a page). Exit 0, or 1 with the reason on stderr.
 fn run_dump(url: &str) -> i32 {
     match recv_loaded(&headless_fetch(url)) {
-        Ok((_, _, body, _)) => {
+        Ok(loaded) => {
+            let body = loaded.body;
             let mut out = io::stdout();
             if out.write_all(&body).and_then(|()| out.flush()).is_err() {
                 return 1;
@@ -270,7 +300,7 @@ fn run_dump_dom(url: &str) -> i32 {
 /// the same everywhere. Parse and layout, but no TUI.
 fn run_dump_text(url: &str) -> i32 {
     let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l.0, p))) {
+    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l.url, p))) {
         Ok((final_url, (mut dom, _))) => {
             // Scripts run before the dump, under the headless rule (one pass,
             // no timers) that `headless::run_scripts` documents. The URL is
@@ -317,12 +347,16 @@ fn run_dump_text(url: &str) -> i32 {
 /// fetches it.
 fn run_dump_js(url: &str) -> i32 {
     let rx = headless_fetch(url);
-    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l.0, p))) {
-        Ok((final_url, (mut dom, _))) => {
+    match recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p))) {
+        Ok((loaded, (mut dom, _))) => {
             // Pointed at a real URL, so external scripts are fetched here —
             // the one headless path that does; see `headless::run_scripts_from`.
+            // The response's own cookies go in before the scripts run, the
+            // same way `App` does it — `--dump-js` is what M11.25's ladder
+            // sweep reads, so a script that reads a cookie the *server* set
+            // has to see it here too (M11.7).
             let (runs, console, pending) =
-                yata::headless::run_scripts_fetching(&mut dom, &final_url);
+                yata::headless::run_scripts_fetching(&mut dom, &loaded.url, &loaded.set_cookie);
             let mut text = String::new();
             for run in runs {
                 text.push_str(&run.dump_line());
@@ -368,7 +402,8 @@ fn run_dump_boxes(url: &str) -> i32 {
     let rx = headless_fetch(url);
     let loaded = recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p)));
     match loaded {
-        Ok(((final_url, ..), (mut dom, _))) => {
+        Ok((loaded, (mut dom, _))) => {
+            let final_url = loaded.url;
             // Relative `src` resolves against the URL the body actually came
             // from (redirects included), like the TUI's discovery does.
             let text = yata::headless::box_dump(&mut dom, Some(&final_url), DUMP_TEXT_WIDTH);
@@ -396,7 +431,7 @@ fn run_dump_boxes(url: &str) -> i32 {
 fn run_timing(url: &str) -> i32 {
     let rx = headless_fetch(url);
     let loaded = recv_loaded(&rx).and_then(|l| recv_parsed(&rx).map(|p| (l, p)));
-    let ((url, status, body, fetch_elapsed), (dom, parse_elapsed)) = match loaded {
+    let (loaded, (dom, parse_elapsed)) = match loaded {
         Ok(ok) => ok,
         Err(reason) => {
             eprintln!("{reason}");
@@ -409,14 +444,17 @@ fn run_timing(url: &str) -> i32 {
     let caps = term::detect_caps_from_env();
     let mut renderer = Renderer::new(w, h, caps);
     let mut app = App::with_caps(w, h, caps.kitty);
-    let id = app.start_fetch(url.clone());
+    let id = app.start_fetch(loaded.url.clone());
     app.update(Msg::Loaded {
         id,
-        url,
-        status,
-        body,
-        elapsed: fetch_elapsed,
+        url: loaded.url,
+        status: loaded.status,
+        body: loaded.body,
+        elapsed: loaded.elapsed,
         content_type: None,
+        // The response's own, through the same path the TUI uses — the jar is
+        // on the load path now, and `--timing` is what measures the load path.
+        set_cookie: loaded.set_cookie,
     });
     app.update(Msg::Parsed {
         id,
@@ -568,6 +606,7 @@ mod tests {
             body,
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         // 200 'j' now scroll for real: still one coalesced redraw decision, not
         // 200 renders. (Clamping to the last page is covered by viewport tests.)
@@ -597,6 +636,7 @@ mod tests {
                     body: html.clone(),
                     elapsed: Duration::ZERO,
                     content_type: None,
+                    set_cookie: Vec::new(),
                 },
                 Msg::Parsed {
                     id,
@@ -659,6 +699,7 @@ mod tests {
             body: b"<img src=pic.png width=8 height=16>".to_vec(),
             elapsed: Duration::ZERO,
             content_type: None,
+            set_cookie: Vec::new(),
         });
         let effect = apply_batch(
             &mut app,
@@ -672,7 +713,7 @@ mod tests {
             effect
                 .images
                 .iter()
-                .any(|(i, u)| *i == id && u == "http://site.test/pic.png"),
+                .any(|(i, r)| *i == id && r.url == "http://site.test/pic.png"),
             "coalesced effect must carry image URLs: {:?}",
             effect.images
         );
@@ -695,7 +736,7 @@ mod tests {
         let mut app = App::new(80, 24);
         let effect = apply_batch(&mut app, msgs.into_iter());
         let (id, url) = effect.fetch.expect("a commit must surface a fetch");
-        assert_eq!(url, "https://b.com", "an earlier commit leaked through");
+        assert_eq!(url.url, "https://b.com", "an earlier commit leaked through");
         assert_eq!(id, net::FetchId(2), "the id must be the second generation");
     }
 }

@@ -37,6 +37,19 @@ pub enum Msg {
         /// Raw `Content-Type` header value, if any. The TUI uses this to refuse
         /// non-document responses (M7); `--dump` ignores it.
         content_type: Option<String>,
+        /// The response's `Set-Cookie` lines, verbatim and unfolded (M11.7).
+        /// `App` parses them on the UI thread — the jar is `!Send` and no
+        /// worker can hold one.
+        ///
+        /// **Only the document carries these.** `Stylesheet`, `Script` and
+        /// `Image` have no such field, and the asymmetry with the `Cookie:`
+        /// header (which every request sends) is the decision: a subresource
+        /// *sends* cookies because a server may require them to serve the
+        /// bytes, but a session is established by the document path, and a
+        /// subresource setting one is a quirk rather than a concept. With no
+        /// field to carry it, "a stylesheet cannot start a session" is
+        /// structural rather than a rule somebody has to remember.
+        set_cookie: Vec<String>,
     },
     /// The parsed tree for a `Loaded` body, sent by the same worker right
     /// after it. Parsing happens off the UI thread (CLAUDE.md: the UI thread

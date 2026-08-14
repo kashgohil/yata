@@ -31,6 +31,32 @@ fn serve_once(response: Vec<u8>) -> SocketAddr {
     addr
 }
 
+/// Serve `count` requests on one ephemeral port, answering each with
+/// `respond(request_text)`. One port means one origin, which is what a
+/// same-origin round trip needs; `serve_once` cannot do it because a
+/// subresource is a second request.
+fn serve_site(count: usize, respond: impl Fn(&str) -> Vec<u8> + Send + 'static) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        for _ in 0..count {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(&respond(&String::from_utf8_lossy(&req)));
+        }
+    });
+    addr
+}
+
 fn response_with_body(status_line: &str, body: &[u8]) -> Vec<u8> {
     let mut resp = format!(
         "HTTP/1.1 {status_line}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -352,6 +378,61 @@ fn dump_js_shows_the_cookies_a_page_sets_and_reads() {
             "warn  ignored document.cookie = \"rubbish\": it has no name=value pair",
         ],
         "the dump does not show what the TUI would:\n{dumped}"
+    );
+}
+
+#[test]
+fn dump_js_shows_a_server_set_cookie_going_back_out_on_the_wire() {
+    // M11.7's round trip, end to end through the real binary: the document
+    // response sets two cookies, the page's own script reads back the one it
+    // is allowed to, and the `<script src>` request that follows carries
+    // **both** — the server echoes the `Cookie:` header it received into the
+    // JavaScript it serves, which is the only way to see the wire from here.
+    //
+    // Two requests, one port, so the script is same-origin with the page.
+    let addr = serve_site(2, |request| {
+        if request.starts_with("GET /lib.js") {
+            let seen = request
+                .lines()
+                .find_map(|line| line.strip_prefix("cookie: "))
+                .unwrap_or("<none>")
+                .trim()
+                .to_string();
+            response_with_body(
+                "200 OK",
+                format!("console.log('server saw: {seen}');").as_bytes(),
+            )
+        } else {
+            let body = b"<script>console.log('script sees: ' + document.cookie);</script>\
+                         <script src=/lib.js></script>";
+            let mut resp = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Set-Cookie: sid=abc; Path=/; HttpOnly\r\n\
+                 Set-Cookie: theme=dark; Path=/\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            resp.extend_from_slice(body);
+            resp
+        }
+    });
+
+    let out = yata(&["--dump-js", &format!("http://{addr}/")]);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let dumped = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        dumped.contains("script sees: theme=dark"),
+        "the page's script should see the non-HttpOnly cookie and only that:\n{dumped}"
+    );
+    assert!(
+        dumped.contains("server saw: sid=abc; theme=dark"),
+        "the subresource request did not carry the session:\n{dumped}"
     );
 }
 

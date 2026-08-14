@@ -173,3 +173,33 @@ mod tests {
 /// a slow stale fetch can never clobber a newer one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FetchId(pub u64);
+
+/// One request a worker is to make: where to, and the `Cookie:` header the jar
+/// decided it may carry (M11.7).
+///
+/// A type rather than a second parameter on five functions, because the
+/// pairing is the whole point. The jar is `Rc<RefCell<…>>` and therefore
+/// `!Send`, so a worker *cannot* hold one — not by discipline, but because it
+/// would not compile. Everything that crosses the channel is this: a URL and a
+/// string somebody already decided on, on the UI thread, through
+/// `cookies::header_for`. "Did this request ask the jar?" is then a question a
+/// reviewer answers by reading a signature rather than by counting call sites.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Request {
+    pub url: String,
+    /// The `Cookie:` header value, or `None` for a request that carries none —
+    /// cross-origin, or a jar with nothing that matches.
+    pub cookie: Option<String>,
+}
+
+impl Request {
+    /// A request that carries no cookies, because there is no jar to ask: the
+    /// headless document fetch (whose jar does not exist until the document
+    /// has arrived) and the tests that are not about cookies.
+    pub fn bare(url: impl Into<String>) -> Request {
+        Request {
+            url: url.into(),
+            cookie: None,
+        }
+    }
+}

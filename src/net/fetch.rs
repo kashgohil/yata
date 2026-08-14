@@ -8,7 +8,7 @@ use crate::css;
 use crate::html;
 use crate::image;
 use crate::msg::Msg;
-use crate::net::FetchId;
+use crate::net::{FetchId, Request};
 
 /// Read size per chunk: small enough that progress messages arrive steadily
 /// on slow links, large enough that syscall overhead is irrelevant.
@@ -31,9 +31,9 @@ const CHUNK: usize = 16 * 1024;
 /// (~tens of ms) would blow the keypress→screen budget if the UI thread did
 /// it. `Loaded` goes out first so a document body shows without waiting on
 /// the parse.
-pub fn spawn_fetch(id: FetchId, url: String, tx: Sender<Msg>) {
+pub fn spawn_fetch(id: FetchId, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        match fetch(id, &url, &tx) {
+        match fetch(id, &request, &tx) {
             Ok(Some(loaded)) => {
                 let Msg::Loaded {
                     body,
@@ -104,9 +104,9 @@ pub fn is_document(status: u16, content_type: Option<&str>) -> bool {
 /// response yields `None`; the page is then styled by whatever else it has,
 /// which is what "render unstyled, then restyle" means when a sheet is missing
 /// rather than slow.
-pub fn spawn_stylesheet(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) {
+pub fn spawn_stylesheet(id: FetchId, slot: usize, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        let sheet = match get(&url) {
+        let sheet = match get(&request) {
             // A 404's body is an error page, not CSS; parsing it would put
             // whatever HTML-shaped garbage recovers into the cascade.
             Ok((status, body)) if (200..300).contains(&status) => {
@@ -136,9 +136,9 @@ pub const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
 /// status, or a body past [`MAX_SCRIPT_BYTES`]. The page is degraded, never an
 /// error page — a missing script is the same class of problem as a missing
 /// stylesheet.
-pub fn spawn_script(id: FetchId, slot: usize, url: String, tx: Sender<Msg>) {
+pub fn spawn_script(id: FetchId, slot: usize, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        let source = match get(&url) {
+        let source = match get(&request) {
             // A 404's body is an error page, not JavaScript. Running it would
             // put whatever HTML-shaped garbage recovers into the engine.
             Ok((status, body)) if (200..300).contains(&status) => {
@@ -182,14 +182,14 @@ pub struct JsResponse {
 pub fn spawn_js_fetch(
     page: FetchId,
     request: u64,
-    url: String,
+    ask: Request,
     method: String,
     headers: Vec<(String, String)>,
     body: Option<String>,
     tx: Sender<Msg>,
 ) {
     thread::spawn(move || {
-        let result = js_request(&url, &method, &headers, body.as_deref());
+        let result = js_request(&ask, &method, &headers, body.as_deref());
         let _ = tx.send(Msg::JsFetch {
             page,
             request,
@@ -199,19 +199,28 @@ pub fn spawn_js_fetch(
 }
 
 fn js_request(
-    url: &str,
+    ask: &Request,
     method: &str,
     headers: &[(String, String)],
     body: Option<&str>,
 ) -> Result<JsResponse, String> {
     let client = client()?;
+    let url = ask.url.as_str();
     let mut req = match method {
         "POST" => client.post(url),
         _ => client.get(url),
     };
     for (name, value) in headers {
+        // `Cookie` is a forbidden header name in `fetch()`, and here it has to
+        // be: the jar decides what this request carries, and a page allowed to
+        // write the header itself could send a `Secure` or `HttpOnly` cookie
+        // back to its own server that `credentials: 'omit'` had just refused.
+        if name.eq_ignore_ascii_case("cookie") {
+            continue;
+        }
         req = req.header(name.as_str(), value.as_str());
     }
+    let mut req = with_cookies(req, ask);
     if let Some(body) = body {
         req = req.body(body.to_string());
     }
@@ -252,25 +261,50 @@ fn js_request(
 /// Fetch and decode one `<img>` on a detached worker (M8). One `Msg::Image`
 /// goes out — success or soft failure. Never an error page: a broken image is
 /// a degraded page, not a navigation failure.
-pub fn spawn_image(id: FetchId, url: String, tx: Sender<Msg>) {
+pub fn spawn_image(id: FetchId, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        let result = match get(&url) {
+        let result = match get(&request) {
             Ok((status, body)) if (200..300).contains(&status) => image::decode(&body),
             Ok((status, _)) => Err(format!("HTTP {status}")),
             Err(e) => Err(e),
         };
-        let _ = tx.send(Msg::Image { id, url, result });
+        let _ = tx.send(Msg::Image {
+            id,
+            url: request.url,
+            result,
+        });
     });
 }
 
 /// A whole response in one go, no progress reporting. Used for subresources,
 /// where there is no byte counter to feed.
-fn get(url: &str) -> Result<(u16, Vec<u8>), String> {
-    let mut resp = client()?.get(url).send().map_err(describe)?;
+///
+/// A subresource *sends* cookies, because a same-origin server may require
+/// them to serve the bytes at all — and it can set none: no `Msg` on this path
+/// carries a `Set-Cookie`, which is what makes "a subresource cannot start a
+/// session" structural rather than a rule somebody has to remember (M11.7,
+/// deliverable 2).
+fn get(request: &Request) -> Result<(u16, Vec<u8>), String> {
+    let mut resp = with_cookies(client()?.get(&request.url), request)
+        .send()
+        .map_err(describe)?;
     let status = resp.status().as_u16();
     let mut body = Vec::new();
     resp.read_to_end(&mut body).map_err(describe)?;
     Ok((status, body))
+}
+
+/// Put the `Cookie:` header on a request, if the jar gave it one. The one
+/// place a cookie becomes a header — every worker goes through it, so a
+/// request path added later has to walk past it to send nothing.
+fn with_cookies(
+    builder: reqwest::blocking::RequestBuilder,
+    request: &Request,
+) -> reqwest::blocking::RequestBuilder {
+    match &request.cookie {
+        Some(cookie) => builder.header(reqwest::header::COOKIE, cookie),
+        None => builder,
+    }
 }
 
 /// One blocking client. Built on the worker, never on the UI thread; defaults
@@ -286,7 +320,12 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 /// failure (bad URL, DNS, connect, TLS, mid-body disconnect). The error's url
 /// is the most precise one known at the point of failure: the requested URL
 /// until headers arrive, the post-redirect final URL after.
-fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (String, String)> {
+fn fetch(
+    id: FetchId,
+    request: &Request,
+    tx: &Sender<Msg>,
+) -> Result<Option<Msg>, (String, String)> {
+    let url = request.url.as_str();
     // Timed on the worker, where the request happens: the duration reaches
     // the app as message data, so the app never reads the clock. The span is
     // the whole request — client build → last body byte.
@@ -294,8 +333,7 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
     // Built on the worker (see `client`), so the UI thread never touches
     // reqwest.
     let client = client().map_err(|reason| (url.to_string(), reason))?;
-    let mut resp = client
-        .get(url)
+    let mut resp = with_cookies(client.get(url), request)
         .send()
         .map_err(|e| (url.to_string(), describe(e)))?;
     let status = resp.status().as_u16();
@@ -306,6 +344,22 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned());
+    // Every `Set-Cookie` line, kept apart: a response may carry several, and
+    // folding them on commas is the classic way to lose one (a comma is legal
+    // inside a cookie value and inside an `Expires` date). Bytes that are not
+    // UTF-8 are skipped rather than lossily decoded — a mangled cookie is a
+    // credential that silently does not work, and dropping it says so.
+    //
+    // Not a header map. M11.20's cache will want `Cache-Control` and `ETag`,
+    // and it can widen this when it has a second reader; a map now is a field
+    // nothing reads.
+    let set_cookie: Vec<String> = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(str::to_string)
+        .collect();
 
     let mut body = Vec::new();
     let mut buf = [0u8; CHUNK];
@@ -332,6 +386,7 @@ fn fetch(id: FetchId, url: &str, tx: &Sender<Msg>) -> Result<Option<Msg>, (Strin
         body,
         elapsed: started.elapsed(),
         content_type,
+        set_cookie,
     }))
 }
 
@@ -355,6 +410,7 @@ mod tests {
     use std::io::Write;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     /// Serve one canned HTTP response on an ephemeral local port, from a test
@@ -377,6 +433,60 @@ mod tests {
             let _ = stream.write_all(&response);
         });
         addr
+    }
+
+    /// Serve `count` requests on one ephemeral port, answering each with
+    /// `respond(request_text)`, and hand back the requests as they were
+    /// received. This is how the M11.7 tests ask "what did the server
+    /// actually see?" — the presence of a `Cookie:` header on the wire is the
+    /// whole claim, and it cannot be checked from this side of the socket.
+    fn serve_capturing(
+        count: usize,
+        respond: impl Fn(&str) -> Vec<u8> + Send + 'static,
+    ) -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&seen);
+        thread::spawn(move || {
+            for _ in 0..count {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut req = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let text = String::from_utf8_lossy(&req).into_owned();
+                let response = respond(&text);
+                captured.lock().unwrap().push(text);
+                let _ = stream.write_all(&response);
+            }
+        });
+        (addr, seen)
+    }
+
+    /// The `Cookie:` header a captured request carried, if any.
+    fn cookie_header(request: &str) -> Option<&str> {
+        request.lines().find_map(|line| {
+            line.strip_prefix("cookie: ")
+                .or_else(|| line.strip_prefix("Cookie: "))
+                .map(str::trim)
+        })
+    }
+
+    /// A 200 with `body` and `Connection: close`, so each request gets its own
+    /// accept.
+    fn ok_body(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
     }
 
     /// Serve a redirect from `/start` to `/final`, then `final_response` on
@@ -490,7 +600,12 @@ mod tests {
     fn a_stylesheet_worker_sends_one_parsed_sheet() {
         let addr = serve_css("HTTP/1.1 200 OK", "a:link { color: #000 } p { color: red }");
         let (tx, rx) = mpsc::channel();
-        spawn_stylesheet(FetchId(7), 3, format!("http://{addr}/news.css"), tx);
+        spawn_stylesheet(
+            FetchId(7),
+            3,
+            Request::bare(format!("http://{addr}/news.css")),
+            tx,
+        );
 
         let msgs = drain(rx);
         assert_eq!(msgs.len(), 1, "one message and nothing else: {msgs:?}");
@@ -513,7 +628,12 @@ mod tests {
         // whatever the recovery path salvages into the cascade.
         let addr = serve_css("HTTP/1.1 404 Not Found", "<html>nope</html>");
         let (tx, rx) = mpsc::channel();
-        spawn_stylesheet(FetchId(8), 0, format!("http://{addr}/missing.css"), tx);
+        spawn_stylesheet(
+            FetchId(8),
+            0,
+            Request::bare(format!("http://{addr}/missing.css")),
+            tx,
+        );
         assert!(matches!(
             drain(rx).as_slice(),
             [Msg::Stylesheet {
@@ -529,7 +649,12 @@ mod tests {
             .local_addr()
             .unwrap();
         let (tx, rx) = mpsc::channel();
-        spawn_stylesheet(FetchId(9), 1, format!("http://{dead}/x.css"), tx);
+        spawn_stylesheet(
+            FetchId(9),
+            1,
+            Request::bare(format!("http://{dead}/x.css")),
+            tx,
+        );
         assert!(matches!(
             drain(rx).as_slice(),
             [Msg::Stylesheet {
@@ -547,8 +672,18 @@ mod tests {
         // deadlocks and `drain`'s timeout fails it.
         let addr = serve_two_but_only_after_both_connect("p { color: red }");
         let (tx, rx) = mpsc::channel();
-        spawn_stylesheet(FetchId(10), 0, format!("http://{addr}/a.css"), tx.clone());
-        spawn_stylesheet(FetchId(10), 1, format!("http://{addr}/b.css"), tx);
+        spawn_stylesheet(
+            FetchId(10),
+            0,
+            Request::bare(format!("http://{addr}/a.css")),
+            tx.clone(),
+        );
+        spawn_stylesheet(
+            FetchId(10),
+            1,
+            Request::bare(format!("http://{addr}/b.css")),
+            tx,
+        );
 
         let msgs = drain(rx);
         assert_eq!(msgs.len(), 2, "one message per sheet: {msgs:?}");
@@ -574,7 +709,7 @@ mod tests {
         );
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(1), url.clone(), tx);
+        spawn_fetch(FetchId(1), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         let (progress, loaded, parsed) = split_success(&msgs);
@@ -611,6 +746,7 @@ mod tests {
                 body: b"hello world".to_vec(),
                 elapsed: *elapsed,
                 content_type: None,
+                set_cookie: Vec::new(),
             }
         );
         // The Parsed message carries the body's tree, built on the worker.
@@ -634,7 +770,7 @@ mod tests {
             .unwrap();
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(2), url.clone(), tx);
+        spawn_fetch(FetchId(2), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         assert_eq!(msgs.len(), 1, "exactly one message expected, got {msgs:?}");
@@ -659,7 +795,11 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nhello",
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(4), format!("http://{addr}/start"), tx);
+        spawn_fetch(
+            FetchId(4),
+            Request::bare(format!("http://{addr}/start")),
+            tx,
+        );
 
         let msgs = drain(rx);
         let (last, progress) = msgs.split_last().expect("worker sent nothing");
@@ -691,7 +831,11 @@ mod tests {
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(5), format!("http://{addr}/start"), tx);
+        spawn_fetch(
+            FetchId(5),
+            Request::bare(format!("http://{addr}/start")),
+            tx,
+        );
 
         let msgs = drain(rx);
         let (_, loaded, _) = split_success(&msgs);
@@ -707,6 +851,7 @@ mod tests {
                 body: b"hello".to_vec(),
                 elapsed: *elapsed,
                 content_type: None,
+                set_cookie: Vec::new(),
             },
             "Loaded must carry the post-redirect URL and the final status"
         );
@@ -730,7 +875,7 @@ mod tests {
         let addr = serve_once(response);
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(6), url.clone(), tx);
+        spawn_fetch(FetchId(6), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         let (_, loaded, _) = split_success(&msgs);
@@ -746,6 +891,7 @@ mod tests {
                 body: b"hello world".to_vec(),
                 elapsed: *elapsed,
                 content_type: None,
+                set_cookie: Vec::new(),
             },
             "the body must arrive decompressed, not as gzip bytes"
         );
@@ -754,7 +900,7 @@ mod tests {
     #[test]
     fn bad_url_sends_exactly_one_net_error() {
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(3), "not a url".to_string(), tx);
+        spawn_fetch(FetchId(3), Request::bare("not a url".to_string()), tx);
         let msgs = drain(rx);
         assert_eq!(msgs.len(), 1, "exactly one message expected, got {msgs:?}");
         assert!(matches!(
@@ -773,7 +919,7 @@ mod tests {
                 .to_vec(),
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(20), format!("http://{addr}/"), tx);
+        spawn_fetch(FetchId(20), Request::bare(format!("http://{addr}/")), tx);
         let msgs = drain(rx);
         assert!(
             msgs.iter()
@@ -791,7 +937,7 @@ mod tests {
                 .to_vec(),
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(21), format!("http://{addr}/"), tx);
+        spawn_fetch(FetchId(21), Request::bare(format!("http://{addr}/")), tx);
         let msgs = drain(rx);
         assert!(
             msgs.iter().any(|m| matches!(
@@ -807,6 +953,308 @@ mod tests {
         assert!(
             !msgs.iter().any(|m| matches!(m, Msg::Parsed { .. })),
             "image/png must not produce Parsed: {msgs:?}"
+        );
+    }
+
+    // ---- M11.7: cookies on the wire ---------------------------------------
+
+    #[test]
+    fn every_worker_sends_the_cookie_header_it_was_given() {
+        // Four of the five request paths, because the fifth (`fetch()`) has
+        // its own test below. One function decided the header; what is pinned
+        // here is that each worker actually puts it on the wire, since a path
+        // that quietly dropped it would leave a reader logged out of exactly
+        // one kind of subresource.
+        let (addr, seen) = serve_capturing(4, |_| ok_body("x"));
+        let request = |path: &str| Request {
+            url: format!("http://{addr}{path}"),
+            cookie: Some("sid=abc".to_string()),
+        };
+
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(1), request("/doc"), tx);
+        drain(rx);
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(FetchId(1), 0, request("/x.css"), tx);
+        drain(rx);
+        let (tx, rx) = mpsc::channel();
+        spawn_script(FetchId(1), 0, request("/x.js"), tx);
+        drain(rx);
+        let (tx, rx) = mpsc::channel();
+        spawn_image(FetchId(1), request("/x.png"), tx);
+        drain(rx);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "one request each: {seen:?}");
+        for request in seen.iter() {
+            assert_eq!(
+                cookie_header(request),
+                Some("sid=abc"),
+                "a worker dropped its Cookie header: {request:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_request_with_no_cookie_sends_no_header_at_all() {
+        // `None` means the header is absent, not empty: an empty `Cookie:` is
+        // a header a server has to parse for nothing.
+        let (addr, seen) = serve_capturing(1, |_| ok_body("x"));
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(
+            FetchId(1),
+            0,
+            Request::bare(format!("http://{addr}/x.css")),
+            tx,
+        );
+        drain(rx);
+        assert_eq!(cookie_header(&seen.lock().unwrap()[0]), None);
+    }
+
+    #[test]
+    fn set_cookie_lines_reach_loaded_unfolded() {
+        // Several lines, kept apart. Folding them on commas is the classic way
+        // to lose one — a comma is legal both inside a value and inside an
+        // `Expires` date, which is why the second line here has one.
+        let addr = serve_once(
+            b"HTTP/1.1 200 OK\r\n\
+              Set-Cookie: a=1; Path=/\r\n\
+              Set-Cookie: b=2; Expires=Sun, 06 Nov 2094 08:49:37 GMT\r\n\
+              Content-Length: 2\r\nConnection: close\r\n\r\nhi"
+                .to_vec(),
+        );
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/")), tx);
+        let msgs = drain(rx);
+        let (_, loaded, _) = split_success(&msgs);
+        let Msg::Loaded { set_cookie, .. } = loaded else {
+            unreachable!()
+        };
+        assert_eq!(
+            *set_cookie,
+            vec![
+                "a=1; Path=/".to_string(),
+                "b=2; Expires=Sun, 06 Nov 2094 08:49:37 GMT".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_set_cookie_that_is_not_utf8_is_skipped_rather_than_mangled() {
+        // A lossy decode would store a credential with a replacement character
+        // in it: a cookie that silently does not work. Dropping it says so.
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nSet-Cookie: bad=\xff\xfe\r\nSet-Cookie: good=1\r\n".to_vec();
+        response.extend_from_slice(b"Content-Length: 2\r\nConnection: close\r\n\r\nhi");
+        let addr = serve_once(response);
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/")), tx);
+        let msgs = drain(rx);
+        let (_, loaded, _) = split_success(&msgs);
+        let Msg::Loaded { set_cookie, .. } = loaded else {
+            unreachable!()
+        };
+        assert_eq!(*set_cookie, vec!["good=1".to_string()]);
+    }
+
+    #[test]
+    fn a_subresource_response_has_nowhere_to_put_a_set_cookie() {
+        // Deliverable 2, as a structural test rather than a policy: the
+        // messages a subresource worker sends have no field a `Set-Cookie`
+        // could travel in, so a stylesheet or an image trying to start a
+        // session sends exactly what it always sent and nothing more.
+        let with_cookie = b"HTTP/1.1 200 OK\r\n\
+                            Set-Cookie: sid=abc; Path=/\r\n\
+                            Content-Length: 16\r\nConnection: close\r\n\r\np { color: red }";
+        let addr = serve_once(with_cookie.to_vec());
+        let (tx, rx) = mpsc::channel();
+        spawn_stylesheet(
+            FetchId(1),
+            0,
+            Request::bare(format!("http://{addr}/x.css")),
+            tx,
+        );
+        assert!(
+            matches!(
+                drain(rx).as_slice(),
+                [Msg::Stylesheet {
+                    id: FetchId(1),
+                    slot: 0,
+                    sheet: Some(_)
+                }]
+            ),
+            "a stylesheet response carried something new"
+        );
+
+        let addr = serve_once(with_cookie.to_vec());
+        let (tx, rx) = mpsc::channel();
+        spawn_script(
+            FetchId(1),
+            0,
+            Request::bare(format!("http://{addr}/x.js")),
+            tx,
+        );
+        assert!(matches!(
+            drain(rx).as_slice(),
+            [Msg::Script {
+                id: FetchId(1),
+                slot: 0,
+                source: Some(_)
+            }]
+        ));
+    }
+
+    #[test]
+    fn a_redirect_to_another_host_does_not_carry_the_first_hosts_cookies() {
+        // **The question this task had to answer rather than assume**
+        // (deliverable 4). Redirects are followed inside the worker, by
+        // reqwest's default policy, so the `Cookie:` header we set for the URL
+        // we asked for travels with the request unless the library strips it.
+        //
+        // It does: reqwest drops `Cookie` (with `Authorization` and the other
+        // credential headers) whenever a hop changes host, port or scheme.
+        // `localhost` and `127.0.0.1` are the same machine and different
+        // hosts, which is what makes this checkable without a network.
+        //
+        // If this ever stops being true, it is a cross-origin credential leak
+        // and this test is the alarm, not a documentation exercise.
+        let (elsewhere, seen_elsewhere) = serve_capturing(1, |_| ok_body("elsewhere"));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let start = listener.local_addr().unwrap();
+        let port = elsewhere.port();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut req = Vec::new();
+            let mut buf = [0u8; 512];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/final\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+        });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(1),
+            Request {
+                url: format!("http://{start}/start"),
+                cookie: Some("sid=abc".to_string()),
+            },
+            tx,
+        );
+        drain(rx);
+        let seen = seen_elsewhere.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the redirect was not followed: {seen:?}");
+        assert_eq!(
+            cookie_header(&seen[0]),
+            None,
+            "a cookie for one host followed a redirect to another: {:?}",
+            seen[0]
+        );
+    }
+
+    #[test]
+    fn a_same_host_redirect_keeps_the_cookie_it_started_with() {
+        // The other half of the redirect decision, and the documented gap:
+        // cookies are computed **once**, for the URL that was asked for, and
+        // the hops inside the worker carry that header unchanged. Same host,
+        // so nothing is being sent anywhere it does not belong; but a hop that
+        // moved to a different *path* is matched against the old one, and a
+        // `Set-Cookie` on the 302 itself is lost — only the final response's
+        // reaches `App`. Driving the hops through the event loop is the fix
+        // and its own task (see the commit message); this test says what
+        // today's behaviour is so that changing it is visible.
+        let (addr, seen) = serve_capturing(2, |request| {
+            if request.starts_with("GET /start") {
+                b"HTTP/1.1 302 Found\r\nLocation: /final\r\nSet-Cookie: hop=lost\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            } else {
+                ok_body("arrived")
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(1),
+            Request {
+                url: format!("http://{addr}/start"),
+                cookie: Some("sid=abc".to_string()),
+            },
+            tx,
+        );
+        let msgs = drain(rx);
+        let (_, loaded, _) = split_success(&msgs);
+        let Msg::Loaded {
+            url, set_cookie, ..
+        } = loaded
+        else {
+            unreachable!()
+        };
+        assert_eq!(*url, format!("http://{addr}/final"));
+        assert!(
+            set_cookie.is_empty(),
+            "a Set-Cookie on the 302 hop reached App: {set_cookie:?}"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(cookie_header(&seen[1]), Some("sid=abc"));
+    }
+
+    #[test]
+    fn a_page_cannot_write_its_own_cookie_header_through_fetch() {
+        // `Cookie` is a forbidden header name in `fetch()`, and here it has to
+        // be: without this, `credentials: 'omit'` would be a suggestion.
+        let (addr, seen) = serve_capturing(2, |_| ok_body("{}"));
+        let (tx, rx) = mpsc::channel();
+        spawn_js_fetch(
+            FetchId(1),
+            1,
+            Request::bare(format!("http://{addr}/a")),
+            "GET".to_string(),
+            vec![
+                ("Cookie".to_string(), "sid=forged".to_string()),
+                ("X-Ok".to_string(), "kept".to_string()),
+            ],
+            None,
+            tx,
+        );
+        drain(rx);
+        // And with a real one, the jar's answer is the only one that lands —
+        // never two `Cookie` headers, which a server is free to read either of.
+        let (tx, rx) = mpsc::channel();
+        spawn_js_fetch(
+            FetchId(1),
+            2,
+            Request {
+                url: format!("http://{addr}/b"),
+                cookie: Some("sid=real".to_string()),
+            },
+            "GET".to_string(),
+            vec![("Cookie".to_string(), "sid=forged".to_string())],
+            None,
+            tx,
+        );
+        drain(rx);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(cookie_header(&seen[0]), None, "{:?}", seen[0]);
+        assert!(seen[0].contains("kept"), "an ordinary header was dropped");
+        assert_eq!(cookie_header(&seen[1]), Some("sid=real"), "{:?}", seen[1]);
+        assert_eq!(
+            seen[1].to_ascii_lowercase().matches("cookie:").count(),
+            1,
+            "two Cookie headers went out: {:?}",
+            seen[1]
         );
     }
 

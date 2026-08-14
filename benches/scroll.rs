@@ -56,6 +56,7 @@ fn page(w: u16, h: u16) -> (App, Renderer) {
         body: html.into_bytes(),
         elapsed: Duration::ZERO,
         content_type: None,
+        set_cookie: Vec::new(),
     });
     // Layout happens here, before the timer starts.
     app.update(Msg::Parsed {
