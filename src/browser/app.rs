@@ -5598,12 +5598,19 @@ mod tests {
         // The jar lives in `App`, not in the engine: the second page runs on a
         // host that has never seen the first page's globals and still reads its
         // cookie. Both pages are `http://final/` — one host, one jar.
-        let (mut app, first) =
-            scripted_app("<p>one</p><script>document.cookie = 'who=first; path=/';</script>");
+        let (mut app, first) = scripted_app(
+            "<p>one</p><script>globalThis.marker = 'page one';\
+             document.cookie = 'who=first; path=/';</script>",
+        );
         app.update(Msg::RunScripts { id: first });
 
         let second = app.start_fetch("http://x/two".into());
-        let page = "<p>two</p><script>console.log('read back: ' + document.cookie);</script>";
+        // `typeof marker` is the control: it says the second page really is
+        // running on a new engine, so the cookie did not simply survive inside
+        // a host nobody dropped.
+        let page = "<p>two</p><script>\
+             console.log('globals: ' + typeof marker);\
+             console.log('read back: ' + document.cookie);</script>";
         load(&mut app, second, page.as_bytes().to_vec());
         app.update(parsed(second, page));
         app.update(Msg::RunScripts { id: second });
@@ -5614,7 +5621,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.text.clone())
                 .collect::<Vec<_>>(),
-            ["read back: who=first"],
+            ["globals: undefined", "read back: who=first"],
             "the jar was dropped with the page's host"
         );
     }

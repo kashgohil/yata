@@ -147,16 +147,23 @@ pub enum Reject {
 }
 
 impl Reject {
-    pub fn message(self) -> &'static str {
+    /// The half-sentence the console line ends with. The two that quote a cap
+    /// read it from the constant rather than repeating the number, because a
+    /// message that drifts from the rule it explains is worse than none.
+    pub fn message(self) -> String {
         match self {
-            Reject::NoPair => "it has no name=value pair",
-            Reject::EmptyName => "its name is empty",
-            Reject::ControlCharacter => "its name or value contains a control character",
-            Reject::TooLarge => "it is larger than 4096 bytes",
-            Reject::HttpOnlyFromScript => "a script cannot set an HttpOnly cookie",
-            Reject::HttpOnlyExists => "an HttpOnly cookie of that name already exists",
-            Reject::SecureFromInsecurePage => "a Secure cookie cannot be set from an http: page",
-            Reject::JarFull => "this host already has as many cookies as this browser keeps",
+            Reject::NoPair => "it has no name=value pair".to_string(),
+            Reject::EmptyName => "its name is empty".to_string(),
+            Reject::ControlCharacter => {
+                "its name or value contains a control character".to_string()
+            }
+            Reject::TooLarge => format!("it is larger than {MAX_COOKIE_BYTES} bytes"),
+            Reject::HttpOnlyFromScript => "a script cannot set an HttpOnly cookie".to_string(),
+            Reject::HttpOnlyExists => "an HttpOnly cookie of that name already exists".to_string(),
+            Reject::SecureFromInsecurePage => {
+                "a Secure cookie cannot be set from an http: page".to_string()
+            }
+            Reject::JarFull => format!("this host already has {MAX_PER_HOST} cookies"),
         }
     }
 }
@@ -278,13 +285,16 @@ impl Jar {
         if cookie.secure && !scope.secure {
             return Err(Reject::SecureFromInsecurePage);
         }
-        // A `Secure` cookie already in the jar is not overwritable from an
-        // insecure page either, for the same reason a script cannot read it:
-        // the http page has no business touching it.
-        if self.holds(&cookie, |existing| existing.http_only) {
+        // The flag protects the *slot*, not just the value: a script that could
+        // overwrite an `HttpOnly` cookie could delete the session and let the
+        // server mint a fresh one, which is the attack the flag exists to stop.
+        if self.holds(&cookie, now, |existing| existing.http_only) {
             return Err(Reject::HttpOnlyExists);
         }
-        if !scope.secure && self.holds(&cookie, |existing| existing.secure) {
+        // And a `Secure` cookie already in the jar is not overwritable from an
+        // insecure page either, for the same reason a script there cannot read
+        // it: the http page has no business touching it.
+        if !scope.secure && self.holds(&cookie, now, |existing| existing.secure) {
             return Err(Reject::SecureFromInsecurePage);
         }
         self.insert(cookie, now)
@@ -333,10 +343,16 @@ impl Jar {
         Ok(())
     }
 
-    /// Whether the slot this cookie would take is already held by one matching
-    /// `predicate`. Only the flags a script is not allowed to walk over are
-    /// asked about.
-    fn holds(&self, cookie: &Cookie, predicate: impl Fn(&Cookie) -> bool) -> bool {
+    /// Whether the slot this cookie would take is already held by a live one
+    /// matching `predicate`. Only the flags a script is not allowed to walk
+    /// over are asked about.
+    ///
+    /// `now` is not decoration: an **expired** cookie holds nothing. Without it
+    /// a server's long-gone `HttpOnly` session cookie would refuse a script's
+    /// write forever, while the getter — which does filter by expiry — reported
+    /// the slot as empty. Two answers to "is there a cookie here" is one too
+    /// many.
+    fn holds(&self, cookie: &Cookie, now: Secs, predicate: impl Fn(&Cookie) -> bool) -> bool {
         self.hosts
             .borrow()
             .hosts
@@ -345,14 +361,17 @@ impl Jar {
                 entries.iter().any(|entry| {
                     entry.cookie.name == cookie.name
                         && entry.cookie.path == cookie.path
+                        && !entry.cookie.expired(now)
                         && predicate(&entry.cookie)
                 })
             })
     }
 
-    /// Every unexpired cookie a host holds, in creation order — for tests and
-    /// for M11.7's `Cookie:` header, which unlike the getter must include
-    /// `HttpOnly` ones.
+    /// Every unexpired cookie a host holds, in creation order — including the
+    /// `HttpOnly` ones the getter hides, which is why no page-facing path may
+    /// reach it. Tests are its only caller; M11.7's `Cookie:` header will be
+    /// the second, and can drop the attribute then.
+    #[cfg(test)]
     pub fn all(&self, host: &str, now: Secs) -> Vec<Cookie> {
         self.hosts
             .borrow()
@@ -896,6 +915,51 @@ mod tests {
         assert_eq!(
             jar.write_from_script("mine=1; HttpOnly", &page, NOW),
             Err(Reject::HttpOnlyFromScript)
+        );
+    }
+
+    #[test]
+    fn an_expired_protected_cookie_stops_protecting_a_slot_it_no_longer_holds() {
+        // The getter filters by expiry and the guard on the setter must agree:
+        // an `HttpOnly` cookie that has run out is *gone*, so a script may take
+        // the name. Two answers to "is there a cookie here" is one too many —
+        // otherwise a server's long-dead session cookie refuses the page's own
+        // write for the rest of the session, invisibly.
+        let jar = Jar::new();
+        let page = scope("https://a.test/");
+        for (name, secure, http_only) in [("session", false, true), ("locked", true, false)] {
+            jar.insert(
+                Cookie {
+                    name: name.into(),
+                    value: "server's".into(),
+                    host: "a.test".into(),
+                    path: "/".into(),
+                    expires: Some(NOW + 60),
+                    secure,
+                    http_only,
+                    same_site: SameSite::Unspecified,
+                },
+                NOW,
+            )
+            .unwrap();
+        }
+        // While they live, they hold their slots.
+        assert_eq!(
+            jar.write_from_script("session=mine", &page, NOW),
+            Err(Reject::HttpOnlyExists)
+        );
+        assert_eq!(
+            jar.write_from_script("locked=mine", &scope("http://a.test/"), NOW),
+            Err(Reject::SecureFromInsecurePage)
+        );
+        // Once expired they hold nothing, and the getter agrees.
+        jar.write_from_script("session=mine", &page, NOW + 61)
+            .unwrap();
+        jar.write_from_script("locked=mine", &scope("http://a.test/"), NOW + 61)
+            .unwrap();
+        assert_eq!(
+            jar.read_for_script(&page, NOW + 61),
+            "session=mine; locked=mine"
         );
     }
 
