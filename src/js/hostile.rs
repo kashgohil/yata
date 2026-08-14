@@ -343,6 +343,130 @@ fn the_console_ring_buffer_holds_under_a_logging_storm() {
     );
 }
 
+/// A page whose script appends a script that appends a script, driven through
+/// `App` the way the event loop drives it (M11.5 deliverable 7).
+///
+/// This is the one hostile shape the rest of this module cannot express, and
+/// the reason is the point: every case above is bounded *inside one tick*, by
+/// M10.13's execution budget. A chain of insertions is bounded by nothing a
+/// tick can see — each link asks the loop for a fresh turn, each turn finishes
+/// well inside its budget, and the loop happily runs them forever. So the
+/// bound has to be a page bound (`js::queue::MAX_INSERTED_SCRIPTS`), and what
+/// it has to preserve is PLAN.md §1.5: `q` still quits.
+///
+/// `App` rather than `Page`: the property under test is about turns of the
+/// event loop, and a harness that runs ticks back to back would prove the
+/// opposite of what the loop does.
+#[cfg(test)]
+mod chain {
+    use crate::browser::app::{App, Effect};
+    use crate::html;
+    use crate::js::SCRIPT_BUDGET;
+    use crate::js::queue::MAX_INSERTED_SCRIPTS;
+    use crate::msg::Msg;
+    use crate::net::FetchId;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::time::{Duration, Instant};
+
+    /// The page: a script whose text is a script that appends a copy of
+    /// itself. Nothing here is a loop inside a tick — each generation is one
+    /// legal insertion, which is exactly what makes it unbounded without a
+    /// page bound.
+    const ENDLESS_CHAIN: &str = "<p>still readable</p><script>\
+         window.link = function () {\
+           var s = document.createElement('script');\
+           s.textContent = 'window.depth = (window.depth || 0) + 1; link();';\
+           document.body.appendChild(s);\
+         };\
+         link();</script>";
+
+    fn loaded(html: &str) -> (App, FetchId) {
+        let mut app = App::new(80, 24);
+        let id = app.start_fetch("http://hostile.test/".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://hostile.test/".into(),
+            status: 200,
+            body: html.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(Msg::Parsed {
+            id,
+            dom: html::parse(html),
+            elapsed: Duration::ZERO,
+        });
+        (app, id)
+    }
+
+    fn key(ch: char) -> Msg {
+        Msg::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn a_script_that_appends_a_script_forever_stops_and_q_still_quits() {
+        let started = Instant::now();
+        let (mut app, id) = loaded(ENDLESS_CHAIN);
+        let mut effect = app.update(Msg::RunScripts { id });
+        let mut turns = 0;
+
+        while let Some(id) = effect.run_scripts {
+            turns += 1;
+            assert!(
+                turns <= MAX_INSERTED_SCRIPTS + 1,
+                "the chain asked for {turns} turns; the bound is {MAX_INSERTED_SCRIPTS}"
+            );
+            // **The loop reaches `recv` between every pair of turns.** Each
+            // link is one message that returns, so a key waiting in the
+            // channel is served before the next one starts — the chain is
+            // never behind more than a single tick, which is the same worst
+            // case M10.13 measured for one runaway script.
+            let turn = Instant::now();
+            effect = app.update(Msg::RunScripts { id });
+            assert!(
+                turn.elapsed() < 3 * SCRIPT_BUDGET,
+                "one link of the chain took {:?}",
+                turn.elapsed()
+            );
+        }
+
+        // It stopped on its own, and it stopped where the bound says.
+        assert_eq!(turns, MAX_INSERTED_SCRIPTS);
+        assert!(
+            app.update(Msg::RunScripts { id }).run_scripts.is_none(),
+            "a page past its bound still asked for another turn"
+        );
+        assert!(app.update(key('q')).quit, "q did not quit");
+        assert!(
+            started.elapsed() < super::PATIENCE,
+            "the chain took {:?}",
+            started.elapsed()
+        );
+        eprintln!(
+            "HOSTILE {:<44} {turns} turns",
+            "a script appending a script"
+        );
+    }
+
+    #[test]
+    fn q_quits_from_inside_the_chain_before_it_has_finished() {
+        // Not just at the end: a reader who wants out mid-chain gets out. The
+        // key is served on the turn after whichever tick was running, because
+        // the loop is at `recv` and the next `RunScripts` is behind it in the
+        // channel.
+        let (mut app, id) = loaded(ENDLESS_CHAIN);
+        app.update(Msg::RunScripts { id });
+        app.update(Msg::RunScripts { id });
+        assert_eq!(
+            app.update(key('q')),
+            Effect {
+                quit: true,
+                ..Effect::default()
+            }
+        );
+    }
+}
+
 #[test]
 fn storage_is_capped_rather_than_unbounded() {
     let page = Page::run(

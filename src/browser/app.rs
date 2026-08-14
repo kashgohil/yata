@@ -198,6 +198,11 @@ pub struct App {
     pending_click_navigation: Option<(FetchId, String)>,
     /// `fetch()` calls a click handler made, carried out the same way.
     pending_click_fetches: Vec<(FetchId, js::FetchAsk)>,
+    /// External scripts a click handler inserted (M11.5), and whether one of
+    /// its insertions can run now — carried out the same way, because a
+    /// bootstrap behind a click is the same shape as one at load.
+    pending_click_scripts: Vec<(FetchId, usize, String)>,
+    pending_click_run: Option<FetchId>,
     /// The page's scripts in document order, with the position execution has
     /// reached (M10.10). External ones are holes until their worker reports;
     /// nothing after a hole runs, because the script that has not arrived may
@@ -327,6 +332,14 @@ pub struct App {
     /// reader.
     #[cfg(test)]
     full_restyle_only: bool,
+    /// Turns M11.5's inserted-script detection off, the same way and for the
+    /// same reason: the measurement has to time the old path and the new one
+    /// in the same process, interleaved. It reaches all the way into the
+    /// bindings — `Host::disarm_script_inserts` — so the A side pays neither
+    /// the drain here nor the tag comparison at each insert. Nothing but
+    /// `measure_a_tick_that_inserts_no_script` sets it.
+    #[cfg(test)]
+    no_insert_detection: bool,
     /// Images: LRU cache, page discovery, Kitty placement state (M8).
     images: ImageSession,
 }
@@ -351,6 +364,8 @@ impl App {
             timing_visible: false,
             pending_click_navigation: None,
             pending_click_fetches: Vec::new(),
+            pending_click_scripts: Vec::new(),
+            pending_click_run: None,
             script_queue: ScriptQueue::default(),
             script_queue_page: None,
             storage: Storage::new(),
@@ -391,6 +406,8 @@ impl App {
             paints: 0,
             #[cfg(test)]
             full_restyle_only: false,
+            #[cfg(test)]
+            no_insert_detection: false,
             images: ImageSession::new(kitty_graphics),
         }
     }
@@ -599,6 +616,11 @@ impl App {
                     return Effect::default();
                 }
                 let failed = source.is_none();
+                // Read before `fill`, because filling is what stops the slot
+                // being pending: `Some(node)` means this body belongs to a
+                // script the page inserted, and that element is owed a
+                // `load` or an `error` (M11.5).
+                let inserted = self.script_queue.element(slot);
                 self.script_queue.fill(slot, source);
                 if failed {
                     self.console.push(
@@ -612,7 +634,13 @@ impl App {
                 let Some(dom) = self.dom.take() else {
                     return Effect::default();
                 };
-                self.run_ready_scripts(id, dom)
+                let mut effect = self.run_ready_scripts(id, dom);
+                // **After** the prefix, never before: `load` means "it ran".
+                if let Some(node) = inserted {
+                    let kind = if failed { "error" } else { "load" };
+                    self.fire_script_event(id, node, kind, &mut effect);
+                }
+                effect
             }
             Msg::JsFetch {
                 page,
@@ -659,6 +687,7 @@ impl App {
                 let mut effect = self.apply_dom_changes(before, after);
                 effect.timers = self.take_timer_requests(page);
                 effect.fetches = self.take_fetch_requests(page);
+                self.adopt_inserted_scripts(page, &mut effect);
                 self.apply_script_navigation(&mut effect);
                 if self.console.entries().len() != logged_before {
                     self.console_view_built = false;
@@ -705,6 +734,7 @@ impl App {
                 let mut effect = self.apply_dom_changes(before, after);
                 effect.timers = self.take_timer_requests(page);
                 effect.fetches = self.take_fetch_requests(page);
+                self.adopt_inserted_scripts(page, &mut effect);
                 self.apply_script_navigation(&mut effect);
                 if self.console.entries().len() != logged_before {
                     self.console_view_built = false;
@@ -746,7 +776,13 @@ impl App {
                 };
 
                 let mut effect = self.run_ready_scripts(id, dom);
-                effect.scripts = scripts;
+                // The document's externals first, then anything the pass
+                // itself inserted (M11.5) — which `run_ready_scripts` has
+                // already put in `effect.scripts`, and which an assignment
+                // here would silently drop.
+                let mut requested = scripts;
+                requested.append(&mut effect.scripts);
+                effect.scripts = requested;
                 effect
             }
             Msg::Image { id, url, result } => {
@@ -2122,7 +2158,10 @@ impl App {
     /// first one.
     fn run_ready_scripts(&mut self, id: FetchId, mut dom: Dom) -> Effect {
         let ready = self.script_queue.take_ready_prefix();
-        let finished = self.script_queue.is_finished();
+        // Once per page (M11.5): an inserted script can finish a queue that
+        // had already finished, and `DOMContentLoaded`/`load` are not events
+        // a page may see twice.
+        let finished = self.script_queue.take_finished();
 
         let started = Instant::now();
         let before = (dom.version(), dom.structure_version());
@@ -2141,7 +2180,6 @@ impl App {
             finished,
         );
         let after = (dom.version(), dom.structure_version());
-        let logged = self.console.entries().len() != logged_before;
         // The DOM comes straight back: the host borrowed it for the tick and
         // holds nothing now.
         self.dom = Some(dom);
@@ -2155,8 +2193,9 @@ impl App {
         let mut effect = self.apply_dom_changes(before, after);
         effect.timers = self.take_timer_requests(id);
         effect.fetches = self.take_fetch_requests(id);
+        self.adopt_inserted_scripts(id, &mut effect);
         self.apply_script_navigation(&mut effect);
-        if logged {
+        if self.console.entries().len() != logged_before {
             // A script that only logged changed no box, but it did change what
             // the console pane holds and what the statusline says about the
             // page — so the frame is stale even though the pipeline had
@@ -2166,6 +2205,144 @@ impl App {
             effect.dirty = true;
         }
         effect
+    }
+
+    /// The `<script>` elements the tick that just ended put into the document
+    /// (M11.5), folded into `effect`.
+    ///
+    /// The bindings recorded *candidates* — "this node was inserted", or "a
+    /// `src` was written on it". Everything that decides whether one of them
+    /// runs happens here, against the tree `App` owns:
+    ///
+    /// - `sources::connected_script` answers whether it is a `<script>` at
+    ///   all, whether it is connected to the document, and whether it sits
+    ///   inside a `<template>`/`<noscript>` — the same three answers the
+    ///   parsed walk gives, from the same code, so the two paths cannot
+    ///   disagree;
+    /// - `ScriptQueue::insert` answers where it goes and whether it has
+    ///   already run.
+    ///
+    /// Nothing runs *here*. An inline one becomes a ready slot and the loop is
+    /// asked for another turn (`Effect::run_scripts`); an external one becomes
+    /// a fetch on a worker through the same `Effect::scripts` a document-order
+    /// `<script src>` uses. Re-entering the engine from inside the tick that
+    /// inserted the script is exactly the `document.write` re-entrancy bug
+    /// M10.2's model exists to make impossible.
+    fn adopt_inserted_scripts(&mut self, id: FetchId, effect: &mut Effect) {
+        // The A side of the interleaved measurement, and its only reader.
+        #[cfg(test)]
+        if self.no_insert_detection {
+            return;
+        }
+        let candidates = self
+            .js_host
+            .as_ref()
+            .map(js::Host::take_script_inserts)
+            .unwrap_or_default();
+        if candidates.is_empty() {
+            return;
+        }
+        let Some(dom) = self.dom.as_ref() else {
+            return;
+        };
+
+        // The tree is read **as the tick left it**, not as it was at the
+        // moment of each call. So a page that appends a script and removes it
+        // again before the tick ends has inserted nothing, which is what the
+        // reader sees too — and is the safer of the two readings, since the
+        // page changed its mind before anything could have observed it.
+        //
+        // Elements whose script will never arrive, so their `error` can be
+        // fired once the borrow of the tree is over.
+        let mut failed = Vec::new();
+        let mut ready = false;
+        // The descriptions first, while the tree is borrowed once; the queue
+        // and the console are `&mut self` from here on.
+        let described: Vec<(NodeId, js::sources::Script)> = candidates
+            .into_iter()
+            .enumerate()
+            .filter_map(|(nth, candidate)| {
+                let node = NodeId(candidate);
+                let name = format!("inserted#{}", self.script_queue.inserted() + nth + 1);
+                js::sources::connected_script(dom, node, &name).map(|script| (node, script))
+            })
+            .collect();
+
+        for (node, script) in described {
+            match self.script_queue.insert(node, script, &self.console) {
+                js::queue::Inserted::Ready => ready = true,
+                js::queue::Inserted::Fetch(external) => {
+                    // The same resolution every other external script gets, so
+                    // a dynamic one inherits the `FetchId` guard, the
+                    // `MAX_SCRIPT_BYTES` cap and the settles-empty behaviour.
+                    // An empty answer means the URL will not resolve and the
+                    // slot has already settled — which is an `error` for the
+                    // element, not a slot that waits forever.
+                    let resolved = self.resolve_script_urls(id, vec![external]);
+                    match resolved.is_empty() {
+                        true => failed.push(node),
+                        false => effect.scripts.extend(resolved),
+                    }
+                }
+                js::queue::Inserted::Nothing => {}
+            }
+        }
+
+        // Only ask for a turn when something can actually run in it. An
+        // insertion that is still fetching is unblocked by its own
+        // `Msg::Script`, which goes through `run_ready_scripts` anyway.
+        if ready {
+            effect.run_scripts = Some(id);
+        }
+        for node in failed {
+            self.fire_script_event(id, node, "error", effect);
+        }
+    }
+
+    /// Fire `load` or `error` at an inserted `<script>` element (M11.5
+    /// deliverable 8), as its own tick, and fold what its handler did into
+    /// `effect`.
+    ///
+    /// Only inserted scripts get this, and only external ones: a browser fires
+    /// neither event for an inline script, and nothing can have registered a
+    /// listener on a parsed `<script src>` before the page ran a line.
+    fn fire_script_event(&mut self, id: FetchId, node: NodeId, kind: &str, effect: &mut Effect) {
+        if self.js_host.is_none() {
+            return;
+        }
+        let Some(mut dom) = self.dom.take() else {
+            return;
+        };
+        let before = (dom.version(), dom.structure_version());
+        let logged_before = self.console.entries().len();
+        let url = self.current_url().unwrap_or_default();
+        js::dispatch(
+            &mut self.js_host,
+            &mut dom,
+            &js::PageContext {
+                page: id.0,
+                url: &url,
+                console: &self.console,
+                storage: &self.storage,
+            },
+            js::Target::Node(node.0),
+            kind,
+        );
+        let after = (dom.version(), dom.structure_version());
+        self.dom = Some(dom);
+
+        effect.dirty |= self.apply_dom_changes(before, after).dirty;
+        effect.timers.extend(self.take_timer_requests(id));
+        effect.fetches.extend(self.take_fetch_requests(id));
+        // A `load` handler that inserts the *next* script in a chain is the
+        // whole reason the event exists, so its own insertions are adopted.
+        self.adopt_inserted_scripts(id, effect);
+        self.apply_script_navigation(effect);
+        if self.console.entries().len() != logged_before {
+            self.console_view_built = false;
+            self.build_visible_inspector();
+            effect.dirty = true;
+        }
     }
 
     /// Resolve each external script's `src` against the page URL, dropping the
@@ -2205,6 +2382,8 @@ impl App {
             dirty: true,
             fetch: self.pending_click_navigation.take(),
             fetches: std::mem::take(&mut self.pending_click_fetches),
+            scripts: std::mem::take(&mut self.pending_click_scripts),
+            run_scripts: self.pending_click_run.take(),
             ..Effect::default()
         }
     }
@@ -2326,8 +2505,11 @@ impl App {
 
         let mut effect = self.apply_dom_changes(before, after);
         self.pending_click_fetches = self.take_fetch_requests(id);
+        self.adopt_inserted_scripts(id, &mut effect);
         self.apply_script_navigation(&mut effect);
         self.pending_click_navigation = effect.fetch.take();
+        self.pending_click_scripts = std::mem::take(&mut effect.scripts);
+        self.pending_click_run = effect.run_scripts.take();
         if self.console.entries().len() != logged_before {
             self.console_view_built = false;
             self.build_visible_inspector();
@@ -4468,6 +4650,353 @@ mod tests {
             after_arrival >= after_pass,
             "the script row went backwards: {after_pass:?} then {after_arrival:?}"
         );
+    }
+
+    // ---- scripts a script inserted (M11.5) --------------------------------
+
+    /// Every console line the page has produced, in order.
+    fn logged(app: &App) -> Vec<String> {
+        app.console
+            .entries()
+            .iter()
+            .map(|e| e.text.clone())
+            .collect()
+    }
+
+    /// Run turns until the page stops asking for another, and report how many
+    /// ran. The loop's job, in a test: `Effect::run_scripts` goes back through
+    /// the channel, so a chain of insertions is a chain of turns.
+    fn drain_turns(app: &mut App, first: Effect) -> usize {
+        let mut effect = first;
+        let mut turns = 0;
+        while let Some(id) = effect.run_scripts {
+            turns += 1;
+            assert!(turns < 200, "the loop never stopped asking for a turn");
+            effect = app.update(Msg::RunScripts { id });
+        }
+        turns
+    }
+
+    /// The script pass and every turn it asks for after it.
+    fn run_turns(app: &mut App, id: FetchId) -> usize {
+        let first = app.update(Msg::RunScripts { id });
+        drain_turns(app, first)
+    }
+
+    #[test]
+    fn an_inserted_inline_script_runs_in_a_later_turn_and_reaches_the_screen() {
+        // The two halves the deviation denied. The insertion tick does *not*
+        // run it — re-entering the engine from inside a binding is the
+        // `document.write` re-entrancy bug — and the turn after it does, with
+        // its DOM changes on screen in the frame after that.
+        let (mut app, id) = scripted_app(
+            "<p>parsed</p><script>\
+             var s = document.createElement('script');\
+             s.textContent = \"document.body.appendChild(document.createElement('p'))\
+                              .textContent = 'from the inserted script';\";\
+             document.body.appendChild(s);</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(
+            !screen(&mut app, 40, 10).contains("from the inserted script"),
+            "the inserted script ran inside the tick that inserted it"
+        );
+        assert_eq!(effect.run_scripts, Some(id), "no later turn was asked for");
+
+        assert_eq!(drain_turns(&mut app, effect), 1);
+        let shown = screen(&mut app, 40, 10);
+        assert!(shown.contains("from the inserted script"), "{shown}");
+        assert!(shown.contains("parsed"), "the page lost its own content");
+    }
+
+    #[test]
+    fn an_inserted_script_that_only_defines_a_function_runs_no_stage() {
+        // The counters, not the appearance (M10.6's rule carried into M11.5):
+        // the *insertion* tick is a structural edit and pays for one, but the
+        // turn that runs the inserted script must cost nothing when the script
+        // changes nothing.
+        let (mut app, id) = scripted_app(
+            "<p>x</p><script>\
+             var s = document.createElement('script');\
+             s.textContent = 'function laterCall() { return 1; }';\
+             document.body.appendChild(s);</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+        assert_eq!(drain_turns(&mut app, effect), 1);
+        assert_eq!(
+            stages(&app),
+            before,
+            "a script that only defined a function ran a pipeline stage"
+        );
+    }
+
+    #[test]
+    fn an_inserted_script_runs_although_a_document_slot_is_still_in_flight() {
+        // **The ordering decision (deliverable 3), end to end, with a pending
+        // slot in the queue at the moment of insertion.** The inserted script
+        // was created by code that has already run, so it cannot be waiting on
+        // `slow.js`; `inline#3`, which the document wrote *after* `slow.js`,
+        // still is.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             var s = document.createElement('script');\
+             s.textContent = \"console.log('inserted');\";\
+             document.body.appendChild(s);</script>\
+             <script src='slow.js'></script>\
+             <script>console.log('inline#3');</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        assert_eq!(app.script_queue.pending(), 1, "slot 1 must still be a hole");
+        drain_turns(&mut app, effect);
+        assert_eq!(logged(&app), ["inserted"]);
+
+        // And the document's own order is untouched: `inline#3` runs only
+        // when the hole in front of it fills.
+        app.update(Msg::Script {
+            id,
+            slot: 1,
+            source: Some("console.log('slow.js');".into()),
+        });
+        assert_eq!(logged(&app), ["inserted", "slow.js", "inline#3"]);
+    }
+
+    #[test]
+    fn the_analytics_loader_fetches_google_analytics_exactly_once() {
+        // **The acceptance page.** motherfuckingwebsite.com's fixture, its own
+        // Google Analytics loader, unedited: `createElement`,
+        // `getElementsByTagName`, `.async`, `.src`, `parentNode.insertBefore`.
+        // The URL is protocol-relative, so the base is load-bearing — and no
+        // test here touches the network: the worker is never spawned, the
+        // `Effect` is the evidence.
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/motherfuckingwebsite.com.html"
+        ));
+        let mut app = App::new(80, 24);
+        let url = "https://motherfuckingwebsite.com/";
+        let id = app.start_fetch(url.into());
+        app.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: fixture.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+        });
+        app.update(parsed(id, fixture));
+
+        let mut asked = Vec::new();
+        let mut effect = app.update(Msg::RunScripts { id });
+        loop {
+            asked.extend(effect.scripts.iter().map(|(_, _, url)| url.clone()));
+            match effect.run_scripts {
+                Some(id) => effect = app.update(Msg::RunScripts { id }),
+                None => break,
+            }
+        }
+        assert_eq!(
+            asked,
+            ["https://www.google-analytics.com/analytics.js"],
+            "the loader asked for {asked:?}"
+        );
+
+        // Once. A second turn must not re-request it — the element has
+        // already started, and the slot is no longer pending.
+        app.update(Msg::RunScripts { id });
+        assert_eq!(app.update(Msg::RunScripts { id }).scripts, []);
+        assert!(screen(&mut app, 80, 24).contains("motherfucking"));
+    }
+
+    #[test]
+    fn an_inserted_script_whose_url_will_not_resolve_settles_rather_than_waiting() {
+        // Deliverable 5's other half, and deliverable 8's error path in one:
+        // the slot settles instead of holding the queue, and the element hears
+        // about it rather than waiting on an event that never comes.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             var s = document.createElement('script');\
+             s.onerror = function () { console.log('error fired'); };\
+             s.src = 'http://';\
+             document.body.appendChild(s);</script>",
+        );
+        run_turns(&mut app, id);
+        assert!(
+            logged(&app).contains(&"error fired".to_string()),
+            "{:?}",
+            logged(&app)
+        );
+        assert_eq!(app.script_queue.pending(), 0, "the slot is still a hole");
+    }
+
+    #[test]
+    fn an_inserted_external_script_runs_then_fires_load_at_its_element() {
+        // Deliverable 8, the success path: `load` means "it ran", so the
+        // ordering between the two is part of the contract a chaining
+        // bootstrap depends on.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             var s = document.createElement('script');\
+             s.onload = function () { console.log('load fired'); };\
+             s.src = 'lib.js';\
+             document.body.appendChild(s);</script>",
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        assert_eq!(effect.scripts, [(id, 1, "http://final/lib.js".to_string())]);
+        assert!(
+            logged(&app).is_empty(),
+            "load fired before the body arrived"
+        );
+
+        app.update(Msg::Script {
+            id,
+            slot: 1,
+            source: Some("console.log('the library ran');".into()),
+        });
+        assert_eq!(logged(&app), ["the library ran", "load fired"]);
+    }
+
+    #[test]
+    fn a_failed_fetch_for_an_inserted_script_fires_error_and_is_not_an_error_page() {
+        let (mut app, id) = scripted_app(
+            "<p>page text</p><script>\
+             var s = document.createElement('script');\
+             s.onerror = function () { console.log('error fired'); };\
+             s.src = 'gone.js';\
+             document.body.appendChild(s);</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(Msg::Script {
+            id,
+            slot: 1,
+            source: None,
+        });
+        assert!(
+            logged(&app).contains(&"error fired".to_string()),
+            "{:?}",
+            logged(&app)
+        );
+        // A script whose fetch failed is a console line, not an error page.
+        assert!(screen(&mut app, 40, 8).contains("page text"));
+    }
+
+    #[test]
+    fn dom_content_loaded_and_load_fire_once_although_an_insertion_finishes_the_queue_twice() {
+        // The latch in `ScriptQueue::take_finished`. A script inserted by a
+        // `load` handler un-finishes a finished queue; without it the page
+        // would see both events a second time.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             window.addEventListener('load', function () { console.log('load'); });\
+             document.addEventListener('DOMContentLoaded', function () {\
+               console.log('dcl');\
+               var s = document.createElement('script');\
+               s.textContent = \"console.log('inserted');\";\
+               document.body.appendChild(s);\
+             });</script>",
+        );
+        run_turns(&mut app, id);
+        assert_eq!(logged(&app), ["dcl", "load", "inserted"]);
+    }
+
+    // The four that must not run, one test each.
+
+    #[test]
+    fn a_script_written_by_inner_html_never_runs() {
+        // HTML says so, and it is a security rule rather than a nicety: it is
+        // the difference between an XSS that can only write markup and one
+        // that can execute. The mechanism is structural — `setInnerHTML` is a
+        // different binding from `appendChild` and records nothing — rather
+        // than a check that could be forgotten.
+        let (mut app, id) = scripted_app(
+            "<div id=host></div><script>\
+             document.getElementById('host').innerHTML =\
+               \"<script>console.log('injected')<\\/script>\";</script>",
+        );
+        run_turns(&mut app, id);
+        assert!(
+            !logged(&app).contains(&"injected".to_string()),
+            "{:?}",
+            logged(&app)
+        );
+    }
+
+    #[test]
+    fn a_script_that_is_never_connected_never_runs() {
+        // Created and dropped, and appended into a subtree that is itself
+        // detached: neither is in the document, so neither runs — until the
+        // subtree is put in, which is the same insertion signal as any other.
+        let (mut app, id) = scripted_app(
+            "<script>\
+             var loose = document.createElement('script');\
+             loose.textContent = \"console.log('loose');\";\
+             var holder = document.createElement('div');\
+             var buried = document.createElement('script');\
+             buried.textContent = \"console.log('buried');\";\
+             holder.appendChild(buried);\
+             window.holder = holder;</script>",
+        );
+        run_turns(&mut app, id);
+        assert!(logged(&app).is_empty(), "{:?}", logged(&app));
+    }
+
+    #[test]
+    fn a_script_inserted_into_a_template_or_noscript_never_runs() {
+        // `js::sources` refuses to descend into these for the parsed document,
+        // and the dynamic path reaches the same answer through the same list —
+        // it does not hold its own opinion about where a script is inert.
+        let (mut app, id) = scripted_app(
+            "<template id=t></template><noscript id=n></noscript><script>\
+             ['t', 'n'].forEach(function (where) {\
+               var s = document.createElement('script');\
+               s.textContent = \"console.log('\" + where + \"');\";\
+               document.getElementById(where).appendChild(s);\
+             });</script>",
+        );
+        run_turns(&mut app, id);
+        assert!(logged(&app).is_empty(), "{:?}", logged(&app));
+    }
+
+    #[test]
+    fn a_script_that_has_already_run_and_is_then_moved_does_not_run_again() {
+        // The "already started" flag. Getting this wrong turns a page that
+        // reorders its own DOM into a page that re-runs its analytics — so
+        // both populations are checked: the document's own `<script>`, and one
+        // the page inserted itself.
+        let (mut app, id) = scripted_app(
+            "<div id=host></div>\
+             <script id=parsed>console.log('parsed script');</script>\
+             <script>\
+             var host = document.getElementById('host');\
+             host.appendChild(document.getElementById('parsed'));\
+             var mine = document.createElement('script');\
+             mine.textContent = \"console.log('inserted script');\";\
+             document.body.appendChild(mine);\
+             window.mine = mine;</script>",
+        );
+        run_turns(&mut app, id);
+        assert_eq!(logged(&app), ["parsed script", "inserted script"]);
+
+        // Now move the inserted one, which has run, somewhere else.
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(0),
+        });
+        let (mut app, id) = scripted_app(
+            "<div id=host></div><script>\
+             var mine = document.createElement('script');\
+             mine.textContent = \"console.log('once');\";\
+             document.body.appendChild(mine);\
+             setTimeout(function () { document.getElementById('host').appendChild(mine); }, 0);\
+             </script>",
+        );
+        run_turns(&mut app, id);
+        let effect = app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        drain_turns(&mut app, effect);
+        assert_eq!(logged(&app), ["once"], "a moved script ran twice");
     }
 
     // ---- timers (M10.9) ---------------------------------------------------
