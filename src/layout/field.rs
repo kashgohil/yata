@@ -219,6 +219,32 @@ fn kind(dom: &Dom, node: NodeId, tag: &str) -> Option<Kind> {
     }
 }
 
+/// What a reader may type into here, and what they would be typing into —
+/// `None` for everything that takes no caret: a button, a `disabled` control,
+/// a `readonly` one, a type this engine draws as nothing, an element that is
+/// not a control.
+///
+/// `readonly` is here and not in M11.8's focus rule because that is where HTML
+/// puts it: a `readonly` field is still reachable and still selectable — it is
+/// showing you something — and the only thing it refuses is an edit. That
+/// makes it exactly this function's question, unlike `disabled`, which answers
+/// two (M11.8 keeps it out of the Tab cycle as well).
+///
+/// The *unmasked* value, because this is the string an edit is applied to. A
+/// password's caret indexes it and not the mask, and the two agree because
+/// [`mask`] is one cell per source character; nothing else ever needs the real
+/// text, so nothing else is given it.
+pub(crate) fn editable_value(dom: &Dom, node: NodeId, tag: &str) -> Option<String> {
+    match kind(dom, node, tag)? {
+        Kind::Text { .. }
+            if dom.attr(node, "disabled").is_none() && dom.attr(node, "readonly").is_none() =>
+        {
+            Some(value(dom, node, tag))
+        }
+        _ => None,
+    }
+}
+
 /// What the control currently holds: the state beside the tree if a reader has
 /// touched it, else what the markup said.
 fn value(dom: &Dom, node: NodeId, tag: &str) -> String {
@@ -303,23 +329,52 @@ pub(crate) struct Run {
     pub style: Style,
 }
 
-/// Everything a control's box puts on screen: its frame, and its text clipped
-/// to the cells the page asked for, one row at a time.
+/// Everything a control's box puts on screen: its frame, its text, and where
+/// its caret sits — one answer, because the caret is a cell of the same window
+/// the text is drawn from and deriving the two separately is how they drift
+/// apart by a glyph.
+pub(crate) struct Painted {
+    pub runs: Vec<Run>,
+    /// Document coordinates, or `None` for a control that takes no caret: a
+    /// button (nothing to type into) and a `disabled` field.
+    pub caret: Option<(i32, i32)>,
+}
+
+/// The cells of a control the page's own paint draws: the **start** of the
+/// value, which is what a browser shows before a field is focused.
 ///
 /// The single source of what a field looks like. Paint emits these as display
 /// commands, `--dump-text` rasterises them into rows, and the focus overlay
-/// reverses the frame cells they name — three surfaces that must not disagree
+/// draws the same runs windowed on the caret — surfaces that must not disagree
 /// about where a field is or what is in it.
-///
-/// The value is **clipped, never wrapped**, and measured with `unicode-width`:
-/// a field is exactly where a CJK value would find a `chars().count()`. An
-/// over-long value shows its start, which is what a browser shows before the
-/// field is focused; the horizontal scrolling that follows a caret is M11.9's.
 pub(crate) fn runs(b: &LayoutBox) -> Vec<Run> {
+    painted(b, None).runs
+}
+
+/// The same cells, windowed on a caret `chars` characters into the value
+/// (M11.9) — what the reader typing into this control sees.
+///
+/// **The window is UI, not layout.** A control's box is `size` cells wide
+/// whatever it holds, so scrolling the value under the caret moves no geometry
+/// and belongs nowhere near the tree: the display list keeps the unfocused
+/// view, and the focus overlay draws this one over exactly the same cells. A
+/// caret in the tree would make layout depend on where a cursor is.
+///
+/// Everything here is measured with `unicode-width` and never with
+/// `chars().count()`: a field is exactly where a CJK value finds that bug, and
+/// a caret counted in characters sits half a glyph off in the one language the
+/// person who wrote it does not read.
+pub(crate) fn painted(b: &LayoutBox, caret: Option<usize>) -> Painted {
     let BoxKind::Field(paint) = b.kind else {
-        return Vec::new();
+        return Painted {
+            runs: Vec::new(),
+            caret: None,
+        };
     };
     let rect = b.dimensions.content;
+    let text = b.text.as_deref().unwrap_or("");
+    let lines: Vec<&str> = text.split('\n').collect();
+    let (first_row, x_off, caret_cell) = window_of(b, paint, &lines, caret);
     let (open, close) = if paint.disabled {
         FRAME_DISABLED
     } else {
@@ -328,7 +383,6 @@ pub(crate) fn runs(b: &LayoutBox) -> Vec<Run> {
     let frame = frame_style(b, paint);
     let interior = interior_style(b, paint);
     let mut out = Vec::new();
-    let mut lines = b.text.as_deref().unwrap_or("").split('\n');
     for row in 0..rect.height {
         let y = rect.y + row;
         // The frame sits in the innermost cell of the control's own padding,
@@ -344,7 +398,11 @@ pub(crate) fn runs(b: &LayoutBox) -> Vec<Run> {
         // A control the page squeezed to nothing (`width: 0`) still has its
         // frame and no interior — an empty run would be a draw command that
         // draws nothing.
-        let line = fit(lines.next().unwrap_or(""), rect.width);
+        let line = lines
+            .get((first_row + row) as usize)
+            .copied()
+            .unwrap_or_default();
+        let line = window(line, x_off, rect.width);
         if !line.is_empty() {
             out.push(Run {
                 x: rect.x,
@@ -362,35 +420,84 @@ pub(crate) fn runs(b: &LayoutBox) -> Vec<Run> {
             });
         }
     }
-    out
+    Painted {
+        runs: out,
+        caret: caret_cell,
+    }
 }
 
-/// Where the caret sits in this control, in document coordinates — `None` for
-/// a button and for a control the reader cannot reach.
-///
-/// At the **end of the value**, because with no editing there is nowhere else
-/// it could be (M11.9 owns everything that moves it). An empty field with a
-/// placeholder puts it at the front, where the first character would go.
+/// Just the caret cell, for the overlay that draws a focused-but-not-typed-into
+/// control: nothing about its text has moved, so building its runs a second
+/// time — every frame, including every scroll step — would be a
+/// `<textarea rows=1000>`'s worth of strings for a rectangle already on screen.
 pub(crate) fn caret(b: &LayoutBox) -> Option<(i32, i32)> {
     let BoxKind::Field(paint) = b.kind else {
         return None;
     };
+    let text = b.text.as_deref().unwrap_or("");
+    let lines: Vec<&str> = text.split('\n').collect();
+    window_of(b, paint, &lines, None).2
+}
+
+/// Which lines and which columns the box shows, and where that puts the caret.
+///
+/// A caret drags the window after it — past the right edge the value scrolls,
+/// and `Home` snaps it back — while a control nobody is typing into always
+/// shows its start, which is what a browser shows before a field is focused.
+fn window_of(
+    b: &LayoutBox,
+    paint: FieldPaint,
+    lines: &[&str],
+    caret: Option<usize>,
+) -> (i32, i32, Option<(i32, i32)>) {
+    let rect = b.dimensions.content;
+    let at = caret_in_value(paint, lines, caret);
+    let (first_row, x_off) = match (at, caret) {
+        (Some((line, col)), Some(_)) => (
+            (line as i32 - rect.height + 1).max(0),
+            (col - rect.width + 1).max(0),
+        ),
+        _ => (0, 0),
+    };
+    let cell = at
+        .filter(|_| rect.width > 0 && rect.height > 0)
+        .map(|(line, col)| {
+            (
+                rect.x + (col - x_off).clamp(0, rect.width - 1),
+                rect.y + (line as i32 - first_row).clamp(0, rect.height - 1),
+            )
+        });
+    (first_row, x_off, cell)
+}
+
+/// Where the caret is in the value: which line, and how many **cells** into it.
+///
+/// `None` for a control that takes no caret. `caret` is a character index into
+/// the value (M11.9's editing state); without one the caret is at the end of
+/// the value, because a control nobody is typing into has nowhere else to put
+/// it (M11.8). A placeholder pins it to the front — the value behind the hint
+/// is empty, so that is where the first character would go.
+fn caret_in_value(paint: FieldPaint, lines: &[&str], caret: Option<usize>) -> Option<(usize, i32)> {
     if paint.disabled || paint.shows == Shows::Label {
         return None;
     }
-    let rect = b.dimensions.content;
-    if rect.width <= 0 || rect.height <= 0 {
-        return None;
+    if paint.shows == Shows::Placeholder {
+        return Some((0, 0));
     }
-    let (row, col) = match paint.shows {
-        Shows::Placeholder => (0, 0),
-        _ => {
-            let lines: Vec<&str> = b.text.as_deref().unwrap_or("").split('\n').collect();
-            let row = (lines.len() as i32 - 1).clamp(0, rect.height - 1);
-            (row, lines[row as usize].width() as i32)
-        }
+    let last = lines.len().saturating_sub(1);
+    let Some(mut left) = caret else {
+        return Some((last, lines[last].width() as i32));
     };
-    Some((rect.x + col.min(rect.width - 1), rect.y + row))
+    for (i, line) in lines.iter().enumerate() {
+        let chars = line.chars().count();
+        if left <= chars || i == last {
+            let upto: String = line.chars().take(left.min(chars)).collect();
+            return Some((i, upto.width() as i32));
+        }
+        // The newline the split consumed is a character the caret can be past.
+        left -= chars + 1;
+    }
+    Some((last, lines[last].width() as i32))
 }
 
 /// The style of the control's own cells: whatever the cascade gave the element,
@@ -429,19 +536,37 @@ fn frame_style(b: &LayoutBox, paint: FieldPaint) -> Style {
     }
 }
 
-/// `text` cut to `cells` columns and padded back out to exactly that many.
+/// The `cells` columns of `text` starting `x_off` columns in, padded back out
+/// to exactly that many.
 ///
-/// Cut by width rather than by characters, and a wide glyph that would straddle
-/// the last cell is dropped rather than halved — the padding then fills the cell
-/// it left, so every row of a field is exactly as wide as the field.
-fn fit(text: &str, cells: i32) -> String {
+/// Cut by width rather than by characters at **both** ends, and a wide glyph
+/// that would straddle either edge is blanked rather than halved: the cells it
+/// still occupies become spaces, so every row of a field is exactly as wide as
+/// the field and no half of a 漢 is ever drawn.
+fn window(text: &str, x_off: i32, cells: i32) -> String {
     if cells <= 0 {
         return String::new();
     }
     let mut out = String::new();
-    let mut used = 0i32;
+    // `used` counts the window's filled cells; `x` the line's own columns.
+    let (mut used, mut x) = (0i32, 0i32);
     for ch in text.chars() {
+        if used >= cells {
+            break;
+        }
         let w = ch.width().unwrap_or(0) as i32;
+        let start = x;
+        x += w;
+        if x <= x_off {
+            continue;
+        }
+        if start < x_off {
+            for _ in 0..(x - x_off).min(cells - used) {
+                out.push(' ');
+                used += 1;
+            }
+            continue;
+        }
         if used + w > cells {
             break;
         }
@@ -632,12 +757,146 @@ mod tests {
     }
 
     #[test]
-    fn fit_clips_by_cells_and_pads_back_to_the_width() {
-        assert_eq!(fit("abc", 5), "abc  ");
-        assert_eq!(fit("abcdef", 3), "abc");
+    fn a_window_clips_by_cells_and_pads_back_to_the_width() {
+        assert_eq!(window("abc", 0, 5), "abc  ");
+        assert_eq!(window("abcdef", 0, 3), "abc");
         // 漢 is two cells: three of them do not fit in five, and the cell the
         // dropped glyph would have half-filled is padded instead.
-        assert_eq!(fit("漢漢漢", 5), "漢漢 ");
-        assert_eq!(fit("x", 0), "");
+        assert_eq!(window("漢漢漢", 0, 5), "漢漢 ");
+        assert_eq!(window("x", 0, 0), "");
+    }
+
+    #[test]
+    fn a_window_scrolled_past_half_a_glyph_shows_a_blank_not_half_of_it() {
+        // M11.9: the value scrolls under the caret in *cells*. Starting one
+        // cell into a 漢 cannot draw half of it, so that cell is blank and the
+        // next glyph starts where it really starts.
+        assert_eq!(window("漢字abc", 0, 4), "漢字");
+        assert_eq!(window("漢字abc", 1, 4), " 字a");
+        assert_eq!(window("漢字abc", 2, 4), "字ab");
+        assert_eq!(window("漢字abc", 4, 4), "abc ");
+        // Past the end of the line: all padding, still exactly as wide.
+        assert_eq!(window("ab", 6, 3), "   ");
+    }
+
+    /// A control's box, hand-built, so the window logic can be asked about a
+    /// caret without going through a whole layout.
+    fn field_box(text: &str, cols: i32, rows: i32, shows: Shows) -> LayoutBox {
+        let dimensions = crate::layout::Dimensions {
+            content: crate::layout::Rect {
+                x: 10,
+                y: 5,
+                width: cols,
+                height: rows,
+            },
+            ..Default::default()
+        };
+        LayoutBox {
+            kind: BoxKind::Field(FieldPaint {
+                shows,
+                disabled: false,
+            }),
+            node: None,
+            dimensions,
+            children: Vec::new(),
+            text: Some(text.to_string()),
+            term_style: Style::default(),
+            computed: crate::style::ComputedStyle::default(),
+            image_src: None,
+            image_size_firm: false,
+        }
+    }
+
+    fn shown(b: &LayoutBox, caret: Option<usize>) -> (Vec<String>, Option<(i32, i32)>) {
+        let p = painted(b, caret);
+        let rows = p
+            .runs
+            .iter()
+            .filter(|r| r.x == b.dimensions.content.x)
+            .map(|r| r.text.clone())
+            .collect();
+        (rows, p.caret)
+    }
+
+    #[test]
+    fn without_a_caret_a_field_shows_the_start_of_its_value() {
+        // M11.8's view, unchanged: paint, `--dump-text` and an unfocused field
+        // all show the value's start, and the caret sits at its end.
+        let b = field_box("abcdefghij", 6, 1, Shows::Value);
+        assert_eq!(shown(&b, None), (vec!["abcdef".into()], Some((15, 5))));
+    }
+
+    #[test]
+    fn typing_past_the_right_edge_scrolls_the_value_under_the_caret() {
+        let b = field_box("abcdefghij", 6, 1, Shows::Value);
+        // Caret inside the first window: nothing scrolls.
+        assert_eq!(shown(&b, Some(3)), (vec!["abcdef".into()], Some((13, 5))));
+        // At the end of a value wider than the box: the last 5 cells and the
+        // caret in the 6th, which is where the next character goes.
+        assert_eq!(shown(&b, Some(10)), (vec!["fghij ".into()], Some((15, 5))));
+        // `Home` snaps back to the start.
+        assert_eq!(shown(&b, Some(0)), (vec!["abcdef".into()], Some((10, 5))));
+    }
+
+    #[test]
+    fn a_cjk_value_scrolls_by_cells_and_the_caret_lands_on_a_whole_glyph() {
+        // Six characters, twelve cells, in an eight-cell box. A caret counted
+        // in `chars()` would put every one of these numbers somewhere else.
+        let b = field_box("漢字漢字漢字", 8, 1, Shows::Value);
+        assert_eq!(shown(&b, Some(0)), (vec!["漢字漢字".into()], Some((10, 5))));
+        // Four characters in is eight cells: one past the window, so it
+        // scrolls by exactly the one cell that puts the caret at the edge.
+        assert_eq!(shown(&b, Some(4)), (vec![" 字漢字 ".into()], Some((17, 5))));
+        // The end of the value: twelve cells, so the window starts at cell 5,
+        // where the third 漢 is already half over — blanked, never halved, and
+        // the row is still exactly eight cells wide.
+        assert_eq!(shown(&b, Some(6)), (vec![" 字漢字 ".into()], Some((17, 5))));
+    }
+
+    #[test]
+    fn a_textarea_scrolls_to_the_line_the_caret_is_on() {
+        // Three lines in a two-row box. The caret is a character index into
+        // the whole value, newlines included.
+        let b = field_box("one\ntwo\nthree", 5, 2, Shows::Value);
+        assert_eq!(
+            shown(&b, Some(1)),
+            (vec!["one  ".into(), "two  ".into()], Some((11, 5)))
+        );
+        // Two characters into the third line (4 + 4 + 2): the window drops the
+        // first line so the caret's own line is on screen.
+        assert_eq!(
+            shown(&b, Some(10)),
+            (vec!["two  ".into(), "three".into()], Some((12, 6)))
+        );
+    }
+
+    #[test]
+    fn a_placeholder_keeps_the_caret_at_the_front_and_a_button_has_none() {
+        let hint = field_box("Search Wikipedia", 8, 1, Shows::Placeholder);
+        assert_eq!(shown(&hint, Some(0)).1, Some((10, 5)));
+        let button = field_box("Search", 6, 1, Shows::Label);
+        assert_eq!(shown(&button, None).1, None);
+    }
+
+    #[test]
+    fn an_editable_value_is_the_unmasked_one_and_only_for_what_takes_a_caret() {
+        let dom = html::parse(
+            "<input value=plain><input type=password value=secret>\
+             <input value=off disabled><input value=shown readonly>\
+             <button>Search</button><input type=hidden value=h>",
+        );
+        let mut got = Vec::new();
+        for id in (0..dom.node_count() as u32).map(NodeId) {
+            if let NodeData::Element { tag, .. } = &dom.node(id).data {
+                got.push(editable_value(&dom, id, tag));
+            }
+        }
+        assert_eq!(
+            got.into_iter().flatten().collect::<Vec<_>>(),
+            // The password's *real* value: an edit applies to the text, not to
+            // the stars, and the caret indexes it. The `readonly` field is
+            // absent — it has a box and a focus and no caret.
+            ["plain".to_string(), "secret".to_string()]
+        );
     }
 }

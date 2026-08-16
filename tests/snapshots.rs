@@ -389,7 +389,19 @@ fn js_page_snapshot() {
 /// M11.8), so it is the only thing in this file that cannot be seen through
 /// `paint` alone. The last row is the statusline and is cropped away.
 fn render_app(html: &str, width: u16, height: u16, tabs: usize) -> Frame {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::KeyCode;
+    render_app_keys(html, width, height, &vec![KeyCode::Tab; tabs])
+}
+
+/// The page after `keys`, pressed one at a time through `App::update` — so the
+/// mode, the focus, the caret and the window are all the real ones (M11.9).
+fn render_app_keys(
+    html: &str,
+    width: u16,
+    height: u16,
+    keys: &[crossterm::event::KeyCode],
+) -> Frame {
+    use crossterm::event::{KeyEvent, KeyModifiers};
     use std::time::Duration;
     use yata::browser::app::App;
     use yata::msg::Msg;
@@ -411,8 +423,8 @@ fn render_app(html: &str, width: u16, height: u16, tabs: usize) -> Frame {
         dom,
         elapsed: Duration::ZERO,
     });
-    for _ in 0..tabs {
-        app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+    for &code in keys {
+        app.update(Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
     let mut frame = Frame::new(width, height + 1);
     app.draw(&mut frame);
@@ -514,6 +526,60 @@ fn hn_search_box_is_the_width_the_page_asked_for() {
     let inside = &field[field.find('[').unwrap() + 1..field.rfind(']').unwrap()];
     assert_eq!(UnicodeWidthStr::width(inside), 17, "{at}");
     assert_snapshot("hn-search", &at);
+}
+
+/// M11.9's acceptance case: HN's own search box, typed into.
+///
+/// One `Shift-Tab` (the search box is the last thing on the page a reader can
+/// reach, so backwards is one press rather than two hundred), `Enter` to start
+/// typing, then eight keystrokes — every one of which is a browse binding on
+/// any other page and here is just a letter. The caret is the reversed cell one
+/// past what was typed, which is where the next character goes.
+#[test]
+fn hn_search_box_takes_what_the_reader_types() {
+    use crossterm::event::KeyCode;
+    let src = fixture("news.ycombinator.com.html");
+    let mut keys = vec![KeyCode::BackTab, KeyCode::Enter];
+    keys.extend("redirect".chars().map(KeyCode::Char));
+    let frame = render_app_keys(&src, 80, 30, &keys);
+    let grid = grid_text(&frame, 80, 30, |c| if c.ch == '\0' { ' ' } else { c.ch });
+    let at = window(&grid, "redirect", 1, 1);
+    let row = at
+        .lines()
+        .find(|r| r.contains("redirect"))
+        .expect("the typed value");
+    // Inside the frame the page asked for: 17 cells, still, because typing
+    // moves no geometry.
+    let inside = &row[row.find('[').unwrap() + 1..row.rfind(']').unwrap()];
+    assert_eq!(inside, "redirect         ", "{at}");
+
+    // The caret: reversed, one cell past the value, on the same row.
+    let reversed = grid_text(&frame, 80, 30, |c| {
+        if c.attrs.contains(yata::term::Attrs::REVERSE) {
+            '#'
+        } else {
+            ' '
+        }
+    });
+    let y = grid
+        .lines()
+        .position(|r| r.contains("redirect"))
+        .expect("the typed row");
+    let caret = row.find("redirect").unwrap() + "redirect".len();
+    let marks: Vec<usize> = reversed
+        .lines()
+        .nth(y)
+        .unwrap()
+        .char_indices()
+        .filter(|(_, c)| *c == '#')
+        .map(|(i, _)| i)
+        .collect();
+    assert!(
+        marks.contains(&caret),
+        "no caret at column {caret}: reversed cells were {marks:?}\n{at}"
+    );
+
+    assert_snapshot("hn-search-typed", &at);
 }
 
 /// Wikipedia's search form: a text field with a placeholder, a button beside

@@ -6,6 +6,7 @@
 use crate::browser::keys::{self, Action, Binding, Chord, Mode};
 use crossterm::event::KeyCode;
 use std::collections::BTreeMap;
+use unicode_width::UnicodeWidthStr;
 
 /// Short human phrase for an action. Exhaustive so a new `Action` fails to
 /// compile until help knows about it.
@@ -27,12 +28,20 @@ pub fn action_help(action: Action) -> &'static str {
         Action::ToggleTiming => "timing overlay",
         Action::Commit => "confirm",
         Action::Cancel => "cancel",
-        Action::DeleteChar => "delete character",
+        Action::DeleteChar => "delete character before the caret",
+        Action::DeleteCharForward => "delete character after the caret",
+        Action::CaretLeft => "caret left",
+        Action::CaretRight => "caret right",
+        Action::CaretToStart => "caret to start of line",
+        Action::CaretToEnd => "caret to end of line",
         Action::HintFollow => "link hints (follow)",
         Action::HintYank => "link hints (yank URL)",
-        Action::FocusNext => "next link",
-        Action::FocusPrev => "previous link",
-        Action::FollowFocus => "follow focused link",
+        // Since M11.8 the cycle is links *and* form controls, and since M11.9
+        // `Enter` on one of those starts typing rather than going nowhere. The
+        // overlay is where a reader finds that out, so it says it.
+        Action::FocusNext => "next link or field",
+        Action::FocusPrev => "previous link or field",
+        Action::FollowFocus => "follow the focused link / type in the field",
         Action::HistoryBack => "history back",
         Action::HistoryForward => "history forward",
         Action::Reload => "reload",
@@ -46,21 +55,33 @@ pub fn action_help(action: Action) -> &'static str {
 
 /// Full help text: title + Browse bindings + input-mode bindings.
 pub fn help_text() -> String {
-    let mut lines = vec![
-        "yata — keybindings".into(),
-        String::new(),
-        "Browse".into(),
-        String::from("──────"),
-    ];
+    let mut lines = vec!["yata — keybindings".into(), String::new()];
+    lines.extend(heading("Browse"));
     lines.extend(section_lines(Mode::Browse));
     lines.push(String::new());
-    lines.push("URL bar / search".into());
-    lines.push(String::from("────────────────"));
+    lines.extend(heading("URL bar / search"));
     // UrlInput and SearchInput share the same chord set in the table.
     lines.extend(section_lines(Mode::UrlInput));
     lines.push(String::new());
+    lines.extend(heading("Text field — Enter starts typing in it, Esc stops"));
+    // The first row is not a binding and cannot be: printable characters are
+    // the one sanctioned path outside the table (CLAUDE.md), and a mode that
+    // listed everything *except* what typing does would be worse than useless.
+    lines.push(format!(
+        "  {:<22} {}",
+        "(any character)", "insert at the caret"
+    ));
+    lines.extend(section_lines(Mode::Field));
+    lines.push(String::new());
     lines.push("Press ? or Esc to close.".into());
     lines.join("\n")
+}
+
+/// A section title and its rule, measured in cells so the rule cannot end up a
+/// character short of the words above it — which is what happened the moment a
+/// third section was hand-underlined.
+fn heading(title: &str) -> [String; 2] {
+    [title.to_string(), "─".repeat(title.width())]
 }
 
 fn section_lines(mode: Mode) -> Vec<String> {
@@ -153,5 +174,31 @@ mod tests {
         // Link hints and quit must be present as concrete keys.
         assert!(text.contains("link hints") || text.contains("follow"));
         assert!(text.contains('q') || text.contains("quit"));
+    }
+
+    #[test]
+    fn help_lists_the_field_mode_because_it_is_generated_from_the_table() {
+        // M11.9: the mode's rows appear here without anything being written
+        // twice — adding a row to `BINDINGS` is what puts it on this page.
+        let text = help_text();
+        assert!(text.contains("Text field"), "{text}");
+        for needle in [
+            "insert at the caret",
+            "delete character before the caret",
+            "delete character after the caret",
+            "caret to start of line",
+            "Ctrl-c",
+        ] {
+            assert!(text.contains(needle), "help missing {needle:?}:\n{text}");
+        }
+        // Every Field binding in the table is on the page, keys and phrase.
+        for b in keys::BINDINGS.iter().filter(|b| b.mode == Mode::Field) {
+            assert!(
+                text.contains(&format_binding(b)),
+                "help missing the chord for {:?}:\n{text}",
+                b.action
+            );
+            assert!(text.contains(action_help(b.action)), "{text}");
+        }
     }
 }

@@ -21,7 +21,15 @@ pub enum Action {
     ToggleConsole,
     Commit,
     Cancel,
+    /// Delete the character *before* the caret (`Backspace`).
     DeleteChar,
+    /// Delete the character *after* it (`Delete`) — a field has both, because
+    /// a caret that can move has something on each side of it (M11.9).
+    DeleteCharForward,
+    CaretLeft,
+    CaretRight,
+    CaretToStart,
+    CaretToEnd,
     /// Link hints → follow (`f`).
     HintFollow,
     /// Link hints → yank URL (`F`).
@@ -52,6 +60,10 @@ pub enum Mode {
     UrlInput,
     /// Same chord set as `UrlInput` (Enter/Esc/Backspace); printable chars type.
     SearchInput,
+    /// Typing into a focused form control (M11.9). Entered with `Enter` on a
+    /// focused text field, left with `Esc` — see the table's rows for why the
+    /// promise that `q` quits is kept by `Ctrl-c` here.
+    Field,
 }
 
 /// One key plus its modifiers. A binding is one chord, or a two-chord sequence
@@ -190,6 +202,55 @@ pub const BINDINGS: &[Binding] = &[
         Mode::SearchInput,
         chord(KeyCode::Char('c'), CTRL),
         Action::Quit,
+    ),
+    // Field (M11.9): typing into the focused control. A third input *mode*,
+    // not a second exception — the printable-character path in `App::on_key`
+    // is widened to it, and nothing else in the app reads `KeyCode::Char`.
+    //
+    // `q` is absent for the reason it is absent above: it is a letter here.
+    // PLAN.md §3 promises `q` "always works" — and in the URL bar that promise
+    // has always been kept by `Ctrl-c`, which is bound in every mode and is the
+    // one chord a reader can press without first knowing where they are. `q`
+    // quits the moment they are not inside a field, which `Esc` makes true in
+    // one key, and the statusline says which of the two they are in.
+    //
+    // `Enter` is **deliberately unbound**: it is M11.10's, where it submits the
+    // form, and a `Tab`-like stopgap now is how that gets decided by accident.
+    // A test pins its absence so it stays a decision.
+    input(Mode::Field, chord(KeyCode::Esc, NONE), Action::Cancel),
+    input(Mode::Field, chord(KeyCode::Char('c'), CTRL), Action::Quit),
+    input(
+        Mode::Field,
+        chord(KeyCode::Backspace, NONE),
+        Action::DeleteChar,
+    ),
+    input(
+        Mode::Field,
+        chord(KeyCode::Delete, NONE),
+        Action::DeleteCharForward,
+    ),
+    input(Mode::Field, chord(KeyCode::Left, NONE), Action::CaretLeft),
+    input(Mode::Field, chord(KeyCode::Right, NONE), Action::CaretRight),
+    input(
+        Mode::Field,
+        chord(KeyCode::Home, NONE),
+        Action::CaretToStart,
+    ),
+    input(Mode::Field, chord(KeyCode::End, NONE), Action::CaretToEnd),
+    // `Tab` moves to the next focusable and **leaves typing**, which is the
+    // browser behaviour minus the half a browser cannot have: there, focus
+    // implies typing, so tabbing between two fields keeps the keyboard. Here
+    // the two are separate states, and the alternative — staying in typing
+    // mode when the next focusable happens to be another field — would make
+    // whether `q` quits depend on what the page put next in the document. One
+    // exit rule instead: you leave a field the same way whatever you land on,
+    // and `Enter` starts typing again in one key. Nothing is committed either
+    // way; the value has been state since the first keystroke.
+    input(Mode::Field, chord(KeyCode::Tab, NONE), Action::FocusNext),
+    input(
+        Mode::Field,
+        chord(KeyCode::BackTab, NONE),
+        Action::FocusPrev,
     ),
 ];
 
@@ -474,6 +535,61 @@ mod tests {
         // A release must not cancel a pending prefix.
         let g = chord(KeyCode::Char('g'), NONE);
         assert_eq!(resolve(Mode::Browse, Some(g), &ev), Resolution::Ignore);
+    }
+
+    #[test]
+    fn a_field_is_a_third_mode_and_letters_type_in_it() {
+        // The table is the whole of the mode (M11.9): `q` and `j` resolve to
+        // nothing here, which is what sends them down `App::on_key`'s
+        // printable-character path — the one sanctioned exception, widened
+        // rather than copied.
+        for c in ['q', 'j', 'o', '/', 'G'] {
+            assert_eq!(
+                resolve(Mode::Field, None, &press(KeyCode::Char(c), NONE)),
+                Resolution::Unbound,
+                "{c} is a letter in a field"
+            );
+        }
+        // Quit is kept by Ctrl-c, in this mode as in the URL bar.
+        assert_eq!(
+            resolve(Mode::Field, None, &press(KeyCode::Char('c'), CTRL)),
+            Resolution::Action(Action::Quit)
+        );
+        for (code, action) in [
+            (KeyCode::Esc, Action::Cancel),
+            (KeyCode::Backspace, Action::DeleteChar),
+            (KeyCode::Delete, Action::DeleteCharForward),
+            (KeyCode::Left, Action::CaretLeft),
+            (KeyCode::Right, Action::CaretRight),
+            (KeyCode::Home, Action::CaretToStart),
+            (KeyCode::End, Action::CaretToEnd),
+            (KeyCode::Tab, Action::FocusNext),
+            (KeyCode::BackTab, Action::FocusPrev),
+        ] {
+            assert_eq!(
+                resolve(Mode::Field, None, &press(code, NONE)),
+                Resolution::Action(action),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn enter_in_a_field_is_reserved_for_m11_10() {
+        // Deliberately unbound, and pinned so it stays a decision: `Enter`
+        // while typing submits the form, which is M11.10's to build. A
+        // stopgap here — "just make it Tab for now" — is how that gets
+        // decided by accident.
+        assert_eq!(
+            resolve(Mode::Field, None, &press(KeyCode::Enter, NONE)),
+            Resolution::Unbound
+        );
+        // And in Browse it still activates the focused thing, which is what
+        // starts the typing in the first place.
+        assert_eq!(
+            browse_key(KeyCode::Enter, NONE),
+            Resolution::Action(Action::FollowFocus)
+        );
     }
 
     #[test]

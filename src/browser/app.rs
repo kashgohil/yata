@@ -188,11 +188,39 @@ enum Surface {
 }
 
 /// Input mode. `Browse` reads the body and scrolls; `UrlInput` / `SearchInput`
-/// are one-line prompts (cursor always at the end, no readline moves).
+/// are one-line prompts (cursor always at the end, no readline moves); `Field`
+/// types into the focused form control (M11.9).
 enum Mode {
     Browse,
-    UrlInput { buffer: String },
-    SearchInput { buffer: String },
+    UrlInput {
+        buffer: String,
+    },
+    SearchInput {
+        buffer: String,
+    },
+    /// Typing into the control named by `focus`.
+    ///
+    /// **Focus and typing are different states**, and separating them costs
+    /// nothing a reader notices. `Tab` past a page whose second focusable is a
+    /// search box must not silently swallow `j`, `/` and `q`: a GUI browser can
+    /// afford focus-implies-typing because it has a mouse and a chrome, and a
+    /// terminal browser whose letters *are* its interface cannot. So `Enter`
+    /// starts typing — it already means "activate the focused thing" — and
+    /// `Esc` ends it with the field still focused.
+    ///
+    /// `caret` is a **character** index into the control's value, not a byte
+    /// offset and not a cell: bytes would make `Backspace` land inside a
+    /// multi-byte character, and cells cannot address the position between two
+    /// halves of a wide glyph, which is where a caret must never be. Cells are
+    /// derived from it at paint time (`layout::field::painted`).
+    ///
+    /// The caret lives here rather than on the node because it is UI, like
+    /// focus and hover: a caret in the tree would make layout depend on where a
+    /// cursor is. It is dropped the moment typing ends, which is the only time
+    /// it means anything.
+    Field {
+        caret: usize,
+    },
 }
 
 /// The UI state. Pure with respect to the terminal: `update` touches only
@@ -388,6 +416,14 @@ pub struct App {
     /// `measure_a_tick_that_inserts_no_script` sets it.
     #[cfg(test)]
     no_insert_detection: bool,
+    /// Turns M11.9's narrowed keystroke path *on*, the same way M11.3's switch
+    /// turns its narrowing off and for the same reason: the two paths have to
+    /// be timed in one process, interleaved. The narrow one is the road not
+    /// taken — the simple path came in inside the budget — so this is off
+    /// everywhere except `measure_a_keystroke_in_a_field` and the test that
+    /// keeps the B side honest.
+    #[cfg(test)]
+    narrow_keystroke: bool,
     /// Images: LRU cache, page discovery, Kitty placement state (M8).
     images: ImageSession,
 }
@@ -459,6 +495,8 @@ impl App {
             full_restyle_only: false,
             #[cfg(test)]
             no_insert_detection: false,
+            #[cfg(test)]
+            narrow_keystroke: false,
             images: ImageSession::new(kitty_graphics),
         }
     }
@@ -648,7 +686,7 @@ impl App {
                 self.clear_page_engine();
                 // Interaction state is page-local.
                 self.hover = None;
-                self.focus = None;
+                self.clear_focus();
                 self.hint = None;
                 self.search = None;
                 redraw()
@@ -990,6 +1028,7 @@ impl App {
             Mode::Browse => keys::Mode::Browse,
             Mode::UrlInput { .. } => keys::Mode::UrlInput,
             Mode::SearchInput { .. } => keys::Mode::SearchInput,
+            Mode::Field { .. } => keys::Mode::Field,
         };
         match keys::resolve(mode, self.pending, &ev) {
             // Not a Press event: leave the pending prefix untouched.
@@ -1007,11 +1046,14 @@ impl App {
             Resolution::Unbound => {
                 self.pending = None;
                 // The one sanctioned key path outside the binding table
-                // (CLAUDE.md): in the URL bar / search prompt a printable
-                // character types into the buffer. `q` is a letter here, not
-                // quit. `resolve` only yields `Unbound` for Press events.
-                if matches!(self.mode, Mode::UrlInput { .. } | Mode::SearchInput { .. })
-                    && let KeyCode::Char(c) = ev.code
+                // (CLAUDE.md): in the URL bar, the search prompt and a form
+                // control (M11.9) a printable character types. `q` is a letter
+                // in all three, and quit is kept by `Ctrl-c`, which every one
+                // of them binds. Widened here rather than copied: a second
+                // place that reads `KeyCode::Char` would be a second exception,
+                // and the rule allows one. `resolve` only yields `Unbound` for
+                // Press events.
+                if let KeyCode::Char(c) = ev.code
                     && !ev
                         .modifiers
                         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -1019,10 +1061,11 @@ impl App {
                     match &mut self.mode {
                         Mode::UrlInput { buffer } | Mode::SearchInput { buffer } => {
                             buffer.push(c);
+                            return redraw();
                         }
+                        Mode::Field { .. } => return self.insert_in_field(c),
                         Mode::Browse => {}
                     }
-                    return redraw();
                 }
                 Effect::default()
             }
@@ -1030,8 +1073,14 @@ impl App {
     }
 
     fn on_mouse(&mut self, ev: MouseEvent) -> Effect {
-        // URL bar and inspectors: no page hit-testing. Wheel still scrolls
-        // whichever surface is active.
+        // URL bar, inspectors and a field being typed into: no page
+        // hit-testing. Wheel still scrolls whichever surface is active.
+        //
+        // Typing swallows the click the same way the URL bar does, and for the
+        // same reason: leaving a mode is `Esc`, one key, always. A click that
+        // blurred the field would be a second way out that only exists for
+        // readers who have a mouse — and the caret's key model has to be
+        // complete without one.
         match ev.kind {
             MouseEventKind::ScrollDown => moved(self.scroll_target().scroll_down()),
             MouseEventKind::ScrollUp => moved(self.scroll_target().scroll_up()),
@@ -1101,19 +1150,33 @@ impl App {
                     return redraw();
                 }
                 // URL bar / search: drop the buffer and return to browse.
+                // A field keeps its focus and its value — `Esc` leaves the
+                // mode, not the control (M11.9), so the reader lands back on
+                // the page with `j`, `/` and `q` live and the caret gone.
                 // Already in browse with nothing to cancel → not dirty.
-                if matches!(self.mode, Mode::UrlInput { .. } | Mode::SearchInput { .. }) {
+                if matches!(
+                    self.mode,
+                    Mode::UrlInput { .. } | Mode::SearchInput { .. } | Mode::Field { .. }
+                ) {
                     self.mode = Mode::Browse;
                     return redraw();
                 }
                 Effect::default()
             }
             Action::DeleteChar => {
+                if let Mode::Field { .. } = self.mode {
+                    return self.delete_in_field(false);
+                }
                 if let Mode::UrlInput { buffer } | Mode::SearchInput { buffer } = &mut self.mode {
                     buffer.pop();
                 }
                 redraw()
             }
+            Action::DeleteCharForward => self.delete_in_field(true),
+            Action::CaretLeft => self.move_caret(CaretMove::Prev),
+            Action::CaretRight => self.move_caret(CaretMove::Next),
+            Action::CaretToStart => self.move_caret(CaretMove::LineStart),
+            Action::CaretToEnd => self.move_caret(CaretMove::LineEnd),
             Action::HintFollow => self.start_hints(false),
             Action::HintYank => self.start_hints(true),
             Action::FocusNext => self.cycle_focus(1),
@@ -1208,7 +1271,7 @@ impl App {
         self.fetch = Fetch::Failed { url, reason };
         self.clear_page_engine();
         self.hover = None;
-        self.focus = None;
+        self.clear_focus();
         self.hint = None;
         self.pending_scroll = None;
         if self.surface != Surface::Help {
@@ -1913,7 +1976,9 @@ impl App {
                 let query = buffer.clone();
                 self.commit_search(query)
             }
-            Mode::Browse => Effect::default(),
+            // A field binds no `Commit`: `Enter` while typing is M11.10's, and
+            // it submits the form rather than confirming a buffer.
+            Mode::Browse | Mode::Field { .. } => Effect::default(),
         }
     }
 
@@ -1970,7 +2035,7 @@ impl App {
             }
         }
         self.hover = None;
-        self.focus = None;
+        self.clear_focus();
         self.hint = None;
         self.search = None;
         self.status_msg = None;
@@ -2069,7 +2134,7 @@ impl App {
     /// *this* fetch generation.
     fn navigate_restore(&mut self, url: String, scroll: usize) -> Effect {
         self.hover = None;
-        self.focus = None;
+        self.clear_focus();
         self.hint = None;
         self.search = None;
         self.status_msg = None;
@@ -2132,7 +2197,7 @@ impl App {
         // owes the reader their own position, not a second jump to the anchor.
         let scroll = self.viewport.offset();
         self.hover = None;
-        self.focus = None;
+        self.clear_focus();
         self.hint = None;
         let id = self.start_fetch(url.clone());
         self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
@@ -2252,7 +2317,26 @@ impl App {
         redraw()
     }
 
+    /// Drop the focus, and with it any typing it was carrying.
+    ///
+    /// One function because the two cannot come apart: a caret with nothing
+    /// under it would be a statusline saying `[typing]` over a page that has no
+    /// field. Every navigation goes through here, including the ones a script
+    /// starts while the reader is mid-word.
+    fn clear_focus(&mut self) {
+        self.focus = None;
+        if matches!(self.mode, Mode::Field { .. }) {
+            self.mode = Mode::Browse;
+        }
+    }
+
     fn cycle_focus(&mut self, dir: i32) -> Effect {
+        // `Tab` out of a field leaves typing (see the table's Field rows): the
+        // reader lands on the next focusable with every browse binding live,
+        // whatever kind of thing it turned out to be.
+        if matches!(self.mode, Mode::Field { .. }) {
+            self.mode = Mode::Browse;
+        }
         let Some(dom) = &self.dom else {
             return Effect::default();
         };
@@ -2292,14 +2376,24 @@ impl App {
     }
 
     fn follow_focus(&mut self) -> Effect {
+        // `Enter` means "activate the focused thing", and activating a text box
+        // is beginning to type in it (M11.9). A button, a `disabled` field and
+        // anything else that takes no caret is not one, so it falls through to
+        // the link path exactly as it did before — which for a control means
+        // doing nothing, because a control has no `href`.
+        //
+        // The caret starts at the **end** of the value: `Enter` is not a click,
+        // it names no position in the text, and the end is where a reader who
+        // just opened a half-filled field wants to carry on.
+        if let Some((_, value)) = self.focused_field() {
+            self.mode = Mode::Field {
+                caret: value.chars().count(),
+            };
+            return redraw();
+        }
         let (Some(focus), Some(dom)) = (self.focus, &self.dom) else {
             return Effect::default();
         };
-        // A focused field has no `href`, so `Enter` on one does nothing — and
-        // that is M11.8's decision rather than an oversight. This task binds no
-        // keys inside a field at all: what `Enter`, `q` and `j` mean once the
-        // caret is in a text box is the mode discipline M11.9 exists to settle,
-        // and deciding one key of it here would decide it by accident.
         let Some(href) = dom.attr(focus, "href") else {
             return Effect::default();
         };
@@ -2308,6 +2402,219 @@ impl App {
             return self.take_click_navigation();
         }
         self.follow_href(&href)
+    }
+
+    /// The focused control if it is one a reader may type into, with the value
+    /// they would be typing into: the state beside the tree if they have
+    /// already, else what the markup said.
+    ///
+    /// `None` for a link, a button, a `disabled` field and a page with nothing
+    /// focused — which is what makes `Enter` on a disabled control open no mode
+    /// (it cannot be focused either, since M11.8 left it out of the Tab cycle,
+    /// but "cannot be reached" and "cannot be typed into" are different claims
+    /// and this is the one that matters here).
+    fn focused_field(&self) -> Option<(NodeId, String)> {
+        let (focus, dom) = (self.focus?, self.dom.as_ref()?);
+        let crate::dom::NodeData::Element { tag, .. } = &dom.node(focus).data else {
+            return None;
+        };
+        Some((focus, layout::field::editable_value(dom, focus, tag)?))
+    }
+
+    /// Insert a character at the caret — the sanctioned printable-key path's
+    /// field arm, and the first production writer `Dom::set_field_value` has
+    /// ever had.
+    fn insert_in_field(&mut self, ch: char) -> Effect {
+        let (Some((node, mut value)), Some(caret)) = (self.focused_field(), self.caret()) else {
+            return Effect::default();
+        };
+        value.insert(byte_at(&value, caret), ch);
+        self.mode = Mode::Field { caret: caret + 1 };
+        self.write_field(node, &value)
+    }
+
+    /// `Backspace` (before the caret) and `Delete` (after it). A caret with
+    /// nothing on the side it was asked about is not a change, and not a
+    /// redraw either.
+    fn delete_in_field(&mut self, forward: bool) -> Effect {
+        let (Some((node, mut value)), Some(caret)) = (self.focused_field(), self.caret()) else {
+            return Effect::default();
+        };
+        let target = match forward {
+            true => caret,
+            false => match caret.checked_sub(1) {
+                Some(before) => before,
+                None => return Effect::default(),
+            },
+        };
+        if target >= value.chars().count() {
+            return Effect::default();
+        }
+        value.remove(byte_at(&value, target));
+        self.mode = Mode::Field { caret: target };
+        self.write_field(node, &value)
+    }
+
+    /// `←` `→` `Home` `End`. The caret is chrome, like focus and hover: moving
+    /// it changes no value, so no stage runs and the overlay draws it in its
+    /// new cell on the next frame.
+    fn move_caret(&mut self, how: CaretMove) -> Effect {
+        let (Some((_, value)), Some(caret)) = (self.focused_field(), self.caret()) else {
+            return Effect::default();
+        };
+        let (start, end) = line_bounds(&value, caret);
+        let next = match how {
+            CaretMove::Prev => caret.saturating_sub(1),
+            CaretMove::Next => (caret + 1).min(value.chars().count()),
+            CaretMove::LineStart => start,
+            CaretMove::LineEnd => end,
+        };
+        if next == caret {
+            return Effect::default();
+        }
+        self.mode = Mode::Field { caret: next };
+        redraw()
+    }
+
+    /// The caret, clamped to the value it indexes.
+    ///
+    /// Clamped rather than trusted because the value can move underneath it:
+    /// a script that writes a `<textarea>`'s content while the reader is in it
+    /// leaves the caret past the end, and an index into a string is the last
+    /// place to find out.
+    fn caret(&self) -> Option<usize> {
+        let Mode::Field { caret } = self.mode else {
+            return None;
+        };
+        let (_, value) = self.focused_field()?;
+        Some(caret.min(value.chars().count()))
+    }
+
+    /// Store what the reader typed and put it on screen.
+    ///
+    /// **The value is state, not an attribute** (M11.8's rule, and this is what
+    /// depends on it): `set_field_value` leaves `value="x"` exactly as the page
+    /// wrote it, so `input[value="x"]` keeps matching the markup and a
+    /// keystroke never reaches the cascade. It is a *text* edit, though, so the
+    /// screen has to follow — see [`Self::after_field_edit`] for what that
+    /// costs and why it is not a relayout.
+    ///
+    /// No event is dispatched, by DEVIATIONS.md's rule that key events never
+    /// reach the page: no `keydown`, no `input`, no `change`. M11.13 owns them.
+    fn write_field(&mut self, node: NodeId, value: &str) -> Effect {
+        let Some(dom) = self.dom.as_mut() else {
+            return Effect::default();
+        };
+        dom.set_field_value(node, value);
+        self.after_field_edit(node)
+    }
+
+    /// What a keystroke costs (M11.9 deliverable 4), and the shape of it is
+    /// the point: **relayout, then repaint. No restyle.**
+    ///
+    /// A keystroke is not a cascade event — the value is state beside the tree
+    /// and not an attribute, so no selector's answer can have moved — and
+    /// `styles_run` says so in a test.
+    ///
+    /// It is a *text* edit, so the page is laid out again, and that is the
+    /// simple thing rather than the fast thing. It was measured before it was
+    /// written, against the narrowing it would obviously want (patch the one
+    /// box whose text changed, since a control's box is `size` cells wide
+    /// whatever it holds, so no geometry can move):
+    ///
+    /// ```text
+    /// keypress→screen, en.wikipedia.org, 80×24, budget < 10 ms
+    ///   relayout + repaint   7.55 ms (7.37–7.89)
+    ///   patch + repaint      2.01 ms (1.98–2.09)
+    /// ```
+    ///
+    /// The simple path is **inside the budget with a quarter of it to spare**,
+    /// so it ships: a second invalidation path costs a correctness obligation
+    /// (the patched tree has to be the tree a relayout would have produced) on
+    /// every future change to how a control is built, and 5 ms nobody is
+    /// waiting for does not buy that. M12's incremental layout is where this
+    /// gets cheaper for every page and not just for fields.
+    ///
+    /// The narrowing stays as the measurement's B side (see
+    /// [`Self::repaint_field`]) so the number can be taken again on a machine
+    /// that disagrees, or when a page bigger than Wikipedia's article says the
+    /// budget has moved.
+    fn after_field_edit(&mut self, node: NodeId) -> Effect {
+        // The A/B switch, and the only thing that reads it: the two paths have
+        // to be timed in the same process, on the same page, interleaved (this
+        // machine drifts 5–10%, so a before-commit/after-commit pair would be
+        // measuring the drift).
+        #[cfg(test)]
+        if self.narrow_keystroke && self.repaint_field(node) {
+            return redraw();
+        }
+        #[cfg(not(test))]
+        let _ = node;
+        self.relayout();
+        redraw()
+    }
+
+    /// Push a control's new text into the live layout tree and repaint from it,
+    /// without laying the page out — the path
+    /// [`Self::after_field_edit`]'s numbers rejected, kept as the B side that
+    /// produced them. `false` when there is no such box.
+    ///
+    /// It has to be a *correct* alternative or the number it produces means
+    /// nothing, so: **the patched tree is the tree a fresh layout would
+    /// produce**, and
+    /// `a_patched_tree_is_the_tree_a_fresh_layout_would_have_built` compares
+    /// the two rather than asserting it. That holds because everything layout
+    /// derives for a control's box comes from either its attributes and the
+    /// cascade (`size`, `cols`, `rows`, `width`) or from the value — and the
+    /// value reaches only `text` and `FieldPaint`, both rewritten here from the
+    /// same `field::control` that layout calls. Nothing sizes a text field by
+    /// what is in it, which is why a button — whose box *is* its label's width
+    /// — is not patchable and never needs to be.
+    #[cfg(test)]
+    fn repaint_field(&mut self, node: NodeId) -> bool {
+        let (Some(dom), Some(tree)) = (self.dom.as_ref(), self.layout_tree.as_mut()) else {
+            return false;
+        };
+        let crate::dom::NodeData::Element { tag, .. } = &dom.node(node).data else {
+            return false;
+        };
+        let Some(control) = layout::field::control(dom, node, tag) else {
+            return false;
+        };
+        let mut patched = false;
+        for b in &mut tree.boxes {
+            if b.node != Some(node) || !matches!(b.kind, BoxKind::Field(_)) {
+                continue;
+            }
+            b.kind = BoxKind::Field(layout::FieldPaint {
+                shows: control.shows,
+                disabled: control.disabled,
+            });
+            b.text = Some(control.text.clone());
+            patched = true;
+        }
+        if !patched {
+            return false;
+        }
+        let pixels = self.images.pixels();
+        if let Some(tree) = &self.layout_tree {
+            self.display_list = paint::paint_with(tree, &pixels);
+            // The rasterised lines come from the same tree, and go stale the
+            // same way: they are what `--dump-text` prints and what the scroll
+            // range is counted from. The row count cannot have changed — no
+            // geometry moved — but one row's text did.
+            let lines = layout::lines_from_tree(tree);
+            self.viewport.set_lines(lines, self.page());
+            #[cfg(test)]
+            {
+                self.paints += 1;
+            }
+        }
+        // F3 names what a control is showing, and typing into an empty field
+        // turns a placeholder into a value.
+        self.boxes_view_built = false;
+        self.build_visible_inspector();
+        true
     }
 
     fn scroll_focus_into_view(&mut self) {
@@ -2839,7 +3146,10 @@ impl App {
         match &self.mode {
             Mode::UrlInput { buffer } => self.draw_prompt(frame, y, "open: ", buffer),
             Mode::SearchInput { buffer } => self.draw_prompt(frame, y, "find: ", buffer),
-            Mode::Browse => self.draw_status(frame, y),
+            // Typing keeps the statusline rather than opening a prompt: the
+            // text being typed is in the page, where the caret is, and the row
+            // is what says which mode the reader is in.
+            Mode::Browse | Mode::Field { .. } => self.draw_status(frame, y),
         }
     }
 
@@ -2960,13 +3270,20 @@ impl App {
         });
     }
 
-    /// The focused control's own chrome: its frame reversed, and a caret where
-    /// the next character would go (M11.8).
+    /// The focused control's own chrome: its frame reversed, a caret where the
+    /// next character would go (M11.8), and — while the reader is typing into
+    /// it — the window of the value that caret is in (M11.9).
     ///
     /// A frame overlay like the focused link's and the search highlight's, for
     /// the same reason: focus is UI chrome, not CSS `:focus`, so moving it must
-    /// restyle nothing, relayout nothing and repaint no display list. The cells
-    /// come from `layout::field`, the same function paint drew them with.
+    /// restyle nothing, relayout nothing and repaint no display list. The
+    /// **window** is here rather than in the tree for the same reason again —
+    /// which window of a value is on screen is a fact about where a cursor is,
+    /// and layout must not depend on that. The display list keeps the view a
+    /// page's own paint produces (the start of the value); this draws the
+    /// scrolled one over exactly the same cells, from the same
+    /// `layout::field` function, so the two cannot disagree about what a field
+    /// looks like.
     fn draw_focused_field(
         &self,
         frame: &mut Frame,
@@ -2976,6 +3293,27 @@ impl App {
         scroll: i32,
     ) {
         let page_h = self.page() as i32;
+        // The window is only redrawn while typing: with no caret it is the one
+        // paint already drew, and building it again — every frame, scroll steps
+        // included — would be work for a rectangle that is already on screen.
+        let caret = match self.caret() {
+            Some(caret) => {
+                let painted = layout::field::painted(b, Some(caret));
+                for run in &painted.runs {
+                    let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) else {
+                        continue;
+                    };
+                    let screen_y = run.y - scroll;
+                    let screen_x = left as i32 + x;
+                    if screen_y < 0 || screen_y >= page_h || screen_x < 0 {
+                        continue;
+                    }
+                    frame.put_str(screen_x as u16, screen_y as u16, &text, run.style);
+                }
+                painted.caret
+            }
+            None => layout::field::caret(b),
+        };
         let mut reverse = |x: i32, y: i32| {
             if !clip.contains(x, y) {
                 return;
@@ -3005,7 +3343,7 @@ impl App {
                 reverse(rect.right(), y);
             }
         }
-        if let Some((x, y)) = layout::field::caret(b) {
+        if let Some((x, y)) = caret {
             reverse(x, y);
         }
     }
@@ -3144,6 +3482,14 @@ impl App {
         } else {
             base
         };
+        // Typing is a mode a reader can be surprised by — every letter goes
+        // into the page instead of doing what it usually does — so the row that
+        // always tells them where they are says so, and `Esc` visibly takes it
+        // away again (UX §1: every keypress produces a visible change).
+        let base = match self.mode {
+            Mode::Field { .. } => format!("[typing · Esc] {base}"),
+            _ => base,
+        };
         match self.surface {
             Surface::Page => base,
             Surface::Dom => format!("[dom] {base}"),
@@ -3220,6 +3566,50 @@ impl App {
         }
         parts.join(" · ")
     }
+}
+
+/// What `←` `→` `Home` `End` ask of the caret (M11.9).
+///
+/// Vim-flavoured word motions (`w`, `b`, `^`, `$`) are deliberately absent:
+/// they need a second modal layer inside an input mode, and no ladder page is
+/// waiting for one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CaretMove {
+    Prev,
+    Next,
+    LineStart,
+    LineEnd,
+}
+
+/// The byte offset of the `chars`-th character, or the end of the string.
+///
+/// The caret is counted in characters and `String` is indexed in bytes; this is
+/// the one place the two meet, so it is the only place a multi-byte character
+/// could be cut in half.
+fn byte_at(value: &str, chars: usize) -> usize {
+    value
+        .char_indices()
+        .nth(chars)
+        .map_or(value.len(), |(at, _)| at)
+}
+
+/// The character indices of the ends of the line the caret is on.
+///
+/// The whole value for an `<input>`, which has one line. A `<textarea>` has
+/// several, and there `Home`/`End` mean what they mean in every editor: the
+/// ends of *this* line, not of everything in the box.
+fn line_bounds(value: &str, caret: usize) -> (usize, usize) {
+    let chars: Vec<char> = value.chars().collect();
+    let caret = caret.min(chars.len());
+    let start = chars[..caret]
+        .iter()
+        .rposition(|&c| c == '\n')
+        .map_or(0, |at| at + 1);
+    let end = chars[caret..]
+        .iter()
+        .position(|&c| c == '\n')
+        .map_or(chars.len(), |at| caret + at);
+    (start, end)
 }
 
 /// Widest the text column ever gets (UX §3.5). Past roughly this many cells the
@@ -6202,9 +6592,11 @@ mod tests {
 
     #[test]
     fn every_browse_binding_still_works_with_a_field_focused() {
-        // The rule this task is most at risk of breaking, and the reason it
-        // binds no keys inside a field at all (M11.9 owns the mode discipline):
-        // a focused field must not swallow the reader's browser.
+        // The rule M11.8 was most at risk of breaking, and the reason M11.9
+        // made typing a *mode* rather than a consequence of focus: a focused
+        // field must not swallow the reader's browser. Every one of these keys
+        // does what it does on any other page, because focusing a field is not
+        // yet typing into one — `Enter` is.
         let tall = format!("{FORM_PAGE}{}", "<p>filler</p>".repeat(40));
         let (mut app, id) = scripted_app(&tall);
         app.update(Msg::RunScripts { id });
@@ -6212,15 +6604,10 @@ mod tests {
         app.update(key(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(focused(&app).as_deref(), Some("input a"));
 
-        // `j` scrolls, `gg` goes back to the top, and `Enter` on the field does
-        // nothing at all — there is nothing yet for it to do.
+        // `j` scrolls and `gg` goes back to the top, with the field focused
+        // throughout.
         app.update(ch('j'));
         assert!(app.viewport.offset() > 0, "j did not scroll");
-        assert_eq!(
-            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
-            Effect::default(),
-            "Enter on a field did something"
-        );
         app.update(ch('g'));
         app.update(ch('g'));
         assert_eq!(app.viewport.offset(), 0, "gg did not reach the top");
@@ -6232,6 +6619,440 @@ mod tests {
 
         // And `q` still quits, which is principle §1.5 and not negotiable.
         assert!(app.update(ch('q')).quit);
+    }
+
+    // ---- M11.9: typing into a field ---------------------------------------
+
+    /// The caret, if the reader is typing.
+    fn caret_of(app: &App) -> Option<usize> {
+        match app.mode {
+            Mode::Field { caret } => Some(caret),
+            _ => None,
+        }
+    }
+
+    /// What the focused control's *box* holds — the string layout will draw,
+    /// which for a password is the mask and never the value.
+    fn field_box_text(app: &App) -> Option<String> {
+        let (focus, tree) = (app.focus?, app.layout_tree.as_ref()?);
+        let mut out = None;
+        tree.walk(tree.root, &mut |_, b| {
+            if b.node == Some(focus) && matches!(b.kind, BoxKind::Field(_)) {
+                out.clone_from(&b.text);
+            }
+        });
+        out
+    }
+
+    /// The first `<input>` in the page, as a node.
+    fn input_node(app: &App) -> NodeId {
+        let dom = app.dom.as_ref().expect("a parsed page");
+        (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&id| {
+                matches!(&dom.node(id).data,
+                crate::dom::NodeData::Element { tag, .. } if tag == "input")
+            })
+            .expect("the fixture's field")
+    }
+
+    /// `Tab` to the page's text field and `Enter` to start typing.
+    fn start_typing(app: &mut App) {
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(focused(app).as_deref(), Some("input a"));
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            redraw()
+        );
+    }
+
+    fn type_str(app: &mut App, text: &str) {
+        for c in text.chars() {
+            app.update(ch(c));
+        }
+    }
+
+    #[test]
+    fn enter_starts_typing_and_esc_gives_the_page_back() {
+        // The mode discipline, end to end. Before `Enter`, `q` quits; after it,
+        // `q` is a letter; after `Esc`, `q` quits again and the field is still
+        // focused — which is the whole promise: the reader can always leave.
+        let tall = format!("{FORM_PAGE}{}", "<p>filler</p>".repeat(40));
+        let (mut app, id) = scripted_app(&tall);
+        app.update(Msg::RunScripts { id });
+        start_typing(&mut app);
+        assert_eq!(caret_of(&app), Some(1), "the caret starts past the value");
+
+        // Every browse binding is now a character. `q` above all.
+        type_str(&mut app, "qj/g");
+        assert_eq!(field_box_text(&app).as_deref(), Some("aqj/g"));
+        assert_eq!(app.viewport.offset(), 0, "j scrolled while typing");
+
+        assert_eq!(app.update(key(KeyCode::Esc, KeyModifiers::NONE)), redraw());
+        assert!(caret_of(&app).is_none(), "Esc left the caret behind");
+        assert_eq!(
+            focused(&app).as_deref(),
+            Some("input a"),
+            "Esc dropped the focus as well as the mode"
+        );
+
+        // And the browse bindings are live again, immediately.
+        app.update(ch('j'));
+        assert!(app.viewport.offset() > 0, "j did not scroll after Esc");
+        app.update(ch('g'));
+        app.update(ch('g'));
+        assert_eq!(app.viewport.offset(), 0, "gg did not reach the top");
+        assert!(app.update(ch('/')).dirty);
+        assert!(
+            matches!(app.mode, Mode::SearchInput { .. }),
+            "/ did not open"
+        );
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.update(ch('q')).quit, "q did not quit after Esc");
+    }
+
+    #[test]
+    fn ctrl_c_quits_from_typing_with_a_half_typed_value() {
+        // PLAN.md §3: quit always works. In a field `q` is a letter, so the
+        // promise is kept by `Ctrl-c` — exactly as it is in the URL bar.
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        start_typing(&mut app);
+        type_str(&mut app, "half");
+        assert_eq!(field_box_text(&app).as_deref(), Some("ahalf"));
+        assert!(
+            app.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+                .quit,
+            "Ctrl-c did not quit from typing mode"
+        );
+    }
+
+    #[test]
+    fn what_a_reader_typed_never_touches_the_value_attribute() {
+        // M11.8's rule, and the reason the store exists: `value` is the
+        // *default*, so a stylesheet's `input[value="a"]` must keep matching
+        // the markup however much has been typed over it. M11.2 made attribute
+        // selectors real, which is what makes this a live wire.
+        let (mut app, id) = scripted_app(&format!(
+            "<style>input[value=\"a\"] {{ font-weight: bold }}</style>{FORM_PAGE}"
+        ));
+        app.update(Msg::RunScripts { id });
+        let input = input_node(&app);
+        start_typing(&mut app);
+        type_str(&mut app, "bcd");
+
+        let dom = app.dom.as_ref().unwrap();
+        assert_eq!(dom.attr(input, "value"), Some("a"), "typing wrote through");
+        assert_eq!(dom.field_value(input), Some("abcd"));
+
+        // Restyled from scratch — the selector is asked again, and still says
+        // yes. (Typing itself runs no restyle; this is the assertion that the
+        // *next* one would answer the same.)
+        app.restyle();
+        assert_eq!(
+            app.styles.as_ref().unwrap().get(input).font_weight,
+            crate::style::values::FontWeight::Bold,
+            "input[value=\"a\"] stopped matching what the page wrote"
+        );
+    }
+
+    #[test]
+    fn a_readonly_field_is_focusable_and_takes_no_caret() {
+        // HTML's own split, and the reason it lives in `editable_value` rather
+        // than in M11.8's focus rule: `readonly` is showing you something, so
+        // it stays reachable, and the only thing it refuses is the edit.
+        let (mut app, id) = scripted_app("<p><input size=8 value=shown readonly></p>");
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.focus.is_some(), "readonly left the Tab cycle");
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default(),
+            "Enter opened a mode on a readonly field"
+        );
+        assert!(app.update(ch('q')).quit);
+    }
+
+    #[test]
+    fn a_disabled_field_cannot_be_typed_into() {
+        // It is not in the Tab cycle (M11.8) — and `Enter` on it opens no mode
+        // either, because "cannot be reached" and "cannot be typed into" are
+        // different claims and a click, a script or a later focus rule could
+        // make the first one false.
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        let dom = app.dom.as_ref().unwrap();
+        let disabled = (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&n| dom.attr(n, "disabled").is_some())
+            .expect("the disabled field");
+        app.focus = Some(disabled);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default(),
+            "Enter opened a mode on a disabled field"
+        );
+        assert!(caret_of(&app).is_none());
+        // And a character is still a browse binding, not a keystroke into it.
+        assert!(app.update(ch('q')).quit);
+    }
+
+    #[test]
+    fn typing_runs_no_restyle_at_all() {
+        // **A keystroke is not a cascade event.** The value is state beside the
+        // tree rather than an attribute, so no selector's answer can have moved
+        // and the cascade must not run — which is the whole reason M11.8 put
+        // the value where it did, and the counter is what says it worked.
+        //
+        // A relayout each, though, deliberately: it is a text edit and the
+        // measurement said the simple path fits the budget (see
+        // `after_field_edit`).
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        start_typing(&mut app);
+        let (styles_run, layouts, paints) = stages(&app);
+        type_str(&mut app, "xyz");
+        assert_eq!(
+            stages(&app),
+            (styles_run, layouts + 3, paints + 3),
+            "a keystroke restyled, or ran a stage twice"
+        );
+        // Moving the caret is chrome: it lays out nothing and paints nothing.
+        app.update(key(KeyCode::Left, KeyModifiers::NONE));
+        app.update(key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(stages(&app), (styles_run, layouts + 3, paints + 3));
+    }
+
+    #[test]
+    fn the_narrowed_keystroke_path_runs_no_layout() {
+        // The B side of the measurement, so its number means something: with
+        // the narrowing on, a keystroke lays nothing out and still puts the
+        // character on screen.
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        app.narrow_keystroke = true;
+        start_typing(&mut app);
+        let (styles_run, layouts, paints) = stages(&app);
+        type_str(&mut app, "xyz");
+        assert_eq!(stages(&app), (styles_run, layouts, paints + 3));
+        assert_eq!(field_box_text(&app).as_deref(), Some("axyz"));
+    }
+
+    #[test]
+    fn the_caret_moves_and_deletes_on_the_side_it_was_asked_about() {
+        let (mut app, id) = scripted_app("<p><input size=8 value=abc></p>");
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(caret_of(&app), Some(3));
+
+        // Home / End are the ends of the line; ← and → are one character.
+        app.update(key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(caret_of(&app), Some(0));
+        app.update(key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(caret_of(&app), Some(1));
+        // Inserting happens *at* the caret, not at the end.
+        type_str(&mut app, "-");
+        assert_eq!(field_box_text(&app).as_deref(), Some("a-bc"));
+        assert_eq!(caret_of(&app), Some(2));
+
+        // Backspace takes what is before it, Delete what is after.
+        app.update(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(field_box_text(&app).as_deref(), Some("abc"));
+        assert_eq!(caret_of(&app), Some(1));
+        app.update(key(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(field_box_text(&app).as_deref(), Some("ac"));
+        assert_eq!(caret_of(&app), Some(1));
+
+        // At either end there is nothing to take, and nothing to redraw.
+        app.update(key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(
+            app.update(key(KeyCode::Backspace, KeyModifiers::NONE)),
+            Effect::default(),
+            "Backspace at the start invented a change"
+        );
+        app.update(key(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            app.update(key(KeyCode::Delete, KeyModifiers::NONE)),
+            Effect::default(),
+            "Delete at the end invented a change"
+        );
+        assert_eq!(field_box_text(&app).as_deref(), Some("ac"));
+    }
+
+    #[test]
+    fn a_textarea_types_line_by_line_and_enter_is_still_reserved() {
+        // A `<textarea>` is a field like any other, and its value keeps the
+        // newlines the markup gave it: `Home`/`End` are the ends of the line
+        // the caret is on, not of the whole box.
+        //
+        // `Enter` does nothing — in a browser it would insert a newline, and
+        // here it is reserved for M11.10's submit. That is a real gap and it is
+        // in the commit's deviations; deciding it now, in the one place a
+        // newline is legal, would decide `Enter` everywhere by accident.
+        let (mut app, id) = scripted_app("<p><textarea cols=8 rows=3>one\ntwo</textarea></p>");
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        assert_eq!(caret_of(&app), Some(7), "the caret starts past the value");
+
+        app.update(key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(caret_of(&app), Some(4), "Home left the caret's own line");
+        type_str(&mut app, "X");
+        assert_eq!(field_box_text(&app).as_deref(), Some("one\nXtwo"));
+        app.update(key(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(caret_of(&app), Some(8));
+
+        // ← across the line break: the newline is a character the caret moves
+        // over, and the value is one string.
+        for _ in 0..4 {
+            app.update(key(KeyCode::Left, KeyModifiers::NONE));
+        }
+        assert_eq!(caret_of(&app), Some(4));
+        app.update(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(field_box_text(&app).as_deref(), Some("oneXtwo"));
+
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default(),
+            "Enter did something a task that does not own it decided"
+        );
+    }
+
+    #[test]
+    fn tab_out_of_a_field_leaves_typing_behind() {
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        start_typing(&mut app);
+        type_str(&mut app, "x");
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(caret_of(&app).is_none(), "Tab kept the reader typing");
+        assert_eq!(focused(&app).as_deref(), Some("button"));
+        // What was typed is still there — nothing is committed and nothing is
+        // discarded; the value has been state since the first keystroke.
+        let dom = app.dom.as_ref().unwrap();
+        assert_eq!(dom.field_value(input_node(&app)), Some("ax"));
+        assert!(app.update(ch('q')).quit, "q did not quit after Tab");
+    }
+
+    #[test]
+    fn a_patched_tree_is_the_tree_a_fresh_layout_would_have_built() {
+        // The narrowing is the measurement's B side, and a B side that produced
+        // the *wrong* tree would be no measurement at all: whatever it patches,
+        // the result has to be what the shipped path would have laid out.
+        let page = "<p><input size=8 value=a> <textarea cols=6 rows=2>hi</textarea></p>";
+        let (mut app, id) = scripted_app(page);
+        app.update(Msg::RunScripts { id });
+        app.narrow_keystroke = true;
+        start_typing_at_first_field(&mut app);
+        type_str(&mut app, "bc");
+
+        let dom = app.dom.as_ref().unwrap();
+        let styles = app.styles.as_ref().unwrap();
+        let fresh = layout::layout_document_with(
+            dom,
+            styles,
+            column(app.size.0).width,
+            layout::Hidden::Respect,
+            &app.images.context(),
+        );
+        let patched = app.layout_tree.as_ref().unwrap();
+        let describe = |tree: &LayoutTree| {
+            let mut out = Vec::new();
+            tree.walk(tree.root, &mut |_, b| {
+                out.push((b.kind, b.node, b.dimensions, b.text.clone()));
+            });
+            out
+        };
+        assert_eq!(
+            describe(patched),
+            describe(&fresh),
+            "the patched tree is not the tree a relayout would have produced"
+        );
+    }
+
+    /// `Tab` once (the first focusable is the field here) and `Enter`.
+    fn start_typing_at_first_field(app: &mut App) {
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(caret_of(app).is_some(), "Enter did not start typing");
+    }
+
+    #[test]
+    fn the_statusline_says_which_mode_the_reader_is_in() {
+        // A mode a reader can be surprised by has to be visible (UX §1): every
+        // letter goes into the page instead of doing what it usually does.
+        let (mut app, id) = scripted_app(FORM_PAGE);
+        app.update(Msg::RunScripts { id });
+        assert!(!screen(&mut app, 60, 8).contains("[typing"));
+        start_typing(&mut app);
+        assert!(
+            screen(&mut app, 60, 8).contains("[typing · Esc]"),
+            "{}",
+            screen(&mut app, 60, 8)
+        );
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!screen(&mut app, 60, 8).contains("[typing"));
+    }
+
+    #[test]
+    fn typing_scrolls_the_value_under_the_caret_in_cells() {
+        // Deliverable 3, on screen: a value longer than its box shows the
+        // window the caret is in, and `Home` snaps back to the start. Measured
+        // in cells — the value is CJK, where a caret counted in `chars()` sits
+        // half a glyph off.
+        let (mut app, id) = scripted_app("<p><input size=6 value=漢字></p>");
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        // The frame's own row, minus the page column's gutter and the nul cells
+        // that stand for the second half of a wide glyph.
+        let row = |app: &mut App| {
+            screen(app, 30, 4)
+                .lines()
+                .next()
+                .unwrap()
+                .replace('\0', "")
+                .trim()
+                .to_string()
+        };
+        assert_eq!(row(&mut app), "[漢字  ]");
+        // Six cells of value in a six-cell box: the caret needs a seventh, so
+        // the window scrolls by one cell and the first glyph is half-cut.
+        type_str(&mut app, "漢");
+        assert_eq!(row(&mut app), "[ 字漢 ]");
+        // Home snaps back and shows the start again.
+        app.update(key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(row(&mut app), "[漢字漢]");
+    }
+
+    #[test]
+    fn the_page_never_sees_a_key() {
+        // DEVIATIONS.md: key events never reach the page — yata's bindings
+        // always win. No `keydown`, no `input`, no `change`: a page cannot
+        // preventDefault its way into the reader's keyboard (M11.13 owns the
+        // events a form really does fire).
+        let (mut app, id) = scripted_app(
+            "<p><input id=f size=8 value=a></p><script>\
+             var f = document.getElementById('f');\
+             ['keydown','keypress','keyup','input','change','focus','blur'].forEach(function (n) {\
+               f.addEventListener(n, function () { console.log('page saw ' + n) });\
+             });</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        // A listener runs synchronously inside its dispatch, so anything it
+        // logged would already be here.
+        let logged = app.console.entries().len();
+        start_typing_at_first_field(&mut app);
+        type_str(&mut app, "xy");
+        app.update(key(KeyCode::Backspace, KeyModifiers::NONE));
+        app.update(key(KeyCode::Delete, KeyModifiers::NONE));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            app.console.entries().len(),
+            logged,
+            "the page saw a key event: {:?}",
+            app.console.entries()
+        );
     }
 
     // ---- invalidation (M10.6) ---------------------------------------------
@@ -7097,6 +7918,106 @@ mod tests {
             "  Loaded + Parsed  empty jar {}  ->  full jar {}",
             summarize(&without),
             summarize(&with),
+        );
+    }
+
+    /// A measurement, not an assertion — see the note on the M10.6 pair.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_a_keystroke -- --ignored --nocapture
+    /// ```
+    ///
+    /// M11.9's deliverable 4: what a keystroke costs, both ways, before either
+    /// is optimised. The page is Wikipedia — the ladder's worst page that has a
+    /// field, and it has the real one (`#searchInput`) rather than one this
+    /// test added. 80×24, the size a reader actually has.
+    ///
+    /// **A** is the simple path, and the one that ships: a keystroke is a text
+    /// edit, so relayout and repaint, which is what `Dom::set_field_value`'s
+    /// own invalidation rule says. **B** patches the one box whose text changed
+    /// and repaints from the tree. Interleaved in one process, alternating
+    /// which goes first, because this machine drifts 5–10% between runs
+    /// (CLAUDE.md).
+    #[test]
+    #[ignore]
+    fn measure_a_keystroke_in_a_field() {
+        const ROUNDS: usize = 5;
+        let source = wikipedia_with_script("", "1;");
+
+        // One keystroke, from the key arriving to the bytes leaving: the same
+        // pair the event loop times as `frame`. The renderer is built outside
+        // the clock — the loop keeps one for the life of the process.
+        let one = |narrow: bool| -> (Duration, (usize, usize, usize)) {
+            let mut app = App::new(80, 24);
+            let id = app.start_fetch("http://x/".into());
+            load(&mut app, id, source.as_bytes().to_vec());
+            app.update(parsed(id, &source));
+            app.update(Msg::RunScripts { id });
+            app.narrow_keystroke = narrow;
+            let dom = app.dom.as_ref().unwrap();
+            app.focus = Some(
+                (0..dom.node_count() as u32)
+                    .map(NodeId)
+                    .find(|&n| dom.attr(n, "id") == Some("searchInput"))
+                    .expect("the article's own search field"),
+            );
+            app.mode = Mode::Field { caret: 0 };
+            let mut renderer =
+                crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
+            // One keystroke thrown away, then the one that counts: the first
+            // draw in a process pays for a frame buffer nothing has touched,
+            // and the steady state is every keystroke after a field's first.
+            app.update(ch('x'));
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let before = stages(&app);
+            let started = Instant::now();
+            app.update(ch('y'));
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let elapsed = started.elapsed();
+            let after = stages(&app);
+            (
+                elapsed,
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            )
+        };
+
+        let (mut simple, mut narrow) = (Vec::new(), Vec::new());
+        let (mut simple_stages, mut narrow_stages) = ((0, 0, 0), (0, 0, 0));
+        for round in 0..=ROUNDS {
+            // Which side goes first alternates, so any residue of running
+            // second cancels across rounds instead of landing on one column.
+            let (a, b) = match round % 2 == 0 {
+                true => {
+                    let a = one(false);
+                    (a, one(true))
+                }
+                false => {
+                    let b = one(true);
+                    (one(false), b)
+                }
+            };
+            simple_stages = a.1;
+            narrow_stages = b.1;
+            if round > 0 {
+                simple.push(a.0);
+                narrow.push(b.0);
+            }
+        }
+        eprintln!(
+            "M11.9 keypress→screen on en.wikipedia.org at 80×24, \
+             mean of {ROUNDS} interleaved rounds (budget < 10 ms):"
+        );
+        eprintln!(
+            "  relayout + repaint (ships)  {}  \
+             (styles/layouts/paints per keystroke: {simple_stages:?})",
+            summarize(&simple),
+        );
+        eprintln!(
+            "  patch + repaint             {}  \
+             (styles/layouts/paints per keystroke: {narrow_stages:?})",
+            summarize(&narrow),
         );
     }
 
