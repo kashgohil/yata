@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::browser::error_page;
+use crate::browser::form;
 use crate::browser::fragment;
 use crate::browser::help;
 use crate::browser::hints;
@@ -1198,6 +1199,12 @@ impl App {
                 };
                 redraw()
             }
+            // `Enter` while typing. The form is whatever the caret is in, and
+            // nothing else about the page is consulted.
+            Action::Submit => match self.focus {
+                Some(node) => self.submit_form(node),
+                None => Effect::default(),
+            },
             Action::SearchNext => self.search_step(1),
             Action::SearchPrev => self.search_step(-1),
             Action::ToggleHelp => self.toggle_surface(Surface::Help),
@@ -2394,6 +2401,13 @@ impl App {
         let (Some(focus), Some(dom)) = (self.focus, &self.dom) else {
             return Effect::default();
         };
+        // A submit button — Wikipedia's `<button>` with no `type` above all —
+        // is the other thing `Enter` can activate, and until M11.10 it fell
+        // through to the `href` path and did nothing at all, because a button
+        // has no `href`.
+        if form::is_submit_button(dom, focus) {
+            return self.submit_form(focus);
+        }
         let Some(href) = dom.attr(focus, "href") else {
             return Effect::default();
         };
@@ -2402,6 +2416,59 @@ impl App {
             return self.take_click_navigation();
         }
         self.follow_href(&href)
+    }
+
+    /// Submit the form `activator` is in — the one function all three ways of
+    /// activating a submission reach: `Enter` while typing, `Enter` on a
+    /// focused submit button, and a click on one. One function so that a click
+    /// and a key cannot come to disagree about what a submission is.
+    ///
+    /// **A submission is a navigation, and there is only one of those.**
+    /// `navigate` already owns everything one needs — history so `H` comes
+    /// back, a fresh `FetchId` so a stale response cannot land on the wrong
+    /// page, `App::request` so the jar attaches the cookies (M11.7), and
+    /// redirects through the event loop (M11.7a) so the `Set-Cookie` on the 302
+    /// a search or a login answers with is not lost. Nothing here fetches, and
+    /// there is no second navigation path to keep in step with the first.
+    ///
+    /// Three ways this does nothing, each a decision:
+    ///
+    /// - the control is in no `<form>`: no navigation, no stage, no message.
+    ///   A search box outside a form is real — sites submit those with
+    ///   JavaScript — and M11.13 is where those start working;
+    /// - the form's method is one this engine cannot send. Then the reader is
+    ///   *told*, in the statusline's flash segment where "yanked" lives,
+    ///   because a key that silently does nothing is indistinguishable from a
+    ///   broken keyboard;
+    /// - the action does not resolve — a page whose `action` is not a URL.
+    ///
+    /// No `submit` event is dispatched and nothing can cancel this (M11.13
+    /// owns both), so DEVIATIONS.md's *"key events never reach the page"*
+    /// stays true of the key that submits a form.
+    fn submit_form(&mut self, activator: NodeId) -> Effect {
+        let (Some(dom), Some(base)) = (self.dom.as_ref(), self.current_url()) else {
+            return Effect::default();
+        };
+        match form::submit(dom, &base, activator) {
+            None => Effect::default(),
+            Some(form::Submit::Unsupported(method)) => {
+                // Words for somebody who has never read PLAN.md — and short
+                // ones, because this segment is what is left of the row after
+                // the URL and the scroll percentage have taken theirs (twenty
+                // cells on an 80-column terminal, where "yanked" lives).
+                // `POST` is the case that matters, and it is refused rather
+                // than downgraded: a value meant for a request body has no
+                // business in a URL or in the back-button list.
+                self.status_msg = Some(format!("can't send {method} forms"));
+                redraw()
+            }
+            // Typing ends here, without being asked to: `navigate` clears the
+            // focus, and `clear_focus` drops the mode with it. So the browse
+            // bindings are live while the new page is still loading — `q`
+            // quits, and the reader is not stuck typing into a field that is
+            // about to be replaced.
+            Some(form::Submit::Get(url)) => self.navigate(url, true),
+        }
     }
 
     /// The focused control if it is one a reader may type into, with the value
@@ -3072,16 +3139,36 @@ impl App {
         let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
             return Effect::default();
         };
-        // A click on a form control focuses it, and does nothing else (M11.8):
-        // no navigation, no keys bound, no event dispatched — form events are
-        // M11.13's. Asked before the link walk so that a control inside an
-        // anchor takes the click, which is what the reader aimed at.
+        // A click on a form control focuses it (M11.8) — and if it is a submit
+        // button, activates it (M11.10), through the same function `Enter`
+        // runs. That is not a new power for the mouse: a click on a *link*
+        // already navigates, and refusing here would make a button the only
+        // thing on a page that looks clickable and is not. Focus first, then
+        // activate, so the two rules stay in the order M11.8 wrote them.
+        //
+        // Still no event dispatched: `click` on a control, `submit` on a form
+        // and `preventDefault` cancelling one are all M11.13's.
+        //
+        // Asked before the link walk so that a control inside an anchor takes
+        // the click, which is what the reader aimed at.
         if let Some(node) = layout::hit_test(tree, x, y).and_then(|n| layout::nearest_field(dom, n))
         {
-            if self.focus == Some(node) {
+            let submits = form::is_submit_button(dom, node);
+            let moved_focus = self.focus != Some(node);
+            self.focus = Some(node);
+            if submits {
+                // The focus moved whatever the submission came to, so a
+                // button in no form — or in one this engine cannot send —
+                // still owes the reader the frame that shows it is focused.
+                let effect = self.submit_form(node);
+                return Effect {
+                    dirty: effect.dirty || moved_focus,
+                    ..effect
+                };
+            }
+            if !moved_focus {
                 return Effect::default();
             }
-            self.focus = Some(node);
             return redraw();
         }
         let Some((node, href)) = layout::link_at(tree, dom, x, y) else {
@@ -6882,15 +6969,17 @@ mod tests {
     }
 
     #[test]
-    fn a_textarea_types_line_by_line_and_enter_is_still_reserved() {
+    fn a_textarea_types_line_by_line_and_enter_never_inserts_a_newline() {
         // A `<textarea>` is a field like any other, and its value keeps the
         // newlines the markup gave it: `Home`/`End` are the ends of the line
         // the caret is on, not of the whole box.
         //
-        // `Enter` does nothing — in a browser it would insert a newline, and
-        // here it is reserved for M11.10's submit. That is a real gap and it is
-        // in the commit's deviations; deciding it now, in the one place a
-        // newline is legal, would decide `Enter` everywhere by accident.
+        // `Enter` submits (M11.10) — in a browser it would insert a newline
+        // here, and in the one place a newline is legal this engine spends the
+        // key on the submission instead, because it is the only activator a
+        // keyboard has. A reader cannot type a line break into a textarea;
+        // that is a standing deviation, and this is where it is pinned. In a
+        // page with no form there is nothing to submit, so it does nothing.
         let (mut app, id) = scripted_app("<p><textarea cols=8 rows=3>one\ntwo</textarea></p>");
         app.update(Msg::RunScripts { id });
         start_typing_at_first_field(&mut app);
@@ -6915,7 +7004,31 @@ mod tests {
         assert_eq!(
             app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
             Effect::default(),
-            "Enter did something a task that does not own it decided"
+            "Enter did something in a page with no form to submit"
+        );
+        assert_eq!(
+            field_box_text(&app).as_deref(),
+            Some("oneXtwo"),
+            "Enter inserted a newline"
+        );
+
+        // The same key in a form sends it, newlines and all — as CRLF, which
+        // is HTML's rule and `browser::form`'s comment.
+        //
+        // And the action resolves against the URL the page *arrived* at:
+        // `scripted_app` asks for `http://x/` and is answered by
+        // `http://final/`, the way a redirect answers (M11.7a). Submitting to
+        // the URL the reader typed would send a login form to the host that
+        // redirected away from it.
+        let (mut app, id) = scripted_app(
+            "<form action=/post><textarea name=t cols=8 rows=3>one\ntwo</textarea></form>",
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            effect.fetch.map(|(_, request)| request.url).as_deref(),
+            Some("http://final/post?t=one%0D%0Atwo")
         );
     }
 
@@ -7051,6 +7164,438 @@ mod tests {
             app.console.entries().len(),
             logged,
             "the page saw a key event: {:?}",
+            app.console.entries()
+        );
+    }
+
+    // ---- M11.10: `<form>` GET ---------------------------------------------
+
+    /// A page loaded from `url` and parsed, in an app of the given size — the
+    /// shape a navigation has, with the URL an `action` resolves against.
+    fn page_from(url: &str, html: &str, w: u16, h: u16) -> (App, FetchId) {
+        let mut app = App::new(w, h);
+        let id = load_with_cookies(&mut app, url, html, &[]);
+        (app, id)
+    }
+
+    /// The URL a submission's `Effect` asks the loop to fetch.
+    fn fetched(effect: &Effect) -> Option<&str> {
+        effect
+            .fetch
+            .as_ref()
+            .map(|(_, request)| request.url.as_str())
+    }
+
+    /// The first element with this `id`.
+    fn by_id(app: &App, id: &str) -> NodeId {
+        let dom = app.dom.as_ref().expect("a parsed page");
+        (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&n| dom.attr(n, "id") == Some(id))
+            .unwrap_or_else(|| panic!("the fixture lost #{id}"))
+    }
+
+    /// Click the first cell of a node's box, having scrolled it on screen —
+    /// the mouse's way of activating something, with the focus left where a
+    /// reader's would be (nowhere) so the click has to do the focusing itself.
+    fn click_node(app: &mut App, node: NodeId) -> Effect {
+        app.focus = Some(node);
+        app.scroll_focus_into_view();
+        app.focus = None;
+        let tree = app.layout_tree.as_ref().expect("a laid-out page");
+        let mut at = None;
+        tree.walk(tree.root, &mut |_, b| {
+            if at.is_none() && b.node == Some(node) && matches!(b.kind, BoxKind::Field(_)) {
+                at = Some((b.dimensions.content.x, b.dimensions.content.y));
+            }
+        });
+        let (x, y) = at.expect("that node generated no control box");
+        let row = y - app.viewport.offset() as i32;
+        let column = column(app.size.0).left + x as u16;
+        app.update(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row: row as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    #[test]
+    fn hns_search_box_searches() {
+        // **The acceptance case**, end to end and asserted on the `Effect`
+        // rather than on the network. HN's form is one line and has *no submit
+        // button at all*, so `Enter` while typing is the only way a reader can
+        // ever send it — which is the key M11.9 left unbound for this task.
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/news.ycombinator.com.html"
+        ));
+        // Over `http` deliberately: the action is protocol-relative
+        // (`//hn.algolia.com/`), so the scheme it inherits is the page's and a
+        // test that only ever used `https` could not tell.
+        let (mut app, _) = page_from("http://news.ycombinator.com/news", fixture, 80, 30);
+
+        // The search box is the last focusable on the page, so backwards is
+        // one press rather than two hundred.
+        app.update(key(KeyCode::BackTab, KeyModifiers::NONE));
+        assert_eq!(
+            app.dom.as_ref().unwrap().attr(app.focus.unwrap(), "name"),
+            Some("q"),
+            "Shift-Tab did not land on HN's search box"
+        );
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        type_str(&mut app, "redirect");
+        assert!(caret_of(&app).is_some(), "the reader is not typing");
+
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fetched(&effect), Some("http://hn.algolia.com/?q=redirect"));
+
+        // Typing is over, and the browse bindings are live while the answer is
+        // still in flight — `q` quits a loading page.
+        assert!(caret_of(&app).is_none(), "the reader is still typing");
+        assert!(matches!(app.fetch, Fetch::Loading { .. }));
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(
+            app.update(ch('q')).quit,
+            "q did not quit after a submission"
+        );
+
+        // And `H` goes back to the story list, because a submission is a
+        // navigation and history was pushed.
+        let back = app.update(ch('H'));
+        assert_eq!(fetched(&back), Some("http://news.ycombinator.com/news"));
+    }
+
+    #[test]
+    fn wikipedias_search_sends_its_hidden_field_however_it_is_activated() {
+        // Tree order and the hidden `title=Special:Search` — the difference
+        // between a search that works and one that lands on the wrong page.
+        // Then the same form again by *clicking* its `<button>` (which has no
+        // `type`, so HTML says it is a submit button, and no `name`, so it
+        // contributes nothing): the two activations are one function, so they
+        // produce one request.
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        let (mut app, _) = page_from("https://en.wikipedia.org/wiki/Cat", fixture, 80, 30);
+        let field = by_id(&app, "searchInput");
+        let form = form::owner(app.dom.as_ref().unwrap(), field).expect("#searchform");
+        let button = {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&n| {
+                    layout::is_under(dom, n, form)
+                        && matches!(&dom.node(n).data,
+                            crate::dom::NodeData::Element { tag, .. } if tag == "button")
+                })
+                .expect("the form's Search button")
+        };
+        let expected = "https://en.wikipedia.org/w/index.php?search=cat&title=Special%3ASearch";
+
+        app.focus = Some(field);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        type_str(&mut app, "cat");
+        let typed = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fetched(&typed), Some(expected));
+
+        // Back on the article, the same value still in the box, and this time
+        // the button is pressed.
+        let (mut app, _) = page_from("https://en.wikipedia.org/wiki/Cat", fixture, 80, 30);
+        let field = by_id(&app, "searchInput");
+        app.dom.as_mut().unwrap().set_field_value(field, "cat");
+        let clicked = click_node(&mut app, button);
+        assert_eq!(
+            fetched(&clicked),
+            Some(expected),
+            "the click sent something else"
+        );
+        // The click focused the button before activating it (M11.8's rule,
+        // unchanged) — and then the navigation cleared the focus, which is why
+        // this is asserted on the request and not on `app.focus`.
+        assert!(app.focus.is_none());
+    }
+
+    #[test]
+    fn a_two_field_button_less_form_submits_on_enter() {
+        // **The deviation** (deliverable 2): HTML submits a button-less form on
+        // `Enter` only when it has exactly one field that blocks implicit
+        // submission, so this form could not be submitted *at all*. In a GUI
+        // browser that is survivable — there is nearly always a button, and a
+        // mouse to press it. Here `Enter` is the only activator a keyboard has,
+        // and the reader pressed it twice, deliberately, in a mode the
+        // statusline named.
+        let (mut app, _) = page_from(
+            "http://x/page",
+            "<form action=/search><input name=a value=1><input name=b value=2></form>",
+            40,
+            10,
+        );
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            fetched(&effect),
+            Some("http://x/search?a=1&b=2"),
+            "both fields, in tree order"
+        );
+    }
+
+    #[test]
+    fn a_post_form_does_not_navigate_and_the_reader_is_told() {
+        // A value meant for a request body has no business in a URL, a history
+        // entry or a `Referer`; the failure mode of getting this wrong is a
+        // password in the back-button list. So it does not navigate — and the
+        // reader is told, rather than pressing a key that does nothing.
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form method=post action=/login><input name=pw value=hunter2>\
+             <button>Sign in</button></form>",
+            80,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+        start_typing_at_first_field(&mut app);
+
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(effect.fetch.is_none(), "a POST form navigated");
+        assert_eq!(stages(&app), before, "a refused submission ran a stage");
+        assert!(
+            !app.history.can_back(),
+            "a refused submission pushed history"
+        );
+        let shown = screen(&mut app, 80, 8);
+        assert!(shown.contains("can't send POST forms"), "{shown}");
+        // And the password is nowhere near a URL: not in the one the page is
+        // known by (which the statusline shows, and which `H` would restore),
+        // and not in a request, because there is no request.
+        assert_eq!(app.current_url().as_deref(), Some("http://x/page"));
+        assert!(!app.status_left().contains("hunter2"), "{shown}");
+
+        // Clicking its button is refused the same way, by the same function —
+        // and it is the one path where what the click did *first* is still
+        // visible afterwards: the button is focused (M11.8's rule, unchanged),
+        // because no navigation came along to clear it.
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let button = {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&n| {
+                    matches!(&dom.node(n).data,
+                    crate::dom::NodeData::Element { tag, .. } if tag == "button")
+                })
+                .expect("the sign-in button")
+        };
+        let effect = click_node(&mut app, button);
+        assert!(effect.fetch.is_none(), "a click submitted a POST form");
+        assert_eq!(
+            app.focus,
+            Some(button),
+            "the click did not focus the button"
+        );
+        assert!(
+            screen(&mut app, 80, 8).contains("can't send POST forms"),
+            "a click was refused silently"
+        );
+    }
+
+    #[test]
+    fn a_button_that_is_not_a_submit_button_submits_nothing_and_resets_nothing() {
+        // `type=button` does nothing at all. `type=reset` does not submit —
+        // **and does not reset**: restoring the dirty values M11.8 stores is
+        // its own small task, no ladder page has a reset button, and a button
+        // that quietly does nothing is better than one that clears a form
+        // nobody asked it to.
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form action=/search><input name=q value=markup>\
+             <input type=button value=plain><input type=reset value=clear></form>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        let field = input_node(&app);
+        app.dom.as_mut().unwrap().set_field_value(field, "typed");
+        let before = stages(&app);
+
+        for id in ["plain", "clear"] {
+            let node = {
+                let dom = app.dom.as_ref().unwrap();
+                (0..dom.node_count() as u32)
+                    .map(NodeId)
+                    .find(|&n| dom.attr(n, "value") == Some(id))
+                    .expect("the button")
+            };
+            app.focus = Some(node);
+            let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(effect.fetch.is_none(), "{id} submitted");
+            assert_eq!(
+                app.dom.as_ref().unwrap().field_value(field),
+                Some("typed"),
+                "{id} changed a value"
+            );
+        }
+        assert_eq!(
+            stages(&app),
+            before,
+            "a button that does nothing ran a stage"
+        );
+    }
+
+    #[test]
+    fn a_click_while_typing_submits_nothing_and_navigates_nowhere() {
+        // Where M11.9's rule meets M11.10's for the first time. Leaving a mode
+        // is `Esc`, one key, always — so a click is swallowed in `Mode::Field`
+        // before any of the submit path is reached, even when it lands on the
+        // submit button that would otherwise send the form.
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form action=/search><input name=q value=v><button>Go</button></form>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        let button = {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&n| {
+                    matches!(&dom.node(n).data,
+                    crate::dom::NodeData::Element { tag, .. } if tag == "button")
+                })
+                .expect("the button")
+        };
+        start_typing_at_first_field(&mut app);
+        let before = stages(&app);
+
+        let effect = click_node(&mut app, button);
+        assert_eq!(
+            effect,
+            Effect::default(),
+            "a click while typing did something"
+        );
+        assert_eq!(stages(&app), before);
+
+        // `Esc` first, and then the same click sends the form.
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let effect = click_node(&mut app, button);
+        assert_eq!(fetched(&effect), Some("http://x/search?q=v"));
+    }
+
+    #[test]
+    fn a_click_on_a_submit_button_in_no_form_still_focuses_it() {
+        // The submission goes nowhere, but the click did something the reader
+        // has to see: M11.8's focus frame. A path that returned "nothing
+        // happened" here would leave the frame a keypress behind.
+        let (mut app, id) = page_from("http://x/page", "<p><button>Go</button></p>", 40, 10);
+        app.update(Msg::RunScripts { id });
+        let button = {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&n| {
+                    matches!(&dom.node(n).data,
+                    crate::dom::NodeData::Element { tag, .. } if tag == "button")
+                })
+                .expect("the button")
+        };
+        let effect = click_node(&mut app, button);
+        assert_eq!(effect, redraw(), "the focus moved without a redraw");
+        assert_eq!(app.focus, Some(button));
+    }
+
+    #[test]
+    fn enter_in_a_field_with_no_form_does_nothing_at_all() {
+        // A search box outside a form is real — sites submit those with
+        // JavaScript — and M11.13 is where they start working. Until then:
+        // no navigation, no message, no stage.
+        let (mut app, id) = page_from("http://x/page", "<p><input name=q value=v></p>", 40, 10);
+        app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+        start_typing_at_first_field(&mut app);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default(),
+            "a control in no form submitted something"
+        );
+        assert_eq!(stages(&app), before);
+        assert!(
+            caret_of(&app).is_some(),
+            "the reader was thrown out of the field"
+        );
+    }
+
+    #[test]
+    fn a_submission_is_one_fetch_with_the_page_s_cookies() {
+        // Deliverable 8, on the `Effect`: exactly one fetch, the same shape a
+        // link click produces, carrying the `Cookie:` header the jar would
+        // have built for that URL — because a submission goes through
+        // `App::navigate` and `App::request` like everything else, rather than
+        // down a second navigation path.
+        let mut app = App::new(60, 8);
+        let html = "<form action=/search><input name=q value=cat></form><a href=/other>x</a>";
+        let id = load_with_cookies(
+            &mut app,
+            "http://site.test/page",
+            html,
+            &["sid=abc; Path=/"],
+        );
+        app.update(Msg::RunScripts { id });
+        let before = stages(&app);
+
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (_, request) = effect.fetch.as_ref().expect("no fetch");
+        assert_eq!(request.url, "http://site.test/search?q=cat");
+        assert_eq!(request.cookie.as_deref(), Some("sid=abc"));
+        // One fetch and nothing else: no sheets, no images, no scripts.
+        assert!(effect.sheets.is_empty() && effect.images.is_empty() && effect.scripts.is_empty());
+        // And no pipeline stage ran here: the pipeline runs when the response
+        // lands, exactly as it does for a link.
+        assert_eq!(stages(&app), before);
+        // The `FetchId` guard is the current generation's, so a response from
+        // the page we just left cannot land on the search results.
+        assert_eq!(
+            effect.fetch.as_ref().map(|(fetch, _)| *fetch),
+            app.current_fetch
+        );
+    }
+
+    #[test]
+    fn the_page_never_sees_a_submission() {
+        // M11.13 owns `submit`, `click` on a control, and `preventDefault`
+        // cancelling either. Until then nothing can cancel a submission and
+        // the page is not told one happened — which keeps DEVIATIONS.md's
+        // "key events never reach the page" true of the key that submits.
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form id=f action=/search><input name=q value=v><button id=b>Go</button></form>\
+             <script>\
+             document.getElementById('f').addEventListener('submit', function (e) {\
+               e.preventDefault(); console.log('page saw submit');\
+             });\
+             document.getElementById('b').addEventListener('click', function () {\
+               console.log('page saw click');\
+             });</script>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        let logged = app.console.entries().len();
+
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            fetched(&effect),
+            Some("http://x/search?q=v"),
+            "a listener cancelled a submission it cannot see"
+        );
+        assert_eq!(
+            app.console.entries().len(),
+            logged,
+            "the page saw the submission: {:?}",
             app.console.entries()
         );
     }

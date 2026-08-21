@@ -30,6 +30,23 @@ pub fn resolve_url(base: &str, href: &str) -> Option<String> {
     Some(base.join(href.trim()).ok()?.to_string())
 }
 
+/// The same URL with its query string **replaced** by `query` (M11.10).
+///
+/// Replaced, not appended to: a GET form submission discards whatever query the
+/// action carried, so `/w/index.php?oldid=5` submitted with `search=cat` is
+/// `/w/index.php?search=cat`. An empty data set still leaves the `?`, which is
+/// what a browser sends.
+///
+/// Here rather than in `browser::form` for the reason `resolve_url` is here:
+/// URL syntax is not a pipeline stage, and `reqwest::Url` is the one parser
+/// this engine uses for it. `None` when the URL is unparseable, and the caller
+/// submits nothing.
+pub fn set_query(url: &str, query: &str) -> Option<String> {
+    let mut url = reqwest::Url::parse(url).ok()?;
+    url.set_query(Some(query));
+    Some(url.to_string())
+}
+
 /// Percent-decode a URL component. Used for fragments (M11.4): a URL escapes
 /// the non-ASCII in `#Ausgangs%C3%BCberpr%C3%BCfung`, while `Dom::attr` holds
 /// the decoded `id="Ausgangsüberprüfung"`, so one side has to be converted
@@ -72,9 +89,38 @@ pub fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
+/// Encode one name or value of an `application/x-www-form-urlencoded` data set
+/// (M11.10) — the other half of [`percent_decode`], and deliberately beside it.
+///
+/// **Not a general URL encoder**, which is why it is its own function rather
+/// than a flag on one: a space becomes `+` here and `%20` everywhere else in a
+/// URL, and the set of characters left literal is HTML's
+/// (`*`, `-`, `.`, `_` and the ASCII alphanumerics), not the URL spec's. Using
+/// this on a path would corrupt it; using a path encoder here would send `+`
+/// as a literal plus and a space as `%20` — which servers accept, and which
+/// makes the query string this engine produces differ from every other
+/// browser's for no reason.
+///
+/// Everything else is percent-encoded from its **UTF-8 bytes** (`猫` →
+/// `%E7%8C%AB`), in uppercase hex. Names and values go through the same
+/// function: `a=b` typed into a field named `a=b` has to survive being written
+/// down beside a `=` that means something.
+pub fn form_urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b' ' => out.push('+'),
+            b'*' | b'-' | b'.' | b'_' => out.push(b as char),
+            b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z' => out.push(b as char),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_url, percent_decode, resolve_url};
+    use super::{form_urlencode, normalize_url, percent_decode, resolve_url};
 
     #[test]
     fn hrefs_resolve_against_the_page_url() {
@@ -150,6 +196,38 @@ mod tests {
         assert_eq!(percent_decode("%FF%FE"), "%FF%FE");
         // `+` is a query-string convention, not a fragment one.
         assert_eq!(percent_decode("a+b%20c"), "a+b c");
+    }
+
+    #[test]
+    fn the_form_encoder_as_a_table_of_cases() {
+        // M11.10 deliverable 5, case by case — every one of these is a
+        // character a reader can type into HN's search box.
+        for (raw, encoded) in [
+            ("plain", "plain"),
+            ("two words", "two+words"),
+            ("a&b", "a%26b"),
+            ("a=b", "a%3Db"),
+            ("100%", "100%25"),
+            ("a+b", "a%2Bb"),
+            ("say \"hi\"", "say+%22hi%22"),
+            ("猫", "%E7%8C%AB"),
+            // The unreserved set HTML keeps literal, and nothing else: `~` is
+            // unreserved in a URL and still escaped here.
+            ("*-._", "*-._"),
+            ("~!", "%7E%21"),
+            ("Special:Search", "Special%3ASearch"),
+            // What a `<textarea>`'s newline has become by the time it reaches
+            // here: CRLF, which HTML requires (see `browser::form`).
+            ("one\r\ntwo", "one%0D%0Atwo"),
+        ] {
+            assert_eq!(form_urlencode(raw), encoded, "encoding {raw:?}");
+        }
+        // The two functions are **not** inverses, and that is the point of
+        // having both: `percent_decode` is a fragment decoder, where `+` is a
+        // plus sign, so it undoes the escapes and leaves the spaces encoded.
+        // Anything that needs a real round trip needs a query-string decoder,
+        // which nothing has asked for yet.
+        assert_eq!(percent_decode(&form_urlencode("猫 & mouse")), "猫+&+mouse");
     }
 
     #[test]

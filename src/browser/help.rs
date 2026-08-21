@@ -50,6 +50,7 @@ pub fn action_help(action: Action) -> &'static str {
         Action::SearchNext => "next search match",
         Action::SearchPrev => "previous search match",
         Action::ToggleHelp => "this help",
+        Action::Submit => "submit the form",
     }
 }
 
@@ -188,6 +189,10 @@ mod tests {
             "delete character after the caret",
             "caret to start of line",
             "Ctrl-c",
+            // M11.10's row, and the reason it is here without anyone editing
+            // this file's list: `Enter` became a `Binding`, so the overlay
+            // grew a line.
+            "submit the form",
         ] {
             assert!(text.contains(needle), "help missing {needle:?}:\n{text}");
         }

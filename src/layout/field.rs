@@ -247,7 +247,12 @@ pub(crate) fn editable_value(dom: &Dom, node: NodeId, tag: &str) -> Option<Strin
 
 /// What the control currently holds: the state beside the tree if a reader has
 /// touched it, else what the markup said.
-fn value(dom: &Dom, node: NodeId, tag: &str) -> String {
+///
+/// The single answer to that question, which is why M11.10's serializer reaches
+/// through here rather than asking `Dom::field_value` itself: **what is sent is
+/// exactly what is drawn**, and two derivations of "the value" would be two
+/// chances for a form to submit something the reader could not see.
+pub(crate) fn value(dom: &Dom, node: NodeId, tag: &str) -> String {
     if let Some(typed) = dom.field_value(node) {
         return typed.to_string();
     }

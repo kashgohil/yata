@@ -50,6 +50,8 @@ pub enum Action {
     SearchPrev,
     /// Toggle the help overlay (`?`).
     ToggleHelp,
+    /// Submit the form the caret is in (`Enter` while typing, M11.10).
+    Submit,
 }
 
 /// Which key map is live. `App`'s own mode carries the URL buffer; this is the
@@ -214,9 +216,16 @@ pub const BINDINGS: &[Binding] = &[
     // quits the moment they are not inside a field, which `Esc` makes true in
     // one key, and the statusline says which of the two they are in.
     //
-    // `Enter` is **deliberately unbound**: it is M11.10's, where it submits the
-    // form, and a `Tab`-like stopgap now is how that gets decided by accident.
-    // A test pins its absence so it stays a decision.
+    // `Enter` submits the form the caret is in (M11.10) — the key M11.9 left
+    // unbound on purpose, spent on the thing it was reserved for. It is the
+    // *only* activator a keyboard has for HN's search box, which has no submit
+    // button at all, and it submits whatever form the control is in rather
+    // than only HTML's single-field case: see `App::submit_form` for why the rule
+    // HTML has here solves a problem a modal browser does not have.
+    //
+    // Typing ends when the submission starts, because a navigation clears the
+    // focus and the mode with it (`App::clear_focus`).
+    input(Mode::Field, chord(KeyCode::Enter, NONE), Action::Submit),
     input(Mode::Field, chord(KeyCode::Esc, NONE), Action::Cancel),
     input(Mode::Field, chord(KeyCode::Char('c'), CTRL), Action::Quit),
     input(
@@ -575,15 +584,22 @@ mod tests {
     }
 
     #[test]
-    fn enter_in_a_field_is_reserved_for_m11_10() {
-        // Deliberately unbound, and pinned so it stays a decision: `Enter`
-        // while typing submits the form, which is M11.10's to build. A
-        // stopgap here — "just make it Tab for now" — is how that gets
-        // decided by accident.
+    fn enter_in_a_field_submits_the_form() {
+        // The key M11.9 left unbound, spent by M11.10 on the thing it was
+        // reserved for. It is the only activator a keyboard has for a form
+        // with no submit button, which is exactly what HN's search is.
         assert_eq!(
             resolve(Mode::Field, None, &press(KeyCode::Enter, NONE)),
-            Resolution::Unbound
+            Resolution::Action(Action::Submit)
         );
+        // And nowhere else: submitting is a thing you do from inside a field,
+        // never from the URL bar or the search prompt, where `Enter` commits.
+        for mode in [Mode::UrlInput, Mode::SearchInput] {
+            assert_eq!(
+                resolve(mode, None, &press(KeyCode::Enter, NONE)),
+                Resolution::Action(Action::Commit)
+            );
+        }
         // And in Browse it still activates the focused thing, which is what
         // starts the typing in the first place.
         assert_eq!(
