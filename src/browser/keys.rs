@@ -52,6 +52,12 @@ pub enum Action {
     ToggleHelp,
     /// Submit the form the caret is in (`Enter` while typing, M11.10).
     Submit,
+    SelectPrev,
+    SelectNext,
+    SelectFirst,
+    SelectLast,
+    SelectToggle,
+    SelectCommit,
 }
 
 /// Which key map is live. `App`'s own mode carries the URL buffer; this is the
@@ -66,6 +72,8 @@ pub enum Mode {
     /// focused text field, left with `Esc` — see the table's rows for why the
     /// promise that `q` quits is kept by `Ctrl-c` here.
     Field,
+    /// Choosing an option without giving ordinary letters to the page.
+    Select,
 }
 
 /// One key plus its modifiers. A binding is one chord, or a two-chord sequence
@@ -261,6 +269,33 @@ pub const BINDINGS: &[Binding] = &[
         chord(KeyCode::BackTab, NONE),
         Action::FocusPrev,
     ),
+    // Select (M11.12): cursor movement is table-driven like every other mode.
+    input(Mode::Select, chord(KeyCode::Up, NONE), Action::SelectPrev),
+    input(Mode::Select, chord(KeyCode::Down, NONE), Action::SelectNext),
+    input(
+        Mode::Select,
+        chord(KeyCode::Home, NONE),
+        Action::SelectFirst,
+    ),
+    input(Mode::Select, chord(KeyCode::End, NONE), Action::SelectLast),
+    input(
+        Mode::Select,
+        chord(KeyCode::Char(' '), NONE),
+        Action::SelectToggle,
+    ),
+    input(
+        Mode::Select,
+        chord(KeyCode::Enter, NONE),
+        Action::SelectCommit,
+    ),
+    input(Mode::Select, chord(KeyCode::Esc, NONE), Action::Cancel),
+    input(Mode::Select, chord(KeyCode::Tab, NONE), Action::FocusNext),
+    input(
+        Mode::Select,
+        chord(KeyCode::BackTab, NONE),
+        Action::FocusPrev,
+    ),
+    input(Mode::Select, chord(KeyCode::Char('c'), CTRL), Action::Quit),
 ];
 
 /// The outcome of resolving one key press against the table, given the current
@@ -605,6 +640,35 @@ mod tests {
         assert_eq!(
             browse_key(KeyCode::Enter, NONE),
             Resolution::Action(Action::FollowFocus)
+        );
+    }
+
+    #[test]
+    fn select_keys_are_one_complete_table_driven_mode() {
+        for (code, action) in [
+            (KeyCode::Up, Action::SelectPrev),
+            (KeyCode::Down, Action::SelectNext),
+            (KeyCode::Home, Action::SelectFirst),
+            (KeyCode::End, Action::SelectLast),
+            (KeyCode::Char(' '), Action::SelectToggle),
+            (KeyCode::Enter, Action::SelectCommit),
+            (KeyCode::Esc, Action::Cancel),
+            (KeyCode::Tab, Action::FocusNext),
+            (KeyCode::BackTab, Action::FocusPrev),
+        ] {
+            assert_eq!(
+                resolve(Mode::Select, None, &press(code, NONE)),
+                Resolution::Action(action),
+                "{code:?}"
+            );
+        }
+        assert_eq!(
+            resolve(Mode::Select, None, &press(KeyCode::Char('c'), CTRL)),
+            Resolution::Action(Action::Quit)
+        );
+        assert_eq!(
+            resolve(Mode::Select, None, &press(KeyCode::Char('q'), NONE)),
+            Resolution::Unbound
         );
     }
 

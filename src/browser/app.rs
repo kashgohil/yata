@@ -14,7 +14,7 @@ use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
-use crate::dom::{AttrChanges, Dom, NodeId};
+use crate::dom::{AttrChanges, Dom, NodeData, NodeId};
 use crate::image::ImageSession;
 use crate::js::cookies::Jar;
 use crate::js::queue::ScriptQueue;
@@ -226,6 +226,12 @@ enum Mode {
     /// it means anything.
     Field {
         caret: usize,
+    },
+    /// Choosing from the focused `<select>`; the cursor is UI state, while
+    /// selectedness remains sparse state on the DOM (M11.12).
+    Select {
+        select: NodeId,
+        cursor: NodeId,
     },
 }
 
@@ -1047,6 +1053,7 @@ impl App {
             Mode::UrlInput { .. } => keys::Mode::UrlInput,
             Mode::SearchInput { .. } => keys::Mode::SearchInput,
             Mode::Field { .. } => keys::Mode::Field,
+            Mode::Select { .. } => keys::Mode::Select,
         };
         match keys::resolve(mode, self.pending, &ev) {
             // Not a Press event: leave the pending prefix untouched.
@@ -1082,7 +1089,7 @@ impl App {
                             return redraw();
                         }
                         Mode::Field { .. } => return self.insert_in_field(c),
-                        Mode::Browse => {}
+                        Mode::Browse | Mode::Select { .. } => {}
                     }
                 }
                 Effect::default()
@@ -1174,7 +1181,10 @@ impl App {
                 // Already in browse with nothing to cancel → not dirty.
                 if matches!(
                     self.mode,
-                    Mode::UrlInput { .. } | Mode::SearchInput { .. } | Mode::Field { .. }
+                    Mode::UrlInput { .. }
+                        | Mode::SearchInput { .. }
+                        | Mode::Field { .. }
+                        | Mode::Select { .. }
                 ) {
                     self.mode = Mode::Browse;
                     return redraw();
@@ -1225,6 +1235,12 @@ impl App {
             Action::SearchNext => self.search_step(1),
             Action::SearchPrev => self.search_step(-1),
             Action::ToggleHelp => self.toggle_surface(Surface::Help),
+            Action::SelectPrev => self.move_select(-1, false),
+            Action::SelectNext => self.move_select(1, false),
+            Action::SelectFirst => self.move_select(1, true),
+            Action::SelectLast => self.move_select(-1, true),
+            Action::SelectToggle => self.toggle_select_option(),
+            Action::SelectCommit => self.commit_select(),
         }
     }
 
@@ -1790,6 +1806,21 @@ impl App {
         }
 
         let structural = structure_after != structure_before;
+        // A control's box also derives directly from HTML attributes that need
+        // not participate in CSS (`checked`, `selected`, `size`, `label`, ...).
+        // Any write on this small family therefore invalidates layout even when
+        // the scoped style comparison says the computed CSS stayed identical.
+        let control_attribute = match (&changes, self.dom.as_ref()) {
+            (Some(AttrChanges::TooMany), _) => true,
+            (Some(AttrChanges::Nodes(nodes)), Some(dom)) => nodes.iter().any(|&node| {
+                matches!(
+                    &dom.node(node).data,
+                    NodeData::Element { tag, .. }
+                        if matches!(tag.as_str(), "input" | "textarea" | "button" | "select" | "option" | "optgroup")
+                )
+            }),
+            _ => false,
+        };
         // M11.3: an attribute-only tick recomputes the subtrees its writes can
         // have reached, not the document. Everything downstream is unchanged —
         // the comparison below is what keeps the narrowing honest.
@@ -1812,6 +1843,7 @@ impl App {
         };
 
         let needs_layout = structural
+            || control_attribute
             || match (&previous, &self.styles) {
                 (Some(old), Some(new)) => !old.layout_eq(new),
                 // No previous styles means nothing has been laid out from
@@ -1824,6 +1856,7 @@ impl App {
         } else {
             self.recolour_and_repaint();
         }
+        self.validate_select_mode();
 
         self.dom_view_built = false;
         self.styles_view_built = false;
@@ -2002,7 +2035,7 @@ impl App {
             }
             // A field binds no `Commit`: `Enter` while typing is M11.10's, and
             // it submits the form rather than confirming a buffer.
-            Mode::Browse | Mode::Field { .. } => Effect::default(),
+            Mode::Browse | Mode::Field { .. } | Mode::Select { .. } => Effect::default(),
         }
     }
 
@@ -2369,8 +2402,46 @@ impl App {
     /// starts while the reader is mid-word.
     fn clear_focus(&mut self) {
         self.focus = None;
-        if matches!(self.mode, Mode::Field { .. }) {
+        if matches!(self.mode, Mode::Field { .. } | Mode::Select { .. }) {
             self.mode = Mode::Browse;
+        }
+    }
+
+    /// Repair Select-mode UI state after a script changes the DOM.
+    fn validate_select_mode(&mut self) {
+        let Mode::Select { select, cursor } = self.mode else {
+            return;
+        };
+        let valid_select = self.dom.as_ref().is_some_and(|dom| {
+            dom.is_connected(select)
+                && matches!(&dom.node(select).data, NodeData::Element { tag, .. } if layout::field::is_select(tag))
+                && dom.attr(select, "disabled").is_none()
+        }) && self.layout_tree.as_ref().is_some_and(|tree| {
+            tree.boxes
+                .iter()
+                .any(|b| b.node == Some(select) && matches!(b.kind, BoxKind::Field(_)))
+        });
+        if !valid_select || self.focus != Some(select) {
+            self.clear_focus();
+            return;
+        }
+        let enabled = self
+            .dom
+            .as_ref()
+            .map(|dom| {
+                layout::field::options(dom, select)
+                    .into_iter()
+                    .filter(|option| !option.disabled)
+                    .map(|option| option.node)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if enabled.contains(&cursor) {
+            return;
+        }
+        match enabled.first().copied() {
+            Some(cursor) => self.mode = Mode::Select { select, cursor },
+            None => self.clear_focus(),
         }
     }
 
@@ -2378,7 +2449,7 @@ impl App {
         // `Tab` out of a field leaves typing (see the table's Field rows): the
         // reader lands on the next focusable with every browse binding live,
         // whatever kind of thing it turned out to be.
-        if matches!(self.mode, Mode::Field { .. }) {
+        if matches!(self.mode, Mode::Field { .. } | Mode::Select { .. }) {
             self.mode = Mode::Browse;
         }
         let Some(dom) = &self.dom else {
@@ -2438,6 +2509,15 @@ impl App {
         let (Some(focus), Some(dom)) = (self.focus, &self.dom) else {
             return Effect::default();
         };
+        let NodeData::Element { tag, .. } = &dom.node(focus).data else {
+            return Effect::default();
+        };
+        if layout::field::is_checkbox(dom, focus, tag) || layout::field::is_radio(dom, focus, tag) {
+            return self.activate_choice(focus);
+        }
+        if layout::field::is_select(tag) {
+            return self.start_select(focus);
+        }
         // A submit button — Wikipedia's `<button>` with no `type` above all —
         // is the other thing `Enter` can activate, and until M11.10 it fell
         // through to the `href` path and did nothing at all, because a button
@@ -2527,6 +2607,149 @@ impl App {
             return None;
         };
         Some((focus, layout::field::editable_value(dom, focus, tag)?))
+    }
+
+    fn activate_choice(&mut self, node: NodeId) -> Effect {
+        let Some(dom) = self.dom.as_ref() else {
+            return Effect::default();
+        };
+        let NodeData::Element { tag, .. } = &dom.node(node).data else {
+            return Effect::default();
+        };
+        let checkbox = layout::field::is_checkbox(dom, node, tag);
+        let radio = layout::field::is_radio(dom, node, tag);
+        if !checkbox && !radio {
+            return Effect::default();
+        }
+        if dom.attr(node, "disabled").is_some() {
+            return Effect::default();
+        }
+        let current = layout::field::checked(dom, node, tag);
+        if radio && current {
+            return Effect::default();
+        }
+        let peers = if radio {
+            layout::field::radio_group(dom, node)
+        } else {
+            vec![node]
+        };
+        let Some(dom) = self.dom.as_mut() else {
+            return Effect::default();
+        };
+        let states = peers
+            .into_iter()
+            .map(|peer| (peer, if radio { peer == node } else { !current }))
+            .collect::<Vec<_>>();
+        let changed = dom.set_choice_group(&states, "checked");
+        if changed {
+            self.after_field_edit(node)
+        } else {
+            Effect::default()
+        }
+    }
+
+    fn start_select(&mut self, node: NodeId) -> Effect {
+        let Some(dom) = self.dom.as_ref() else {
+            return Effect::default();
+        };
+        if dom.attr(node, "disabled").is_some() {
+            return Effect::default();
+        }
+        let options = layout::field::options(dom, node);
+        let selected = layout::field::selected_options(dom, node, &options);
+        let cursor = selected
+            .iter()
+            .find(|id| options.iter().any(|o| o.node == **id && !o.disabled))
+            .copied()
+            .or_else(|| options.iter().find(|o| !o.disabled).map(|o| o.node));
+        let Some(cursor) = cursor else {
+            return Effect::default();
+        };
+        self.mode = Mode::Select {
+            select: node,
+            cursor,
+        };
+        redraw()
+    }
+
+    fn move_select(&mut self, direction: i32, edge: bool) -> Effect {
+        let Mode::Select { select, cursor } = self.mode else {
+            return Effect::default();
+        };
+        let Some(dom) = self.dom.as_ref() else {
+            return Effect::default();
+        };
+        let enabled = layout::field::options(dom, select)
+            .into_iter()
+            .filter(|option| !option.disabled)
+            .map(|option| option.node)
+            .collect::<Vec<_>>();
+        let Some(at) = enabled.iter().position(|id| *id == cursor) else {
+            return Effect::default();
+        };
+        let next = if edge {
+            if direction < 0 { enabled.len() - 1 } else { 0 }
+        } else if direction < 0 {
+            at.saturating_sub(1)
+        } else {
+            (at + 1).min(enabled.len() - 1)
+        };
+        if next == at {
+            return Effect::default();
+        }
+        self.mode = Mode::Select {
+            select,
+            cursor: enabled[next],
+        };
+        redraw()
+    }
+
+    fn toggle_select_option(&mut self) -> Effect {
+        let (Mode::Select { select, cursor }, Some(dom)) = (&self.mode, self.dom.as_ref()) else {
+            return Effect::default();
+        };
+        if dom.attr(*select, "multiple").is_none() {
+            return Effect::default();
+        }
+        let options = layout::field::options(dom, *select);
+        let selected = layout::field::selected_options(dom, *select, &options);
+        let value = !selected.contains(cursor);
+        let cursor = *cursor;
+        let select = *select;
+        self.dom
+            .as_mut()
+            .expect("DOM checked above")
+            .set_choice_state(cursor, "selected", value);
+        self.after_field_edit(select)
+    }
+
+    fn commit_select(&mut self) -> Effect {
+        let (Mode::Select { select, cursor }, Some(dom)) = (&self.mode, self.dom.as_ref()) else {
+            return Effect::default();
+        };
+        if dom.attr(*select, "multiple").is_some() {
+            self.mode = Mode::Browse;
+            return redraw();
+        }
+        let options = layout::field::options(dom, *select);
+        let cursor = *cursor;
+        let select = *select;
+        if layout::field::selected_options(dom, select, &options) == [cursor] {
+            self.mode = Mode::Browse;
+            return redraw();
+        }
+        let dom = self.dom.as_mut().expect("DOM checked above");
+        let states = options
+            .into_iter()
+            .map(|option| (option.node, option.node == cursor))
+            .collect::<Vec<_>>();
+        let changed = dom.set_choice_group(&states, "selected");
+        self.mode = Mode::Browse;
+        if changed {
+            self.after_field_edit(select)
+        } else {
+            redraw()
+        }
     }
 
     /// Insert a character at the caret — the sanctioned printable-key path's
@@ -3195,6 +3418,13 @@ impl App {
         if let Some(node) = layout::hit_test(tree, x, y).and_then(|n| layout::nearest_field(dom, n))
         {
             let submits = form::is_submit_button(dom, node);
+            let choice = match &dom.node(node).data {
+                NodeData::Element { tag, .. } => {
+                    layout::field::is_checkbox(dom, node, tag)
+                        || layout::field::is_radio(dom, node, tag)
+                }
+                _ => false,
+            };
             let moved_focus = self.focus != Some(node);
             self.focus = Some(node);
             if submits {
@@ -3202,6 +3432,13 @@ impl App {
                 // button in no form — or in one this engine cannot send —
                 // still owes the reader the frame that shows it is focused.
                 let effect = self.submit_form(node);
+                return Effect {
+                    dirty: effect.dirty || moved_focus,
+                    ..effect
+                };
+            }
+            if choice {
+                let effect = self.activate_choice(node);
                 return Effect {
                     dirty: effect.dirty || moved_focus,
                     ..effect
@@ -3277,7 +3514,7 @@ impl App {
             // Typing keeps the statusline rather than opening a prompt: the
             // text being typed is in the page, where the caret is, and the row
             // is what says which mode the reader is in.
-            Mode::Browse | Mode::Field { .. } => self.draw_status(frame, y),
+            Mode::Browse | Mode::Field { .. } | Mode::Select { .. } => self.draw_status(frame, y),
         }
     }
 
@@ -3421,27 +3658,39 @@ impl App {
         scroll: i32,
     ) {
         let page_h = self.page() as i32;
-        // The window is only redrawn while typing: with no caret it is the one
-        // paint already drew, and building it again — every frame, scroll steps
-        // included — would be work for a rectangle that is already on screen.
-        let caret = match self.caret() {
-            Some(caret) => {
-                let painted = layout::field::painted(b, Some(caret));
-                for run in &painted.runs {
-                    let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) else {
-                        continue;
-                    };
-                    let screen_y = run.y - scroll;
-                    let screen_x = left as i32 + x;
-                    if screen_y < 0 || screen_y >= page_h || screen_x < 0 {
-                        continue;
-                    }
-                    frame.put_str(screen_x as u16, screen_y as u16, &text, run.style);
-                }
-                painted.caret
-            }
-            None => layout::field::caret(b),
+        // Redraw only when UI state changes the window: a text caret or select
+        // cursor. Otherwise paint already drew these cells.
+        let painted = match self.mode {
+            Mode::Select { select, cursor } if b.node == Some(select) => self
+                .dom
+                .as_ref()
+                .and_then(|dom| {
+                    layout::field::options(dom, select)
+                        .iter()
+                        .position(|option| option.node == cursor)
+                })
+                .map(|row| layout::field::painted_select(b, row)),
+            _ => self
+                .caret()
+                .map(|caret| layout::field::painted(b, Some(caret))),
         };
+        if let Some(painted) = &painted {
+            for run in &painted.runs {
+                let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) else {
+                    continue;
+                };
+                let screen_y = run.y - scroll;
+                let screen_x = left as i32 + x;
+                if screen_y < 0 || screen_y >= page_h || screen_x < 0 {
+                    continue;
+                }
+                frame.put_str(screen_x as u16, screen_y as u16, &text, run.style);
+            }
+        }
+        let caret = painted
+            .as_ref()
+            .and_then(|painted| painted.caret)
+            .or_else(|| layout::field::caret(b));
         let mut reverse = |x: i32, y: i32| {
             if !clip.contains(x, y) {
                 return;
@@ -3469,6 +3718,19 @@ impl App {
             }
             if b.dimensions.padding.right > 0 {
                 reverse(rect.right(), y);
+            }
+        }
+        if let BoxKind::Field(paint) = b.kind
+            && matches!(
+                paint.shows,
+                layout::Shows::Checkbox(_) | layout::Shows::Radio(_)
+            )
+        {
+            reverse(rect.x, rect.y);
+        }
+        if let Some(row) = painted.as_ref().and_then(|painted| painted.cursor_row) {
+            for x in 0..rect.width {
+                reverse(rect.x + x, rect.y + row);
             }
         }
         if let Some((x, y)) = caret {
@@ -3616,6 +3878,7 @@ impl App {
         // away again (UX §1: every keypress produces a visible change).
         let base = match self.mode {
             Mode::Field { .. } => format!("[typing · Esc] {base}"),
+            Mode::Select { .. } => format!("[selecting · Esc] {base}"),
             _ => base,
         };
         match self.surface {
@@ -6680,6 +6943,28 @@ mod tests {
         })
     }
 
+    fn field_rect(app: &App, node: NodeId) -> layout::Rect {
+        app.layout_tree
+            .as_ref()
+            .unwrap()
+            .boxes
+            .iter()
+            .find(|b| b.node == Some(node) && matches!(b.kind, BoxKind::Field(_)))
+            .unwrap()
+            .dimensions
+            .content
+    }
+
+    fn click_control(app: &mut App, node: NodeId) -> Effect {
+        let rect = field_rect(app, node);
+        app.update(Msg::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: column(app.size.0).left + rect.x as u16,
+            row: (rect.y - app.viewport.offset() as i32) as u16,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
     #[test]
     fn tab_cycles_links_and_fields_together_in_document_order() {
         let (mut app, _) = scripted_app(FORM_PAGE);
@@ -6735,6 +7020,525 @@ mod tests {
         assert!(effect.fetch.is_none(), "a click on a field navigated");
         assert_eq!(focused(&app).as_deref(), Some("input a"));
         assert_eq!(stages(&app), before);
+    }
+
+    #[test]
+    fn enter_toggles_a_checkbox_without_changing_its_attribute() {
+        let (mut app, id) = scripted_app("<input id=c type=checkbox>");
+        app.update(Msg::RunScripts { id });
+        let node = by_id(&app, "c");
+        app.focus = Some(node);
+        let before = stages(&app);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            redraw()
+        );
+        let dom = app.dom.as_ref().unwrap();
+        assert!(layout::field::checked(dom, node, "input"));
+        assert_eq!(dom.attr(node, "checked"), None);
+        assert_eq!(app.styles_run, before.0, "choice activation restyled");
+        app.dom.as_mut().unwrap().set_attr(node, "checked", "");
+        app.dom.as_mut().unwrap().remove_attr(node, "checked");
+        assert!(layout::field::checked(
+            app.dom.as_ref().unwrap(),
+            node,
+            "input"
+        ));
+    }
+
+    #[test]
+    fn disabled_choices_refuse_stale_focus_and_an_all_disabled_select_cannot_trap() {
+        let src = "<input id=c type=checkbox disabled>\
+                   <select id=s><option disabled>A</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let checkbox = by_id(&app, "c");
+        app.focus = Some(checkbox);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default()
+        );
+        assert_eq!(app.dom.as_ref().unwrap().choice_state(checkbox), None);
+
+        app.focus = Some(by_id(&app, "s"));
+        let before = stages(&app);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default()
+        );
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(stages(&app), before);
+    }
+
+    #[test]
+    fn clicks_activate_a_checkbox_but_only_focus_a_select() {
+        let src = "<input id=c type=checkbox><select id=s>\
+                   <option id=a selected>A</option><option>B</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (checkbox, select, selected) = (by_id(&app, "c"), by_id(&app, "s"), by_id(&app, "a"));
+        click_control(&mut app, checkbox);
+        assert!(layout::field::checked(
+            app.dom.as_ref().unwrap(),
+            checkbox,
+            "input"
+        ));
+        click_control(&mut app, select);
+        assert_eq!(app.focus, Some(select));
+        assert!(matches!(app.mode, Mode::Browse));
+        let dom = app.dom.as_ref().unwrap();
+        let options = layout::field::options(dom, select);
+        assert_eq!(
+            layout::field::selected_options(dom, select, &options),
+            [selected]
+        );
+    }
+
+    #[test]
+    fn focus_reverses_a_choice_mark_and_select_mode_draws_its_cursor_label() {
+        let src = "<input id=c type=checkbox checked><select id=s>\
+                   <option selected>A</option><option>B</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let checkbox = by_id(&app, "c");
+        app.focus = Some(checkbox);
+        let rect = field_rect(&app, checkbox);
+        let mut frame = Frame::new(app.size.0, app.size.1);
+        app.draw(&mut frame);
+        assert!(
+            frame
+                .get(column(app.size.0).left + rect.x as u16, rect.y as u16)
+                .attrs
+                .contains(Attrs::REVERSE)
+        );
+
+        let select = by_id(&app, "s");
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        let rect = field_rect(&app, select);
+        let mut frame = Frame::new(app.size.0, app.size.1);
+        app.draw(&mut frame);
+        let x = column(app.size.0).left + rect.x as u16;
+        assert_eq!(frame.get(x, rect.y as u16).ch, 'B');
+        assert!(frame.get(x, rect.y as u16).attrs.contains(Attrs::REVERSE));
+    }
+
+    fn choice_screen(app: &mut App, width: u16, height: u16) -> String {
+        let mut frame = Frame::new(width, height);
+        app.draw(&mut frame);
+        let mut rows = Vec::new();
+        for y in 0..height - 1 {
+            let last = (0..width).rfind(|&x| {
+                frame.get(x, y).ch != ' ' || frame.get(x, y).attrs.contains(Attrs::REVERSE)
+            });
+            let Some(last) = last else {
+                continue;
+            };
+            rows.push((0..=last).map(|x| frame.get(x, y).ch).collect::<String>());
+            rows.push(
+                (0..=last)
+                    .map(|x| {
+                        if frame.get(x, y).attrs.contains(Attrs::REVERSE) {
+                            '^'
+                        } else {
+                            '.'
+                        }
+                    })
+                    .collect::<String>(),
+            );
+        }
+        rows.join("\n")
+    }
+
+    #[test]
+    fn multiple_select_windows_have_a_committed_before_during_and_after_snapshot() {
+        let src = "<style>html,body{margin:0}</style><select id=s multiple size=2>\
+                   <option>A</option><option selected>B</option><option>C</option>\
+                   <option selected>D</option><option>E</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.size = (30, 6);
+        app.update(Msg::RunScripts { id });
+        app.relayout();
+        let select = by_id(&app, "s");
+        let before = choice_screen(&mut app, 30, 6);
+
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::End, KeyModifiers::NONE));
+        let during = choice_screen(&mut app, 30, 6);
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let after_escape = choice_screen(&mut app, 30, 6);
+
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Home, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let after_commit = choice_screen(&mut app, 30, 6);
+        let actual = format!(
+            "before\n{before}\n\nduring\n{during}\n\nafter escape\n{after_escape}\n\nafter commit\n{after_commit}"
+        );
+        assert_eq!(
+            actual,
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/snapshots/choice-select-mode.txt"
+            ))
+            .trim_end()
+        );
+    }
+
+    #[test]
+    fn choosing_a_radio_clears_only_its_group() {
+        let src = "<form><input id=a type=radio name=x checked>\
+                   <input id=b type=radio name=x><input id=d type=radio name=x>\
+                   <input id=e type=radio name=x checked disabled></form>\
+                   <form><input id=c type=radio name=x checked></form>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (a, b, c) = (by_id(&app, "a"), by_id(&app, "b"), by_id(&app, "c"));
+        app.focus = Some(b);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let dom = app.dom.as_ref().unwrap();
+        assert!(!layout::field::checked(dom, a, "input"));
+        assert!(layout::field::checked(dom, b, "input"));
+        assert!(layout::field::checked(dom, c, "input"));
+        assert!(!layout::field::checked(dom, by_id(&app, "e"), "input"));
+        let before = stages(&app);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            Effect::default()
+        );
+        assert_eq!(stages(&app), before);
+        let d = by_id(&app, "d");
+        app.dom.as_mut().unwrap().set_attr(d, "checked", "");
+        let dom = app.dom.as_ref().unwrap();
+        assert!(layout::field::checked(dom, b, "input"));
+        assert!(!layout::field::checked(dom, d, "input"));
+    }
+
+    #[test]
+    fn select_mode_moves_a_cursor_and_enter_commits_the_choice() {
+        let src = "<select id=s><option id=a selected>A</option>\
+                   <option id=b>B</option><option id=c>C</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (select, second) = (by_id(&app, "s"), by_id(&app, "b"));
+        app.focus = Some(select);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            redraw()
+        );
+        assert!(matches!(app.mode, Mode::Select { .. }));
+        assert_eq!(app.update(key(KeyCode::Down, KeyModifiers::NONE)), redraw());
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            redraw()
+        );
+        assert!(matches!(app.mode, Mode::Browse));
+        let dom = app.dom.as_ref().unwrap();
+        let options = layout::field::options(dom, select);
+        assert_eq!(
+            layout::field::selected_options(dom, select, &options),
+            [second]
+        );
+        assert_eq!(dom.attr(second, "selected"), None);
+        let third = by_id(&app, "c");
+        app.dom.as_mut().unwrap().set_attr(third, "selected", "");
+        let dom = app.dom.as_ref().unwrap();
+        assert_eq!(
+            layout::field::selected_options(dom, select, &options),
+            [second]
+        );
+    }
+
+    #[test]
+    fn select_mode_skips_disabled_options_and_esc_discards_a_single_cursor() {
+        let src = "<select id=s><option id=a selected>A</option>\
+                   <option disabled>B</option><option id=c>C</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (select, first, last) = (by_id(&app, "s"), by_id(&app, "a"), by_id(&app, "c"));
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == last));
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let dom = app.dom.as_ref().unwrap();
+        let options = layout::field::options(dom, select);
+        assert_eq!(
+            layout::field::selected_options(dom, select, &options),
+            [first]
+        );
+    }
+
+    #[test]
+    fn select_cursor_movement_skips_disabled_options_and_runs_no_stage() {
+        let src = "<select id=s><option id=a>A</option><option disabled>B</option>\
+                   <option id=c selected>C</option><option disabled>D</option>\
+                   <option id=e>E</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (select, first, middle, last) = (
+            by_id(&app, "s"),
+            by_id(&app, "a"),
+            by_id(&app, "c"),
+            by_id(&app, "e"),
+        );
+        app.focus = Some(select);
+        let before = stages(&app);
+        assert_eq!(
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE)),
+            redraw()
+        );
+        assert_eq!(stages(&app), before);
+
+        for (key_code, expected, effect) in [
+            (KeyCode::Up, first, redraw()),
+            (KeyCode::Up, first, Effect::default()),
+            (KeyCode::Down, middle, redraw()),
+            (KeyCode::Down, last, redraw()),
+            (KeyCode::Down, last, Effect::default()),
+            (KeyCode::Home, first, redraw()),
+            (KeyCode::Home, first, Effect::default()),
+            (KeyCode::End, last, redraw()),
+            (KeyCode::End, last, Effect::default()),
+        ] {
+            assert_eq!(app.update(key(key_code, KeyModifiers::NONE)), effect);
+            assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == expected));
+        }
+        assert_eq!(stages(&app), before);
+    }
+
+    #[test]
+    fn multiple_select_toggles_immediately_and_keeps_it_on_escape() {
+        for exit in [KeyCode::Esc, KeyCode::Enter] {
+            let src = "<select id=s multiple><option id=a>A</option><option>B</option></select>";
+            let (mut app, id) = scripted_app(src);
+            app.update(Msg::RunScripts { id });
+            let (select, first) = (by_id(&app, "s"), by_id(&app, "a"));
+            app.focus = Some(select);
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            app.update(key(KeyCode::Char(' '), KeyModifiers::NONE));
+            let after_toggle = stages(&app);
+            app.update(key(exit, KeyModifiers::NONE));
+            assert!(matches!(app.mode, Mode::Browse));
+            assert_eq!(stages(&app), after_toggle);
+            let dom = app.dom.as_ref().unwrap();
+            let options = layout::field::options(dom, select);
+            assert_eq!(
+                layout::field::selected_options(dom, select, &options),
+                [first]
+            );
+        }
+    }
+
+    #[test]
+    fn space_is_a_single_select_noop_and_a_multiple_select_structural_edit() {
+        let (mut app, id) = scripted_app(
+            "<select id=s><option id=a selected>A</option><option id=b>B</option></select>",
+        );
+        app.update(Msg::RunScripts { id });
+        let (select, first, second) = (by_id(&app, "s"), by_id(&app, "a"), by_id(&app, "b"));
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        let before = stages(&app);
+        assert_eq!(
+            app.update(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+            Effect::default()
+        );
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == second));
+        let dom = app.dom.as_ref().unwrap();
+        let options = layout::field::options(dom, select);
+        assert_eq!(
+            layout::field::selected_options(dom, select, &options),
+            [first]
+        );
+        assert_eq!(stages(&app), before);
+
+        let (mut app, id) = scripted_app(
+            "<select id=s multiple><option selected>A</option><option disabled>B</option>\
+             <option id=c>C</option></select>",
+        );
+        app.update(Msg::RunScripts { id });
+        let (select, third) = (by_id(&app, "s"), by_id(&app, "c"));
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        let (styles, layouts, paints) = stages(&app);
+        assert_eq!(
+            app.update(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+            redraw()
+        );
+        assert_eq!(stages(&app), (styles, layouts + 1, paints + 1));
+        assert!(app.dom.as_ref().unwrap().choice_state(third).unwrap());
+    }
+
+    #[test]
+    fn select_exit_and_quit_keys_keep_their_mode_specific_meaning() {
+        let src = "<a href=/before>before</a><select id=s><option>A</option></select>\
+                   <a href=/after>after</a>";
+        for (exit, expected) in [(KeyCode::Tab, "a /after"), (KeyCode::BackTab, "a /before")] {
+            let (mut app, id) = scripted_app(src);
+            app.update(Msg::RunScripts { id });
+            let select = by_id(&app, "s");
+            app.focus = Some(select);
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            let before = stages(&app);
+            assert_eq!(app.update(key(exit, KeyModifiers::NONE)), redraw());
+            assert!(matches!(app.mode, Mode::Browse));
+            assert_eq!(focused(&app).as_deref(), Some(expected));
+            assert_eq!(stages(&app), before);
+            assert!(app.update(ch('q')).quit);
+        }
+
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let select = by_id(&app, "s");
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let before = stages(&app);
+        assert_eq!(app.update(ch('q')), Effect::default());
+        assert!(matches!(app.mode, Mode::Select { .. }));
+        let quit = app.update(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(quit.quit);
+        assert!(!quit.dirty);
+        assert_eq!(stages(&app), before);
+    }
+
+    #[test]
+    fn dom_mutation_repairs_or_ends_select_mode() {
+        let src = "<select id=s><option id=a>A</option><option id=b>B</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (select, first, second) = (by_id(&app, "s"), by_id(&app, "a"), by_id(&app, "b"));
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+
+        let before = {
+            let dom = app.dom.as_ref().unwrap();
+            (dom.version(), dom.structure_version())
+        };
+        app.dom.as_mut().unwrap().set_attr(second, "disabled", "");
+        let after = {
+            let dom = app.dom.as_ref().unwrap();
+            (dom.version(), dom.structure_version())
+        };
+        app.apply_dom_changes(before, after);
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == first));
+
+        let before = after;
+        app.dom.as_mut().unwrap().remove(select);
+        let after = {
+            let dom = app.dom.as_ref().unwrap();
+            (dom.version(), dom.structure_version())
+        };
+        app.apply_dom_changes(before, after);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.focus, None);
+    }
+
+    #[test]
+    fn timer_mutations_repair_or_end_select_mode() {
+        let src = "<select id=s><option id=a>A</option><option id=b>B</option>\
+                   <option id=c>C</option></select><script>\
+                   setTimeout(function () { document.getElementById('b').remove(); }, 0);\
+                   setTimeout(function () { document.getElementById('c').setAttribute('disabled', ''); }, 0);\
+                   setTimeout(function () { document.getElementById('s').remove(); }, 0);\
+                   </script>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (select, first, second, third) = (
+            by_id(&app, "s"),
+            by_id(&app, "a"),
+            by_id(&app, "b"),
+            by_id(&app, "c"),
+        );
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == second));
+
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == first));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == third));
+
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(2),
+        });
+        assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == first));
+        assert_eq!(app.focus, Some(select));
+
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(3),
+        });
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.focus, None);
+        assert!(!app.dom.as_ref().unwrap().is_connected(select));
+    }
+
+    #[test]
+    fn clean_choice_attributes_rebuild_glyphs_geometry_and_focusability() {
+        let src = "<input id=c type=checkbox><select id=s>\
+                   <option id=a>A</option><option id=b label='Long label'>B</option></select>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let (checkbox, select, second) = (by_id(&app, "c"), by_id(&app, "s"), by_id(&app, "b"));
+        let before = {
+            let dom = app.dom.as_ref().unwrap();
+            (dom.version(), dom.structure_version())
+        };
+        {
+            let dom = app.dom.as_mut().unwrap();
+            dom.set_attr(checkbox, "checked", "");
+            dom.set_attr(checkbox, "disabled", "");
+            dom.set_attr(second, "selected", "");
+            dom.set_attr(second, "label", "A much longer label");
+        }
+        let after = {
+            let dom = app.dom.as_ref().unwrap();
+            (dom.version(), dom.structure_version())
+        };
+        assert!(after.0 > before.0);
+        let layouts = app.layouts;
+        app.apply_dom_changes(before, after);
+        assert_eq!(app.layouts, layouts + 1);
+
+        let checkbox_box = app
+            .layout_tree
+            .as_ref()
+            .unwrap()
+            .boxes
+            .iter()
+            .find(|b| b.node == Some(checkbox) && matches!(b.kind, BoxKind::Field(_)))
+            .unwrap();
+        assert!(
+            matches!(
+                checkbox_box.kind,
+                BoxKind::Field(layout::FieldPaint {
+                    shows: layout::Shows::Checkbox(true),
+                    disabled: true
+                })
+            ),
+            "{:?}",
+            checkbox_box.kind
+        );
+        assert_eq!(field_rect(&app, select).width, 21);
+        let dom = app.dom.as_ref().unwrap();
+        assert!(!layout::focusables(app.layout_tree.as_ref().unwrap(), dom).contains(&checkbox));
+        let options = layout::field::options(dom, select);
+        assert_eq!(
+            layout::field::selected_options(dom, select, &options),
+            [second]
+        );
     }
 
     #[test]
@@ -7228,6 +8032,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keyboard_and_mouse_choice_activation_dispatch_no_page_events() {
+        let src = "<form id=f><input id=kc type=checkbox>\
+                   <input id=kr type=radio name=k><input id=mc type=checkbox>\
+                   <input id=mr type=radio name=m>\
+                   <select id=ks><option>A</option><option>B</option></select>\
+                   <select id=ms><option>A</option></select></form><script>\
+                   ['kc','kr','mc','mr','ks','ms'].forEach(function (id) {\
+                     var control = document.getElementById(id);\
+                     ['click','input','change','focus','blur','submit'].forEach(function (name) {\
+                       control.addEventListener(name, function () { console.log(id + ':' + name); });\
+                     });\
+                   });\
+                   document.getElementById('f').addEventListener('submit', function () { console.log('form:submit'); });\
+                   </script>";
+        let (mut app, id) = scripted_app(src);
+        app.update(Msg::RunScripts { id });
+        let logged = app.console.entries().len();
+
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let mouse_checkbox = by_id(&app, "mc");
+        let mouse_radio = by_id(&app, "mr");
+        click_control(&mut app, mouse_checkbox);
+        click_control(&mut app, mouse_radio);
+        let keyboard_select = by_id(&app, "ks");
+        app.focus = Some(keyboard_select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let mouse_select = by_id(&app, "ms");
+        click_control(&mut app, mouse_select);
+
+        let dom = app.dom.as_ref().unwrap();
+        for id in ["kc", "kr", "mc", "mr"] {
+            assert!(layout::field::checked(dom, by_id(&app, id), "input"));
+        }
+        assert_eq!(
+            app.console.entries().len(),
+            logged,
+            "choice activation dispatched an event: {:?}",
+            app.console.entries()
+        );
+    }
+
     // ---- M11.10: `<form>` GET ---------------------------------------------
 
     /// A page loaded from `url` and parsed, in an app of the given size — the
@@ -7335,6 +8186,41 @@ mod tests {
         // navigation and history was pushed.
         let back = app.update(ch('H'));
         assert_eq!(fetched(&back), Some("http://news.ycombinator.com/news"));
+    }
+
+    #[test]
+    fn reader_choices_reach_get_and_post_requests_through_the_same_submission_path() {
+        for method in ["", " method=post"] {
+            let html = format!(
+                "<form{method} action=/save><input id=c type=checkbox name=c value=yes>\
+                 <select id=s name=s><option value=a>A</option><option value=b>B</option></select>\
+                 <button id=go>Save</button></form>"
+            );
+            let (mut app, _) = page_from("http://site.test/page", &html, 80, 10);
+            let checkbox = by_id(&app, "c");
+            app.focus = Some(checkbox);
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            let select = by_id(&app, "s");
+            app.focus = Some(select);
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            app.update(key(KeyCode::Down, KeyModifiers::NONE));
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            app.focus = Some(by_id(&app, "go"));
+            let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            let (_, request) = effect.fetch.as_ref().expect("choice form did not submit");
+            if method.is_empty() {
+                assert_eq!(request.url, "http://site.test/save?c=yes&s=b");
+                assert_eq!(request.method, net::Method::Get);
+            } else {
+                assert_eq!(request.url, "http://site.test/save");
+                assert_eq!(
+                    request.method,
+                    net::Method::Post {
+                        body: "c=yes&s=b".into()
+                    }
+                );
+            }
+        }
     }
 
     #[test]
@@ -8906,6 +9792,84 @@ mod tests {
         eprintln!(
             "  patch + repaint             {}  \
              (styles/layouts/paints per keystroke: {narrow_stages:?})",
+            summarize(&narrow),
+        );
+    }
+
+    /// M11.12's activation measurement, using one of Wikipedia's real dropdown
+    /// checkboxes and the same narrowed-box B side as the text-field benchmark.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_choice_activation -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_choice_activation_on_wikipedia() {
+        const ROUNDS: usize = 5;
+        let source = wikipedia_with_script("", "1;");
+        let one = |narrow: bool| -> (Duration, (usize, usize, usize)) {
+            let mut app = App::new(80, 24);
+            let id = app.start_fetch("http://x/".into());
+            load(&mut app, id, source.as_bytes().to_vec());
+            app.update(parsed(id, &source));
+            app.update(Msg::RunScripts { id });
+            app.narrow_keystroke = narrow;
+            let dom = app.dom.as_ref().unwrap();
+            app.focus = Some(
+                (0..dom.node_count() as u32)
+                    .map(NodeId)
+                    .find(|&node| {
+                        matches!(&dom.node(node).data, NodeData::Element { tag, .. } if tag == "input")
+                            && dom.attr(node, "type") == Some("checkbox")
+                    })
+                    .expect("Wikipedia's dropdown checkbox"),
+            );
+            let mut renderer =
+                crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let before = stages(&app);
+            let started = Instant::now();
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let elapsed = started.elapsed();
+            let after = stages(&app);
+            (
+                elapsed,
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+            )
+        };
+
+        let (mut simple, mut narrow) = (Vec::new(), Vec::new());
+        let (mut simple_stages, mut narrow_stages) = ((0, 0, 0), (0, 0, 0));
+        for round in 0..=ROUNDS {
+            let (a, b) = if round % 2 == 0 {
+                let a = one(false);
+                (a, one(true))
+            } else {
+                let b = one(true);
+                (one(false), b)
+            };
+            simple_stages = a.1;
+            narrow_stages = b.1;
+            if round > 0 {
+                simple.push(a.0);
+                narrow.push(b.0);
+            }
+        }
+        eprintln!(
+            "M11.12 checkbox keypress→screen on en.wikipedia.org at 80×24, \
+             mean of {ROUNDS} interleaved rounds (budget < 10 ms):"
+        );
+        eprintln!(
+            "  relayout + repaint (ships)  {}  \
+             (styles/layouts/paints: {simple_stages:?})",
+            summarize(&simple),
+        );
+        eprintln!(
+            "  patch + repaint             {}  \
+             (styles/layouts/paints: {narrow_stages:?})",
             summarize(&narrow),
         );
     }

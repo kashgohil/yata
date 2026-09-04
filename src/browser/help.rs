@@ -53,6 +53,12 @@ pub fn action_help(action: Action) -> &'static str {
         Action::SearchPrev => "previous search match",
         Action::ToggleHelp => "this help",
         Action::Submit => "submit the form",
+        Action::SelectPrev => "previous option",
+        Action::SelectNext => "next option",
+        Action::SelectFirst => "first option",
+        Action::SelectLast => "last option",
+        Action::SelectToggle => "toggle option",
+        Action::SelectCommit => "choose option and close",
     }
 }
 
@@ -75,6 +81,9 @@ pub fn help_text() -> String {
         "(any character)", "insert at the caret"
     ));
     lines.extend(section_lines(Mode::Field));
+    lines.push(String::new());
+    lines.extend(heading("Select — Enter chooses, Esc stops"));
+    lines.extend(section_lines(Mode::Select));
     lines.push(String::new());
     lines.push("Press ? or Esc to close.".into());
     lines.join("\n")
@@ -216,6 +225,16 @@ mod tests {
                 "help missing the chord for {:?}:\n{text}",
                 b.action
             );
+            assert!(text.contains(action_help(b.action)), "{text}");
+        }
+    }
+
+    #[test]
+    fn help_lists_every_select_binding_from_the_table() {
+        let text = help_text();
+        assert!(text.contains("Select"), "{text}");
+        for b in keys::BINDINGS.iter().filter(|b| b.mode == Mode::Select) {
+            assert!(text.contains(&format_binding(b)), "{:?}\n{text}", b.action);
             assert!(text.contains(action_help(b.action)), "{text}");
         }
     }
