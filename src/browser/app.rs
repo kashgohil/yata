@@ -733,10 +733,7 @@ impl App {
                     );
                     self.console_view_built = false;
                 }
-                // 301/302/303 rewrite POST to GET; 307/308 keep it. Matching
-                // browsers, not the HTTP spec's historical confusion about
-                // 301/302 — a login *is* POST /login → 302 → GET /app, and
-                // keeping POST would send the password at `/app`.
+                // `rewrite_method` — a login's 302 must not keep POST.
                 let next_method = match &self.fetch {
                     Fetch::Loading { method, .. } => rewrite_method(status, method),
                     _ => net::Method::Get,
@@ -7484,21 +7481,33 @@ mod tests {
         }
     }
 
+    fn login_page() -> (App, FetchId) {
+        let mut app = App::new(80, 8);
+        let id = load_with_cookies(
+            &mut app,
+            "http://site.test/page",
+            login_form(),
+            &["sid=abc; Path=/"],
+        );
+        app.update(Msg::RunScripts { id });
+        (app, id)
+    }
+
     #[test]
     fn a_login_shaped_post_hops_to_get_with_the_cookie() {
-        // **The acceptance case.** POST /login with the fields in the body,
-        // then a 302 that hands out a session, then GET /app carrying it —
-        // same FetchId, no body on the hop, history pointing at the form page.
-        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
-        app.update(Msg::RunScripts { id });
+        // **The acceptance case.** POST /login with the fields in the body
+        // and the jar's `Cookie:` for that URL, then a 302 that hands out a
+        // session, then GET /app carrying it — same FetchId, no body on the
+        // hop, history pointing at the form page.
+        let (mut app, _) = login_page();
         let before = stages(&app);
         start_typing_at_first_field(&mut app);
 
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         let (fetch_id, request) = effect.fetch.as_ref().expect("a POST did not navigate");
         assert_login_post(request);
+        assert_eq!(request.cookie.as_deref(), Some("sid=abc"));
         assert_eq!(Some(*fetch_id), app.current_fetch);
-        assert_eq!(request.cookie.as_deref(), None);
         assert_eq!(stages(&app), before, "a POST ran a pipeline stage");
         assert!(app.history.can_back(), "a POST did not push history");
         assert!(
@@ -7510,8 +7519,7 @@ mod tests {
         assert!(app.update(ch('q')).quit, "q did not quit after a POST");
 
         // The 302: same generation, GET, cookie from the hop, no body.
-        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
-        app.update(Msg::RunScripts { id });
+        let (mut app, _) = login_page();
         start_typing_at_first_field(&mut app);
         let posted = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         let fetch_id = posted.fetch.as_ref().unwrap().0;
