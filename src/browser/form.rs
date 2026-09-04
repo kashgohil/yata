@@ -135,7 +135,9 @@ pub fn submit(dom: &Dom, base: &str, activator: NodeId) -> Option<Submit> {
 ///   and it is the difference between a search that works and one that lands on
 ///   the wrong page;
 /// - the **activating** submit button contributes its own `name=value` if it
-///   has a name; no other button in the form does, ever.
+///   has a name; no other button in the form does, ever. Implicit
+///   submission from a field therefore sends no button — a deviation from
+///   HTML, which still has a submitter then (the first submit button).
 ///
 /// The controls M11.12 owns — `checkbox`, `radio`, `select`, `file` — and the
 /// types M11.8 draws as nothing contribute **nothing**, because this engine has
@@ -421,7 +423,11 @@ mod tests {
             url_of(submit(&dom, "http://x/page", buttons[1])),
             "http://x/page?q=v&two=2"
         );
-        // Activated from the field instead: no button at all.
+        // **The deviation**: HTML still has a submitter here — the first
+        // submit button in the form — so this would send `one=1` in a browser.
+        // The caret's field is the activator, and a default-button rule would
+        // send a name the reader never pressed. It will matter the moment a
+        // server keys off the button (`search` vs `cancel`).
         assert_eq!(
             url_of(submit(&dom, "http://x/page", first(&dom, "input"))),
             "http://x/page?q=v"

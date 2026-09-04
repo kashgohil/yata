@@ -41,7 +41,9 @@ pub fn action_help(action: Action) -> &'static str {
         // overlay is where a reader finds that out, so it says it.
         Action::FocusNext => "next link or field",
         Action::FocusPrev => "previous link or field",
-        Action::FollowFocus => "follow the focused link / type in the field",
+        // Wikipedia's Search is a `<button>` with no type: `Enter` submits it,
+        // and the overlay is where a reader Tabs to Search and finds that out.
+        Action::FollowFocus => "follow the focused link / type in the field / submit a button",
         Action::HistoryBack => "history back",
         Action::HistoryForward => "history forward",
         Action::Reload => "reload",
@@ -164,7 +166,18 @@ mod tests {
     #[test]
     fn help_mentions_flagship_bindings() {
         let text = help_text();
-        for needle in ["f ", "follow", "?", "/", "q ", "gg", "scroll", "search"] {
+        for needle in [
+            "f ",
+            "follow",
+            "?",
+            "/",
+            "q ",
+            "gg",
+            "scroll",
+            "search",
+            // M11.10: Browse `Enter` also submits a focused submit button.
+            "submit a button",
+        ] {
             assert!(
                 text.to_ascii_lowercase()
                     .contains(&needle.to_ascii_lowercase())

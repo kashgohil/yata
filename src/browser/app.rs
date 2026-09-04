@@ -7318,6 +7318,48 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_focused_submit_button_submits() {
+        // The third activator: `Enter` in Browse on a focused submit button —
+        // Wikipedia's `<button>` with no `type`, and `<input type=submit>`.
+        // The Wikipedia fixture covers Field-mode `Enter` and a click; the
+        // type=button/reset test covers Browse `Enter` only for the *non*-
+        // submit case. A later `follow_focus` refactor cannot drop this
+        // branch without failing here.
+        let html = "<form action=/search>\
+            <input name=q value=cat>\
+            <button name=go value=1 id=go>Search</button>\
+            <input type=submit name=alt value=2 id=alt></form>";
+
+        let (mut app, _) = page_from("http://x/page", html, 60, 8);
+        app.focus = Some(by_id(&app, "go"));
+        let keyed = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            fetched(&keyed),
+            Some("http://x/search?q=cat&go=1"),
+            "Enter on the focused <button> did not submit"
+        );
+
+        let (mut app, _) = page_from("http://x/page", html, 60, 8);
+        app.focus = Some(by_id(&app, "alt"));
+        let keyed = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            fetched(&keyed),
+            Some("http://x/search?q=cat&alt=2"),
+            "Enter on the focused <input type=submit> did not submit"
+        );
+
+        // The same button, clicked: one function, one request.
+        let (mut app, _) = page_from("http://x/page", html, 60, 8);
+        let button = by_id(&app, "go");
+        let clicked = click_node(&mut app, button);
+        assert_eq!(
+            fetched(&clicked),
+            Some("http://x/search?q=cat&go=1"),
+            "clicking the button sent something else"
+        );
+    }
+
+    #[test]
     fn a_two_field_button_less_form_submits_on_enter() {
         // **The deviation** (deliverable 2): HTML submits a button-less form on
         // `Enter` only when it has exactly one field that blocks implicit
