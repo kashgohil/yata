@@ -188,11 +188,8 @@ fn bounded_token(s: &str) -> String {
 ///   submission from a field therefore sends no button — a deviation from
 ///   HTML, which still has a submitter then (the first submit button).
 ///
-/// The controls M11.12 owns — `checkbox`, `radio`, `select`, `file` — and the
-/// types M11.8 draws as nothing contribute **nothing**, because this engine has
-/// no state for them yet. A form with a checkbox submits as if it were
-/// unchecked, which is right by accident and wrong in general (recorded as a
-/// deviation, with M11.12 named).
+/// Choice controls contribute their live state. File inputs and specialized
+/// controls still contribute nothing because this engine cannot operate them.
 fn data_set(dom: &Dom, form: NodeId, activator: NodeId) -> String {
     let mut pairs: Vec<String> = Vec::new();
     walk(dom, form, &mut |node, tag| {
@@ -202,22 +199,40 @@ fn data_set(dom: &Dom, form: NodeId, activator: NodeId) -> String {
         if dom.attr(node, "disabled").is_some() {
             return;
         }
-        let value = match entry(dom, node, tag) {
-            Entry::Value => field::value(dom, node, tag),
+        let values = match entry(dom, node, tag) {
+            Entry::Value => vec![field::value(dom, node, tag)],
+            Entry::Checkbox | Entry::Radio if field::checked(dom, node, tag) => {
+                vec![dom.attr(node, "value").unwrap_or("on").to_string()]
+            }
+            Entry::Checkbox | Entry::Radio => return,
+            Entry::Select => {
+                let options = field::options(dom, node);
+                field::selected_options(dom, node, &options)
+                    .into_iter()
+                    .filter_map(|selected| {
+                        options
+                            .iter()
+                            .find(|option| option.node == selected && !option.disabled)
+                            .map(|option| option.value.clone())
+                    })
+                    .collect()
+            }
             // A button is in the set only when it is the one that was pressed,
             // and then it contributes the `value` attribute it was written
             // with — not the label a reader sees, which HTML invents
             // ("Submit") for a button that has none.
             Entry::Submitter if node == activator && is_submit_button(dom, node) => {
-                dom.attr(node, "value").unwrap_or_default().to_string()
+                vec![dom.attr(node, "value").unwrap_or_default().to_string()]
             }
             Entry::Submitter | Entry::None => return,
         };
-        pairs.push(format!(
-            "{}={}",
-            net::form_urlencode(name),
-            net::form_urlencode(&crlf(&value))
-        ));
+        for value in values {
+            pairs.push(format!(
+                "{}={}",
+                net::form_urlencode(name),
+                net::form_urlencode(&crlf(&value))
+            ));
+        }
     });
     pairs.join("&")
 }
@@ -229,6 +244,9 @@ enum Entry {
     Value,
     /// Its value, but only if it is the control that was activated.
     Submitter,
+    Checkbox,
+    Radio,
+    Select,
     /// Nothing, ever.
     None,
 }
@@ -240,9 +258,11 @@ fn entry(dom: &Dom, node: NodeId, tag: &str) -> Entry {
     if tag.eq_ignore_ascii_case("button") {
         return Entry::Submitter;
     }
+    if tag.eq_ignore_ascii_case("select") {
+        return Entry::Select;
+    }
     if !tag.eq_ignore_ascii_case("input") {
-        // `<select>`: M11.12's, and until then it has no selected option to
-        // report. `<output>`, `<object>` and the rest of HTML's list are not
+        // `<output>`, `<object>` and the rest of HTML's list are not
         // controls this engine has at all.
         return Entry::None;
     }
@@ -253,11 +273,15 @@ fn entry(dom: &Dom, node: NodeId, tag: &str) -> Entry {
     }
     // The list is written out rather than borrowed from `field::kind`, which
     // groups by "draws no box" and would put `hidden` on the wrong side of it.
-    // The two lists mean different things and will move apart when M11.12 gives
-    // a checkbox both a box and a state.
+    // The two lists mean different things: hidden serializes without a box,
+    // while choice controls have both boxes and live state.
+    if is(&["checkbox"]) {
+        return Entry::Checkbox;
+    }
+    if is(&["radio"]) {
+        return Entry::Radio;
+    }
     if is(&[
-        "checkbox",
-        "radio",
         "file",
         "image",
         "range",
@@ -329,6 +353,13 @@ mod tests {
                     NodeData::Element { tag: t, .. } if t.eq_ignore_ascii_case(tag))
             })
             .unwrap_or_else(|| panic!("the fixture has no <{tag}>"))
+    }
+
+    fn find_id(dom: &Dom, wanted: &str) -> NodeId {
+        (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&id| dom.attr(id, "id") == Some(wanted))
+            .unwrap_or_else(|| panic!("the fixture has no #{wanted}"))
     }
 
     fn url_of(submitted: Option<Submit>) -> String {
@@ -445,8 +476,53 @@ mod tests {
         );
         assert_eq!(
             url_of(submit(&dom, "http://x/page", first(&dom, "input"))),
-            "http://x/page?a=1&c=3&d=4&g=text"
+            "http://x/page?a=1&c=3&d=4&e=on&f=1&g=text"
         );
+    }
+
+    #[test]
+    fn choices_contribute_zero_one_or_many_values_in_tree_order() {
+        let mut dom = html::parse(
+            "<form method=post><input id=a type=checkbox name=c value=yes>\
+             <input id=b type=checkbox name=c checked>\
+             <input type=radio name=r value=old checked>\
+             <input id=r type=radio name=r value=new checked>\
+             <select name=s multiple><option value=1 selected>one</option>\
+             <option disabled selected value=2>two</option>\
+             <option selected> three </option></select></form>",
+        );
+        let checkbox = find_id(&dom, "a");
+        dom.set_choice_state(checkbox, "checked", true);
+        assert_eq!(
+            submit(&dom, "http://x/page", checkbox),
+            Some(Submit::Post {
+                url: "http://x/page".into(),
+                body: "c=yes&c=on&r=new&s=1&s=three".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn choice_data_is_identical_for_get_and_post_and_skips_disabled_placeholders() {
+        let controls = "<input type=checkbox name=off>\
+                        <input type=radio name=r value=no>\
+                        <select name=placeholder><option disabled selected value=no>Choose</option>\
+                        <option value=yes>Yes</option></select>\
+                        <select name=empty><option selected value=''>Blank label</option></select>\
+                        <select name=none multiple><option>No choice</option></select>";
+        for (method, expected) in [
+            ("", "http://x/page?empty="),
+            (" method=post", "POST http://x/page empty="),
+        ] {
+            let dom = html::parse(&format!("<form{method}>{controls}</form>"));
+            let submitted = submit(&dom, "http://x/page", first(&dom, "input"));
+            let actual = match submitted {
+                Some(Submit::Get(url)) => url,
+                Some(Submit::Post { url, body }) => format!("POST {url} {body}"),
+                other => panic!("unexpected submission: {other:?}"),
+            };
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -684,6 +760,30 @@ mod tests {
             }
             other => panic!("expected a POST under the cap, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn multiple_selected_options_share_the_post_body_cap() {
+        let mut dom = html::parse(
+            "<form method=post action=/x><select name=m multiple>\
+             <option id=a selected>A</option><option id=b selected>B</option>\
+             </select></form>",
+        );
+        let select = first(&dom, "select");
+        let (first_option, second_option) = (find_id(&dom, "a"), find_id(&dom, "b"));
+        let first_len = MAX_POST_BODY / 2;
+        let second_len = MAX_POST_BODY - first_len - 5;
+        dom.set_attr(first_option, "value", &"a".repeat(first_len));
+        dom.set_attr(second_option, "value", &"b".repeat(second_len));
+        match submit(&dom, "http://x/page", select) {
+            Some(Submit::Post { body, .. }) => assert_eq!(body.len(), MAX_POST_BODY),
+            other => panic!("expected a POST at the cap, got {other:?}"),
+        }
+        dom.set_attr(second_option, "value", &"b".repeat(second_len + 1));
+        assert_eq!(
+            submit(&dom, "http://x/page", select),
+            Some(Submit::Unsupported("huge".into()))
+        );
     }
 
     #[test]
