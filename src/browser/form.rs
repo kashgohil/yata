@@ -1,4 +1,4 @@
-//! What a `<form>` submission *is* (M11.10): a query string and a URL.
+//! What a `<form>` submission *is* (M11.10, M11.11): a GET query or a POST body.
 //!
 //! **A submission is a navigation, and there is only one of those.** Everything
 //! here is a pure function of the DOM plus the control that was activated; it
