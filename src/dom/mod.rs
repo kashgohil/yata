@@ -153,6 +153,9 @@ pub struct Dom {
     /// Absent means clean, so the map stays empty on every page nobody has
     /// typed into, which is every page until M11.9.
     field_values: HashMap<NodeId, String>,
+    /// Live checkedness/selectedness after a reader changes a choice (M11.12).
+    /// Missing means the content attribute is still the default.
+    choice_states: HashMap<NodeId, bool>,
 }
 
 /// What kind of change an edit was, for `Dom::note_edit`.
@@ -190,6 +193,7 @@ impl Dom {
             attr_changes: Vec::new(),
             attr_changes_overflowed: false,
             field_values: HashMap::new(),
+            choice_states: HashMap::new(),
         }
     }
 
@@ -428,6 +432,59 @@ impl Dom {
     pub fn set_field_value(&mut self, id: NodeId, value: &str) {
         self.field_values.insert(id, value.to_string());
         self.note_edit(Edit::Structure);
+    }
+
+    /// A reader's live checked/selected override, or `None` while the element
+    /// still follows its content attribute.
+    pub fn choice_state(&self, id: NodeId) -> Option<bool> {
+        self.choice_states.get(&id).copied()
+    }
+
+    /// Set live checkedness/selectedness without changing the content
+    /// attribute selectors see. Returns whether the live state changed.
+    pub fn set_choice_state(&mut self, id: NodeId, attribute: &str, value: bool) -> bool {
+        let current = self
+            .choice_states
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| self.attr(id, attribute).is_some());
+        if current == value {
+            return false;
+        }
+        self.choice_states.insert(id, value);
+        self.note_edit(Edit::Structure);
+        true
+    }
+
+    /// Atomically dirty a radio group or single select. When its canonical
+    /// answer changes, every member gets an override so later attribute writes
+    /// cannot make a clean peer rejoin the live group.
+    pub fn set_choice_group(&mut self, states: &[(NodeId, bool)], attribute: &str) -> bool {
+        let changed = states.iter().any(|&(id, value)| {
+            self.choice_states
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| self.attr(id, attribute).is_some())
+                != value
+        });
+        if !changed {
+            return false;
+        }
+        self.choice_states.extend(states.iter().copied());
+        self.note_edit(Edit::Structure);
+        true
+    }
+
+    /// Whether this arena node is currently under the document root.
+    pub fn is_connected(&self, id: NodeId) -> bool {
+        let mut current = Some(id);
+        while let Some(node) = current {
+            if node == self.root {
+                return true;
+            }
+            current = self.node(node).parent;
+        }
+        false
     }
 
     /// Replace a text node's content. `false`, and no change, when `id` is not
@@ -1018,6 +1075,34 @@ mod tests {
         assert!(!dom.set_text(div, "nope"));
         assert!(!dom.set_attr(text, "id", "nope"));
         assert!(!dom.remove_attr(text, "id"));
+    }
+
+    #[test]
+    fn a_changed_choice_group_dirties_every_member_once() {
+        let mut dom = Dom::new_document();
+        let first = dom.append_child(
+            dom.root,
+            NodeData::Element {
+                tag: "input".into(),
+                attrs: vec![("checked".into(), String::new())],
+            },
+        );
+        let second = dom.append_child(
+            dom.root,
+            NodeData::Element {
+                tag: "input".into(),
+                attrs: Vec::new(),
+            },
+        );
+        let before = dom.version();
+        assert!(dom.set_choice_group(&[(first, false), (second, true)], "checked"));
+        assert_eq!(dom.version(), before + 1);
+        assert_eq!(dom.choice_state(first), Some(false));
+        assert_eq!(dom.choice_state(second), Some(true));
+
+        let before = dom.version();
+        assert!(!dom.set_choice_group(&[(first, false), (second, true)], "checked"));
+        assert_eq!(dom.version(), before);
     }
 
     #[test]
