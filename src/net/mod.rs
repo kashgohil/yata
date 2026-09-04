@@ -252,8 +252,8 @@ mod tests {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FetchId(pub u64);
 
-/// One request a worker is to make: where to, and the `Cookie:` header the jar
-/// decided it may carry (M11.7).
+/// One request a worker is to make: where to, the `Cookie:` header the jar
+/// decided it may carry (M11.7), and — for a document — the method.
 ///
 /// A type rather than a second parameter on five functions, because the
 /// pairing is the whole point. The jar is `Rc<RefCell<…>>` and therefore
@@ -262,12 +262,28 @@ pub struct FetchId(pub u64);
 /// string somebody already decided on, on the UI thread, through
 /// `cookies::header_for`. "Did this request ask the jar?" is then a question a
 /// reviewer answers by reading a signature rather than by counting call sites.
+///
+/// The method is an enum whose POST variant *is* the body, so a GET cannot
+/// carry one (M11.11). A password has no business riding along on a link
+/// click, a reload, or a 303 hop by accident.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Request {
     pub url: String,
     /// The `Cookie:` header value, or `None` for a request that carries none —
     /// cross-origin, or a jar with nothing that matches.
     pub cookie: Option<String>,
+    pub method: Method,
+}
+
+/// What kind of document request this is (M11.11). Subresources are always
+/// [`Get`]: they have no caller that would set a body.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub enum Method {
+    #[default]
+    Get,
+    /// `application/x-www-form-urlencoded` body. The Content-Type is implied;
+    /// the worker writes it, so a GET cannot grow one by forgetting a branch.
+    Post { body: String },
 }
 
 impl Request {
@@ -278,6 +294,7 @@ impl Request {
         Request {
             url: url.into(),
             cookie: None,
+            method: Method::Get,
         }
     }
 }

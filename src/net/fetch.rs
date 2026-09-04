@@ -8,7 +8,7 @@ use crate::css;
 use crate::html;
 use crate::image;
 use crate::msg::Msg;
-use crate::net::{FetchId, Request};
+use crate::net::{FetchId, Method, Request};
 
 /// Read size per chunk: small enough that progress messages arrive steadily
 /// on slow links, large enough that syscall overhead is irrelevant.
@@ -345,11 +345,9 @@ fn document_client() -> Result<reqwest::blocking::Client, String> {
 /// Where a 3xx says to go, resolved against the URL that produced it — or
 /// `None` when this is not a redirect the loop can follow.
 ///
-/// The statuses are HTTP's five: 301, 302, 303, 307 and 308. Every request this
-/// engine makes today is a GET, so the distinction between them — 303 rewrites
-/// the method to GET, 307 and 308 preserve it — has nothing to bite on yet.
-/// **M11.11 is where it does**, when a form POST meets a 303 and the difference
-/// is the whole of whether the form is submitted twice.
+/// The statuses are HTTP's five: 301, 302, 303, 307 and 308. The worker
+/// reports the status and stops; rewriting POST→GET on 301/302/303 (and
+/// keeping POST on 307/308) is the event loop's (M11.11).
 ///
 /// A 3xx with no `Location`, or one whose `Location` will not resolve, is not a
 /// redirect: it falls through as an ordinary response, which the error-page
@@ -386,7 +384,17 @@ fn fetch(
     // reqwest. The document's client does not follow redirects: this worker
     // performs exactly one request and reports what happened (M11.7a).
     let client = document_client().map_err(|reason| (url.to_string(), reason))?;
-    let mut resp = with_cookies(client.get(url), request)
+    let builder = match &request.method {
+        Method::Get => client.get(url),
+        Method::Post { body } => client
+            .post(url)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/x-www-form-urlencoded",
+            )
+            .body(body.clone()),
+    };
+    let mut resp = with_cookies(builder, request)
         .send()
         .map_err(|e| (url.to_string(), describe(e)))?;
     let status = resp.status().as_u16();
@@ -424,6 +432,7 @@ fn fetch(
             id,
             url: final_url,
             to,
+            status,
             elapsed: started.elapsed(),
             set_cookie,
         }));
@@ -523,10 +532,23 @@ mod tests {
                 };
                 let mut req = Vec::new();
                 let mut buf = [0u8; 1024];
-                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                loop {
                     match stream.read(&mut buf) {
                         Ok(0) | Err(_) => break,
-                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                        Ok(n) => {
+                            req.extend_from_slice(&buf[..n]);
+                            if let Some(at) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                                let length = content_length_of(&req[..at]).unwrap_or(0);
+                                let need = at + 4 + length;
+                                while req.len() < need {
+                                    match stream.read(&mut buf) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                                    }
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
                 let text = String::from_utf8_lossy(&req).into_owned();
@@ -536,6 +558,17 @@ mod tests {
             }
         });
         (addr, seen)
+    }
+
+    fn content_length_of(headers: &[u8]) -> Option<usize> {
+        let text = std::str::from_utf8(headers).ok()?;
+        text.lines().find_map(|line| {
+            line.split_once(':').and_then(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().ok())
+                    .flatten()
+            })
+        })
     }
 
     /// The `Cookie:` header a captured request carried, if any.
@@ -893,6 +926,7 @@ mod tests {
             id,
             url,
             to,
+            status,
             elapsed,
             set_cookie,
         } = &msgs[0]
@@ -902,12 +936,88 @@ mod tests {
         assert_eq!(*id, FetchId(5));
         assert_eq!(*url, format!("http://{addr}/start"));
         assert_eq!(*to, format!("http://{addr}/final"));
+        assert_eq!(*status, 302);
         assert_eq!(set_cookie, &["sid=abc; Path=/".to_string()]);
         assert!(*elapsed > Duration::ZERO, "the worker must measure its hop");
         assert_eq!(
             seen.lock().unwrap().len(),
             1,
             "the worker followed the redirect itself"
+        );
+    }
+
+    #[test]
+    fn a_post_goes_on_the_wire_with_its_body_and_content_type() {
+        // The document worker is the one that sends a form POST (M11.11).
+        // `spawn_js_fetch` already knew `.post()`; routing a navigation
+        // through it would make a form submission a promise, not a page.
+        let (addr, seen) = serve_capturing(1, |_| ok_body("ok"));
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(1),
+            Request {
+                url: format!("http://{addr}/login"),
+                cookie: Some("sid=abc".into()),
+                method: Method::Post {
+                    body: "acct=pg&pw=secret".into(),
+                },
+            },
+            tx,
+        );
+        drain(rx);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let req = &seen[0];
+        assert!(req.starts_with("POST "), "{req}");
+        assert!(
+            req.to_ascii_lowercase()
+                .contains("content-type: application/x-www-form-urlencoded"),
+            "{req}"
+        );
+        assert_eq!(cookie_header(req), Some("sid=abc"));
+        assert!(
+            req.contains("acct=pg&pw=secret"),
+            "the body did not reach the server: {req}"
+        );
+    }
+
+    #[test]
+    fn a_post_302_is_a_redirect_message_with_its_status() {
+        // The worker reports the 302 and stops. Rewriting POST→GET is App's.
+        let (addr, seen) = serve_capturing(2, |_| {
+            b"HTTP/1.1 302 Found\r\nLocation: /app\r\nSet-Cookie: sid=abc; Path=/\r\n\
+              Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(1),
+            Request {
+                url: format!("http://{addr}/login"),
+                cookie: None,
+                method: Method::Post {
+                    body: "acct=pg&pw=secret".into(),
+                },
+            },
+            tx,
+        );
+        let msgs = drain(rx);
+        let Msg::Redirect {
+            status,
+            to,
+            set_cookie,
+            ..
+        } = &msgs[0]
+        else {
+            panic!("expected Redirect, got {:?}", msgs[0]);
+        };
+        assert_eq!(*status, 302);
+        assert!(to.ends_with("/app"), "{to}");
+        assert_eq!(set_cookie, &["sid=abc; Path=/".to_string()]);
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "the worker followed the 302 itself"
         );
     }
 
@@ -943,10 +1053,12 @@ mod tests {
             drain(rx).remove(0)
         };
         for status in [301, 302, 303, 307, 308] {
-            assert!(
-                matches!(hop(status, "Location: /next\r\n"), Msg::Redirect { .. }),
-                "{status} did not hop"
-            );
+            match hop(status, "Location: /next\r\n") {
+                Msg::Redirect {
+                    status: reported, ..
+                } => assert_eq!(reported, status, "{status} lost its status"),
+                other => panic!("{status} did not hop: {other:?}"),
+            }
         }
         assert!(matches!(hop(302, ""), Msg::Loaded { status: 302, .. }));
         assert!(matches!(
@@ -1072,6 +1184,7 @@ mod tests {
         let request = |path: &str| Request {
             url: format!("http://{addr}{path}"),
             cookie: Some("sid=abc".to_string()),
+            method: crate::net::Method::Get,
         };
 
         let (tx, rx) = mpsc::channel();
@@ -1371,6 +1484,7 @@ mod tests {
             Request {
                 url: format!("http://{start}/start.css"),
                 cookie: Some("sid=abc".to_string()),
+                method: crate::net::Method::Get,
             },
             tx,
         );
@@ -1413,6 +1527,7 @@ mod tests {
             Request {
                 url: format!("http://{addr}/b"),
                 cookie: Some("sid=real".to_string()),
+                method: crate::net::Method::Get,
             },
             "GET".to_string(),
             vec![("Cookie".to_string(), "sid=forged".to_string())],

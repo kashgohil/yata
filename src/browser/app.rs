@@ -160,6 +160,11 @@ enum Fetch {
     Loading {
         url: String,
         bytes_so_far: u64,
+        /// The document request this generation last asked the loop to send
+        /// (M11.11). A hop rewrites it in place so `POST → 307 → POST → 303 →
+        /// GET` does not resurrect the body after the 303. `Loaded` does not
+        /// remember a body: once the page has landed, reload is GET.
+        method: net::Method,
     },
     Loaded {
         url: String,
@@ -546,6 +551,7 @@ impl App {
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
+            method: net::Method::Get,
         };
         self.spinner = 0;
         id
@@ -696,6 +702,7 @@ impl App {
                 id,
                 url,
                 to,
+                status,
                 elapsed,
                 set_cookie,
             } => {
@@ -726,6 +733,17 @@ impl App {
                     );
                     self.console_view_built = false;
                 }
+                // 301/302/303 rewrite POST to GET; 307/308 keep it. Matching
+                // browsers, not the HTTP spec's historical confusion about
+                // 301/302 — a login *is* POST /login → 302 → GET /app, and
+                // keeping POST would send the password at `/app`.
+                let next_method = match &self.fetch {
+                    Fetch::Loading { method, .. } => rewrite_method(status, method),
+                    _ => net::Method::Get,
+                };
+                if let Fetch::Loading { method, .. } = &mut self.fetch {
+                    *method = next_method.clone();
+                }
                 // Then the page's URL, and only then the next request: the
                 // ordering *is* the task. `App::request` measures the jar
                 // against `current_url`, so moving it to the target first is
@@ -741,9 +759,11 @@ impl App {
                 if let Some(fragment) = fragment_of(&to).filter(|f| !f.is_empty()) {
                     self.pending_scroll = Some((id, PendingScroll::Fragment(fragment.to_string())));
                 }
+                let mut request = self.request(to);
+                request.method = next_method;
                 Effect {
                     dirty: true,
-                    fetch: Some((id, self.request(to))),
+                    fetch: Some((id, request)),
                     ..Effect::default()
                 }
             }
@@ -2006,7 +2026,11 @@ impl App {
     fn request(&self, url: String) -> net::Request {
         let page = self.current_url().unwrap_or_default();
         let cookie = js::cookies::header_for(&self.cookies, &page, &url, js::cookies::now());
-        net::Request { url, cookie }
+        net::Request {
+            url,
+            cookie,
+            method: net::Method::Get,
+        }
     }
 
     /// Current page URL if one is known (loaded, loading, or failed).
@@ -2022,6 +2046,12 @@ impl App {
     /// Start a navigation. When `push_history` is true and there is a current
     /// page, push it (with scroll) onto the back stack and clear forward.
     fn navigate(&mut self, url: String, push_history: bool) -> Effect {
+        self.navigate_with(url, net::Method::Get, push_history)
+    }
+
+    /// A navigation that may be a POST (M11.11). GET still goes through
+    /// [`Self::navigate`]; this is the one path, with a method.
+    fn navigate_with(&mut self, url: String, method: net::Method, push_history: bool) -> Effect {
         if let Some(cur) = self.current_url() {
             // Same document (a pure fragment change): no fetch, no new
             // generation — a scroll and a URL. Checked before `push_history`
@@ -2034,7 +2064,12 @@ impl App {
             // to the top: it is what the URL bar does when the reader re-enters
             // the page's own URL, and what `location.reload()` has always been
             // spelled as. Both fall through to the fetch below.
-            if url.contains('#') && same_document(&cur, &url) {
+            //
+            // **POST never jumps.** A login form that posts to itself — or to
+            // `#x` — is a new request with a body, not a scroll of a cached
+            // display list.
+            if matches!(method, net::Method::Get) && url.contains('#') && same_document(&cur, &url)
+            {
                 return self.jump_to_fragment(url, push_history);
             }
             if push_history {
@@ -2047,9 +2082,14 @@ impl App {
         self.search = None;
         self.status_msg = None;
         let id = self.start_fetch(url.clone());
+        if let Fetch::Loading { method: slot, .. } = &mut self.fetch {
+            *slot = method.clone();
+        }
+        let mut request = self.request(url);
+        request.method = method;
         Effect {
             dirty: true,
-            fetch: Some((id, self.request(url))),
+            fetch: Some((id, request)),
             ..Effect::default()
         }
     }
@@ -2456,10 +2496,11 @@ impl App {
                 // ones, because this segment is what is left of the row after
                 // the URL and the scroll percentage have taken theirs (twenty
                 // cells on an 80-column terminal, where "yanked" lives).
-                // `POST` is the case that matters, and it is refused rather
-                // than downgraded: a value meant for a request body has no
-                // business in a URL or in the back-button list.
-                self.status_msg = Some(format!("can't send {method} forms"));
+                self.status_msg = Some(match method.as_str() {
+                    "FILE" => "can't send files".into(),
+                    "huge" => "form is too large".into(),
+                    other => format!("can't send {other} forms"),
+                });
                 redraw()
             }
             // Typing ends here, without being asked to: `navigate` clears the
@@ -2468,6 +2509,9 @@ impl App {
             // quits, and the reader is not stuck typing into a field that is
             // about to be replaced.
             Some(form::Submit::Get(url)) => self.navigate(url, true),
+            Some(form::Submit::Post { url, body }) => {
+                self.navigate_with(url, net::Method::Post { body }, true)
+            }
         }
     }
 
@@ -3796,6 +3840,18 @@ fn same_document(a: &str, b: &str) -> bool {
         s.split_once('#').map(|(u, _)| u).unwrap_or(s)
     }
     strip(a) == strip(b)
+}
+
+/// What the next hop's method is, given this hop's status (M11.11).
+///
+/// 301/302/303 rewrite POST to GET and drop the body; 307/308 keep POST.
+/// GET stays GET. Matching browsers, so a login's 302 does not POST the
+/// password at the landing page.
+fn rewrite_method(status: u16, method: &net::Method) -> net::Method {
+    match (status, method) {
+        (301..=303, net::Method::Post { .. }) => net::Method::Get,
+        (_, method) => method.clone(),
+    }
 }
 
 /// The fragment a URL carries, without its `#`. `Some("")` for a bare `#`,
@@ -6253,12 +6309,17 @@ mod tests {
 
     // ---- redirects through the loop (M11.7a) ------------------------------
 
-    /// One hop, as the worker reports it.
+    /// One hop, as the worker reports it. 302 is the login-shaped default.
     fn hop(id: FetchId, from: &str, to: &str, set_cookie: &[&str]) -> Msg {
+        hop_at(id, from, to, 302, set_cookie)
+    }
+
+    fn hop_at(id: FetchId, from: &str, to: &str, status: u16, set_cookie: &[&str]) -> Msg {
         Msg::Redirect {
             id,
             url: from.into(),
             to: to.into(),
+            status,
             elapsed: Duration::ZERO,
             set_cookie: set_cookie.iter().map(|s| (*s).to_string()).collect(),
         }
@@ -6558,6 +6619,7 @@ mod tests {
             id,
             url: "http://site.test/start".into(),
             to: "http://site.test/mid".into(),
+            status: 302,
             elapsed: Duration::from_millis(30),
             set_cookie: Vec::new(),
         });
@@ -6565,6 +6627,7 @@ mod tests {
             id,
             url: "http://site.test/mid".into(),
             to: "http://site.test/land".into(),
+            status: 302,
             elapsed: Duration::from_millis(20),
             set_cookie: Vec::new(),
         });
@@ -7186,6 +7249,10 @@ mod tests {
             .map(|(_, request)| request.url.as_str())
     }
 
+    fn fetched_request(effect: &Effect) -> Option<&net::Request> {
+        effect.fetch.as_ref().map(|(_, request)| request)
+    }
+
     /// The first element with this `id`.
     fn by_id(app: &App, id: &str) -> NodeId {
         let dom = app.dom.as_ref().expect("a parsed page");
@@ -7249,6 +7316,13 @@ mod tests {
 
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(fetched(&effect), Some("http://hn.algolia.com/?q=redirect"));
+        assert!(
+            matches!(
+                fetched_request(&effect).map(|r| &r.method),
+                Some(net::Method::Get)
+            ),
+            "HN's search grew a body"
+        );
 
         // Typing is over, and the browse bindings are live while the answer is
         // still in flight — `q` quits a loading page.
@@ -7299,6 +7373,13 @@ mod tests {
         type_str(&mut app, "cat");
         let typed = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(fetched(&typed), Some(expected));
+        assert!(
+            matches!(
+                fetched_request(&typed).map(|r| &r.method),
+                Some(net::Method::Get)
+            ),
+            "Wikipedia's search grew a body"
+        );
 
         // Back on the article, the same value still in the box, and this time
         // the button is pressed.
@@ -7383,43 +7464,95 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_post_form_does_not_navigate_and_the_reader_is_told() {
-        // A value meant for a request body has no business in a URL, a history
-        // entry or a `Referer`; the failure mode of getting this wrong is a
-        // password in the back-button list. So it does not navigate — and the
-        // reader is told, rather than pressing a key that does nothing.
-        let (mut app, id) = page_from(
-            "http://x/page",
-            "<form method=post action=/login><input name=pw value=hunter2>\
-             <button>Sign in</button></form>",
-            80,
-            8,
+    fn login_form() -> &'static str {
+        "<form method=post action=/login>\
+         <input name=acct value=pg>\
+         <input type=password name=pw value=secret>\
+         <button>login</button></form>"
+    }
+
+    fn assert_login_post(request: &net::Request) {
+        assert_eq!(request.url, "http://site.test/login");
+        assert!(
+            !request.url.contains("secret") && !request.url.contains("acct="),
+            "a password landed in the URL: {}",
+            request.url
         );
+        match &request.method {
+            net::Method::Post { body } => assert_eq!(body, "acct=pg&pw=secret"),
+            other => panic!("expected POST, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_login_shaped_post_hops_to_get_with_the_cookie() {
+        // **The acceptance case.** POST /login with the fields in the body,
+        // then a 302 that hands out a session, then GET /app carrying it —
+        // same FetchId, no body on the hop, history pointing at the form page.
+        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
         app.update(Msg::RunScripts { id });
         let before = stages(&app);
         start_typing_at_first_field(&mut app);
 
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(effect.fetch.is_none(), "a POST form navigated");
-        assert_eq!(stages(&app), before, "a refused submission ran a stage");
+        let (fetch_id, request) = effect.fetch.as_ref().expect("a POST did not navigate");
+        assert_login_post(request);
+        assert_eq!(Some(*fetch_id), app.current_fetch);
+        assert_eq!(request.cookie.as_deref(), None);
+        assert_eq!(stages(&app), before, "a POST ran a pipeline stage");
+        assert!(app.history.can_back(), "a POST did not push history");
         assert!(
-            !app.history.can_back(),
-            "a refused submission pushed history"
+            !app.status_left().contains("secret"),
+            "the password is in the statusline: {}",
+            app.status_left()
         );
-        let shown = screen(&mut app, 80, 8);
-        assert!(shown.contains("can't send POST forms"), "{shown}");
-        // And the password is nowhere near a URL: not in the one the page is
-        // known by (which the statusline shows, and which `H` would restore),
-        // and not in a request, because there is no request.
-        assert_eq!(app.current_url().as_deref(), Some("http://x/page"));
-        assert!(!app.status_left().contains("hunter2"), "{shown}");
+        assert!(caret_of(&app).is_none(), "the reader is still typing");
+        assert!(app.update(ch('q')).quit, "q did not quit after a POST");
 
-        // Clicking its button is refused the same way, by the same function —
-        // and it is the one path where what the click did *first* is still
-        // visible afterwards: the button is focused (M11.8's rule, unchanged),
-        // because no navigation came along to clear it.
-        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        // The 302: same generation, GET, cookie from the hop, no body.
+        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let posted = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let fetch_id = posted.fetch.as_ref().unwrap().0;
+        let hop = app.update(hop_at(
+            fetch_id,
+            "http://site.test/login",
+            "http://site.test/app",
+            302,
+            &["sid=abc; Path=/"],
+        ));
+        let next = next_request(&hop).expect("the 302 did not re-spawn");
+        assert_eq!(next.url, "http://site.test/app");
+        assert!(matches!(next.method, net::Method::Get), "{:?}", next.method);
+        assert_eq!(next.cookie.as_deref(), Some("sid=abc"));
+        assert_eq!(Some(fetch_id), app.current_fetch);
+
+        let back = app.update(ch('H'));
+        assert_eq!(fetched(&back), Some("http://site.test/page"));
+        assert!(
+            matches!(
+                fetched_request(&back).map(|r| &r.method),
+                Some(net::Method::Get)
+            ),
+            "H resubmitted the POST"
+        );
+        assert!(
+            fetched(&back).is_some_and(|u| !u.contains("secret")),
+            "H carried the password"
+        );
+    }
+
+    #[test]
+    fn enter_and_click_produce_the_same_post() {
+        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let keyed = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_login_post(fetched_request(&keyed).unwrap());
+
+        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
+        app.update(Msg::RunScripts { id });
         let button = {
             let dom = app.dom.as_ref().unwrap();
             (0..dom.node_count() as u32)
@@ -7428,18 +7561,179 @@ mod tests {
                     matches!(&dom.node(n).data,
                     crate::dom::NodeData::Element { tag, .. } if tag == "button")
                 })
-                .expect("the sign-in button")
+                .expect("the login button")
         };
-        let effect = click_node(&mut app, button);
-        assert!(effect.fetch.is_none(), "a click submitted a POST form");
-        assert_eq!(
-            app.focus,
-            Some(button),
-            "the click did not focus the button"
-        );
+        let clicked = click_node(&mut app, button);
+        assert_login_post(fetched_request(&clicked).unwrap());
+    }
+
+    #[test]
+    fn post_redirects_rewrite_the_method() {
+        let post = |status: u16| {
+            let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
+            app.update(Msg::RunScripts { id });
+            start_typing_at_first_field(&mut app);
+            let posted = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            let fetch_id = posted.fetch.as_ref().unwrap().0;
+            let hop = app.update(hop_at(
+                fetch_id,
+                "http://site.test/login",
+                "http://site.test/app",
+                status,
+                &[],
+            ));
+            fetched_request(&hop).unwrap().method.clone()
+        };
+        assert!(matches!(post(301), net::Method::Get), "301 kept POST");
+        assert!(matches!(post(302), net::Method::Get), "302 kept POST");
+        assert!(matches!(post(303), net::Method::Get), "303 kept POST");
+        match post(307) {
+            net::Method::Post { body } => assert_eq!(body, "acct=pg&pw=secret"),
+            other => panic!("307 dropped the body: {other:?}"),
+        }
+        match post(308) {
+            net::Method::Post { body } => assert_eq!(body, "acct=pg&pw=secret"),
+            other => panic!("308 dropped the body: {other:?}"),
+        }
+
+        // In-flight memory updates each hop: 307 keeps POST, 303 then drops it.
+        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let posted = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let fetch_id = posted.fetch.as_ref().unwrap().0;
+        let mid = app.update(hop_at(
+            fetch_id,
+            "http://site.test/login",
+            "http://site.test/mid",
+            307,
+            &[],
+        ));
+        assert!(matches!(
+            fetched_request(&mid).map(|r| &r.method),
+            Some(net::Method::Post { .. })
+        ));
+        let land = app.update(hop_at(
+            fetch_id,
+            "http://site.test/mid",
+            "http://site.test/app",
+            303,
+            &[],
+        ));
         assert!(
-            screen(&mut app, 80, 8).contains("can't send POST forms"),
-            "a click was refused silently"
+            matches!(
+                fetched_request(&land).map(|r| &r.method),
+                Some(net::Method::Get)
+            ),
+            "the body came back after the 303"
+        );
+    }
+
+    #[test]
+    fn a_post_to_the_document_url_fetches_it_does_not_jump() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form method=post action=#here><input name=q value=v></form>",
+            40,
+            10,
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let request = fetched_request(&effect).expect("a same-document POST jumped");
+        assert!(
+            request.url.contains('#') || request.url.ends_with("/page"),
+            "{}",
+            request.url
+        );
+        assert!(matches!(&request.method, net::Method::Post { body } if body == "q=v"));
+    }
+
+    #[test]
+    fn reload_after_a_post_200_is_a_get_with_no_body() {
+        let (mut app, id) = page_from("http://site.test/page", login_form(), 80, 8);
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let posted = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let fetch_id = posted.fetch.as_ref().unwrap().0;
+        app.update(Msg::Loaded {
+            id: fetch_id,
+            url: "http://site.test/login".into(),
+            status: 200,
+            body: b"<p>ok</p>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        app.update(parsed(fetch_id, "<p>ok</p>"));
+        let reloaded = app.update(ch('r'));
+        let request = fetched_request(&reloaded).expect("reload did nothing");
+        assert_eq!(request.url, "http://site.test/login");
+        assert!(matches!(request.method, net::Method::Get));
+        assert!(!request.url.contains("secret"));
+    }
+
+    #[test]
+    fn dialog_and_multipart_still_refuse() {
+        for (html, needle) in [
+            (
+                "<form method=dialog action=/x><input name=q value=v></form>",
+                "can't send DIALOG",
+            ),
+            (
+                "<form method=post enctype=multipart/form-data action=/x>\
+                 <input name=q value=v></form>",
+                "can't send files",
+            ),
+            (
+                "<form method=post enctype=text/plain action=/x>\
+                 <input name=q value=v></form>",
+                "can't send PLAIN",
+            ),
+        ] {
+            let (mut app, id) = page_from("http://x/page", html, 80, 8);
+            app.update(Msg::RunScripts { id });
+            let before = stages(&app);
+            start_typing_at_first_field(&mut app);
+            let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(effect.fetch.is_none(), "{html} navigated");
+            assert_eq!(stages(&app), before, "{html} ran a stage");
+            assert!(!app.history.can_back(), "{html} pushed history");
+            let shown = screen(&mut app, 80, 8);
+            assert!(shown.contains(needle), "missing {needle:?} in {shown}");
+        }
+    }
+
+    #[test]
+    fn a_post_body_over_the_cap_does_not_navigate() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form method=post action=/x><input name=q value=v>\
+             <input type=hidden name=h></form>",
+            80,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        let hidden = {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&n| dom.attr(n, "name") == Some("h"))
+                .expect("the hidden field")
+        };
+        app.dom
+            .as_mut()
+            .unwrap()
+            .set_field_value(hidden, &"x".repeat(form::MAX_POST_BODY));
+        let before = stages(&app);
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(effect.fetch.is_none(), "an over-cap POST navigated");
+        assert_eq!(stages(&app), before);
+        assert!(
+            screen(&mut app, 80, 8).contains("form is too large"),
+            "{}",
+            screen(&mut app, 80, 8)
         );
     }
 

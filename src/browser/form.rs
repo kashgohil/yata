@@ -3,10 +3,11 @@
 //! **A submission is a navigation, and there is only one of those.** Everything
 //! here is a pure function of the DOM plus the control that was activated; it
 //! fetches nothing, mutates nothing and reads nothing downstream of the tree.
-//! `App::submit_form` takes the URL this produces to `App::navigate` — the
+//! `App::submit_form` takes what this produces to `App::navigate` — the
 //! same path a link click takes, so a submission gets history, the `FetchId`
 //! guard, the jar's `Cookie:` header (M11.7) and redirects through the event
-//! loop (M11.7a) without any of it being written twice.
+//! loop (M11.7a) without any of it being written twice. GET puts the data set
+//! on the URL; POST puts it on the body and leaves the action URL alone.
 //!
 //! The data set is a **snapshot of state, in tree order** — never of the
 //! screen. A control scrolled out of view, clipped by an `overflow`, or off the
@@ -18,17 +19,27 @@ use crate::dom::{Dom, NodeData, NodeId};
 use crate::layout::field;
 use crate::net;
 
+/// Largest encoded POST body this engine will put on the wire (M11.11).
+///
+/// A form a reader typed is small; a hidden field a page wrote is not.
+/// M10.13 forbids a page from buying unbounded work with an attribute, and a
+/// 4 MB `<input type=hidden>` copied onto the channel would be that. 1 MiB is
+/// larger than any form a person filled in and smaller than
+/// [`net::MAX_FETCH_BYTES`].
+pub const MAX_POST_BODY: usize = 1024 * 1024;
+
 /// What activating a control comes to.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Submit {
     /// Navigate here: the action resolved, with its query replaced by the form
     /// data set.
     Get(String),
-    /// A method this engine does not implement, named so the reader can be
-    /// told which one. **Not a silent GET**: a value meant for a request body
-    /// has no business in a URL, a history entry or a `Referer`, and the
-    /// failure mode of getting that wrong is a password in the back-button
-    /// list. M11.11 is where `POST` starts working.
+    /// Navigate here with this `application/x-www-form-urlencoded` body. The
+    /// action's own query is **kept** — GET replaces it, POST does not.
+    Post { url: String, body: String },
+    /// A method or encoding this engine does not implement, named so the
+    /// reader can be told which one. **Not a silent GET**: a value meant for a
+    /// request body has no business in a URL, a history entry or a `Referer`.
     Unsupported(String),
 }
 
@@ -88,33 +99,71 @@ pub fn submit(dom: &Dom, base: &str, activator: NodeId) -> Option<Submit> {
     // An absent `method` is GET, which is what Wikipedia's form says by saying
     // nothing. HTML treats an *unrecognized* method as GET too; this engine
     // refuses it instead, for the reason `Submit::Unsupported` gives — the
-    // deviation is deliberate and recorded.
+    // deviation is deliberate and recorded. Empty is GET as well: a page that
+    // wrote `method=""` asked for nothing.
     let method = dom.attr(form, "method").unwrap_or("get");
     let method = method.trim();
-    if !method.eq_ignore_ascii_case("get") {
+    let is_get = method.is_empty() || method.eq_ignore_ascii_case("get");
+    let is_post = method.eq_ignore_ascii_case("post");
+    if !is_get && !is_post {
         // Bounded, because this is page-controlled text on its way to the
         // statusline and `<form method="…a megabyte…">` must cost this engine
         // nothing (M10.13). No real method is longer than `dialog`.
-        return Some(Submit::Unsupported(
-            method
-                .chars()
-                .take(16)
-                .flat_map(char::to_uppercase)
-                .collect(),
-        ));
+        return Some(Submit::Unsupported(bounded_token(method)));
     }
-    let query = data_set(dom, form, activator);
+    if is_post && let Some(refused) = refuse_enctype(dom, form) {
+        return Some(refused);
+    }
+    let data = data_set(dom, form, activator);
     let action = dom.attr(form, "action").unwrap_or("").trim();
     // An absent or empty `action` submits to the document's own URL, which is
     // what joining an empty href against it already means. `resolve_url` also
     // gets HN's protocol-relative `//hn.algolia.com/` right, by inheriting the
     // page's scheme.
     let resolved = net::resolve_url(base, action)?;
-    // **Replaced, not appended to**: `action="/w/index.php?oldid=5"` submitted
-    // with `search=cat` is `/w/index.php?search=cat`, and the `oldid` is gone.
-    // HTML says so, and the append version looks right on both ladder pages,
-    // which have no query to lose.
-    Some(Submit::Get(net::set_query(&resolved, &query)?))
+    if is_get {
+        // **Replaced, not appended to**: `action="/w/index.php?oldid=5"` submitted
+        // with `search=cat` is `/w/index.php?search=cat`, and the `oldid` is gone.
+        // HTML says so, and the append version looks right on both ladder pages,
+        // which have no query to lose.
+        Some(Submit::Get(net::set_query(&resolved, &data)?))
+    } else {
+        // **Kept, not replaced**: `action="/login?next=/app"` plus `acct=pg` is
+        // URL `/login?next=/app` and body `acct=pg`. GET's replace looks right
+        // on a login whose action has no query to preserve, and putting the
+        // fields on both sides is how a password ends up in `H`.
+        if data.len() > MAX_POST_BODY {
+            return Some(Submit::Unsupported("huge".into()));
+        }
+        Some(Submit::Post {
+            url: resolved,
+            body: data,
+        })
+    }
+}
+
+/// `enctype` is ignored on GET (HTML). On POST, only urlencoded is sent;
+/// multipart and anything else refuse rather than silently drop files.
+fn refuse_enctype(dom: &Dom, form: NodeId) -> Option<Submit> {
+    let raw = dom.attr(form, "enctype").unwrap_or("").trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // `;charset=…` is ignored: we always encode UTF-8.
+    let ty = raw.split(';').next().unwrap_or(raw).trim();
+    if ty.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+        None
+    } else if ty.eq_ignore_ascii_case("multipart/form-data") {
+        Some(Submit::Unsupported("FILE".into()))
+    } else if ty.eq_ignore_ascii_case("text/plain") {
+        Some(Submit::Unsupported("PLAIN".into()))
+    } else {
+        Some(Submit::Unsupported(bounded_token(ty)))
+    }
+}
+
+fn bounded_token(s: &str) -> String {
+    s.chars().take(16).flat_map(char::to_uppercase).collect()
 }
 
 /// The form data set, encoded: the successful controls in `form`, in tree
@@ -503,14 +552,10 @@ mod tests {
 
     #[test]
     fn a_method_this_engine_cannot_send_is_refused_by_name() {
-        // A `POST` form must not be submitted as a GET: a value meant for a
-        // request body has no business in a URL or a history entry.
-        for (method, named) in [
-            ("post", "POST"),
-            ("POST", "POST"),
-            ("dialog", "DIALOG"),
-            ("wibble", "WIBBLE"),
-        ] {
+        // `dialog` and anything unrecognized stay refused. POST is a real
+        // method now (M11.11); putting it back in this table would silently
+        // undo the task.
+        for (method, named) in [("dialog", "DIALOG"), ("wibble", "WIBBLE")] {
             let dom = html::parse(&format!(
                 "<form method={method}><input name=pw value=hunter2></form>"
             ));
@@ -537,6 +582,107 @@ mod tests {
                 url_of(submit(&dom, "http://x/page", first(&dom, "input"))),
                 "http://x/page?q=v"
             );
+        }
+        // POST, in any spelling: body, not query. The action's query is kept.
+        for method in ["post", "POST", " Post "] {
+            let dom = html::parse(&format!(
+                "<form method=\"{method}\" action=/login?next=/app>\
+                 <input name=acct value=pg></form>"
+            ));
+            assert_eq!(
+                submit(&dom, "http://x/page", first(&dom, "input")),
+                Some(Submit::Post {
+                    url: "http://x/login?next=/app".into(),
+                    body: "acct=pg".into(),
+                }),
+                "method={method}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_post_keeps_the_actions_query_and_puts_fields_in_the_body() {
+        // **The trap, inverted.** GET would replace `next=/app` with `acct=pg`.
+        let dom = html::parse(
+            "<form method=post action=/login?next=/app>\
+             <input name=acct value=pg><input name=pw value=secret></form>",
+        );
+        assert_eq!(
+            submit(&dom, "http://x/page", first(&dom, "input")),
+            Some(Submit::Post {
+                url: "http://x/login?next=/app".into(),
+                body: "acct=pg&pw=secret".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn enctype_urlencoded_is_the_only_post_this_engine_sends() {
+        let post = |enctype: &str| {
+            let attr = if enctype.is_empty() {
+                String::new()
+            } else {
+                format!(" enctype=\"{enctype}\"")
+            };
+            let dom = html::parse(&format!(
+                "<form method=post action=/login{attr}><input name=q value=v></form>"
+            ));
+            submit(&dom, "http://x/page", first(&dom, "input"))
+        };
+        assert_eq!(
+            post(""),
+            Some(Submit::Post {
+                url: "http://x/login".into(),
+                body: "q=v".into(),
+            })
+        );
+        assert_eq!(
+            post("application/x-www-form-urlencoded;charset=UTF-8"),
+            Some(Submit::Post {
+                url: "http://x/login".into(),
+                body: "q=v".into(),
+            }),
+            "charset is ignored; we always encode UTF-8"
+        );
+        assert_eq!(
+            post("multipart/form-data"),
+            Some(Submit::Unsupported("FILE".into()))
+        );
+        assert_eq!(
+            post("text/plain"),
+            Some(Submit::Unsupported("PLAIN".into()))
+        );
+        assert_eq!(post("wibble"), Some(Submit::Unsupported("WIBBLE".into())));
+        // GET ignores enctype, as HTML says.
+        let dom = html::parse(
+            "<form enctype=multipart/form-data action=/search>\
+             <input name=q value=v></form>",
+        );
+        assert_eq!(
+            url_of(submit(&dom, "http://x/page", first(&dom, "input"))),
+            "http://x/search?q=v"
+        );
+    }
+
+    #[test]
+    fn a_post_body_over_the_cap_is_refused() {
+        // The encoded body is `h=` plus the value (ASCII, so no percent-growth).
+        let mut over = html::parse("<form method=post action=/x><input type=hidden name=h></form>");
+        let field = first(&over, "input");
+        over.set_field_value(field, &"x".repeat(MAX_POST_BODY));
+        assert_eq!(
+            submit(&over, "http://x/page", field),
+            Some(Submit::Unsupported("huge".into()))
+        );
+        let mut under =
+            html::parse("<form method=post action=/x><input type=hidden name=h></form>");
+        let field = first(&under, "input");
+        under.set_field_value(field, &"x".repeat(MAX_POST_BODY - 2));
+        match submit(&under, "http://x/page", field) {
+            Some(Submit::Post { body, .. }) => {
+                assert_eq!(body.len(), MAX_POST_BODY);
+            }
+            other => panic!("expected a POST under the cap, got {other:?}"),
         }
     }
 

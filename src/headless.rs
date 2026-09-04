@@ -370,7 +370,11 @@ fn script_request(
         &url,
         crate::js::cookies::now(),
     );
-    net::Request { url, cookie }
+    net::Request {
+        url,
+        cookie,
+        method: net::Method::Get,
+    }
 }
 
 /// How many `fetch()` calls one headless run will answer. A page that fetches

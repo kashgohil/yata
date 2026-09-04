@@ -1041,6 +1041,7 @@ pub fn install<'js>(
                     ask: crate::net::Request {
                         url: resolved,
                         cookie,
+                        method: crate::net::Method::Get,
                     },
                     method,
                     headers,

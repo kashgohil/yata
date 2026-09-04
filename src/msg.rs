@@ -70,10 +70,15 @@ pub enum Msg {
     /// page path already refuses.
     ///
     /// Only the **document** path produces these — see `net::fetch::client`.
+    ///
+    /// `status` is the 3xx that produced the hop (M11.11): 301/302/303 rewrite
+    /// a POST to GET, 307/308 keep it. Without the status the loop cannot pick
+    /// a row, and a login's 302 would POST the password at `/app`.
     Redirect {
         id: FetchId,
         url: String,
         to: String,
+        status: u16,
         elapsed: Duration,
         /// This hop's own `Set-Cookie` lines, for the same reason `Loaded`
         /// carries them: the 302 that hands out a session cookie and points at

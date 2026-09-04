@@ -190,6 +190,7 @@ const DUMP_TEXT_WIDTH: u16 = 80;
 struct Hop {
     url: String,
     to: String,
+    status: u16,
     elapsed: Duration,
     set_cookie: Vec<String>,
 }
@@ -219,7 +220,11 @@ impl Session {
     /// same one function `App::request` and `headless::script_request` ask.
     fn request(&self, url: String) -> net::Request {
         let cookie = js::cookies::header_for(&self.cookies, &url, &url, js::cookies::now());
-        net::Request { url, cookie }
+        net::Request {
+            url,
+            cookie,
+            method: net::Method::Get,
+        }
     }
 
     /// A response's `Set-Cookie` lines, scoped to the URL that sent them.
@@ -297,6 +302,7 @@ fn headless_fetch(url: &str, session: &Session) -> Result<(Loaded, mpsc::Receive
             Ok(Msg::Redirect {
                 url,
                 to,
+                status,
                 elapsed,
                 set_cookie,
                 ..
@@ -314,6 +320,7 @@ fn headless_fetch(url: &str, session: &Session) -> Result<(Loaded, mpsc::Receive
                 hops.push(Hop {
                     url,
                     to,
+                    status,
                     elapsed,
                     set_cookie,
                 });
@@ -550,6 +557,7 @@ fn run_timing(url: &str) -> i32 {
             id,
             url: hop.url,
             to: hop.to,
+            status: hop.status,
             elapsed: hop.elapsed,
             set_cookie: hop.set_cookie,
         });
