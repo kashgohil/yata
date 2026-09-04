@@ -1022,6 +1022,70 @@ mod tests {
     }
 
     #[test]
+    fn a_login_chain_on_the_wire_is_post_then_get_with_the_cookie() {
+        // The worker reports the 302 and stops (pinned above). The chain
+        // still has to exist on the socket: hop 2 is GET /app, the hop's
+        // cookie, no body — the request App would spawn after
+        // `rewrite_method(302, Post)`.
+        let (addr, seen) = serve_capturing(2, |req| {
+            if req.starts_with("POST") {
+                b"HTTP/1.1 302 Found\r\nLocation: /app\r\nSet-Cookie: sid=abc; Path=/\r\n\
+                  Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_vec()
+            } else {
+                ok_body("app")
+            }
+        });
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(1),
+            Request {
+                url: format!("http://{addr}/login"),
+                cookie: Some("sid=pre".into()),
+                method: Method::Post {
+                    body: "acct=pg&pw=secret".into(),
+                },
+            },
+            tx,
+        );
+        let msgs = drain(rx);
+        let Msg::Redirect { to, status, .. } = &msgs[0] else {
+            panic!("expected Redirect, got {:?}", msgs[0]);
+        };
+        assert_eq!(*status, 302);
+
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(1),
+            Request {
+                url: to.clone(),
+                cookie: Some("sid=abc".into()),
+                method: Method::Get,
+            },
+            tx,
+        );
+        drain(rx);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].starts_with("POST "), "{}", seen[0]);
+        assert!(
+            seen[0].contains("acct=pg&pw=secret"),
+            "POST body missing: {}",
+            seen[0]
+        );
+        assert_eq!(cookie_header(&seen[0]), Some("sid=pre"));
+        let get = &seen[1];
+        assert!(get.starts_with("GET "), "{get}");
+        assert!(get.contains("/app"), "{get}");
+        assert_eq!(cookie_header(get), Some("sid=abc"));
+        assert!(
+            !get.contains("acct=pg") && !get.contains("pw=secret"),
+            "the POST body rode the GET: {get}"
+        );
+    }
+
+    #[test]
     fn a_hop_to_a_scheme_this_browser_cannot_fetch_is_an_error_not_a_panic() {
         // The loop follows a `Location` wherever it points, so the worker is
         // where a `file:` URL — or any other scheme reqwest will not perform —
