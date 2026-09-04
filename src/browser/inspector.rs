@@ -395,6 +395,15 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
                     crate::layout::Shows::Value => "value",
                     crate::layout::Shows::Placeholder => "placeholder",
                     crate::layout::Shows::Label => "label",
+                    crate::layout::Shows::Checkbox(true) => "checkbox checked",
+                    crate::layout::Shows::Checkbox(false) => "checkbox unchecked",
+                    crate::layout::Shows::Radio(true) => "radio checked",
+                    crate::layout::Shows::Radio(false) => "radio unchecked",
+                    crate::layout::Shows::Select { .. } => "select",
+                    crate::layout::Shows::SelectList { multiple: true, .. } => "select multiple",
+                    crate::layout::Shows::SelectList {
+                        multiple: false, ..
+                    } => "select listbox",
                 };
                 let disabled = if paint.disabled { " disabled" } else { "" };
                 format!(

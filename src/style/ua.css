@@ -80,4 +80,4 @@ input, textarea, button, select { display: inline-block }
    engine disagree with the page about how much a reader can see. A page that
    zeroes it gets a flush field, exactly as it gets a browser field with no
    border. */
-input, textarea, button { padding-left: 8px; padding-right: 8px }
+input, textarea, button, select { padding-left: 8px; padding-right: 8px }

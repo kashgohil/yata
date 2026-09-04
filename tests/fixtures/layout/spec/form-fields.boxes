@@ -8,15 +8,14 @@
 #
 # `<p>before</p>`  — row 0.
 #
-# `<form>` — row 1. Three inputs, one box:
+# `<form>` — row 1. Three inputs, two boxes:
 #   `size="17"` is 17 characters and a character is a cell, so the content box
 #   is 17 wide and 1 row tall. Its margin box is 17 + 2 = 19. The newline
 #   between `<form>` and `<input>` is a leading space on the line and is
 #   dropped, so the margin box starts at x=0 and the content box at x=1.
-#   `type=hidden` and `type=checkbox` generate no box at all: hidden because
-#   HTML says so, checkbox because this engine recognizes the type and has not
-#   implemented it (M11.12), and an empty text box would be a worse lie than
-#   nothing.
+#   `type=hidden` generates no box. M11.12's checkbox follows immediately: its
+#   one-cell mark plus the two UA padding/frame cells starts at x=19, so its
+#   content is at x=20.
 #
 # `<p>` with a `<textarea>` and a `<button>` — rows 2-4.
 #   The textarea is `cols=20` × `rows=3`: content 20 × 3, margin box 22 × 3.
@@ -46,6 +45,7 @@
       anonymous  x=0 y=1 w=40 h=1
         line  x=0 y=1 w=40 h=1
           <input …> field value "typed"  x=1 y=1 w=17 h=1
+          <input …> field checkbox unchecked ""  x=20 y=1 w=1 h=1
     <p>  x=0 y=2 w=40 h=3
       anonymous  x=0 y=2 w=40 h=3
         line  x=0 y=2 w=40 h=3

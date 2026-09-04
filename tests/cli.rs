@@ -306,6 +306,34 @@ fn dump_boxes_names_a_field_box_and_its_geometry() {
 }
 
 #[test]
+fn dump_text_and_boxes_expose_choice_controls_without_option_prose() {
+    let body = br#"<body style="margin:0"><p style="margin:0">Choice <input type=checkbox checked> <select><option>One</option><option selected>Two</option></select></p></body>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().lines().next(),
+        Some("Choice [x] [Two v]")
+    );
+
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains(r#"<input …> field checkbox checked "x"  x=8 y=0 w=1 h=1"#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"<select> field select "One Two"  x=12 y=0 w=5 h=1"#),
+        "{text}"
+    );
+    assert_eq!(text.matches(" field ").count(), 2, "{text}");
+    assert!(!text.contains('\u{1b}'));
+}
+
+#[test]
 fn dump_boxes_prints_the_box_tree_to_stdout() {
     // The layout stage's headless hook (M9.1): one line per box with its
     // geometry, indented like the tree — the same text F3 shows and the same

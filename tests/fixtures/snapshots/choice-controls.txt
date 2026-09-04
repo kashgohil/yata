@@ -1,0 +1,5 @@
+Checks [ ] [x] (x)
+Radios [o] [*] [*]
+Single [Shown label v]
+     [[x] Two  ]
+List [[ ] Three]

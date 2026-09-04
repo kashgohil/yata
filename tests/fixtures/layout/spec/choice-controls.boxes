@@ -1,0 +1,41 @@
+# M11.12 — choice-control geometry derived from the fixture.
+#
+# Checkbox and radio content is one cell; the UA sheet contributes one frame
+# cell of padding on each side, so source spaces put their content at x=8, 12,
+# and 16. Both rows are one cell tall.
+#
+# The single select's widest label is 11 cells and ` v` adds two, giving a
+# 13-cell content box. The multiple select's widest label is five cells and its
+# `[ ] ` prefix adds four, giving nine cells; size=2 gives two rows. Options and
+# their descendant text are data for those atomic controls, not child boxes.
+<html>  x=0 y=0 w=80 h=5
+  <body>  x=0 y=0 w=80 h=5
+    <form>  x=0 y=0 w=80 h=5
+      <p>  x=0 y=0 w=80 h=1
+        anonymous  x=0 y=0 w=80 h=1
+          line  x=0 y=0 w=80 h=1
+            #text "Checks"  x=0 y=0 w=7 h=1
+            <input …> field checkbox unchecked ""  x=8 y=0 w=1 h=1
+            #text ""  x=10 y=0 w=1 h=1
+            <input …> field checkbox checked "x"  x=12 y=0 w=1 h=1
+            #text ""  x=14 y=0 w=1 h=1
+            <input …> field checkbox checked "x" disabled  x=16 y=0 w=1 h=1
+      <p>  x=0 y=1 w=80 h=1
+        anonymous  x=0 y=1 w=80 h=1
+          line  x=0 y=1 w=80 h=1
+            #text "Radios"  x=0 y=1 w=7 h=1
+            <input …> field radio unchecked "o"  x=8 y=1 w=1 h=1
+            #text ""  x=10 y=1 w=1 h=1
+            <input …> field radio checked "*"  x=12 y=1 w=1 h=1
+            #text ""  x=14 y=1 w=1 h=1
+            <input …> field radio checked "*"  x=16 y=1 w=1 h=1
+      <p>  x=0 y=2 w=80 h=1
+        anonymous  x=0 y=2 w=80 h=1
+          line  x=0 y=2 w=80 h=1
+            #text "Single"  x=0 y=2 w=7 h=1
+            <select …> field select "Short Shown lab…"  x=8 y=2 w=13 h=1
+      <p>  x=0 y=3 w=80 h=2
+        anonymous  x=0 y=3 w=80 h=2
+          line  x=0 y=3 w=80 h=2
+            #text "List"  x=0 y=4 w=5 h=1
+            <select …> field select multiple "[ ] Zero [ ] On…"  x=6 y=3 w=9 h=2

@@ -458,6 +458,12 @@ fn a_control_is_framed_in_the_padding_the_ua_sheet_gives_it() {
     assert_snapshot("form-controls", &grid);
 }
 
+#[test]
+fn choice_controls_snapshot() {
+    let grid = render_grid(&fixture("layout/spec/choice-controls.html"), 80, 8);
+    assert_snapshot("choice-controls", &grid);
+}
+
 /// The same line, focused. Reverse video over a *run of text* means "Enter
 /// follows this" (M6.3's focused link), so a focused control must not borrow
 /// it: its two frame cells reverse, and a text field shows a caret where the
@@ -586,20 +592,18 @@ fn hn_search_box_takes_what_the_reader_types() {
 /// it, and a hidden input that must not take a cell — every case this task has
 /// to answer, on one page.
 ///
-/// And the case deliverable 2 exists for: eight of the article's dropdowns are
-/// `<input type="checkbox">` used as CSS-only toggles. HTML says an
-/// unimplemented type falls back to a text field; here it falls back to
-/// nothing, because eight stray empty boxes in the article chrome would serve
-/// no one.
+/// The offline fixture omits the external sheet that hides Wikipedia's eight
+/// CSS dropdown toggles, so M11.12 renders them honestly as checkboxes. A
+/// page-specific UA exception would be worse than the incomplete fixture.
 #[test]
-fn wikipedia_search_form_draws_a_field_a_button_and_no_checkboxes() {
+fn wikipedia_search_form_draws_its_fields_and_choice_controls() {
     let src = fixture("en.wikipedia.org.html");
     let grid = render_grid(&src, 80, 900);
     assert_snapshot("wikipedia-search", &window(&grid, "Search Wikipedia", 0, 1));
+    assert_snapshot("wikipedia-choice", &window(&grid, "Main menu", 1, 1));
 
-    // No box was generated for a checkbox, a hidden input, or any other type
-    // M11.12 owns — asked of the tree rather than of the pixels, because "it
-    // is not visible" and "it is not there" are different claims.
+    // Asked of the tree rather than pixels: every dropdown input is now a real
+    // choice, while hidden controls still follow the generic no-box path.
     let dom = html::parse(&src);
     let sheets = style::sources::inline_sheets(&dom);
     let refs: Vec<_> = sheets.iter().collect();
@@ -618,5 +622,8 @@ fn wikipedia_search_form_draws_a_field_a_button_and_no_checkboxes() {
         }
     });
     assert!(fields > 0, "the page's own search field lost its box");
-    assert_eq!(checkboxes, 0, "a dropdown toggle became a text box");
+    assert_eq!(
+        checkboxes, 8,
+        "the fixture's choice controls lost their boxes"
+    );
 }

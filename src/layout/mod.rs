@@ -2472,17 +2472,23 @@ mod tests {
 
     #[test]
     fn a_control_this_engine_does_not_draw_occupies_no_cells() {
-        // Byte-identical rows, not "looks empty": a hidden input and a type
-        // M11.12 owns must generate no box, so the page has to lay out exactly
-        // as it does without them.
+        // Byte-identical rows, not "looks empty": hidden and still unsupported
+        // controls generate no box.
         let bare = plain(&lines("<p>a<span>b</span></p>", 40));
         for src in [
             "<p>a<input type=hidden value=x><span>b</span></p>",
-            "<p>a<input type=checkbox><span>b</span></p>",
-            "<p>a<input type=radio><input type=file><span>b</span></p>",
+            "<p>a<input type=file><span>b</span></p>",
+            "<p>a<input type=range><span>b</span></p>",
         ] {
             assert_eq!(plain(&lines(src, 40)), bare, "{src}");
         }
+        assert_eq!(
+            plain(&lines(
+                "<p>a<input type=checkbox checked><input type=radio><span>b</span></p>",
+                40,
+            ))[0],
+            "a[x][o]b"
+        );
     }
 
     #[test]
@@ -2527,6 +2533,42 @@ mod tests {
         assert_eq!(field_widths("div { display: flex }"), [17]);
         // CSS wins when the page states one, as it does in a browser.
         assert_eq!(field_widths("input { width: 40px }"), [5]);
+    }
+
+    #[test]
+    fn selects_keep_css_geometry_through_inline_block_and_flex_layout() {
+        let html = "<p>L<select id=i><option>A</option></select>R</p>\
+                    <select id=b size=2><option>A</option></select>\
+                    <div id=r><span>L</span><select id=f><option>A</option></select><span>R</span></div>";
+        let css = "html, body, p, div, select { margin: 0; padding: 0 }\
+                   #b { display: block; width: 40px; height: 48px }\
+                   #r { display: flex }";
+        let (dom, styles) = styled_dom(html, css);
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let rect = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| {
+                    matches!(b.kind, BoxKind::Field(_))
+                        && b.node
+                            .is_some_and(|node| dom.attr(node, "id") == Some(wanted))
+                })
+                .unwrap()
+                .dimensions
+                .content
+        };
+        assert_eq!(
+            (rect("i").x, rect("i").y, rect("i").width, rect("i").height),
+            (1, 0, 3, 1)
+        );
+        assert_eq!(
+            (rect("b").x, rect("b").y, rect("b").width, rect("b").height),
+            (0, 1, 5, 3)
+        );
+        assert_eq!(
+            (rect("f").x, rect("f").y, rect("f").width, rect("f").height),
+            (1, 4, 3, 1)
+        );
     }
 
     #[test]
@@ -2625,6 +2667,124 @@ mod tests {
                 boxes.1,
             );
         }
+    }
+
+    /// M11.12's A/B measurement: unlike M11.8's switch above, the baseline
+    /// keeps text fields and buttons and disables only checkbox/radio/select.
+    ///
+    /// ```text
+    /// cargo test --release --lib measure_choice_control_work -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn measure_choice_control_work_on_the_ladder_and_flex_bench() {
+        use std::time::{Duration, Instant};
+
+        const ROUNDS: usize = 8;
+        const PAGES: [&str; 4] = [
+            "motherfuckingwebsite.com.html",
+            "danluu.com.html",
+            "news.ycombinator.com.html",
+            "en.wikipedia.org.html",
+        ];
+        let summarize = |samples: &[Duration]| {
+            let mean = samples.iter().sum::<Duration>() / samples.len() as u32;
+            let (lo, hi) = (samples.iter().min().unwrap(), samples.iter().max().unwrap());
+            format!("{mean:.2?} ({lo:.2?}-{hi:.2?})")
+        };
+
+        eprintln!("M11.12 layout at 80 cells, mean of {ROUNDS} interleaved rounds:");
+        for page in PAGES {
+            let src = std::fs::read_to_string(format!(
+                "{}/tests/fixtures/{page}",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .expect("committed fixture");
+            let dom = html::parse(&src);
+            let sheets = style::sources::inline_sheets(&dom);
+            let refs: Vec<_> = sheets.iter().collect();
+            let styles = style::style_tree(&dom, &refs);
+            let once = || {
+                let started = Instant::now();
+                let tree = layout_document(&dom, &styles, 80, Hidden::Respect);
+                (started.elapsed(), tree.boxes.len())
+            };
+
+            let (mut before, mut after) = (Vec::new(), Vec::new());
+            let mut boxes = (0, 0);
+            for round in 0..=ROUNDS {
+                let (a, b) = if round % 2 == 0 {
+                    let a = field::without_choice_detection(once);
+                    (a, once())
+                } else {
+                    let b = once();
+                    (field::without_choice_detection(once), b)
+                };
+                if round > 0 {
+                    before.push(a.0);
+                    after.push(b.0);
+                }
+                boxes = (a.1, b.1);
+            }
+            eprintln!(
+                "  {page:<28} choices off {} ({} boxes)  ->  on {} ({} boxes)",
+                summarize(&before),
+                boxes.0,
+                summarize(&after),
+                boxes.1,
+            );
+        }
+
+        // The M9 layout bench's 300-card nested flex deck, repeated here so
+        // both M11.12 sides run interleaved in this one process.
+        let mut src = String::from(
+            "<!doctype html><html><head><style>body{margin:0}div,p{margin:0}\
+             .deck{display:flex;flex-wrap:wrap;gap:8px}\
+             .card{display:flex;flex-direction:column;flex:1 1 160px}\
+             .head{display:flex;justify-content:space-between}\
+             .tag{flex:0 0 48px}</style></head><body><div class=deck>",
+        );
+        for i in 0..300 {
+            src.push_str(&format!(
+                "<div class=card><div class=head><span class=tag>t{i}</span>\
+                 <span>card title {i}</span></div><p>a line of body text long enough \
+                 to need measuring and breaking</p></div>"
+            ));
+        }
+        src.push_str("</div></body></html>");
+        let dom = html::parse(&src);
+        let sheets = style::sources::inline_sheets(&dom);
+        let refs: Vec<_> = sheets.iter().collect();
+        let styles = style::style_tree(&dom, &refs);
+        let once = || {
+            let started = Instant::now();
+            let tree = layout_document(&dom, &styles, 80, Hidden::Respect);
+            (started.elapsed(), tree.boxes.len())
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        let mut boxes = (0, 0);
+        for round in 0..=ROUNDS {
+            let (a, b) = if round % 2 == 0 {
+                let a = field::without_choice_detection(once);
+                (a, once())
+            } else {
+                let b = once();
+                (field::without_choice_detection(once), b)
+            };
+            if round > 0 {
+                before.push(a.0);
+                after.push(b.0);
+            }
+            boxes = (a.1, b.1);
+        }
+        eprintln!(
+            "  {:<28} choices off {} ({} boxes)  ->  on {} ({} boxes)",
+            "M9 flex deck",
+            summarize(&before),
+            boxes.0,
+            summarize(&after),
+            boxes.1,
+        );
     }
 
     mod ladder {

@@ -1,0 +1,9 @@
+# M11.12 — recognizing a checkbox never bypasses the cascade.
+# `display:none` removes the control before inline layout, so A and B remain
+# adjacent and no field box exists.
+<html>  x=0 y=0 w=80 h=1
+  <body>  x=0 y=0 w=80 h=1
+    <p>  x=0 y=0 w=80 h=1
+      anonymous  x=0 y=0 w=80 h=1
+        line  x=0 y=0 w=80 h=1
+          #text "AB"  x=0 y=0 w=2 h=1

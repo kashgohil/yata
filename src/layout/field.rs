@@ -77,6 +77,15 @@ pub enum Shows {
     /// A button's label. A button takes no caret: there is nothing to type
     /// into it.
     Label,
+    Checkbox(bool),
+    Radio(bool),
+    Select {
+        selected: Option<usize>,
+    },
+    SelectList {
+        multiple: bool,
+        first_selected: Option<usize>,
+    },
 }
 
 /// How a form control's box is painted (M11.8) — the payload of
@@ -103,12 +112,17 @@ pub(crate) struct Control {
 /// What kind of control an element is, before its value is read.
 enum Kind {
     /// A text field. `masked` is `type="password"`.
-    Text { masked: bool },
+    Text {
+        masked: bool,
+    },
     /// `<button>` and the three button `type`s: the same box with a label in
     /// it and no caret.
     Button,
-    /// Recognized, and deliberately drawn as nothing: `hidden`, plus every type
-    /// whose real rendering is a control M11.12 owns.
+    Checkbox,
+    Radio,
+    Select,
+    /// Recognized, and deliberately drawn as nothing: `hidden` and specialized
+    /// controls whose rendering remains out of scope.
     Absent,
 }
 
@@ -117,17 +131,14 @@ enum Kind {
 /// Cheap enough to ask on the inline path, which is why the decision is split
 /// this way: everything else about a control costs a `Dom` lookup.
 pub(crate) fn is_control_tag(tag: &str) -> bool {
-    detect() && matches!(tag, "input" | "textarea" | "button")
+    detect()
+        && (matches!(tag, "input" | "textarea" | "button") || tag == "select" && detect_choices())
 }
 
 /// Does this element generate no box at all — `<input type=hidden>`, and the
 /// control types this engine recognizes but has not implemented?
 ///
-/// A deliberate departure from HTML, which falls back to a text field for a
-/// type it does not know: Wikipedia drives eight CSS-only dropdowns from
-/// `<input type="checkbox">`, and rendering those as eight empty text boxes
-/// would put stray fields in the article chrome to nobody's benefit. They draw
-/// nothing today and they draw nothing until M11.12 gives them a real box.
+/// Unknown types do not reach this answer; HTML falls them back to text.
 pub(crate) fn generates_no_box(dom: &Dom, node: NodeId, tag: &str) -> bool {
     matches!(kind(dom, node, tag), Some(Kind::Absent))
 }
@@ -150,6 +161,94 @@ pub(crate) fn control(dom: &Dom, node: NodeId, tag: &str) -> Option<Control> {
                 rows: 1,
                 text,
                 shows: Shows::Label,
+                disabled,
+            })
+        }
+        Kind::Checkbox | Kind::Radio => {
+            let checked = checked(dom, node, tag);
+            let (text, shows) = match kind {
+                Kind::Checkbox => (
+                    if checked { "x" } else { " " }.to_string(),
+                    Shows::Checkbox(checked),
+                ),
+                Kind::Radio => (
+                    if checked { "*" } else { "o" }.to_string(),
+                    Shows::Radio(checked),
+                ),
+                _ => unreachable!(),
+            };
+            Some(Control {
+                text,
+                shows,
+                cols: 1,
+                rows: 1,
+                disabled,
+            })
+        }
+        Kind::Select => {
+            let options = options(dom, node);
+            let multiple =
+                dom.attr(node, "multiple").is_some() || characters(dom, node, "size", 1) > 1;
+            let selected = selected_options(dom, node, &options);
+            let widest = options
+                .iter()
+                .map(|option| option.label.width())
+                .max()
+                .unwrap_or(0);
+            let selected_index = selected
+                .first()
+                .and_then(|id| options.iter().position(|option| option.node == *id));
+            let (text, shows, cols, rows) = if multiple {
+                let text = options
+                    .iter()
+                    .map(|option| {
+                        let mark = if selected.contains(&option.node) {
+                            'x'
+                        } else {
+                            ' '
+                        };
+                        format!("[{mark}] {}", option.label)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let rows = characters(
+                    dom,
+                    node,
+                    "size",
+                    if dom.attr(node, "multiple").is_some() {
+                        4
+                    } else {
+                        1
+                    },
+                );
+                (
+                    text,
+                    Shows::SelectList {
+                        multiple: dom.attr(node, "multiple").is_some(),
+                        first_selected: selected_index,
+                    },
+                    widest.saturating_add(4).min(MAX_CHARS as usize) as i32,
+                    rows,
+                )
+            } else {
+                (
+                    options
+                        .iter()
+                        .map(|option| option.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    Shows::Select {
+                        selected: selected_index,
+                    },
+                    widest.saturating_add(2).min(MAX_CHARS as usize) as i32,
+                    1,
+                )
+            };
+            Some(Control {
+                text,
+                shows,
+                cols,
+                rows,
                 disabled,
             })
         }
@@ -186,6 +285,7 @@ fn kind(dom: &Dom, node: NodeId, tag: &str) -> Option<Kind> {
     match tag {
         "textarea" => Some(Kind::Text { masked: false }),
         "button" => Some(Kind::Button),
+        "select" => Some(Kind::Select),
         _ => {
             let ty = dom.attr(node, "type").unwrap_or("text").trim();
             let is = |names: &[&str]| names.iter().any(|n| ty.eq_ignore_ascii_case(n));
@@ -193,10 +293,20 @@ fn kind(dom: &Dom, node: NodeId, tag: &str) -> Option<Kind> {
                 Kind::Text { masked: true }
             } else if is(&["submit", "button", "reset"]) {
                 Kind::Button
+            } else if is(&["checkbox"]) {
+                if detect_choices() {
+                    Kind::Checkbox
+                } else {
+                    Kind::Absent
+                }
+            } else if is(&["radio"]) {
+                if detect_choices() {
+                    Kind::Radio
+                } else {
+                    Kind::Absent
+                }
             } else if is(&[
                 "hidden",
-                "checkbox",
-                "radio",
                 "file",
                 "range",
                 "color",
@@ -217,6 +327,146 @@ fn kind(dom: &Dom, node: NodeId, tag: &str) -> Option<Kind> {
             })
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OptionItem {
+    pub node: NodeId,
+    pub label: String,
+    pub value: String,
+    pub disabled: bool,
+}
+
+pub(crate) fn is_checkbox(dom: &Dom, node: NodeId, tag: &str) -> bool {
+    matches!(kind(dom, node, tag), Some(Kind::Checkbox))
+}
+
+pub(crate) fn is_radio(dom: &Dom, node: NodeId, tag: &str) -> bool {
+    matches!(kind(dom, node, tag), Some(Kind::Radio))
+}
+
+pub(crate) fn is_select(tag: &str) -> bool {
+    tag.eq_ignore_ascii_case("select")
+}
+
+fn raw_choice(dom: &Dom, node: NodeId, attr: &str) -> bool {
+    dom.choice_state(node)
+        .unwrap_or_else(|| dom.attr(node, attr).is_some())
+}
+
+pub(crate) fn checked(dom: &Dom, node: NodeId, tag: &str) -> bool {
+    if is_checkbox(dom, node, tag) {
+        return raw_choice(dom, node, "checked");
+    }
+    if !is_radio(dom, node, tag) || !raw_choice(dom, node, "checked") {
+        return false;
+    }
+    if dom.attr(node, "name").is_none_or(str::is_empty) {
+        return true;
+    }
+    radio_group(dom, node)
+        .into_iter()
+        .rev()
+        .find(|&candidate| raw_choice(dom, candidate, "checked"))
+        == Some(node)
+}
+
+fn form_owner(dom: &Dom, node: NodeId) -> Option<NodeId> {
+    let mut current = Some(node);
+    while let Some(id) = current {
+        if let NodeData::Element { tag, .. } = &dom.node(id).data
+            && tag.eq_ignore_ascii_case("form")
+        {
+            return Some(id);
+        }
+        if id == dom.root {
+            return Some(id);
+        }
+        current = dom.node(id).parent;
+    }
+    None
+}
+
+pub(crate) fn radio_group(dom: &Dom, node: NodeId) -> Vec<NodeId> {
+    if !dom.is_connected(node) {
+        return Vec::new();
+    }
+    let Some(name) = dom.attr(node, "name").filter(|name| !name.is_empty()) else {
+        return vec![node];
+    };
+    let owner = form_owner(dom, node);
+    fn collect(dom: &Dom, id: NodeId, name: &str, owner: Option<NodeId>, out: &mut Vec<NodeId>) {
+        if let NodeData::Element { tag, .. } = &dom.node(id).data
+            && is_radio(dom, id, tag)
+            && dom.attr(id, "name") == Some(name)
+            && form_owner(dom, id) == owner
+        {
+            out.push(id);
+        }
+        for child in dom.children(id) {
+            collect(dom, child, name, owner, out);
+        }
+    }
+    let mut out = Vec::new();
+    collect(dom, dom.root, name, owner, &mut out);
+    out
+}
+
+pub(crate) fn options(dom: &Dom, select: NodeId) -> Vec<OptionItem> {
+    fn collect(dom: &Dom, node: NodeId, inherited_disabled: bool, out: &mut Vec<OptionItem>) {
+        for child in dom.children(node) {
+            let NodeData::Element { tag, .. } = &dom.node(child).data else {
+                continue;
+            };
+            if tag.eq_ignore_ascii_case("option") {
+                let mut text = String::new();
+                push_text(dom, child, &mut text);
+                let text = collapse_ascii_whitespace(&text);
+                out.push(OptionItem {
+                    node: child,
+                    label: dom.attr(child, "label").unwrap_or(&text).to_string(),
+                    value: dom.attr(child, "value").unwrap_or(&text).to_string(),
+                    disabled: inherited_disabled || dom.attr(child, "disabled").is_some(),
+                });
+            } else {
+                collect(
+                    dom,
+                    child,
+                    inherited_disabled
+                        || tag.eq_ignore_ascii_case("optgroup")
+                            && dom.attr(child, "disabled").is_some(),
+                    out,
+                );
+            }
+        }
+    }
+    let mut out = Vec::new();
+    collect(dom, select, false, &mut out);
+    out
+}
+
+fn collapse_ascii_whitespace(text: &str) -> String {
+    text.split([' ', '\t', '\n', '\r', '\x0c'])
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(crate) fn selected_options(dom: &Dom, select: NodeId, options: &[OptionItem]) -> Vec<NodeId> {
+    if dom.attr(select, "multiple").is_some() {
+        return options
+            .iter()
+            .filter(|option| raw_choice(dom, option.node, "selected"))
+            .map(|option| option.node)
+            .collect();
+    }
+    options
+        .iter()
+        .rev()
+        .find(|option| raw_choice(dom, option.node, "selected"))
+        .or_else(|| options.iter().find(|option| !option.disabled))
+        .map(|option| vec![option.node])
+        .unwrap_or_default()
 }
 
 /// What a reader may type into here, and what they would be typing into —
@@ -343,6 +593,9 @@ pub(crate) struct Painted {
     /// Document coordinates, or `None` for a control that takes no caret: a
     /// button (nothing to type into) and a `disabled` field.
     pub caret: Option<(i32, i32)>,
+    /// Content row occupied by a select cursor, when cursor-aware paint was
+    /// requested.
+    pub cursor_row: Option<i32>,
 }
 
 /// The cells of a control the page's own paint draws: the **start** of the
@@ -353,7 +606,7 @@ pub(crate) struct Painted {
 /// draws the same runs windowed on the caret — surfaces that must not disagree
 /// about where a field is or what is in it.
 pub(crate) fn runs(b: &LayoutBox) -> Vec<Run> {
-    painted(b, None).runs
+    painted_inner(b, None, None).runs
 }
 
 /// The same cells, windowed on a caret `chars` characters into the value
@@ -370,16 +623,55 @@ pub(crate) fn runs(b: &LayoutBox) -> Vec<Run> {
 /// a caret counted in characters sits half a glyph off in the one language the
 /// person who wrote it does not read.
 pub(crate) fn painted(b: &LayoutBox, caret: Option<usize>) -> Painted {
+    painted_inner(b, caret, None)
+}
+
+/// Cursor-aware select paint over the same fixed layout rectangle.
+pub(crate) fn painted_select(b: &LayoutBox, cursor: usize) -> Painted {
+    painted_inner(b, None, Some(cursor))
+}
+
+fn painted_inner(b: &LayoutBox, caret: Option<usize>, select_cursor: Option<usize>) -> Painted {
     let BoxKind::Field(paint) = b.kind else {
         return Painted {
             runs: Vec::new(),
             caret: None,
+            cursor_row: None,
         };
     };
     let rect = b.dimensions.content;
     let text = b.text.as_deref().unwrap_or("");
     let lines: Vec<&str> = text.split('\n').collect();
-    let (first_row, x_off, caret_cell) = window_of(b, paint, &lines, caret);
+    let (mut first_row, x_off, caret_cell) = window_of(b, paint, &lines, caret);
+    let collapsed = match paint.shows {
+        Shows::Select { selected } => {
+            let at = select_cursor.or(selected);
+            Some(format!(
+                "{} v",
+                at.and_then(|i| lines.get(i)).copied().unwrap_or("")
+            ))
+        }
+        Shows::SelectList { first_selected, .. } => {
+            if let Some(cursor) = select_cursor {
+                let base = first_selected.unwrap_or(0) as i32;
+                let cursor = cursor as i32;
+                first_row = if cursor < base {
+                    cursor
+                } else if cursor >= base + rect.height {
+                    cursor - rect.height + 1
+                } else {
+                    base
+                };
+            }
+            None
+        }
+        _ => None,
+    };
+    let cursor_row = select_cursor.map(|cursor| match paint.shows {
+        Shows::Select { .. } => 0,
+        Shows::SelectList { .. } => cursor as i32 - first_row,
+        _ => 0,
+    });
     let (open, close) = if paint.disabled {
         FRAME_DISABLED
     } else {
@@ -403,9 +695,16 @@ pub(crate) fn painted(b: &LayoutBox, caret: Option<usize>) -> Painted {
         // A control the page squeezed to nothing (`width: 0`) still has its
         // frame and no interior — an empty run would be a draw command that
         // draws nothing.
-        let line = lines
-            .get((first_row + row) as usize)
-            .copied()
+        let line = collapsed
+            .as_deref()
+            .filter(|_| row == 0)
+            .or_else(|| {
+                if collapsed.is_some() {
+                    None
+                } else {
+                    lines.get((first_row + row) as usize).copied()
+                }
+            })
             .unwrap_or_default();
         let line = window(line, x_off, rect.width);
         if !line.is_empty() {
@@ -428,6 +727,7 @@ pub(crate) fn painted(b: &LayoutBox, caret: Option<usize>) -> Painted {
     Painted {
         runs: out,
         caret: caret_cell,
+        cursor_row,
     }
 }
 
@@ -462,7 +762,10 @@ fn window_of(
             (line as i32 - rect.height + 1).max(0),
             (col - rect.width + 1).max(0),
         ),
-        _ => (0, 0),
+        _ => match paint.shows {
+            Shows::SelectList { first_selected, .. } => (first_selected.unwrap_or(0) as i32, 0),
+            _ => (0, 0),
+        },
     };
     let cell = at
         .filter(|_| rect.width > 0 && rect.height > 0)
@@ -483,7 +786,7 @@ fn window_of(
 /// it (M11.8). A placeholder pins it to the front — the value behind the hint
 /// is empty, so that is where the first character would go.
 fn caret_in_value(paint: FieldPaint, lines: &[&str], caret: Option<usize>) -> Option<(usize, i32)> {
-    if paint.disabled || paint.shows == Shows::Label {
+    if paint.disabled || !matches!(paint.shows, Shows::Value | Shows::Placeholder) {
         return None;
     }
     if paint.shows == Shows::Placeholder {
@@ -516,7 +819,7 @@ fn caret_in_value(paint: FieldPaint, lines: &[&str], caret: Option<usize>) -> Op
 /// reader's own text.
 fn interior_style(b: &LayoutBox, paint: FieldPaint) -> Style {
     let mut style = b.term_style;
-    if paint.shows != Shows::Label {
+    if matches!(paint.shows, Shows::Value | Shows::Placeholder) {
         style.attrs = style.attrs | Attrs::UNDERLINE;
     }
     if paint.shows == Shows::Placeholder {
@@ -617,6 +920,30 @@ pub(crate) fn without_detection<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
+#[cfg(not(test))]
+const fn detect_choices() -> bool {
+    true
+}
+
+#[cfg(test)]
+fn detect_choices() -> bool {
+    DETECT_CHOICES.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    static DETECT_CHOICES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Run `f` with only M11.12's checkbox, radio, and select recognition off.
+#[cfg(test)]
+pub(crate) fn without_choice_detection<T>(f: impl FnOnce() -> T) -> T {
+    DETECT_CHOICES.with(|d| d.set(false));
+    let out = f();
+    DETECT_CHOICES.with(|d| d.set(true));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -672,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_type_is_a_text_field_and_a_recognized_one_is_nothing() {
+    fn an_unknown_type_is_text_hidden_is_absent_and_checkbox_is_a_choice() {
         let dom = html::parse(
             "<input type=wibble><input type=hidden><input type=checkbox><input type=search>",
         );
@@ -686,13 +1013,9 @@ mod tests {
             .iter()
             .map(|&id| control(&dom, id, "input").is_some())
             .collect();
-        assert_eq!(drawn, [true, false, false, true]);
-        assert!(
-            ids.iter()
-                .skip(1)
-                .take(2)
-                .all(|&id| generates_no_box(&dom, id, "input"))
-        );
+        assert_eq!(drawn, [true, false, true, true]);
+        assert!(generates_no_box(&dom, ids[1], "input"));
+        assert!(!generates_no_box(&dom, ids[2], "input"));
     }
 
     #[test]
@@ -903,5 +1226,211 @@ mod tests {
             // absent — it has a box and a focus and no caret.
             ["plain".to_string(), "secret".to_string()]
         );
+    }
+
+    #[test]
+    fn radio_checkedness_is_group_normalized_and_live_state_is_not_an_attribute() {
+        let mut dom = html::parse(
+            "<form><input id=a type=radio name=x checked>\
+             <input id=b type=radio name=x checked></form>",
+        );
+        let ids = (0..dom.node_count() as u32)
+            .map(NodeId)
+            .filter(|id| dom.attr(*id, "id").is_some())
+            .collect::<Vec<_>>();
+        assert!(!checked(&dom, ids[0], "input"));
+        assert!(checked(&dom, ids[1], "input"));
+        dom.set_choice_state(ids[0], "checked", true);
+        dom.set_choice_state(ids[1], "checked", false);
+        assert!(checked(&dom, ids[0], "input"));
+        assert!(!checked(&dom, ids[1], "input"));
+        assert!(dom.attr(ids[1], "checked").is_some());
+    }
+
+    #[test]
+    fn radio_normalization_follows_the_connected_tree_not_arena_order() {
+        let mut dom = html::parse(
+            "<form><input id=a type=radio name=x checked>\
+             <input id=b type=radio name=x checked></form>",
+        );
+        let form = node(&dom, "form");
+        let group = radio_group(
+            &dom,
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&id| dom.attr(id, "id") == Some("a"))
+                .unwrap(),
+        );
+        let (first, second) = (group[0], group[1]);
+        dom.append(form, first).unwrap();
+        assert!(checked(&dom, first, "input"));
+        assert!(!checked(&dom, second, "input"));
+
+        let detached = dom.create_element(
+            "input",
+            vec![
+                ("type".into(), "radio".into()),
+                ("name".into(), "x".into()),
+                ("checked".into(), String::new()),
+            ],
+        );
+        assert!(!radio_group(&dom, first).contains(&detached));
+        assert!(checked(&dom, first, "input"));
+    }
+
+    #[test]
+    fn radios_outside_forms_group_by_name_while_unnamed_radios_stand_alone() {
+        let dom = html::parse(
+            "<input id=a type=radio name=x checked><input id=b type=radio name=x checked>\
+             <input id=c type=radio checked><input id=d type=radio checked>",
+        );
+        let id = |wanted| {
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&node| dom.attr(node, "id") == Some(wanted))
+                .unwrap()
+        };
+        assert!(!checked(&dom, id("a"), "input"));
+        assert!(checked(&dom, id("b"), "input"));
+        assert!(checked(&dom, id("c"), "input"));
+        assert!(checked(&dom, id("d"), "input"));
+    }
+
+    #[test]
+    fn a_select_uses_option_labels_and_normalizes_one_or_many_selections() {
+        let dom = html::parse(
+            "<select><option selected value=one>First</option>\
+             <option selected label=Shown value=two>Second</option></select>\
+             <select multiple><option selected>A</option><option selected>B</option></select>",
+        );
+        let selects = (0..dom.node_count() as u32)
+            .map(NodeId)
+            .filter(|id| matches!(&dom.node(*id).data, NodeData::Element { tag, .. } if tag == "select"))
+            .collect::<Vec<_>>();
+        let first = options(&dom, selects[0]);
+        assert_eq!(selected_options(&dom, selects[0], &first), [first[1].node]);
+        assert_eq!(first[1].label, "Shown");
+        assert_eq!(first[1].value, "two");
+        let control = control(&dom, selects[0], "select").unwrap();
+        assert_eq!(control.shows, Shows::Select { selected: Some(1) });
+        let many = options(&dom, selects[1]);
+        assert_eq!(selected_options(&dom, selects[1], &many).len(), 2);
+    }
+
+    #[test]
+    fn select_size_and_unicode_width_follow_cell_defaults_and_bounds() {
+        for src in [
+            "<select><option>A</option></select>",
+            "<select size=0><option>A</option></select>",
+            "<select size=-1><option>A</option></select>",
+            "<select size=abc><option>A</option></select>",
+        ] {
+            let c = control_of(src, "select").unwrap();
+            assert_eq!((c.cols, c.rows), (3, 1), "{src}");
+            assert_eq!(c.shows, Shows::Select { selected: Some(0) }, "{src}");
+        }
+        let list = control_of("<select size=2><option>A</option></select>", "select").unwrap();
+        assert_eq!((list.cols, list.rows), (5, 2));
+        assert_eq!(
+            list.shows,
+            Shows::SelectList {
+                multiple: false,
+                first_selected: Some(0)
+            }
+        );
+        let many = control_of("<select multiple><option>A</option></select>", "select").unwrap();
+        assert_eq!((many.cols, many.rows), (5, 4));
+        let wide = control_of(
+            "<select><option selected>漢字漢</option></select>",
+            "select",
+        )
+        .unwrap();
+        assert_eq!((wide.cols, wide.rows), (8, 1));
+    }
+
+    #[test]
+    fn select_defaults_handle_disabled_placeholders_and_empty_multiple_choices() {
+        let dom = html::parse(
+            "<select id=f><option disabled>Skip</option><option id=enabled>Use</option></select>\
+             <select id=p><option id=placeholder disabled selected>Choose</option>\
+             <option>Use</option></select><select id=m multiple><option>None</option></select>",
+        );
+        let id = |wanted| {
+            (0..dom.node_count() as u32)
+                .map(NodeId)
+                .find(|&node| dom.attr(node, "id") == Some(wanted))
+                .unwrap()
+        };
+        let fallback = options(&dom, id("f"));
+        assert_eq!(selected_options(&dom, id("f"), &fallback), [id("enabled")]);
+        let placeholder = options(&dom, id("p"));
+        assert_eq!(
+            selected_options(&dom, id("p"), &placeholder),
+            [id("placeholder")]
+        );
+        let multiple = options(&dom, id("m"));
+        assert!(selected_options(&dom, id("m"), &multiple).is_empty());
+    }
+
+    #[test]
+    fn select_paint_windows_from_selection_and_then_around_the_cursor() {
+        let collapsed = field_box("zero\none\ntwo", 8, 1, Shows::Select { selected: Some(1) });
+        assert_eq!(shown(&collapsed, None).0, ["one v   "]);
+        assert_eq!(
+            painted_select(&collapsed, 2)
+                .runs
+                .iter()
+                .filter(|run| run.x == 10)
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
+            ["two v   "]
+        );
+
+        let list = field_box(
+            "[ ] zero\n[ ] one\n[x] two\n[ ] three\n[ ] four",
+            10,
+            2,
+            Shows::SelectList {
+                multiple: true,
+                first_selected: Some(2),
+            },
+        );
+        assert_eq!(shown(&list, None).0, ["[x] two   ", "[ ] three "]);
+        let cursor = painted_select(&list, 4);
+        assert_eq!(cursor.cursor_row, Some(1));
+        assert_eq!(
+            cursor
+                .runs
+                .iter()
+                .filter(|run| run.x == 10)
+                .map(|run| run.text.as_str())
+                .collect::<Vec<_>>(),
+            ["[ ] three ", "[ ] four  "]
+        );
+
+        let wide = field_box("漢字漢", 5, 1, Shows::Select { selected: Some(0) });
+        assert_eq!(shown(&wide, None).0, ["漢字 "]);
+        let sparse = field_box(
+            "[x] one",
+            7,
+            3,
+            Shows::SelectList {
+                multiple: true,
+                first_selected: Some(0),
+            },
+        );
+        assert_eq!(shown(&sparse, None).0, ["[x] one", "       ", "       "]);
+    }
+
+    #[test]
+    fn option_text_collapses_only_ascii_space_and_only_optgroup_disables_descendants() {
+        let dom = html::parse(
+            "<select><div disabled><option>A\t B&nbsp;C</option></div>\
+             <optgroup disabled><option>D</option></optgroup></select>",
+        );
+        let items = options(&dom, node(&dom, "select"));
+        assert_eq!(items[0].label, "A B\u{a0}C");
+        assert!(!items[0].disabled);
+        assert!(items[1].disabled);
     }
 }
