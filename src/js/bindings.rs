@@ -533,6 +533,290 @@ pub fn install<'js>(
         })?,
     )?;
 
+    // Current text-control values are deliberately not reflected attributes:
+    // a listener can observe a reader/script write without changing selector
+    // matching or the markup default.
+    let s = Rc::clone(slot);
+    api.set(
+        "formValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let node = node(dom, id)?;
+                let NodeData::Element { tag, .. } = &dom.node(node).data else {
+                    return None;
+                };
+                crate::layout::field::has_live_value(dom, node, tag)
+                    .then(|| crate::layout::field::value(dom, node, tag))
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setFormValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, value: String| {
+            s.with_mut(&ctx, |dom| {
+                let Some(node) = node(dom, id) else {
+                    return false;
+                };
+                let NodeData::Element { tag, .. } = &dom.node(node).data else {
+                    return false;
+                };
+                if !crate::layout::field::has_live_value(dom, node, tag) {
+                    return false;
+                }
+                dom.set_field_value(node, &value);
+                true
+            })
+        })?,
+    )?;
+
+    // Non-text inputs reflect their markup `value`; their current semantic
+    // state is checkedness, not a second sparse string.
+    let s = Rc::clone(slot);
+    api.set(
+        "reflectedInputValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let node = node(dom, id)?;
+                let tag = element_tag(dom, node)?;
+                (tag == "input" && !crate::layout::field::has_live_value(dom, node, tag))
+                    .then(|| dom.attr(node, "value").unwrap_or_default().to_string())
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setReflectedInputValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, value: String| {
+            s.with_mut(&ctx, |dom| {
+                let Some(node) = node(dom, id) else {
+                    return false;
+                };
+                let Some(tag) = element_tag(dom, node).map(str::to_string) else {
+                    return false;
+                };
+                tag == "input"
+                    && !crate::layout::field::has_live_value(dom, node, &tag)
+                    && dom.set_attr(node, "value", &value)
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "formChecked",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let node = node(dom, id)?;
+                let tag = element_tag(dom, node)?;
+                (crate::layout::field::is_checkbox(dom, node, tag)
+                    || crate::layout::field::is_radio(dom, node, tag))
+                .then(|| crate::layout::field::checked(dom, node, tag))
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setFormChecked",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, checked: bool| {
+            s.with_mut(&ctx, |dom| {
+                let Some(node) = node(dom, id) else {
+                    return false;
+                };
+                let Some(tag) = element_tag(dom, node).map(str::to_string) else {
+                    return false;
+                };
+                if crate::layout::field::is_checkbox(dom, node, &tag) {
+                    dom.set_choice_state(node, "checked", checked);
+                    return true;
+                }
+                if crate::layout::field::is_radio(dom, node, &tag) {
+                    if checked {
+                        let states = crate::layout::field::radio_group(dom, node)
+                            .into_iter()
+                            .map(|peer| (peer, peer == node))
+                            .collect::<Vec<_>>();
+                        dom.set_choice_group(&states, "checked");
+                    } else {
+                        dom.set_choice_state(node, "checked", false);
+                    }
+                    return true;
+                }
+                false
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "optionSelected",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                node(dom, id).and_then(|node| option_selected(dom, node))
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setOptionSelected",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, selected: bool| {
+            s.with_mut(&ctx, |dom| {
+                node(dom, id).is_some_and(|node| set_option_selected(dom, node, selected))
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "optionValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let option = node(dom, id)?;
+                (element_tag(dom, option)? == "option").then(|| {
+                    select_owner(dom, option)
+                        .and_then(|select| {
+                            crate::layout::field::options(dom, select)
+                                .into_iter()
+                                .find(|item| item.node == option)
+                                .map(|item| item.value)
+                        })
+                        .unwrap_or_else(|| {
+                            dom.attr(option, "value").unwrap_or_default().to_string()
+                        })
+                })
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setOptionValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, value: String| {
+            s.with_mut(&ctx, |dom| {
+                let Some(option) = node(dom, id) else {
+                    return false;
+                };
+                if element_tag(dom, option) != Some("option") {
+                    return false;
+                }
+                dom.set_attr(option, "value", &value)
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "selectValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let select = node(dom, id)?;
+                if element_tag(dom, select)? != "select" {
+                    return None;
+                }
+                let options = crate::layout::field::options(dom, select);
+                Some(
+                    crate::layout::field::selected_options(dom, select, &options)
+                        .first()
+                        .and_then(|node| options.iter().find(|item| item.node == *node))
+                        .map(|item| item.value.clone())
+                        .unwrap_or_default(),
+                )
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "selectIndex",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let select = node(dom, id)?;
+                if element_tag(dom, select)? != "select" {
+                    return None;
+                }
+                let options = crate::layout::field::options(dom, select);
+                Some(
+                    crate::layout::field::selected_options(dom, select, &options)
+                        .first()
+                        .and_then(|node| options.iter().position(|item| item.node == *node))
+                        .map(|index| index as i32)
+                        .unwrap_or(-1),
+                )
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "selectOptions",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32| {
+            s.with(&ctx, |dom| {
+                let select = node(dom, id)?;
+                if element_tag(dom, select)? != "select" {
+                    return None;
+                }
+                let options = crate::layout::field::options(dom, select);
+                Some(
+                    crate::layout::field::selected_options(dom, select, &options)
+                        .into_iter()
+                        .map(id_of)
+                        .collect::<Vec<_>>(),
+                )
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setSelectIndex",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, index: i32| {
+            s.with_mut(&ctx, |dom| {
+                let Some(select) = node(dom, id) else {
+                    return false;
+                };
+                if element_tag(dom, select) != Some("select") {
+                    return false;
+                }
+                let options = crate::layout::field::options(dom, select);
+                let states = options
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, item)| (item.node, at as i32 == index))
+                    .collect::<Vec<_>>();
+                dom.set_choice_group(&states, "selected");
+                true
+            })
+        })?,
+    )?;
+
+    let s = Rc::clone(slot);
+    api.set(
+        "setSelectValue",
+        Function::new(ctx.clone(), move |ctx: Ctx<'_>, id: u32, value: String| {
+            s.with_mut(&ctx, |dom| {
+                let Some(select) = node(dom, id) else {
+                    return false;
+                };
+                if element_tag(dom, select) != Some("select") {
+                    return false;
+                }
+                let options = crate::layout::field::options(dom, select);
+                let selected = options.iter().position(|item| item.value == value);
+                let states = options
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, item)| (item.node, Some(at) == selected))
+                    .collect::<Vec<_>>();
+                dom.set_choice_group(&states, "selected");
+                true
+            })
+        })?,
+    )?;
+
     let s = Rc::clone(slot);
     api.set(
         "parentElement",
@@ -1145,6 +1429,60 @@ fn node(dom: &Dom, id: u32) -> Option<NodeId> {
     ((id as usize) < dom.node_count()).then_some(NodeId(id))
 }
 
+fn element_tag(dom: &Dom, node: NodeId) -> Option<&str> {
+    match &dom.node(node).data {
+        NodeData::Element { tag, .. } => Some(tag),
+        _ => None,
+    }
+}
+
+fn select_owner(dom: &Dom, option: NodeId) -> Option<NodeId> {
+    let mut current = dom.node(option).parent;
+    while let Some(node) = current {
+        if element_tag(dom, node).is_some_and(crate::layout::field::is_select) {
+            return Some(node);
+        }
+        current = dom.node(node).parent;
+    }
+    None
+}
+
+fn option_selected(dom: &Dom, option: NodeId) -> Option<bool> {
+    if element_tag(dom, option)? != "option" {
+        return None;
+    }
+    Some(select_owner(dom, option).map_or_else(
+        || {
+            dom.choice_state(option)
+                .unwrap_or_else(|| dom.attr(option, "selected").is_some())
+        },
+        |select| {
+            let options = crate::layout::field::options(dom, select);
+            crate::layout::field::selected_options(dom, select, &options).contains(&option)
+        },
+    ))
+}
+
+fn set_option_selected(dom: &mut Dom, option: NodeId, selected: bool) -> bool {
+    if element_tag(dom, option) != Some("option") {
+        return false;
+    }
+    let Some(select) = select_owner(dom, option) else {
+        dom.set_choice_state(option, "selected", selected);
+        return true;
+    };
+    if selected && dom.attr(select, "multiple").is_none() {
+        let states = crate::layout::field::options(dom, select)
+            .into_iter()
+            .map(|item| (item.node, item.node == option))
+            .collect::<Vec<_>>();
+        dom.set_choice_group(&states, "selected");
+    } else {
+        dom.set_choice_state(option, "selected", selected);
+    }
+    true
+}
+
 /// Every descendant of `scope` matching `keep`, in document order — the shape
 /// both `getElementsBy*` collections need.
 ///
@@ -1396,6 +1734,57 @@ const PRELUDE: &str = r#"
       get: function () { return raw.textContent(idOf(this)); },
       set: function (value) { raw.setTextContent(idOf(this), String(value)); },
     },
+    value: {
+      get: function () {
+        const value = raw.formValue(idOf(this));
+        if (value !== undefined) return value;
+        const select = raw.selectValue(idOf(this));
+        if (select !== undefined) return select;
+        const option = raw.optionValue(idOf(this));
+        if (option !== undefined) return option;
+        return raw.reflectedInputValue(idOf(this));
+      },
+      set: function (value) {
+        const string = String(value);
+        if (!raw.setFormValue(idOf(this), string) && !raw.setSelectValue(idOf(this), string) && !raw.setOptionValue(idOf(this), string) && !raw.setReflectedInputValue(idOf(this), string)) {
+          throw new TypeError("value is not supported by this element");
+        }
+      },
+    },
+    checked: {
+      get: function () { return raw.formChecked(idOf(this)); },
+      set: function (value) {
+        if (!raw.setFormChecked(idOf(this), Boolean(value))) {
+          throw new TypeError("checked is not supported by this element");
+        }
+      },
+    },
+    selected: {
+      get: function () { return raw.optionSelected(idOf(this)); },
+      set: function (value) {
+        if (!raw.setOptionSelected(idOf(this), Boolean(value))) {
+          throw new TypeError("selected is not supported by this element");
+        }
+      },
+    },
+    selectedIndex: {
+      get: function () {
+        return raw.selectIndex(idOf(this));
+      },
+      set: function (value) {
+        const number = Number(value);
+        const index = Number.isFinite(number) ? Math.trunc(number) : -1;
+        if (!raw.setSelectIndex(idOf(this), index)) {
+          throw new TypeError("selectedIndex is not supported by this element");
+        }
+      },
+    },
+    selectedOptions: {
+      get: function () {
+        const options = raw.selectOptions(idOf(this));
+        return options === undefined ? undefined : options.map(wrap);
+      },
+    },
     setAttribute: {
       value: function (name, value) {
         raw.setAttribute(idOf(this), String(name), String(value));
@@ -1633,7 +2022,7 @@ const PRELUDE: &str = r#"
     }
   }
 
-  function makeEvent(type, target, bubbles) {
+  function makeEvent(type, target, bubbles, cancelable) {
     let stopped = false;
     let stoppedImmediately = false;
     let prevented = false;
@@ -1643,9 +2032,9 @@ const PRELUDE: &str = r#"
       currentTarget: null,
       eventPhase: 0,
       bubbles: bubbles,
-      cancelable: true,
+      cancelable: cancelable,
       get defaultPrevented() { return prevented; },
-      preventDefault: function () { prevented = true; },
+      preventDefault: function () { if (cancelable) prevented = true; },
       stopPropagation: function () { stopped = true; },
       stopImmediatePropagation: function () { stopped = true; stoppedImmediately = true; },
     };
@@ -1711,11 +2100,11 @@ const PRELUDE: &str = r#"
     return ["window", "document"].concat(chain);
   }
 
-  function dispatch(kind, id, type, bubbles) {
+  function dispatch(kind, id, type, bubbles, cancelable) {
     const target = kind === "window" ? globalThis : kind === "document" ? document : wrap(id);
     if (target === null) return false;
 
-    const state = makeEvent(String(type), target, !!bubbles);
+    const state = makeEvent(String(type), target, !!bubbles, !!cancelable);
     const path = pathTo(target);
     const last = path.length - 1;
 
@@ -2132,6 +2521,64 @@ mod tests {
         assert_eq!(value("document.documentElement.tagName"), "\"HTML\"");
         // Uppercase, as the DOM specifies, even though the parser lowercases.
         assert_eq!(value("document.getElementById('wrap').tagName"), "\"DIV\"");
+    }
+
+    #[test]
+    fn text_control_value_is_live_state_not_a_content_attribute() {
+        let page = "<input id=x value=markup><textarea id=t>start</textarea><input id=h type=hidden value=no>";
+        assert_eq!(
+            eval_on(
+                page,
+                "var x = document.getElementById('x'); x.value = 'live'; \
+                 [x.value, x.getAttribute('value')].join('|')",
+            ),
+            "inline#1 ok \"live|markup\""
+        );
+        assert_eq!(
+            eval_on(
+                page,
+                "var t = document.getElementById('t'); t.value = 'changed'; \
+                 [t.value, t.textContent].join('|')",
+            ),
+            "inline#1 ok \"changed|start\""
+        );
+        assert_eq!(
+            eval_on(
+                page,
+                "var h = document.getElementById('h'); h.value = 'yes'; [h.value, h.getAttribute('value')].join('|')",
+            ),
+            "inline#1 ok \"yes|yes\""
+        );
+    }
+
+    #[test]
+    fn choice_and_select_properties_share_the_live_control_state() {
+        let page = "<input id=c type=checkbox><input id=a type=radio name=r checked><input id=b type=radio name=r>\
+                    <select id=s><option value=one>One</option><option id=o value=two selected>Two</option></select>";
+        assert_eq!(
+            eval_on(
+                page,
+                "var c = document.getElementById('c'), a = document.getElementById('a'), b = document.getElementById('b');\
+                 c.checked = 1; b.checked = true; [c.checked, a.checked, b.checked].join('|')",
+            ),
+            "inline#1 ok \"true|false|true\""
+        );
+        assert_eq!(
+            eval_on(
+                page,
+                "var s = document.getElementById('s'); s.selectedIndex = -1;\
+                 [s.value, s.selectedIndex, s.selectedOptions.length].join('|')",
+            ),
+            "inline#1 ok \"|-1|0\""
+        );
+        assert_eq!(
+            eval_on(
+                page,
+                "var s = document.getElementById('s'), o = document.getElementById('o');\
+                 s.value = 'one'; [s.value, s.selectedIndex, o.selected, o.value].join('|')",
+            ),
+            "inline#1 ok \"one|0|false|two\""
+        );
     }
 
     #[test]
@@ -3642,6 +4089,13 @@ mod tests {
     /// Run `page`'s scripts, then click the element with `id=t`, and return
     /// what the console saw plus whether the default action was cancelled.
     fn click(page: &str) -> (Vec<String>, bool) {
+        event(page, crate::js::EventDescriptor::CLICK)
+    }
+
+    /// Dispatch a descriptor at `#t`, retaining the click helper above for
+    /// M10.8's readable test names while allowing M11.13 to pin the rest of
+    /// the event table through the same dispatcher.
+    fn event(page: &str, event: crate::js::EventDescriptor) -> (Vec<String>, bool) {
         let mut dom = html::parse(page);
         let mut host = None;
         let console = Console::new();
@@ -3662,7 +4116,7 @@ mod tests {
                 cookies: &Jar::new(),
             },
             js::Target::Node(target.0),
-            "click",
+            event,
         );
         crate::dom::check_links(&dom);
         (
@@ -3716,6 +4170,60 @@ mod tests {
              });</script>",
         );
         assert_eq!(entries, ["log   click B DIV 3 true false"]);
+    }
+
+    #[test]
+    fn every_event_descriptor_reaches_the_page_with_its_declared_metadata() {
+        let cases = [
+            (crate::js::EventDescriptor::CLICK, "click", true, true),
+            (crate::js::EventDescriptor::INPUT, "input", true, false),
+            (crate::js::EventDescriptor::CHANGE, "change", true, false),
+            (crate::js::EventDescriptor::SUBMIT, "submit", true, true),
+            (crate::js::EventDescriptor::FOCUS, "focus", false, false),
+            (crate::js::EventDescriptor::BLUR, "blur", false, false),
+            (
+                crate::js::EventDescriptor::DOM_CONTENT_LOADED,
+                "DOMContentLoaded",
+                true,
+                false,
+            ),
+            (crate::js::EventDescriptor::LOAD, "load", false, false),
+            (crate::js::EventDescriptor::ERROR, "error", false, false),
+        ];
+        for (descriptor, kind, bubbles, cancelable) in cases {
+            let page = format!(
+                "<div id=outer><b id=t>x</b></div><script>\
+                 document.getElementById('t').addEventListener({kind:?}, function (e) {{\
+                   console.log(e.type, e.bubbles, e.cancelable);\
+                 }});\
+                 </script>"
+            );
+            let (entries, _) = event(&page, descriptor);
+            assert_eq!(
+                (descriptor.kind, descriptor.bubbles, descriptor.cancelable),
+                (kind, bubbles, cancelable)
+            );
+            assert_eq!(
+                entries,
+                [format!("log   {kind} {bubbles} {cancelable}")],
+                "{kind} metadata did not survive the Rust-to-prelude dispatch"
+            );
+        }
+    }
+
+    #[test]
+    fn non_cancelable_events_still_capture_but_ignore_prevent_default() {
+        let (entries, prevented) = event(
+            "<div id=outer><b id=t>x</b></div><script>\
+             document.getElementById('outer').addEventListener('focus', function (e) {\
+               e.preventDefault(); console.log(e.eventPhase, e.bubbles, e.cancelable, e.defaultPrevented);\
+             }, true);\
+             document.getElementById('outer').addEventListener('focus', function () { console.log('bubble'); });\
+             </script>",
+            crate::js::EventDescriptor::FOCUS,
+        );
+        assert_eq!(entries, ["log   1 false false false"]);
+        assert!(!prevented);
     }
 
     #[test]
