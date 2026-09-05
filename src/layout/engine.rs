@@ -629,14 +629,29 @@ impl<'a> Engine<'a> {
         let max_table = constraints
             .iter()
             .fold(0i32, |sum, column| sum.saturating_add(column.max));
-        // Auto tables shrink-wrap between their intrinsic bounds. A definite
-        // width (including one imposed by a table min/max clamp) instead asks
-        // the distributor to spend every requested cell.
-        let target = if computed.width.is_auto()
-            && computed.min_width.is_auto()
-            && computed.max_width.is_auto()
-        {
-            requested.min(max_table).max(min_table)
+        // Auto tables shrink-wrap between their intrinsic bounds *before*
+        // their own min/max clamp applies. `resolve_block_dims` starts a block
+        // at its containing width, so using that value directly here would
+        // make `min-width: 20` turn a two-cell auto table into a 40-cell one.
+        let target = if computed.width.is_auto() {
+            let dims = self.boxes[box_id.0 as usize].dimensions;
+            let axis = Axis {
+                edges: dims
+                    .padding
+                    .left
+                    .saturating_add(dims.padding.right)
+                    .saturating_add(dims.border.left)
+                    .saturating_add(dims.border.right),
+                box_sizing: computed.box_sizing,
+            };
+            let mut target = requested.min(max_table).max(min_table);
+            if !computed.max_width.is_auto() {
+                target = target.min(axis.content_from(computed.max_width.to_cells_h(requested)));
+            }
+            if !computed.min_width.is_auto() {
+                target = target.max(axis.content_from(computed.min_width.to_cells_h(requested)));
+            }
+            target
         } else {
             requested
         };

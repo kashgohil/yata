@@ -2871,6 +2871,52 @@ mod tests {
     }
 
     #[test]
+    fn table_columns_honour_definite_percent_and_border_box_constraints() {
+        let (dom, styles) = styled_dom(
+            "<table class=fixed><tr><td class=border>fixed</td><td class=border>other</td></tr></table>\
+             <table class=percent><tr><td>left</td><td>right</td></tr></table>",
+            "table, tr, td { display: block }\
+             table { width: 160px }\
+             .fixed { width: 96px }\
+             .border { width: 48px; padding: 8px; box-sizing: border-box }\
+             .percent td { width: 50% }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let rows: Vec<_> = tree
+            .boxes
+            .iter()
+            .filter(|box_| box_.kind == BoxKind::TableRow)
+            .collect();
+        let widths = |row: &LayoutBox| {
+            row.children
+                .iter()
+                .map(|&cell| tree.get(cell).dimensions.margin_box_width())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(widths(rows[0]), vec![6, 6], "border-box includes edges");
+        assert_eq!(widths(rows[1]), vec![10, 10], "percentages use table width");
+    }
+
+    #[test]
+    fn table_min_and_max_widths_request_their_clamped_used_width() {
+        let (dom, styles) = styled_dom(
+            "<table class=min><tr><td>a</td><td>b</td></tr></table>\
+             <table class=max><tr><td>title words</td><td>meta</td></tr></table>",
+            "table, tr, td { display: block }\
+             .min { min-width: 160px }\
+             .max { max-width: 80px }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let tables: Vec<_> = tree
+            .boxes
+            .iter()
+            .filter(|box_| box_.kind == BoxKind::Table)
+            .collect();
+        assert_eq!(tables[0].dimensions.content.width, 20);
+        assert_eq!(tables[1].dimensions.content.width, 10);
+    }
+
+    #[test]
     fn links_and_controls_inside_cells_keep_the_existing_hit_paths() {
         let (dom, styles) = styled_dom(
             "<table><tr><td><a href=/docs>docs</a></td><td><input value=go size=2></td></tr></table>",
