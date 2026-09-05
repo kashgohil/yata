@@ -131,7 +131,7 @@ fn run_scripts_from(
     let mut settled = 0usize;
     // The `load`/`error` an inserted script's element is owed: once its body
     // has actually run, or once its URL turns out to be unusable (M11.5).
-    let mut owed_events: Vec<(crate::dom::NodeId, &'static str)> = Vec::new();
+    let mut owed_events: Vec<(crate::dom::NodeId, js::EventDescriptor)> = Vec::new();
     loop {
         // One per round, taken before anything runs, which is exactly what
         // `App::run_ready_scripts` does with a turn — an event owed by *this*
@@ -182,7 +182,7 @@ fn run_scripts_from(
         // is when it executed. `--dump-js` is what M11.25's ladder sweep
         // reads, so a page that chains on `onload` has to behave here the way
         // it behaves in the TUI.
-        if let Some((node, kind)) = owed {
+        if let Some((node, event)) = owed {
             js::dispatch(
                 &mut host,
                 dom,
@@ -194,7 +194,7 @@ fn run_scripts_from(
                     cookies,
                 },
                 js::Target::Node(node.0),
-                kind,
+                event,
             );
             // The handler may have inserted the next link in a chain, which
             // the top of the next round adopts.
@@ -256,11 +256,16 @@ fn run_scripts_from(
                 // Only an *inserted* slot names an element; a document-order
                 // `<script src>` has none, because nothing could have put a
                 // listener on it before the page ran.
-                owed_events.extend(
-                    queue
-                        .element(slot)
-                        .map(|node| (node, if failed { "error" } else { "load" })),
-                );
+                owed_events.extend(queue.element(slot).map(|node| {
+                    (
+                        node,
+                        if failed {
+                            js::EventDescriptor::ERROR
+                        } else {
+                            js::EventDescriptor::LOAD
+                        },
+                    )
+                }));
                 queue.fill(slot, source);
                 in_flight -= 1;
             }
@@ -313,7 +318,7 @@ fn adopt_inserted_scripts(
     base_url: Option<&str>,
     tx: &mpsc::Sender<Msg>,
     in_flight: &mut usize,
-) -> Vec<(crate::dom::NodeId, &'static str)> {
+) -> Vec<(crate::dom::NodeId, js::EventDescriptor)> {
     let mut owed = Vec::new();
     for candidate in host.map(js::Host::take_script_inserts).unwrap_or_default() {
         let node = crate::dom::NodeId(candidate);
@@ -344,7 +349,7 @@ fn adopt_inserted_scripts(
                     // an `error` would put a console line in the dump that the
                     // TUI never produces, which is the same lie in reverse.
                     if base_url.is_some() {
-                        owed.push((node, "error"));
+                        owed.push((node, js::EventDescriptor::ERROR));
                     }
                 }
             }

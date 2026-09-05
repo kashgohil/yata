@@ -96,7 +96,7 @@ impl Page {
             &mut self.dom,
             &ctx,
             Target::Node(target),
-            "click",
+            crate::js::EventDescriptor::CLICK,
         );
     }
 

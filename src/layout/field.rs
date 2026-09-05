@@ -143,6 +143,13 @@ pub(crate) fn generates_no_box(dom: &Dom, node: NodeId, tag: &str) -> bool {
     matches!(kind(dom, node, tag), Some(Kind::Absent))
 }
 
+/// Whether this control owns the sparse current-value state. Unlike
+/// [`editable_value`], this deliberately includes readonly and disabled text
+/// controls: those limit reader input, not a script's `.value` setter.
+pub(crate) fn has_live_value(dom: &Dom, node: NodeId, tag: &str) -> bool {
+    matches!(kind(dom, node, tag), Some(Kind::Text { .. }))
+}
+
 /// The control this element is, with everything its box needs — or `None` when
 /// it is not a control, or is one this engine draws as nothing.
 pub(crate) fn control(dom: &Dom, node: NodeId, tag: &str) -> Option<Control> {
@@ -464,7 +471,16 @@ pub(crate) fn selected_options(dom: &Dom, select: NodeId, options: &[OptionItem]
         .iter()
         .rev()
         .find(|option| raw_choice(dom, option.node, "selected"))
-        .or_else(|| options.iter().find(|option| !option.disabled))
+        // A sparse override is HTML's dirty selectedness flag. Once one
+        // exists, an all-false single select is a real script-created state,
+        // not a cue to restore the clean first-enabled fallback.
+        .or_else(|| {
+            (!options
+                .iter()
+                .any(|option| dom.choice_state(option.node).is_some()))
+            .then(|| options.iter().find(|option| !option.disabled))
+            .flatten()
+        })
         .map(|option| vec![option.node])
         .unwrap_or_default()
 }

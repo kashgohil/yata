@@ -95,7 +95,7 @@ fn js_benches(c: &mut Criterion) {
                     &mut dom,
                     &context(&console, &storage, &cookies),
                     Target::Node(target.0),
-                    "click",
+                    js::EventDescriptor::CLICK,
                 );
                 let styles = style::style_tree(&dom, &[]);
                 black_box(layout::layout(&dom, &styles, 80, layout::Hidden::Respect).len())

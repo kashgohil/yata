@@ -278,11 +278,11 @@ pub fn run_prefix(
     // They fire even if every script threw or failed to arrive: a page whose
     // first script broke may still have registered a handler in its second.
     if finished {
-        for (target, kind) in [
-            (Target::Document, "DOMContentLoaded"),
-            (Target::Window, "load"),
+        for (target, event) in [
+            (Target::Document, EventDescriptor::DOM_CONTENT_LOADED),
+            (Target::Window, EventDescriptor::LOAD),
         ] {
-            if let Err(error) = host.dispatch(target, kind, kind == "DOMContentLoaded") {
+            if let Err(error) = host.dispatch(target, event) {
                 console.push(
                     Level::Error,
                     Some(error.source.clone()),
@@ -564,21 +564,21 @@ impl Host {
     /// `target` says where the event starts: a node, `document`, or `window`.
     /// A page with no listeners at all still pays only a map lookup per node
     /// on the path.
-    pub fn dispatch(&mut self, target: Target, kind: &str, bubbles: bool) -> Result<bool, JsError> {
+    pub fn dispatch(&mut self, target: Target, event: EventDescriptor) -> Result<bool, JsError> {
         let (tag, id) = match target {
             Target::Node(id) => ("node", id),
             Target::Document => ("document", 0),
             Target::Window => ("window", 0),
         };
         let entries = self.entries.clone();
-        let kind = kind.to_string();
+        let kind = event.kind.to_string();
         // Under the same budget as a script: a listener that loops forever is
         // a runaway script that happens to have been reached by a click.
         self.under_budget(&format!("{kind} listener"), move |ctx| {
             entries
                 .restore(ctx)?
                 .get::<_, Function>("dispatch")?
-                .call::<_, bool>((tag, id, kind.as_str(), bubbles))
+                .call::<_, bool>((tag, id, kind.as_str(), event.bubbles, event.cancelable))
         })
     }
 
@@ -758,7 +758,7 @@ pub fn dispatch(
     dom: &mut Dom,
     ctx: &PageContext<'_>,
     target: Target,
-    kind: &str,
+    event: EventDescriptor,
 ) -> bool {
     let (page, url, console) = (ctx.page, ctx.url, ctx.console);
     let Some(host) = host.as_mut() else {
@@ -767,11 +767,7 @@ pub fn dispatch(
 
     host.dom
         .lend(std::mem::replace(dom, Dom::new_document()), page, url);
-    // Which events bubble, as the DOM says. It matters more than it looks:
-    // `DOMContentLoaded` bubbles, which is the only reason a listener put on
-    // `window` for it ever runs, and `load` does not.
-    let bubbles = matches!(kind, "click" | "DOMContentLoaded");
-    let prevented = match host.dispatch(target, kind, bubbles) {
+    let prevented = match host.dispatch(target, event) {
         Ok(prevented) => prevented,
         Err(error) => {
             console.push(
@@ -836,6 +832,39 @@ pub enum Target {
     Node(u32),
     Document,
     Window,
+}
+
+/// The browser-visible facts of an event dispatched by Yata.
+///
+/// Keeping these facts beside the event name makes dispatch callers state the
+/// contract they are invoking.  In particular, cancellation is not an
+/// accidental property of every event merely because it happens to travel
+/// through the same dispatcher as `click`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EventDescriptor {
+    pub kind: &'static str,
+    pub bubbles: bool,
+    pub cancelable: bool,
+}
+
+impl EventDescriptor {
+    pub const CLICK: Self = Self::new("click", true, true);
+    pub const INPUT: Self = Self::new("input", true, false);
+    pub const CHANGE: Self = Self::new("change", true, false);
+    pub const SUBMIT: Self = Self::new("submit", true, true);
+    pub const FOCUS: Self = Self::new("focus", false, false);
+    pub const BLUR: Self = Self::new("blur", false, false);
+    pub const DOM_CONTENT_LOADED: Self = Self::new("DOMContentLoaded", true, false);
+    pub const LOAD: Self = Self::new("load", false, false);
+    pub const ERROR: Self = Self::new("error", false, false);
+
+    pub const fn new(kind: &'static str, bubbles: bool, cancelable: bool) -> Self {
+        Self {
+            kind,
+            bubbles,
+            cancelable,
+        }
+    }
 }
 
 /// The script name and line from a listener's stack, skipping frames inside

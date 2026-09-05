@@ -138,6 +138,9 @@ pub struct Dom {
     /// can be answered by restyling and comparing computed values, which is
     /// far cheaper than laying the page out to find out.
     structure_version: u64,
+    /// Bumped by current form value/choice writes. These affect layout but
+    /// cannot affect selector matching, unlike tree/text and attribute edits.
+    live_state_version: u64,
     /// *Which* nodes those attribute writes landed on, since the list was last
     /// read (M11.3) — the difference between knowing that the cascade's answer
     /// may have moved and knowing where. Bounded by
@@ -172,6 +175,8 @@ enum Edit {
     /// of its own — but it does grow `node_count`, which the styled tree is
     /// sized by, so it still counts as an edit.
     Detached,
+    /// Changed a sparse current form value or choice state.
+    LiveState,
 }
 
 impl Dom {
@@ -190,6 +195,7 @@ impl Dom {
             root: NodeId(0),
             version: 0,
             structure_version: 0,
+            live_state_version: 0,
             attr_changes: Vec::new(),
             attr_changes_overflowed: false,
             field_values: HashMap::new(),
@@ -236,6 +242,7 @@ impl Dom {
             Edit::Structure => self.structure_version += 1,
             Edit::Attribute(id) => self.note_attr_change(id),
             Edit::Detached => {}
+            Edit::LiveState => self.live_state_version += 1,
         }
     }
 
@@ -279,6 +286,20 @@ impl Dom {
     /// this is the half of `version` that always needs a relayout.
     pub fn structure_version(&self) -> u64 {
         self.structure_version
+    }
+
+    /// Edits to current form state, which need layout but never a restyle.
+    pub fn live_state_version(&self) -> u64 {
+        self.live_state_version
+    }
+
+    /// The complete invalidation stamp consumed at a JS action boundary.
+    pub fn change_versions(&self) -> (u64, u64, u64) {
+        (
+            self.version,
+            self.structure_version,
+            self.live_state_version,
+        )
     }
 
     /// A new element belonging to no tree. It exists in the arena — style will
@@ -428,10 +449,19 @@ impl Dom {
     /// what a reader typed, and a keystroke must not become a cascade edit.
     ///
     /// It *is* a text edit, though — the value is what the box draws — so it
-    /// invalidates the way `set_text` does: relayout, then repaint.
-    pub fn set_field_value(&mut self, id: NodeId, value: &str) {
+    /// invalidates the way `set_text` does: relayout, then repaint. Returns
+    /// `false` when an existing dirty value already equals `value`.
+    pub fn set_field_value(&mut self, id: NodeId, value: &str) -> bool {
+        if self
+            .field_values
+            .get(&id)
+            .is_some_and(|current| current == value)
+        {
+            return false;
+        }
         self.field_values.insert(id, value.to_string());
-        self.note_edit(Edit::Structure);
+        self.note_edit(Edit::LiveState);
+        true
     }
 
     /// A reader's live checked/selected override, or `None` while the element
@@ -452,7 +482,7 @@ impl Dom {
             return false;
         }
         self.choice_states.insert(id, value);
-        self.note_edit(Edit::Structure);
+        self.note_edit(Edit::LiveState);
         true
     }
 
@@ -471,7 +501,38 @@ impl Dom {
             return false;
         }
         self.choice_states.extend(states.iter().copied());
-        self.note_edit(Edit::Structure);
+        self.note_edit(Edit::LiveState);
+        true
+    }
+
+    /// Preserve the sparse live-state representation across a cancelable
+    /// pre-activation. `None` is significant: it means the control is still
+    /// following its content attribute rather than a reader-created override.
+    pub fn choice_state_snapshot(&self, ids: &[NodeId]) -> Vec<(NodeId, Option<bool>)> {
+        ids.iter()
+            .map(|&id| (id, self.choice_states.get(&id).copied()))
+            .collect()
+    }
+
+    /// Restore a snapshot made by [`Self::choice_state_snapshot`].
+    pub fn restore_choice_state_snapshot(&mut self, snapshot: &[(NodeId, Option<bool>)]) -> bool {
+        let changed = snapshot
+            .iter()
+            .any(|(id, value)| self.choice_states.get(id).copied() != *value);
+        if !changed {
+            return false;
+        }
+        for &(id, value) in snapshot {
+            match value {
+                Some(value) => {
+                    self.choice_states.insert(id, value);
+                }
+                None => {
+                    self.choice_states.remove(&id);
+                }
+            }
+        }
+        self.note_edit(Edit::LiveState);
         true
     }
 
@@ -1103,6 +1164,19 @@ mod tests {
         let before = dom.version();
         assert!(!dom.set_choice_group(&[(first, false), (second, true)], "checked"));
         assert_eq!(dom.version(), before);
+    }
+
+    #[test]
+    fn a_live_field_write_is_quiet_when_the_dirty_value_is_unchanged() {
+        let (mut dom, field, _, _) = sample();
+        let before = dom.version();
+        assert!(dom.set_field_value(field, "typed"));
+        assert_eq!(dom.version(), before + 1);
+
+        let before = dom.version();
+        assert!(!dom.set_field_value(field, "typed"));
+        assert_eq!(dom.version(), before);
+        assert_eq!(dom.field_value(field), Some("typed"));
     }
 
     #[test]
