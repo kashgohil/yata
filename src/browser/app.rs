@@ -9557,6 +9557,26 @@ mod tests {
     }
 
     #[test]
+    fn table_resize_relayouts_once_and_scrolling_uses_the_cached_tree() {
+        let mut html = String::from("<table>");
+        for index in 0..80 {
+            html.push_str(&format!(
+                "<tr><td>{index}.</td><td>▲</td><td>story title {index} with metadata</td></tr>"
+            ));
+        }
+        html.push_str("</table>");
+        let mut app = page(40, 10, &html);
+        assert_eq!(app.layouts, 1);
+        for _ in 0..80 {
+            app.update(ch('j'));
+        }
+        assert!(app.viewport.offset() > 0);
+        assert_eq!(app.layouts, 1, "scroll must not remeasure table columns");
+        app.update(Msg::Resize(30, 10));
+        assert_eq!(app.layouts, 2, "resize performs one ordinary relayout");
+    }
+
+    #[test]
     fn a_script_live_value_write_relayouts_without_restyling() {
         let (mut app, id) = scripted_app(
             "<input id=x value=markup><script>document.getElementById('x').value = 'live';</script>",

@@ -2966,6 +2966,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn absurd_table_and_cell_widths_are_capped_without_losing_cells() {
+        let (dom, styles) = styled_dom(
+            "<table><tr><td class=wide>界界界</td><td class=wide></td></tr></table>",
+            "table, tr, td { display: block }\
+             table { width: 1e11em }\
+             .wide { min-width: 1e11em; padding: 1e11em; box-sizing: border-box }",
+        );
+        let tree = layout_document(&dom, &styles, 1, Hidden::Respect);
+        let row = tree
+            .boxes
+            .iter()
+            .find(|box_| box_.kind == BoxKind::TableRow)
+            .unwrap();
+        assert_eq!(row.children.len(), 2);
+        assert!(
+            row.children
+                .iter()
+                .all(|&cell| tree.get(cell).dimensions.margin_box_width() > 0)
+        );
+        assert!(tree.boxes.len() < 32, "CSS widths allocated layout boxes");
+    }
+
     mod ladder {
         use super::*;
         use std::fs;
