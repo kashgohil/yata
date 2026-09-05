@@ -9315,6 +9315,65 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_submit_keeps_a_listener_requested_navigation() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form action=/native><input name=q value=x></form><script>\
+             document.querySelector('form').addEventListener('submit', function (e) {\
+               e.preventDefault(); location.href = '/script';\
+             });</script>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fetched(&effect), Some("http://x/script"));
+    }
+
+    #[test]
+    fn uncancelled_native_submit_wins_over_listener_navigation() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form action=/native><input name=q value=x></form><script>\
+             document.querySelector('form').addEventListener('submit', function () {\
+               location.href = '/script';\
+             });</script>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fetched(&effect), Some("http://x/native?q=x"));
+    }
+
+    #[test]
+    fn submit_button_click_revalidates_type_disabled_and_connection() {
+        for mutation in [
+            "b.setAttribute('type', 'button')",
+            "b.setAttribute('disabled', '')",
+            "b.remove()",
+        ] {
+            let html = format!(
+                "<form action=/native><button id=b>Send</button></form><script>\
+                 var b = document.getElementById('b');\
+                 b.addEventListener('click', function () {{ {mutation}; }});\
+                 </script>"
+            );
+            let (mut app, id) = page_from("http://x/page", &html, 60, 8);
+            app.update(Msg::RunScripts { id });
+            let button = by_id(&app, "b");
+            let effect = click_node(&mut app, button);
+            assert_eq!(
+                fetched(&effect),
+                None,
+                "mutation `{mutation}` left the old submit default active"
+            );
+        }
+    }
+
+    #[test]
     fn a_control_click_listener_sends_its_timer_request_with_the_action() {
         let (mut app, id) = scripted_app(
             "<input id=c type=checkbox><script>\
