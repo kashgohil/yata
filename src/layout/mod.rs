@@ -2917,6 +2917,27 @@ mod tests {
     }
 
     #[test]
+    fn decoded_image_in_a_cell_contributes_its_terminal_width() {
+        let (dom, styles) = styled_dom(
+            "<table><tr><td><img src=logo.png width=80 height=16></td><td>meta</td></tr></table>",
+            "table, tr, td { display: block }",
+        );
+        let images = crate::image::discover(&dom, Some("https://fixture.test/page"));
+        let context = crate::image::ImageContext::from_discovery(
+            &images,
+            &mut crate::image::ImageCache::default(),
+        );
+        let tree = layout_document_with(&dom, &styles, 20, Hidden::Respect, &context);
+        let row = tree
+            .boxes
+            .iter()
+            .find(|box_| box_.kind == BoxKind::TableRow)
+            .unwrap();
+        assert_eq!(tree.get(row.children[0]).dimensions.margin_box_width(), 10);
+        assert_eq!(tree.get(row.children[1]).dimensions.margin_box_width(), 4);
+    }
+
+    #[test]
     fn links_and_controls_inside_cells_keep_the_existing_hit_paths() {
         let (dom, styles) = styled_dom(
             "<table><tr><td><a href=/docs>docs</a></td><td><input value=go size=2></td></tr></table>",
