@@ -1,0 +1,48 @@
+<html>  x=0 y=0 w=40 h=7
+  <body>  x=0 y=0 w=40 h=7
+    table <table.auto>  x=0 y=0 w=26 h=1
+      table-row <tr>  x=0 y=0 w=26 h=1
+        table-cell <td>  x=0 y=0 w=2 h=1
+          anonymous  x=0 y=0 w=2 h=1
+            line  x=0 y=0 w=2 h=1
+              #text "1."  x=0 y=0 w=2 h=1
+        table-cell <td>  x=2 y=0 w=1 h=1
+          anonymous  x=2 y=0 w=1 h=1
+            line  x=2 y=0 w=1 h=1
+              #text "▲"  x=2 y=0 w=1 h=1
+        table-cell <td>  x=3 y=0 w=23 h=1
+          anonymous  x=3 y=0 w=23 h=1
+            line  x=3 y=0 w=23 h=1
+              #text "title lorem ipsum d…"  x=3 y=0 w=23 h=1
+    table <table.specified>  x=0 y=1 w=20 h=3
+      table-row <tr>  x=0 y=1 w=20 h=3
+        table-cell <td.border>  x=1 y=2 w=6 h=1
+          anonymous  x=1 y=2 w=6 h=1
+            line  x=1 y=2 w=6 h=1
+              #text "fixed"  x=1 y=2 w=5 h=1
+        table-cell <td>  x=8 y=1 w=12 h=1
+          anonymous  x=8 y=1 w=12 h=1
+            line  x=8 y=1 w=12 h=1
+              #text "grows here"  x=8 y=1 w=10 h=1
+    table <table.minimum>  x=0 y=4 w=12 h=1
+      table-row <tr>  x=0 y=4 w=12 h=1
+        table-cell <td>  x=0 y=4 w=6 h=1
+          anonymous  x=0 y=4 w=6 h=1
+            line  x=0 y=4 w=6 h=1
+              #text "a"  x=0 y=4 w=1 h=1
+        table-cell <td>  x=6 y=4 w=6 h=1
+          anonymous  x=6 y=4 w=6 h=1
+            line  x=6 y=4 w=6 h=1
+              #text "b"  x=6 y=4 w=1 h=1
+    table <table.maximum>  x=0 y=5 w=10 h=2
+      table-row <tr>  x=0 y=5 w=10 h=2
+        table-cell <td>  x=0 y=5 w=6 h=2
+          anonymous  x=0 y=5 w=6 h=2
+            line  x=0 y=5 w=6 h=1
+              #text "title"  x=0 y=5 w=5 h=1
+            line  x=0 y=6 w=6 h=1
+              #text "words"  x=0 y=6 w=5 h=1
+        table-cell <td>  x=6 y=5 w=4 h=1
+          anonymous  x=6 y=5 w=4 h=1
+            line  x=6 y=5 w=4 h=1
+              #text "meta"  x=6 y=5 w=4 h=1

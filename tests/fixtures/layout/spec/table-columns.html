@@ -1,0 +1,21 @@
+<!-- width: 40 -->
+<!-- M11.15: no-span auto table columns use min/max contributions. -->
+<style>
+  html, body, table, tr, td { display: block; margin: 0 }
+  .specified { width: 160px }
+  .minimum { min-width: 96px }
+  .maximum { max-width: 80px }
+  .border { width: 48px; padding: 8px; box-sizing: border-box }
+</style>
+<table class="auto">
+  <tr><td>1.</td><td>▲</td><td>title lorem ipsum dolor</td></tr>
+</table>
+<table class="specified">
+  <tr><td class="border">fixed</td><td>grows here</td></tr>
+</table>
+<table class="minimum">
+  <tr><td>a</td><td>b</td></tr>
+</table>
+<table class="maximum">
+  <tr><td>title words</td><td>meta</td></tr>
+</table>
