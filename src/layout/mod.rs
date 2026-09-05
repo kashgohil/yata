@@ -14,7 +14,7 @@ mod hit;
 pub(crate) mod intrinsic;
 mod lines;
 
-pub use boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
+pub use boxes::{BoxId, BoxKind, GridBorder, LayoutBox, LayoutTree};
 pub use clip::Clip;
 pub use dimensions::{Dimensions, EdgeSizes, Rect};
 pub use engine::{Hidden, layout_tree, layout_tree_with, term_color, term_style};
@@ -2307,6 +2307,360 @@ mod tests {
         assert!(saw_text);
     }
 
+    #[test]
+    fn positioned_boxes_keep_flow_and_use_final_rectangles() {
+        let html = "<div id='card'><div id='close'>x</div><div id='copy'>copy</div></div>";
+        let (dom, styles) = styled_dom(
+            html,
+            "* { margin: 0 } #card { position: relative; padding: 1em } \
+             #close { position: absolute; top: 1em; left: 1em; width: 8px }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let by_id = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .expect("fixture element must have a layout box")
+        };
+        let card = by_id("card").dimensions;
+        let close = by_id("close").dimensions;
+        let copy = by_id("copy").dimensions;
+        assert_eq!(close.content.x, card.padding_box().x + 2);
+        assert_eq!(close.content.y, card.padding_box().y + 1);
+        assert_eq!(
+            copy.content.y, card.content.y,
+            "absolute child consumed flow"
+        );
+        let card_box = by_id("card");
+        let child_ids: Vec<_> = card_box
+            .children
+            .iter()
+            .filter_map(|&child| tree.get(child).node.and_then(|n| dom.attr(n, "id")))
+            .collect();
+        assert_eq!(
+            child_ids,
+            ["close", "copy"],
+            "deferred child lost DOM paint order"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='outer'><div id='middle'><div id='static'>x</div></div></div>",
+            "* { margin: 0 } #outer { position: relative; padding: 1em } \
+             #middle { padding: 1em } #static { position: absolute }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let lookup = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .expect("fixture element must have a layout box")
+                .dimensions
+        };
+        assert_eq!(
+            lookup("static").content.x,
+            lookup("middle").content.x,
+            "an absolute child without horizontal insets lost its static parent origin"
+        );
+        assert_eq!(
+            lookup("static").content.y,
+            lookup("middle").content.y,
+            "an absolute child without vertical insets lost its static parent origin"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='first'>one</div><div id='second'>two</div>",
+            "* { margin: 0 } #first { position: relative; top: 2em; bottom: 9em }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let first = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("first"))
+            .unwrap();
+        let second = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("second"))
+            .unwrap();
+        assert_eq!(first.dimensions.content.y, 2, "top wins over bottom");
+        assert_eq!(
+            second.dimensions.content.y, 1,
+            "relative shift changed flow"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><p>copy</p><a id='close' href='/x'>x</a></div>",
+            "* { margin: 0 } #card { position: relative } #close { position: absolute; top: 0; right: 0; width: 8px }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let close = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("close"))
+            .unwrap();
+        let hit = hit_test(
+            &tree,
+            close.dimensions.content.x,
+            close.dimensions.content.y,
+        )
+        .expect("shifted link must be hit-testable");
+        assert_eq!(
+            nearest_link(&dom, hit).map(|(node, _)| node),
+            close.node,
+            "later positioned link did not win its painted cell"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><span>flow<a id='popup'>popup</a></span><div id='after'>after</div></div>",
+            "* { margin: 0 } #card { position: relative } #popup { position: absolute; top: 0; left: 0 }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let lookup = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .unwrap()
+                .dimensions
+        };
+        assert_eq!(lookup("popup").content.y, lookup("card").padding_box().y);
+        assert_eq!(
+            lookup("after").content.y,
+            1,
+            "inline absolute child took a line"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><div id='bottom'>x</div></div>",
+            "* { margin: 0 } #card { position: relative; height: 4em } #bottom { position: absolute; bottom: 1em; height: 1em }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let lookup = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .unwrap()
+                .dimensions
+        };
+        assert_eq!(
+            lookup("bottom").content.y,
+            2,
+            "bottom inset ignored definite height"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div><span id='badge'>badge</span> tail</div>",
+            "* { margin: 0 } #badge { position: relative; left: 1em; top: 1em }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let badge = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("badge"))
+            .unwrap();
+        assert_eq!(
+            badge.dimensions.content.x, 2,
+            "relative inline did not shift"
+        );
+        assert_eq!(
+            badge.dimensions.content.y, 1,
+            "relative inline did not shift vertically"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><div id='tiny'>x</div><p id='flow'>flow</p></div>",
+            "* { margin: 0 } #card { position: relative; width: 8px } #tiny { position: absolute; left: 1e11em; right: 1e11em }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let tiny = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("tiny"))
+            .unwrap();
+        assert_eq!(
+            tiny.dimensions.content.width, 1,
+            "opposing hostile insets lost the present box"
+        );
+        assert!(
+            tiny.dimensions.content.x >= 0,
+            "saturated offset wrapped left of the document"
+        );
+        let flow = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("flow"))
+            .unwrap();
+        assert_eq!(
+            flow.dimensions.content.y, 0,
+            "hostile absolute box entered flow"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><a id='cjk' href='/x'>世界</a><p>flow</p></div>",
+            "* { margin: 0 } #card { position: relative } #cjk { position: absolute; left: 1em; top: 1em }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let cjk = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("cjk"))
+            .unwrap();
+        assert_eq!(cjk.dimensions.content.x, 2);
+        assert_eq!(cjk.dimensions.content.y, 1);
+        let cjk_text = tree
+            .boxes
+            .iter()
+            .find(|b| b.text.as_deref() == Some("世界"))
+            .unwrap();
+        assert_eq!(
+            cjk_text.dimensions.content.width, 4,
+            "CJK width must stay in cells"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><a id='hidden' href='/x'>hidden</a><p>shown</p></div>",
+            "* { margin: 0 } #card { position: relative; height: 1em; overflow: hidden } #hidden { position: absolute; top: 2em; left: 0 }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let visible = plain(&lines_from_tree(&tree));
+        assert!(
+            visible.iter().any(|line| line.contains("shown")),
+            "{visible:?}"
+        );
+        assert!(
+            !visible.iter().any(|line| line.contains("hidden")),
+            "shifted descendant escaped its ancestor clip: {visible:?}"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><table id='panel'><tr><td>key</td><td>value</td></tr></table><p>flow</p></div>",
+            "* { margin: 0 } #card { position: relative } #panel { position: absolute; top: 1em; left: 1em }",
+        );
+        let tree = layout_document(&dom, &styles, 30, Hidden::Respect);
+        let panel = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("panel"))
+            .unwrap();
+        assert_eq!(panel.dimensions.content.x, 2);
+        assert_eq!(panel.dimensions.content.y, 1);
+        assert!(
+            plain(&lines_from_tree(&tree))
+                .iter()
+                .any(|line| line.contains("keyvalue"))
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='card'><input id='field' size='4' value='go'><p>flow</p></div>",
+            "* { margin: 0 } #card { position: relative } #field { position: absolute; top: 1em; left: 1em }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let field = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("field"))
+            .unwrap();
+        assert!(matches!(field.kind, BoxKind::Field(_)));
+        assert_eq!(field.dimensions.margin_box().x, 2);
+        assert_eq!(field.dimensions.content.y, 1);
+
+        let dom = html::parse(
+            "<div id='card'><img id='image' src='a.png' width='16' height='16'><p id='flow'>flow</p></div>",
+        );
+        let sheet = crate::css::parse(
+            "* { margin: 0 } #card { position: relative } #image { position: absolute; left: 1em; top: 1em }",
+        );
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let images = crate::image::discover(&dom, Some("https://fixture.test/"));
+        let mut cache = crate::image::ImageCache::default();
+        let context = crate::image::ImageContext::from_discovery(&images, &mut cache);
+        let tree = layout_document_with(&dom, &styles, 20, Hidden::Respect, &context);
+        let image = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("image"))
+            .expect("absolute image must retain its replaced-element box");
+        assert!(matches!(image.kind, BoxKind::Image));
+        assert_eq!(image.dimensions.content.x, 2);
+        assert_eq!(image.dimensions.content.y, 1);
+        let flow = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some("flow"))
+            .unwrap();
+        assert_eq!(flow.dimensions.content.y, 0, "absolute image entered flow");
+
+        let (dom, styles) = styled_dom(
+            "<div id='auto'><p id='auto-child'>x</p></div><div id='fixed'><p id='fixed-child'>x</p></div>",
+            "* { margin: 0 } #auto-child { position: relative; top: 50% } #fixed { height: 4em } #fixed-child { position: relative; top: 50% }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let position = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .unwrap()
+                .dimensions
+                .content
+                .y
+        };
+        assert_eq!(
+            position("auto-child"),
+            0,
+            "indefinite percentage offset must be auto"
+        );
+        assert_eq!(
+            position("fixed-child"),
+            3,
+            "definite percentage offset did not resolve"
+        );
+
+        let static_geometry = geometry(
+            "<div id='x'>x</div><p>after</p>",
+            "* { margin: 0 } #x { top: 9em; left: 9em; right: 9em; bottom: 9em }",
+            20,
+        );
+        let baseline_geometry = geometry("<div id='x'>x</div><p>after</p>", "* { margin: 0 }", 20);
+        assert_eq!(
+            static_geometry, baseline_geometry,
+            "static insets changed layout"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<div id='flex'><div id='one'>one</div><div id='abs'>abs</div><div id='two'>two</div></div>",
+            "* { margin: 0 } #flex { display: flex; position: relative; gap: 1em } #abs { position: absolute; left: 0; top: 0 }",
+        );
+        let tree = layout_document(&dom, &styles, 30, Hidden::Respect);
+        let item_x = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .unwrap()
+                .dimensions
+                .margin_box()
+                .x
+        };
+        assert_eq!(
+            item_x("two"),
+            5,
+            "absolute child consumed a flex slot or gap"
+        );
+
+        let (dom, styles) = styled_dom(
+            "<table id='table'><tr><td id='normal'>normal</td><td id='abs'>abs</td></tr></table>",
+            "* { margin: 0 } #table { position: relative } #abs { position: absolute; top: 0; left: 0 }",
+        );
+        let tree = layout_document(&dom, &styles, 30, Hidden::Respect);
+        let cell = |wanted: &str| {
+            tree.boxes
+                .iter()
+                .find(|b| b.node.and_then(|n| dom.attr(n, "id")) == Some(wanted))
+                .unwrap()
+                .dimensions
+        };
+        assert_eq!(cell("normal").content.x, 0);
+        assert_eq!(cell("abs").margin_box().x, 0);
+    }
+
     // ---- M9.2 sizing: the cases a golden cannot show -----------------------
 
     /// Every rect in the tree, for the invariants that must hold everywhere.
@@ -2845,6 +3199,55 @@ mod tests {
             vec!["LanguageYear", "Rust        extra"],
             "dump-text consumes the positioned cell tree in visual row order"
         );
+    }
+
+    #[test]
+    fn table_spans_claim_rectangles_and_leave_no_interior_grid_rule() {
+        let (dom, styles) = styled_dom(
+            "<table><tr><th colspan=2>Language</th><th>Year</th></tr>\
+             <tr><td rowspan=2>Rust</td><td>stable</td><td>2015</td></tr>\
+             <tr><td>edition</td><td>2024</td></tr></table>",
+            "table, tr, td, th { display: block } table, td, th { border: 1em solid }",
+        );
+        let tree = layout_document(&dom, &styles, 36, Hidden::Respect);
+        let table = tree
+            .boxes
+            .iter()
+            .position(|b| b.kind == BoxKind::Table)
+            .unwrap();
+        let rows: Vec<_> = tree.get(BoxId(table as u32)).children.clone();
+        let header = tree.get(rows[0]).children[0];
+        let rust = tree.get(rows[1]).children[0];
+        let stable = tree.get(rows[1]).children[1];
+        let edition = tree.get(rows[2]).children[0];
+        let header_box = tree.get(header).dimensions.border_box();
+        let stable_box = tree.get(stable).dimensions.border_box();
+        let rust_box = tree.get(rust).dimensions.border_box();
+        assert!(header_box.width > stable_box.width);
+        assert!(
+            rust_box.height >= stable_box.height + tree.get(edition).dimensions.border_box().height
+        );
+        assert_eq!(tree.get(edition).dimensions.border_box().x, stable_box.x);
+        // The shared internal vertical line starts below the colspan header;
+        // the rowspan similarly leaves no horizontal rule through Rust.
+        assert!(tree.grid_borders.iter().all(|edge| !edge.horizontal
+            || edge.y != tree.get(rows[2]).dimensions.content.y
+            || edge.x >= stable_box.x));
+        assert!(tree.grid_borders.iter().any(|edge| edge.horizontal));
+        assert!(tree.grid_borders.iter().any(|edge| !edge.horizontal));
+    }
+
+    #[test]
+    fn table_grid_keeps_the_widest_shared_border_and_clips_its_output() {
+        let (dom, styles) = styled_dom(
+            "<div class=clip><table><tr><td class=wide>a</td><td class=narrow>b</td></tr></table></div>",
+            ".clip { display:block; width: 8em; overflow:hidden } table, tr, td { display:block }\
+             table { border: 1em solid } .wide { border-right: 3em solid } .narrow { border-left: 1em solid }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        assert!(tree.grid_borders.iter().any(|edge| edge.thickness >= 6));
+        let list = crate::paint::paint(&tree);
+        assert!(list.commands.iter().any(|command| matches!(command, crate::paint::DisplayCommand::GridBorder { border } if border.thickness >= 6)));
     }
 
     #[test]

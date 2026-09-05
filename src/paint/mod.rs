@@ -14,7 +14,7 @@ use std::sync::Arc;
 use crate::image::{
     DecodedImage, HalfBlockGrid, KittyPlacement, placeholder_grid, raster_halfblocks,
 };
-use crate::layout::{BoxKind, Clip, LayoutBox, LayoutTree, Rect, term_color};
+use crate::layout::{BoxKind, Clip, GridBorder, LayoutBox, LayoutTree, Rect, term_color};
 use crate::style::values::ColorValue;
 use crate::term::{Color, Style};
 
@@ -25,6 +25,9 @@ pub enum DisplayCommand {
     FillRect { rect: Rect, color: Color },
     /// Draw a border around the border box with box-drawing characters.
     Border { rect: Rect },
+    /// A resolved table rule. Unlike `Border`, this is a single edge and can
+    /// therefore be shared by two cells or omitted inside a span.
+    GridBorder { border: GridBorder },
     /// A run of text at (x, y). Never contains a newline.
     Text {
         x: i32,
@@ -64,7 +67,56 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
         width: tree.width,
         height: tree.height,
     };
-    tree.walk_clipped(&mut |_, b, clip| paint_box(b, images, &mut list, clip));
+    let mut clips = vec![Clip::NONE; tree.boxes.len()];
+    tree.walk_clipped(&mut |id, b, clip| {
+        clips[id.0 as usize] = clip;
+        let rect = b.dimensions.border_box();
+        let resolved_grid = matches!(
+            b.kind,
+            BoxKind::Table | BoxKind::TableRow | BoxKind::TableCell
+        ) && tree.grid_borders.iter().any(|edge| {
+            edge.owner == id
+                && edge.x >= rect.x
+                && edge.x < rect.right()
+                && edge.y >= rect.y
+                && edge.y < rect.bottom()
+        });
+        paint_box(b, images, &mut list, clip, resolved_grid)
+    });
+    for border in &tree.grid_borders {
+        let raw = if border.horizontal {
+            Rect {
+                x: border.x,
+                y: border.y,
+                width: border.length,
+                height: border.thickness,
+            }
+        } else {
+            Rect {
+                x: border.x,
+                y: border.y,
+                width: border.thickness,
+                height: border.length,
+            }
+        };
+        let visible = clips[border.owner.0 as usize].apply(raw);
+        if visible.width > 0 && visible.height > 0 {
+            let mut border = *border;
+            border.x = visible.x;
+            border.y = visible.y;
+            border.length = if border.horizontal {
+                visible.width
+            } else {
+                visible.height
+            };
+            border.thickness = if border.horizontal {
+                visible.height
+            } else {
+                visible.width
+            };
+            list.commands.push(DisplayCommand::GridBorder { border });
+        }
+    }
     list
 }
 
@@ -72,21 +124,26 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
 /// `overflow` leaves for it. The box's *own* `overflow` is not applied here:
 /// it clips this box's content and descendants, which is what the walk hands
 /// them (see [`Clip::inside`]).
-fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: Clip) {
+fn paint_box(
+    b: &LayoutBox,
+    images: &ImagePixels,
+    list: &mut DisplayList,
+    clip: Clip,
+    resolved_table_grid: bool,
+) {
     match b.kind {
         // A flex container paints exactly like a block: a background fills its
         // padding box and a border outlines it, whoever placed what is inside.
-        BoxKind::Block
-        | BoxKind::Flex
-        | BoxKind::Table
-        | BoxKind::TableRow
-        | BoxKind::TableCell => paint_decorations(b, list, clip),
+        BoxKind::Block | BoxKind::Flex => paint_decorations(b, list, clip, true),
+        BoxKind::Table | BoxKind::TableRow | BoxKind::TableCell => {
+            paint_decorations(b, list, clip, !resolved_table_grid)
+        }
         // A form control is an ordinary box from the outside — its background
         // and border paint like any other — and then draws its own cells
         // (M11.8). Its frame lives in the padding, which is why the decorations
         // go down first.
         BoxKind::Field(_) => {
-            paint_decorations(b, list, clip);
+            paint_decorations(b, list, clip, true);
             for run in crate::layout::field::runs(b) {
                 if let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) {
                     list.commands.push(DisplayCommand::Text {
@@ -178,7 +235,7 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
 /// A box's background and border — everything it paints that is not its
 /// content. Shared by blocks, flex containers and form controls, because from
 /// the outside those differ only in what goes *inside* the padding box.
-fn paint_decorations(b: &LayoutBox, list: &mut DisplayList, clip: Clip) {
+fn paint_decorations(b: &LayoutBox, list: &mut DisplayList, clip: Clip, paint_border: bool) {
     // Background fills the padding box (CSS).
     if let ColorValue::Rgb(r, g, bcol) = b.computed.background_color {
         let rect = clip.apply(b.dimensions.padding_box());
@@ -198,7 +255,8 @@ fn paint_decorations(b: &LayoutBox, list: &mut DisplayList, clip: Clip) {
     // open-sided borders — would put clip state into the scroll path, which
     // M9.3 exists to avoid.
     let border = b.dimensions.border;
-    if border.top > 0 || border.right > 0 || border.bottom > 0 || border.left > 0 {
+    if paint_border && (border.top > 0 || border.right > 0 || border.bottom > 0 || border.left > 0)
+    {
         let rect = clip.apply(b.dimensions.border_box());
         if rect.width > 0 && rect.height > 0 {
             list.commands.push(DisplayCommand::Border { rect });
@@ -270,6 +328,9 @@ pub fn paint_to_frame(
                     continue;
                 }
                 draw_border(frame, origin_x, scroll_y, page_h, *rect);
+            }
+            DisplayCommand::GridBorder { border } => {
+                draw_grid_border(frame, origin_x, scroll_y, page_h, *border);
             }
             DisplayCommand::Text { x, y, text, style } => {
                 if !visible(*y, 1) {
@@ -476,6 +537,41 @@ fn draw_border(
     for r in 1..rect.height - 1 {
         put(frame, rect.x, rect.y + r, '│');
         put(frame, rect.x + rect.width - 1, rect.y + r, '│');
+    }
+}
+
+/// Draw one already-resolved table rule. Crossings are assembled in the frame,
+/// which lets separately emitted horizontal and vertical segments meet without
+/// a table-specific display-list pass.
+fn draw_grid_border(
+    frame: &mut crate::term::Frame,
+    origin_x: u16,
+    scroll_y: i32,
+    page_h: i32,
+    border: GridBorder,
+) {
+    let style = Style::default();
+    for depth in 0..border.thickness.max(1) {
+        for offset in 0..border.length.max(0) {
+            let dx = border
+                .x
+                .saturating_add(if border.horizontal { offset } else { depth });
+            let dy = border
+                .y
+                .saturating_add(if border.horizontal { depth } else { offset });
+            let sy = dy - scroll_y;
+            let sx = origin_x as i32 + dx;
+            if sy < 0 || sy >= page_h || sx < 0 || sx >= frame.width() as i32 {
+                continue;
+            }
+            let old = frame.get(sx as u16, sy as u16).ch;
+            let ch = match (old, border.horizontal) {
+                ('│', true) | ('─', false) | ('┼', _) => '┼',
+                _ if border.horizontal => '─',
+                _ => '│',
+            };
+            frame.set(sx as u16, sy as u16, crate::term::Cell::new(ch, style));
+        }
     }
 }
 

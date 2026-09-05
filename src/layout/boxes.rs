@@ -88,6 +88,23 @@ pub struct LayoutTree {
     pub width: i32,
     /// Total height of the root margin box — the scroll range.
     pub height: i32,
+    /// Resolved table grid rules. These are final layout output: paint never
+    /// has to infer spans or inspect the DOM.
+    pub grid_borders: Vec<GridBorder>,
+}
+
+/// One horizontal or vertical rule in a resolved table grid.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GridBorder {
+    /// The table that owns this rule, used only to carry its normal ancestor
+    /// clip into paint. Paint still never discovers the grid from the DOM.
+    pub owner: BoxId,
+    pub x: i32,
+    pub y: i32,
+    pub length: i32,
+    pub horizontal: bool,
+    /// The winning adjacent resolved border width, in terminal cells.
+    pub thickness: i32,
 }
 
 impl LayoutTree {

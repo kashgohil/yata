@@ -6,7 +6,7 @@
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
-use crate::layout::boxes::{BoxId, BoxKind, LayoutBox, LayoutTree};
+use crate::layout::boxes::{BoxId, BoxKind, GridBorder, LayoutBox, LayoutTree};
 use crate::layout::field::{self, FieldPaint};
 use std::ops::Range;
 
@@ -15,7 +15,7 @@ use crate::layout::flex;
 use crate::layout::intrinsic::IntrinsicSizer;
 use crate::style::values::{
     AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FlexWrap, FontStyle, FontWeight,
-    Gaps, Length, TextAlign,
+    Gaps, Length, Position, TextAlign,
 };
 use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
@@ -60,6 +60,7 @@ pub fn layout_tree_with(
         images,
         boxes: Vec::new(),
         sizer: IntrinsicSizer::new(dom, styles, images, hidden),
+        grid_borders: Vec::new(),
     };
     // Synthetic root: full column width, no margins of its own. Children of
     // the document (html) are laid out into it.
@@ -89,10 +90,21 @@ pub fn layout_tree_with(
         // for a percentage to resolve against. `height: 100%` on a top-level
         // element therefore means "as tall as my content", never "as tall as
         // the terminal" (CSS 2.1 §10.5, and M9.2's definiteness rule).
-        if let Some(id) = eng.layout_node(child, 0, width, None, y, &mut prev_mb, false) {
+        if matches!(dom.node(child).data, NodeData::Element { .. })
+            && styles.get(child).position == Position::Absolute
+        {
+            if let Some(id) = eng.layout_absolute(child, root, false) {
+                eng.boxes[root.0 as usize].children.push(id);
+            }
+        } else if let Some(id) = eng.layout_node(child, 0, width, None, y, &mut prev_mb, false) {
             eng.boxes[root.0 as usize].children.push(id);
             let mb = eng.boxes[id.0 as usize].dimensions.margin_box();
-            y = mb.bottom();
+            let dy = if styles.get(child).position == Position::Relative {
+                relative_delta(*styles.get(child), width, None).1
+            } else {
+                0
+            };
+            y = mb.bottom().saturating_sub(dy);
             prev_mb = eng.boxes[id.0 as usize].dimensions.margin.bottom;
         }
     }
@@ -113,6 +125,7 @@ pub fn layout_tree_with(
         root,
         width,
         height: 0,
+        grid_borders: eng.grid_borders,
     };
     let mut lowest = 0;
     tree.walk_clipped(&mut |_, b, clip| {
@@ -140,6 +153,7 @@ struct Engine<'a> {
     /// linear. It measures without allocating a box, which is why an item's
     /// contents are laid out exactly once per pass and not twice.
     sizer: IntrinsicSizer<'a>,
+    grid_borders: Vec<GridBorder>,
 }
 
 impl<'a> Engine<'a> {
@@ -216,7 +230,7 @@ impl<'a> Engine<'a> {
                 if field::generates_no_box(self.dom, id, tag) {
                     return None;
                 }
-                match tag.as_str() {
+                let laid_out = match tag.as_str() {
                     "br" => self.layout_br(x, containing_width, y, prev_margin_bottom, computed),
                     "hr" => self.layout_hr(x, containing_width, y, prev_margin_bottom, computed),
                     "img" => self.layout_img_block(
@@ -260,9 +274,202 @@ impl<'a> Engine<'a> {
                             )
                         }
                     }
+                };
+                if computed.position == Position::Relative
+                    && let Some(box_id) = laid_out
+                {
+                    self.apply_relative(box_id, computed, containing_width, containing_height);
                 }
+                laid_out
             }
         }
+    }
+
+    /// Layout one out-of-flow child after its in-flow siblings have chosen
+    /// their static geometry.  Ownership remains with the ordinary parent;
+    /// only its rectangle is selected from the nearest positioned ancestor.
+    fn layout_absolute(&mut self, id: NodeId, normal_parent: BoxId, pre: bool) -> Option<BoxId> {
+        let NodeData::Element { tag, .. } = &self.dom.node(id).data else {
+            return None;
+        };
+        if self.is_hidden(id) || field::generates_no_box(self.dom, id, tag) {
+            return None;
+        }
+        let (cb, cb_height) = self.containing_block(id, normal_parent);
+        // A missing inset retains the static position the normal parent would
+        // have supplied.  This differs from the containing block whenever a
+        // static intermediate ancestor sits between this child and its nearest
+        // positioned ancestor.
+        let static_origin = self.boxes[normal_parent.0 as usize].dimensions.content;
+        let style = *self.styles.get(id);
+        if tag == "img" {
+            let img = self.images.by_node.get(&id)?;
+            let (intrinsic_w, intrinsic_h, firm) = self.images.size_for(img, cb.width.max(1));
+            let width = if style.width.is_auto() {
+                intrinsic_w.min(cb.width.max(1)).max(1)
+            } else {
+                style.width.to_cells_h(cb.width).max(1)
+            };
+            let left = inset_h(style.left, cb.width);
+            let right = inset_h(style.right, cb.width);
+            let top = inset_v(style.top, cb.width, cb_height);
+            let bottom = cb_height.and_then(|height| inset_v(style.bottom, cb.width, Some(height)));
+            let x = left.map(|n| cb.x.saturating_add(n)).unwrap_or_else(|| {
+                right
+                    .map(|n| cb.right().saturating_sub(n).saturating_sub(width))
+                    .unwrap_or(static_origin.x)
+            });
+            let y = top.map(|n| cb.y.saturating_add(n)).unwrap_or_else(|| {
+                bottom
+                    .map(|n| cb.bottom().saturating_sub(n).saturating_sub(intrinsic_h))
+                    .unwrap_or(static_origin.y)
+            });
+            return Some(self.alloc(LayoutBox {
+                kind: BoxKind::Image,
+                node: Some(id),
+                dimensions: Dimensions {
+                    content: Rect {
+                        x,
+                        y,
+                        width,
+                        height: intrinsic_h.max(1),
+                    },
+                    ..Dimensions::default()
+                },
+                children: Vec::new(),
+                text: Some(img.alt.clone()),
+                term_style: Style::default(),
+                computed: style,
+                image_src: Some(img.url.clone()),
+                image_size_firm: firm,
+            }));
+        }
+        let intrinsic = field::control(self.dom, id, tag).map(|c| c.cols);
+        let mut dims = resolve_block_dims(&style, cb.width.max(1), intrinsic);
+        let left = inset_h(style.left, cb.width);
+        let right = inset_h(style.right, cb.width);
+        if style.width.is_auto()
+            && let (Some(left), Some(right)) = (left, right)
+        {
+            let edges = dims.margin.left
+                + dims.margin.right
+                + dims.border.left
+                + dims.border.right
+                + dims.padding.left
+                + dims.padding.right;
+            dims.content.width = cb
+                .width
+                .saturating_sub(left)
+                .saturating_sub(right)
+                .saturating_sub(edges)
+                .max(1);
+        }
+        let outer_w = dims.margin_box_width();
+        let margin_x = if let Some(left) = left {
+            cb.x.saturating_add(left)
+        } else if let Some(right) = right {
+            cb.right().saturating_sub(right).saturating_sub(outer_w)
+        } else {
+            static_origin.x
+        };
+        dims.content.x = margin_x
+            .saturating_add(dims.margin.left)
+            .saturating_add(dims.border.left)
+            .saturating_add(dims.padding.left);
+        dims.content.y =
+            cb.y.saturating_add(dims.margin.top)
+                .saturating_add(dims.border.top)
+                .saturating_add(dims.padding.top);
+        let box_id = self.layout_box_at(id, tag, style, dims, cb_height, pre || tag == "pre");
+        let top = inset_v(style.top, cb.width, cb_height);
+        // An end inset needs an end edge. The scrolling document root has no
+        // definite vertical end, so a bottom-only child keeps its static row.
+        let bottom = cb_height.and_then(|height| inset_v(style.bottom, cb.width, Some(height)));
+        let mut target_y = if let Some(top) = top {
+            cb.y.saturating_add(top)
+        } else if let Some(bottom) = bottom {
+            cb.bottom()
+                .saturating_sub(bottom)
+                .saturating_sub(self.boxes[box_id.0 as usize].dimensions.margin_box().height)
+        } else {
+            static_origin.y
+        };
+        if let (Some(top), Some(bottom), Some(cb_height)) = (top, bottom, cb_height)
+            && style.height.is_auto()
+        {
+            let available = cb_height
+                .saturating_sub(top)
+                .saturating_sub(bottom)
+                .saturating_sub(self.boxes[box_id.0 as usize].dimensions.margin.top)
+                .saturating_sub(self.boxes[box_id.0 as usize].dimensions.margin.bottom)
+                .saturating_sub(
+                    self.boxes[box_id.0 as usize].dimensions.border.top
+                        + self.boxes[box_id.0 as usize].dimensions.border.bottom
+                        + self.boxes[box_id.0 as usize].dimensions.padding.top
+                        + self.boxes[box_id.0 as usize].dimensions.padding.bottom,
+                )
+                .max(0);
+            self.boxes[box_id.0 as usize].dimensions.content.height = available;
+            target_y = cb.y.saturating_add(top);
+        }
+        let current = self.boxes[box_id.0 as usize].dimensions.margin_box();
+        self.shift_subtree(
+            box_id,
+            margin_x.saturating_sub(current.x),
+            target_y.saturating_sub(current.y),
+        );
+        Some(box_id)
+    }
+
+    fn containing_block(&self, id: NodeId, fallback: BoxId) -> (Rect, Option<i32>) {
+        let mut node = self.dom.node(id).parent;
+        while let Some(ancestor) = node {
+            if self.styles.get(ancestor).position != Position::Static
+                && let Some(b) = self.boxes.iter().rev().find(|b| b.node == Some(ancestor))
+            {
+                let mut padding = b.dimensions.padding_box();
+                // During a parent's content pass its final height has not been
+                // committed yet. An explicit px/em height is nevertheless
+                // definite for descendants, so recover it here rather than
+                // making bottom-only placement wait for a second layout pass.
+                let definite = definite_v(b.computed.height, None).map(|h| {
+                    Axis {
+                        edges: b.dimensions.padding.top
+                            + b.dimensions.padding.bottom
+                            + b.dimensions.border.top
+                            + b.dimensions.border.bottom,
+                        box_sizing: b.computed.box_sizing,
+                    }
+                    .content_from(h)
+                    .saturating_add(b.dimensions.padding.top)
+                    .saturating_add(b.dimensions.padding.bottom)
+                });
+                if let Some(height) = definite {
+                    padding.height = height;
+                }
+                return (padding, definite);
+            }
+            node = self.dom.node(ancestor).parent;
+        }
+        // The synthetic document root is the initial containing block.
+        (
+            self.boxes
+                .first()
+                .map(|b| b.dimensions.content)
+                .unwrap_or(self.boxes[fallback.0 as usize].dimensions.content),
+            None,
+        )
+    }
+
+    fn apply_relative(
+        &mut self,
+        box_id: BoxId,
+        style: ComputedStyle,
+        width: i32,
+        height: Option<i32>,
+    ) {
+        let (dx, dy) = relative_delta(style, width, height);
+        self.shift_subtree(box_id, dx, dy);
     }
 
     // Geometry args are the block-layout signature; grouping them would
@@ -492,7 +699,14 @@ impl<'a> Engine<'a> {
         let mut marker_pending = bullet;
 
         let child_ids: Vec<NodeId> = self.dom.children(id).collect();
+        let mut absolute_children = Vec::new();
         for child in child_ids {
+            if matches!(self.dom.node(child).data, NodeData::Element { .. })
+                && self.styles.get(child).position == Position::Absolute
+            {
+                absolute_children.push(child);
+                continue;
+            }
             match self.child_mode(child, pre) {
                 ChildMode::Skip => {}
                 ChildMode::Block => {
@@ -535,7 +749,12 @@ impl<'a> Engine<'a> {
                         pre,
                     ) {
                         let mb = self.boxes[cid.0 as usize].dimensions.margin_box();
-                        content_y = mb.bottom();
+                        let dy = if self.styles.get(child).position == Position::Relative {
+                            relative_delta(*self.styles.get(child), content_w, specified_height).1
+                        } else {
+                            0
+                        };
+                        content_y = mb.bottom().saturating_sub(dy);
                         child_prev_mb = self.boxes[cid.0 as usize].dimensions.margin.bottom;
                         children.push(cid);
                     }
@@ -548,6 +767,7 @@ impl<'a> Engine<'a> {
                         });
                         marker_pending = false;
                     }
+                    absolute_children.extend(self.inline_absolute_descendants(child));
                     self.push_inline(child, pre, content_w, &mut inline_run);
                 }
             }
@@ -559,6 +779,15 @@ impl<'a> Engine<'a> {
             &mut content_y,
             &mut child_prev_mb,
         );
+
+        // They remain children in the normal tree, but never update the flow
+        // cursor or its collapsed-margin state.
+        let has_absolute_children = !absolute_children.is_empty();
+        for child in absolute_children {
+            if let Some(abs) = self.layout_absolute(child, box_id, pre) {
+                children.push(abs);
+            }
+        }
 
         // Empty <li> still gets a bullet line.
         if marker_pending
@@ -580,14 +809,16 @@ impl<'a> Engine<'a> {
             children.push(anon);
         }
 
+        if has_absolute_children {
+            self.order_children_by_dom(id, &mut children);
+        }
         self.boxes[box_id.0 as usize].children = children;
         (content_y - dims.content.y).max(0)
     }
 
-    /// The no-span part of automatic table layout: cells establish a floor and
-    /// ceiling for their document column, then the table spends its available
-    /// content width between those bounds.  This stays beside block/flex
-    /// formatting so paint and hit testing only ever see ordinary layout boxes.
+    /// Automatic table layout with a bounded, short-lived occupancy grid.
+    /// Cells are laid out once after their final column widths are known; row
+    /// spans only move and enlarge that already-built subtree.
     fn layout_table_contents(
         &mut self,
         id: NodeId,
@@ -603,7 +834,12 @@ impl<'a> Engine<'a> {
             return self.layout_contents(id, "table", computed, box_id, heights, pre);
         }
 
-        let columns = rows.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
+        let placements = self.table_placements(&rows);
+        let columns = placements
+            .iter()
+            .map(|p| p.col + p.colspan)
+            .max()
+            .unwrap_or(0);
         if columns == 0 {
             return self.layout_contents(id, "table", computed, box_id, heights, pre);
         }
@@ -616,11 +852,38 @@ impl<'a> Engine<'a> {
             .width
             .max(1);
         let mut constraints = vec![TableColumn::EMPTY; columns];
-        for (_, cells) in &rows {
-            for (column, &cell) in cells.iter().enumerate() {
-                let contribution = self.table_cell_contribution(cell, requested);
-                constraints[column].min = constraints[column].min.max(contribution.min);
-                constraints[column].max = constraints[column].max.max(contribution.max);
+        let contributions: Vec<_> = placements
+            .iter()
+            .map(|placement| self.table_cell_contribution(placement.cell, requested))
+            .collect();
+        // All floors settle before any ceilings: a later one-column minimum
+        // must participate in a preceding colspan's max constraint.
+        for (placement, contribution) in placements.iter().zip(&contributions) {
+            if placement.colspan == 1 {
+                let column = &mut constraints[placement.col];
+                column.min = column.min.max(contribution.min);
+            } else {
+                raise_track_sum(
+                    &mut constraints,
+                    placement.col,
+                    placement.colspan,
+                    contribution.min,
+                    true,
+                );
+            }
+        }
+        for (placement, contribution) in placements.iter().zip(&contributions) {
+            if placement.colspan == 1 {
+                let column = &mut constraints[placement.col];
+                column.max = column.max.max(contribution.max).max(column.min);
+            } else {
+                raise_track_sum(
+                    &mut constraints,
+                    placement.col,
+                    placement.colspan,
+                    contribution.max,
+                    false,
+                );
             }
         }
         let min_table = constraints
@@ -672,6 +935,14 @@ impl<'a> Engine<'a> {
         // siblings formed rows. Keep it on the existing block path before the
         // derived row subtree.
         for child in loose_children {
+            if matches!(self.dom.node(child).data, NodeData::Element { .. })
+                && self.styles.get(child).position == Position::Absolute
+            {
+                if let Some(abs) = self.layout_absolute(child, box_id, pre) {
+                    row_boxes.push(abs);
+                }
+                continue;
+            }
             if let Some(child_box) = self.layout_node(
                 child,
                 table.x,
@@ -688,11 +959,12 @@ impl<'a> Engine<'a> {
             }
         }
 
-        for (row, cells) in rows {
-            let row_style = *self.styles.get(row);
+        let mut row_ids = Vec::with_capacity(rows.len());
+        for (row, _) in &rows {
+            let row_style = *self.styles.get(*row);
             let row_id = self.alloc(LayoutBox {
                 kind: BoxKind::TableRow,
-                node: Some(row),
+                node: Some(*row),
                 dimensions: Dimensions {
                     content: Rect {
                         x: table.x,
@@ -709,50 +981,130 @@ impl<'a> Engine<'a> {
                 image_src: None,
                 image_size_firm: false,
             });
-            let mut x = table.x;
-            let mut row_height = 1;
-            let mut cell_boxes = Vec::with_capacity(cells.len());
-            for (column, cell) in cells.into_iter().enumerate() {
-                let cell_style = *self.styles.get(cell);
-                let slot = widths[column];
-                let mut dims = resolve_block_dims(&cell_style, slot, None);
-                // A table slot fixes the cell's outer horizontal budget. CSS
-                // widths and auto margins cannot make it drift into a neighbour
-                // before M11.15's real column algorithm has a say.
-                dims.margin.left = 0;
-                dims.margin.right = 0;
-                dims.content.width = (slot
-                    - dims.padding.left
-                    - dims.padding.right
-                    - dims.border.left
-                    - dims.border.right)
-                    .max(0);
-                dims.content.x = x + dims.border.left + dims.padding.left;
-                dims.content.y = y + dims.border.top + dims.padding.top;
-                dims.content.height = 0;
-                let tag = self.tag(cell).to_owned();
-                let cell_id =
-                    self.layout_box_at(cell, &tag, cell_style, dims, heights.specified, pre);
-                let cell_height = self.boxes[cell_id.0 as usize]
-                    .dimensions
-                    .margin_box()
-                    .height
-                    .max(1);
-                self.boxes[cell_id.0 as usize].dimensions.content.height = self.boxes
-                    [cell_id.0 as usize]
-                    .dimensions
-                    .content
-                    .height
-                    .max(1);
-                row_height = row_height.max(cell_height);
-                cell_boxes.push(cell_id);
-                x = x.saturating_add(slot);
-            }
-            self.boxes[row_id.0 as usize].children = cell_boxes;
-            self.boxes[row_id.0 as usize].dimensions.content.height = row_height;
-            row_boxes.push(row_id);
-            y = y.saturating_add(row_height);
+            row_ids.push(row_id);
         }
+
+        let mut cell_boxes = Vec::with_capacity(placements.len());
+        let mut cell_heights = Vec::with_capacity(placements.len());
+        for placement in &placements {
+            let cell_style = *self.styles.get(placement.cell);
+            let x = table.x.saturating_add(
+                widths[..placement.col]
+                    .iter()
+                    .fold(0i32, |n, w| n.saturating_add(*w)),
+            );
+            let slot = widths[placement.col..placement.col + placement.colspan]
+                .iter()
+                .fold(0i32, |n, w| n.saturating_add(*w));
+            let mut dims = resolve_block_dims(&cell_style, slot, None);
+            // A table slot fixes the cell's outer horizontal budget. CSS
+            // widths and auto margins cannot make it drift into a neighbour
+            // before M11.15's real column algorithm has a say.
+            dims.margin.left = 0;
+            dims.margin.right = 0;
+            dims.content.width = (slot
+                - dims.padding.left
+                - dims.padding.right
+                - dims.border.left
+                - dims.border.right)
+                .max(0);
+            dims.content.x = x + dims.border.left + dims.padding.left;
+            dims.content.y = y + dims.border.top + dims.padding.top;
+            dims.content.height = 0;
+            let tag = self.tag(placement.cell).to_owned();
+            let cell_id = self.layout_box_at(
+                placement.cell,
+                &tag,
+                cell_style,
+                dims,
+                heights.specified,
+                pre,
+            );
+            let cell_height = self.boxes[cell_id.0 as usize]
+                .dimensions
+                .margin_box()
+                .height
+                .max(1);
+            self.boxes[cell_id.0 as usize].dimensions.content.height = self.boxes
+                [cell_id.0 as usize]
+                .dimensions
+                .content
+                .height
+                .max(1);
+            cell_boxes.push(cell_id);
+            cell_heights.push(cell_height);
+        }
+        let mut row_heights = vec![1i32; rows.len()];
+        for (placement, &height) in placements.iter().zip(&cell_heights) {
+            if placement.rowspan == 1 {
+                row_heights[placement.row] = row_heights[placement.row].max(height);
+            } else {
+                raise_row_sum(&mut row_heights, placement.row, placement.rowspan, height);
+            }
+        }
+        let mut row_y = Vec::with_capacity(rows.len());
+        for (index, row_id) in row_ids.iter().enumerate() {
+            row_y.push(y);
+            self.boxes[row_id.0 as usize].dimensions.content.y = y;
+            self.boxes[row_id.0 as usize].dimensions.content.height = row_heights[index];
+            row_boxes.push(*row_id);
+            y = y.saturating_add(row_heights[index]);
+        }
+        for (index, placement) in placements.iter().enumerate() {
+            let cell_id = cell_boxes[index];
+            let final_y = row_y[placement.row];
+            let final_outer_h = row_heights[placement.row..placement.row + placement.rowspan]
+                .iter()
+                .fold(0i32, |n, h| n.saturating_add(*h));
+            let old = self.boxes[cell_id.0 as usize].dimensions.content;
+            let dims = self.boxes[cell_id.0 as usize].dimensions;
+            let content_h = final_outer_h
+                .saturating_sub(dims.padding.top)
+                .saturating_sub(dims.padding.bottom)
+                .saturating_sub(dims.border.top)
+                .saturating_sub(dims.border.bottom)
+                .max(1);
+            if placement.rowspan > 1 {
+                self.boxes[cell_id.0 as usize].dimensions.content.height = content_h;
+            }
+            self.shift_subtree(
+                cell_id,
+                0,
+                final_y
+                    .saturating_add(dims.border.top)
+                    .saturating_add(dims.padding.top)
+                    .saturating_sub(old.y),
+            );
+            self.boxes[row_ids[placement.row].0 as usize]
+                .children
+                .push(cell_id);
+        }
+        // A positioned table cell remains owned by its row, but it is not a
+        // grid track participant. Build it only after rows have their final
+        // rectangles so its containing block is available without a second
+        // table pass.
+        for (row_index, (row, _)) in rows.iter().enumerate() {
+            for cell in self.dom.children(*row) {
+                if self.styles.get(cell).position == Position::Absolute
+                    && matches!(&self.dom.node(cell).data, NodeData::Element { tag, .. } if matches!(tag.as_str(), "td" | "th"))
+                    && let Some(abs) = self.layout_absolute(cell, row_ids[row_index], pre)
+                {
+                    self.boxes[row_ids[row_index].0 as usize].children.push(abs);
+                }
+            }
+        }
+        self.resolve_table_borders(
+            TableGrid {
+                placements: &placements,
+                rows: &rows,
+                widths: &widths,
+                row_y: &row_y,
+                row_heights: &row_heights,
+            },
+            box_id,
+            table,
+            computed,
+        );
         self.boxes[box_id.0 as usize].children = row_boxes;
         (y - table.y).max(0)
     }
@@ -807,6 +1159,195 @@ impl<'a> Engine<'a> {
         .normalized()
     }
 
+    /// Turn parser supplied rows into finite rectangles. The grid is local to
+    /// this call and its track cap is deliberately independent of attributes:
+    /// hostile `rowspan=...` cannot turn into an allocation request.
+    fn table_placements(&self, rows: &[(NodeId, Vec<NodeId>)]) -> Vec<TablePlacement> {
+        const MAX_TRACKS: usize = 1024;
+        let mut occupied = vec![vec![false; MAX_TRACKS]; rows.len()];
+        let mut out = Vec::new();
+        for (row, (_, cells)) in rows.iter().enumerate() {
+            let mut cursor = 0usize;
+            for &cell in cells {
+                while cursor < MAX_TRACKS && occupied[row][cursor] {
+                    cursor += 1;
+                }
+                if cursor == MAX_TRACKS {
+                    break;
+                }
+                let colspan = table_span(self.dom.attr(cell, "colspan"), MAX_TRACKS - cursor);
+                let rowspan = table_span(self.dom.attr(cell, "rowspan"), rows.len() - row);
+                for occupied_row in occupied.iter_mut().skip(row).take(rowspan) {
+                    for slot in occupied_row.iter_mut().skip(cursor).take(colspan) {
+                        *slot = true;
+                    }
+                }
+                out.push(TablePlacement {
+                    cell,
+                    row,
+                    col: cursor,
+                    rowspan,
+                    colspan,
+                });
+                cursor += colspan;
+            }
+        }
+        out
+    }
+
+    fn resolve_table_borders(
+        &mut self,
+        grid: TableGrid<'_>,
+        table_owner: BoxId,
+        table: Rect,
+        table_style: ComputedStyle,
+    ) {
+        let row_count = grid.row_heights.len();
+        let cols = grid.widths.len();
+        let mut owner = vec![vec![None; cols]; row_count];
+        for (index, p) in grid.placements.iter().enumerate() {
+            for owner_row in owner.iter_mut().skip(p.row).take(p.rowspan) {
+                for slot in owner_row.iter_mut().skip(p.col).take(p.colspan) {
+                    *slot = Some(index);
+                }
+            }
+        }
+        let edge = |style: ComputedStyle, side: usize, basis: i32| -> i32 {
+            let lengths = [
+                style.border.top,
+                style.border.right,
+                style.border.bottom,
+                style.border.left,
+            ];
+            if !lengths[side].is_auto() {
+                lengths[side].to_cells_h(basis).max(0)
+            } else {
+                0
+            }
+        };
+        let mut horizontal = vec![vec![0i32; cols]; row_count + 1];
+        let mut vertical = vec![vec![0i32; cols + 1]; row_count];
+        for r in 0..=row_count {
+            for c in 0..cols {
+                if r == 0 {
+                    horizontal[r][c] = horizontal[r][c].max(edge(table_style, 0, table.width));
+                }
+                if r == row_count {
+                    horizontal[r][c] = horizontal[r][c].max(edge(table_style, 2, table.width));
+                }
+                if r > 0 {
+                    horizontal[r][c] = horizontal[r][c].max(edge(
+                        *self.styles.get(grid.rows[r - 1].0),
+                        2,
+                        table.width,
+                    ));
+                }
+                if r < row_count {
+                    horizontal[r][c] = horizontal[r][c].max(edge(
+                        *self.styles.get(grid.rows[r].0),
+                        0,
+                        table.width,
+                    ));
+                }
+                let above = if r > 0 { owner[r - 1][c] } else { None };
+                let below = if r < row_count { owner[r][c] } else { None };
+                if above != below {
+                    if let Some(i) = above {
+                        horizontal[r][c] = horizontal[r][c].max(edge(
+                            *self.styles.get(grid.placements[i].cell),
+                            2,
+                            table.width,
+                        ));
+                    }
+                    if let Some(i) = below {
+                        horizontal[r][c] = horizontal[r][c].max(edge(
+                            *self.styles.get(grid.placements[i].cell),
+                            0,
+                            table.width,
+                        ));
+                    }
+                }
+            }
+        }
+        for r in 0..row_count {
+            for c in 0..=cols {
+                if c == 0 {
+                    vertical[r][c] = vertical[r][c].max(edge(table_style, 3, table.width));
+                }
+                if c == cols {
+                    vertical[r][c] = vertical[r][c].max(edge(table_style, 1, table.width));
+                }
+                let left = if c > 0 { owner[r][c - 1] } else { None };
+                let right = if c < cols { owner[r][c] } else { None };
+                if left != right {
+                    if let Some(i) = left {
+                        vertical[r][c] = vertical[r][c].max(edge(
+                            *self.styles.get(grid.placements[i].cell),
+                            1,
+                            table.width,
+                        ));
+                    }
+                    if let Some(i) = right {
+                        vertical[r][c] = vertical[r][c].max(edge(
+                            *self.styles.get(grid.placements[i].cell),
+                            3,
+                            table.width,
+                        ));
+                    }
+                }
+            }
+        }
+        let xs: Vec<i32> = grid
+            .widths
+            .iter()
+            .scan(table.x, |x, width| {
+                let at = *x;
+                *x = x.saturating_add(*width);
+                Some(at)
+            })
+            .collect();
+        for (r, horizontal_row) in horizontal.iter().enumerate() {
+            for (c, &thickness) in horizontal_row.iter().enumerate() {
+                if thickness > 0 {
+                    let y = if r == row_count {
+                        grid.row_y[r - 1]
+                            .saturating_add(grid.row_heights[r - 1])
+                            .saturating_sub(1)
+                    } else {
+                        grid.row_y[r]
+                    };
+                    self.grid_borders.push(GridBorder {
+                        owner: table_owner,
+                        x: xs[c],
+                        y,
+                        length: grid.widths[c],
+                        horizontal: true,
+                        thickness,
+                    });
+                }
+            }
+        }
+        for (r, vertical_row) in vertical.iter().enumerate() {
+            for (c, &thickness) in vertical_row.iter().enumerate() {
+                if thickness > 0 {
+                    let x = if c == cols {
+                        table.x.saturating_add(table.width).saturating_sub(1)
+                    } else {
+                        xs[c]
+                    };
+                    self.grid_borders.push(GridBorder {
+                        owner: table_owner,
+                        x,
+                        y: grid.row_y[r],
+                        length: grid.row_heights[r],
+                        horizontal: false,
+                        thickness,
+                    });
+                }
+            }
+        }
+    }
+
     fn tag(&self, id: NodeId) -> &str {
         match &self.dom.node(id).data {
             NodeData::Element { tag, .. } => tag,
@@ -823,12 +1364,18 @@ impl<'a> Engine<'a> {
                 let NodeData::Element { tag, .. } = &eng.dom.node(child).data else {
                     continue;
                 };
-                if eng.is_hidden(child) || tag == "table" || matches!(tag.as_str(), "td" | "th") {
+                if eng.is_hidden(child)
+                    || eng.styles.get(child).position == Position::Absolute
+                    || tag == "table"
+                    || matches!(tag.as_str(), "td" | "th")
+                {
                     continue;
                 }
                 if tag == "tr" {
                     let cells = eng.dom.children(child).filter(|&cell| {
-                        !eng.is_hidden(cell) && matches!(&eng.dom.node(cell).data, NodeData::Element { tag, .. } if matches!(tag.as_str(), "td" | "th"))
+                        !eng.is_hidden(cell)
+                            && eng.styles.get(cell).position != Position::Absolute
+                            && matches!(&eng.dom.node(cell).data, NodeData::Element { tag, .. } if matches!(tag.as_str(), "td" | "th"))
                     }).collect();
                     out.push((child, cells));
                 } else {
@@ -846,7 +1393,8 @@ impl<'a> Engine<'a> {
                 NodeData::Text(text) => !text.chars().all(is_html_space),
                 NodeData::Element { tag, .. } => {
                     !self.is_hidden(child)
-                        && !matches!(tag.as_str(), "tr" | "thead" | "tbody" | "tfoot")
+                        && (self.styles.get(child).position == Position::Absolute
+                            || !matches!(tag.as_str(), "tr" | "thead" | "tbody" | "tfoot"))
                 }
             })
             .collect();
@@ -1103,6 +1651,14 @@ impl<'a> Engine<'a> {
         // `layout_box_at` applies it and the min/max clamps afterwards, exactly
         // as it does for a block.
         let height = if axis.vertical { inner_main } else { cross };
+        for child in self.dom.children(id) {
+            if matches!(self.dom.node(child).data, NodeData::Element { .. })
+                && self.styles.get(child).position == Position::Absolute
+                && let Some(abs) = self.layout_absolute(child, box_id, pre)
+            {
+                children.push(abs);
+            }
+        }
         self.boxes[box_id.0 as usize].children = children;
         height
     }
@@ -1755,6 +2311,12 @@ impl<'a> Engine<'a> {
     ) -> Vec<FlexItem> {
         flex_sources(self.dom, container, &|n| self.is_hidden(n), pre)
             .into_iter()
+            .filter(|source| match source {
+                FlexItemSource::Element(node) => {
+                    self.styles.get(*node).position != Position::Absolute
+                }
+                FlexItemSource::Text(_) => true,
+            })
             .map(|source| {
                 if axis.vertical {
                     self.column_item(source, axis, style, content, definite_height, pre)
@@ -2419,7 +2981,7 @@ impl<'a> Engine<'a> {
                     }
                     // `false`: an atomic inside a `<pre>` reaches the breaker
                     // through `layout_pre`, never through here.
-                    self.build_atomic(node, dims, x + cur_cells, line_y, false)
+                    self.build_atomic(node, dims, x + cur_cells, line_y, width, false)
                 }
                 InlineFrag::Piece(p) => p,
             };
@@ -2576,6 +3138,7 @@ impl<'a> Engine<'a> {
         mut dims: Dimensions,
         x: i32,
         y: i32,
+        _containing_width: i32,
         pre: bool,
     ) -> Piece {
         let computed = *self.styles.get(node);
@@ -2748,6 +3311,10 @@ impl<'a> Engine<'a> {
                     let placed = self.boxes[box_id.0 as usize].dimensions.margin_box();
                     let (_, baseline) = self.atomic_rows(box_id);
                     self.shift_subtree(box_id, cx - placed.x, (baseline_row - baseline) - placed.y);
+                    let computed = self.boxes[box_id.0 as usize].computed;
+                    if computed.position == Position::Relative {
+                        self.apply_relative(box_id, computed, width, None);
+                    }
                     box_id
                 }
                 _ => self.alloc(LayoutBox {
@@ -2819,7 +3386,7 @@ impl<'a> Engine<'a> {
                 InlineItem::Atomic { node } => {
                     let placed: i32 = cur.iter().map(|p| p.cells).sum();
                     let dims = self.atomic_dims(*node, width, width - placed);
-                    let piece = self.build_atomic(*node, dims, x + placed, line_y, true);
+                    let piece = self.build_atomic(*node, dims, x + placed, line_y, width, true);
                     cur.push(piece);
                 }
                 img @ InlineItem::Image { .. } => {
@@ -2961,6 +3528,12 @@ impl<'a> Engine<'a> {
                 if self.is_hidden(id) {
                     return;
                 }
+                // An out-of-flow inline neither leaves a text fragment nor a
+                // line-sized atomic item. Its block parent schedules it after
+                // normal flow has been laid out.
+                if self.styles.get(id).position == Position::Absolute {
+                    return;
+                }
                 if tag == "br" {
                     // Nested `<br>` inside an inline (e.g. `<span>a<br>b</span>`).
                     out.push(InlineItem::Break);
@@ -2993,6 +3566,13 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let computed = self.styles.get(id);
+                if computed.position == Position::Relative {
+                    // A relative inline needs a real subtree to move after it
+                    // has claimed its ordinary line space. Atomic placement is
+                    // the engine's existing representation of that invariant.
+                    out.push(InlineItem::Atomic { node: id });
+                    return;
+                }
                 // An atomic inline goes on the line whole, edges and all: its
                 // margins and padding belong to its own box rather than
                 // becoming spacers, and its contents are laid out inside it
@@ -3036,6 +3616,54 @@ impl<'a> Engine<'a> {
         self.push_inline(id, pre, containing_width, &mut out);
         out
     }
+
+    /// Absolute descendants under ordinary inline wrappers have no inline box
+    /// to own a placement pass. Their nearest block formatting owner schedules
+    /// them; an atomic inline/block descendant stops the walk because its own
+    /// box construction will schedule its children instead.
+    fn inline_absolute_descendants(&self, id: NodeId) -> Vec<NodeId> {
+        fn walk(eng: &Engine<'_>, node: NodeId, out: &mut Vec<NodeId>) {
+            for child in eng.dom.children(node) {
+                let NodeData::Element { .. } = &eng.dom.node(child).data else {
+                    continue;
+                };
+                let style = eng.styles.get(child);
+                if style.position == Position::Absolute {
+                    out.push(child);
+                } else if style.display == Display::Inline {
+                    walk(eng, child, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self, id, &mut out);
+        out
+    }
+
+    /// Deferred out-of-flow children must be restored to source order before
+    /// paint/hit testing observes the ordinary child list.
+    fn order_children_by_dom(&self, owner: NodeId, children: &mut [BoxId]) {
+        fn first_direct(eng: &Engine<'_>, owner: NodeId, box_id: BoxId) -> Option<NodeId> {
+            let b = &eng.boxes[box_id.0 as usize];
+            if let Some(mut node) = b.node {
+                while let Some(parent) = eng.dom.node(node).parent {
+                    if parent == owner {
+                        return Some(node);
+                    }
+                    node = parent;
+                }
+            }
+            b.children
+                .iter()
+                .find_map(|&child| first_direct(eng, owner, child))
+        }
+        let direct: Vec<NodeId> = self.dom.children(owner).collect();
+        children.sort_by_key(|&box_id| {
+            first_direct(self, owner, box_id)
+                .and_then(|node| direct.iter().position(|&candidate| candidate == node))
+                .unwrap_or(usize::MAX)
+        });
+    }
 }
 
 /// The rows a form control's own text sits on — its first and its last — or
@@ -3076,6 +3704,33 @@ pub(super) fn edge_v(len: crate::style::values::Length, containing_width: i32) -
     } else {
         len.to_cells_v(containing_width)
     }
+}
+
+/// A physical horizontal inset. `auto` remains absent so the caller can apply
+/// start-over-end precedence rather than confusing it with zero.
+fn inset_h(len: Length, containing_width: i32) -> Option<i32> {
+    (!len.is_auto()).then(|| len.to_cells_h(containing_width))
+}
+
+/// A vertical inset. Percentages need a definite containing-block height;
+/// absolute pixel/em values do not. This mirrors the height definiteness rule
+/// rather than using the margin/padding percentage convention.
+fn inset_v(len: Length, containing_width: i32, containing_height: Option<i32>) -> Option<i32> {
+    match len {
+        Length::Auto => None,
+        Length::Percent(_) => containing_height.map(|height| len.to_lines(height)),
+        _ => Some(len.to_cells_v(containing_width)),
+    }
+}
+
+fn relative_delta(style: ComputedStyle, width: i32, height: Option<i32>) -> (i32, i32) {
+    let dx = inset_h(style.left, width)
+        .or_else(|| inset_h(style.right, width).map(|n| -n))
+        .unwrap_or(0);
+    let dy = inset_v(style.top, width, height)
+        .or_else(|| inset_v(style.bottom, width, height).map(|n| -n))
+        .unwrap_or(0);
+    (dx, dy)
 }
 
 /// CSS 2.1 §10.3.5's shrink-to-fit width, the one a float uses:
@@ -4000,6 +4655,76 @@ struct TableColumn {
     used: i32,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TablePlacement {
+    cell: NodeId,
+    row: usize,
+    col: usize,
+    rowspan: usize,
+    colspan: usize,
+}
+
+struct TableGrid<'a> {
+    placements: &'a [TablePlacement],
+    rows: &'a [(NodeId, Vec<NodeId>)],
+    widths: &'a [i32],
+    row_y: &'a [i32],
+    row_heights: &'a [i32],
+}
+
+/// HTML spans are positive base-ten integers only. The caller supplies the
+/// already finite space left in its grid, so parsing cannot cause an oversized
+/// multiplication, index, or allocation.
+fn table_span(raw: Option<&str>, limit: usize) -> usize {
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|&value| value > 0)
+        .map(|value| (value.min(limit as u64)) as usize)
+        .filter(|&value| value > 0)
+        .unwrap_or(1)
+}
+
+fn raise_track_sum(columns: &mut [TableColumn], start: usize, span: usize, wanted: i32, min: bool) {
+    let end = start.saturating_add(span).min(columns.len());
+    let have = columns[start..end].iter().fold(0i32, |sum, c| {
+        sum.saturating_add(if min { c.min } else { c.max })
+    });
+    let deficit = wanted.saturating_sub(have);
+    let count = (end - start) as i32;
+    if deficit == 0 || count == 0 {
+        return;
+    }
+    let each = deficit / count;
+    let remainder = deficit % count;
+    for (offset, column) in columns[start..end].iter_mut().enumerate() {
+        let add = each.saturating_add((offset < remainder as usize) as i32);
+        if min {
+            column.min = column.min.saturating_add(add);
+            column.max = column.max.max(column.min);
+        } else {
+            column.max = column.max.saturating_add(add).max(column.min);
+        }
+    }
+}
+
+fn raise_row_sum(rows: &mut [i32], start: usize, span: usize, wanted: i32) {
+    let end = start.saturating_add(span).min(rows.len());
+    let have = rows[start..end]
+        .iter()
+        .fold(0i32, |sum, row| sum.saturating_add(*row));
+    let deficit = wanted.saturating_sub(have);
+    let count = (end - start) as i32;
+    if deficit == 0 || count == 0 {
+        return;
+    }
+    let each = deficit / count;
+    let remainder = deficit % count;
+    for (offset, row) in rows[start..end].iter_mut().enumerate() {
+        *row = row
+            .saturating_add(each)
+            .saturating_add((offset < remainder as usize) as i32);
+    }
+}
+
 impl TableColumn {
     const EMPTY: TableColumn = TableColumn {
         min: 1,
@@ -4098,7 +4823,7 @@ pub(super) fn is_html_space(c: char) -> bool {
 
 #[cfg(test)]
 mod table_tests {
-    use super::{TableColumn, fit_table_columns};
+    use super::{TableColumn, fit_table_columns, raise_row_sum, raise_track_sum, table_span};
 
     fn columns(bounds: &[(i32, i32)]) -> Vec<TableColumn> {
         bounds
@@ -4128,5 +4853,24 @@ mod table_tests {
         let bounds = columns(&[(2, 2), (1, 1), (5, 8)]);
         assert_eq!(fit_table_columns(&bounds, 1), vec![2, 1, 5]);
         assert_eq!(fit_table_columns(&bounds, 17), vec![4, 3, 10]);
+    }
+
+    #[test]
+    fn spans_are_positive_bounded_integers_and_deficits_keep_document_order() {
+        assert_eq!(table_span(None, 4), 1);
+        assert_eq!(table_span(Some("0"), 4), 1);
+        assert_eq!(table_span(Some("-2"), 4), 1);
+        assert_eq!(table_span(Some("wat"), 4), 1);
+        assert_eq!(table_span(Some("999999999999999999999"), 4), 1);
+        assert_eq!(table_span(Some("9"), 4), 4);
+        let mut tracks = columns(&[(1, 1), (1, 1), (1, 1)]);
+        raise_track_sum(&mut tracks, 0, 3, 8, true);
+        assert_eq!(
+            tracks.iter().map(|t| t.min).collect::<Vec<_>>(),
+            vec![3, 3, 2]
+        );
+        let mut rows = vec![1, 1];
+        raise_row_sum(&mut rows, 0, 2, 5);
+        assert_eq!(rows, vec![3, 2]);
     }
 }

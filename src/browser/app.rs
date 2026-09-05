@@ -9597,6 +9597,22 @@ mod tests {
     }
 
     #[test]
+    fn a_position_style_mutation_restyles_and_relayouts_once() {
+        let (mut app, id) = scripted_app(
+            "<style>.moved { position: relative; left: 1em }</style><p id=x>text</p>\
+             <script>document.getElementById('x').setAttribute('class', 'moved')</script>",
+        );
+        let before = stages(&app);
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(effect.dirty);
+        assert_eq!(
+            stages(&app),
+            (before.0 + 1, before.1 + 1, before.2 + 1),
+            "position is geometry, not paint-only state"
+        );
+    }
+
+    #[test]
     fn a_tick_that_only_touches_cookies_runs_no_stage_either() {
         // M11.6 deliverable 9, under M10.6's discipline: `document.cookie` is
         // read by the first inline script of a page, so it is on the load path
