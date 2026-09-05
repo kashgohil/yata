@@ -30,6 +30,18 @@ fn wiki_dom_styles() -> (yata::dom::Dom, yata::style::Styles) {
     (dom, styles)
 }
 
+fn hn_dom_styles() -> (yata::dom::Dom, yata::style::Styles) {
+    let dom = html::parse(include_str!("../tests/fixtures/news.ycombinator.com.html"));
+    let page = yata::css::parse(include_str!(
+        "../tests/fixtures/news.ycombinator.com.news.css"
+    ));
+    let inline = style::sources::inline_sheets(&dom);
+    let mut sheets: Vec<_> = inline.iter().collect();
+    sheets.push(&page);
+    let styles = style::style_tree(&dom, &sheets);
+    (dom, styles)
+}
+
 fn danluu_pipeline() {
     let html = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -77,6 +89,18 @@ fn layout_benches(c: &mut Criterion) {
             black_box(layout::layout_document(
                 black_box(&dom),
                 black_box(&styles),
+                80,
+                Hidden::Respect,
+            ))
+        })
+    });
+
+    let (hn_dom, hn_styles) = hn_dom_styles();
+    c.bench_function("layout HN auto table 80-col", |b| {
+        b.iter(|| {
+            black_box(layout::layout_document(
+                black_box(&hn_dom),
+                black_box(&hn_styles),
                 80,
                 Hidden::Respect,
             ))
