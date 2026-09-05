@@ -7634,6 +7634,51 @@ mod tests {
     }
 
     #[test]
+    fn select_events_follow_changed_commits_and_multiple_toggles_only() {
+        let (mut app, id) = scripted_app(
+            "<select id=s><option selected>A</option><option>B</option></select><script>\
+             var s = document.getElementById('s');\
+             ['input','change'].forEach(function (n) { s.addEventListener(n, function () { console.log(n) }) });\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        let select = by_id(&app, "s");
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let entries = app.console.entries();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["input", "change"]
+        );
+
+        let (mut app, id) = scripted_app(
+            "<select id=s multiple><option>A</option><option>B</option></select><script>\
+             var s = document.getElementById('s');\
+             ['input','change'].forEach(function (n) { s.addEventListener(n, function () { console.log(n) }) });\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        let select = by_id(&app, "s");
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char(' '), KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let entries = app.console.entries();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["input", "change"]
+        );
+    }
+
+    #[test]
     fn space_is_a_single_select_noop_and_a_multiple_select_structural_edit() {
         let (mut app, id) = scripted_app(
             "<select id=s><option id=a selected>A</option><option id=b>B</option></select>",
@@ -9371,6 +9416,51 @@ mod tests {
                 "mutation `{mutation}` left the old submit default active"
             );
         }
+    }
+
+    #[test]
+    fn submit_button_click_reparents_before_resolving_its_form() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form id=old action=/old><button id=b>Send</button></form>\
+             <form id=new action=/new></form><script>\
+             var b = document.getElementById('b');\
+             b.addEventListener('click', function () { document.getElementById('new').appendChild(b) });\
+             </script>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        let button = by_id(&app, "b");
+        let effect = click_node(&mut app, button);
+        assert_eq!(fetched(&effect), Some("http://x/new?"));
+    }
+
+    #[test]
+    fn cancelled_submit_keeps_listener_fetches_and_timers() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form action=/native><input name=q value=x></form><script>\
+             document.querySelector('form').addEventListener('submit', function (e) {\
+               e.preventDefault(); fetch('/listener'); setTimeout(function () {}, 25);\
+             });</script>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fetched(&effect), None);
+        assert_eq!(effect.fetches.len(), 1);
+        assert_eq!(effect.fetches[0].1.ask.url, "http://x/listener");
+        assert_eq!(
+            effect.timers,
+            [TimerRequest::Schedule {
+                page: id,
+                id: TimerId(1),
+                delay: Duration::from_millis(25),
+            }]
+        );
     }
 
     #[test]
