@@ -1,0 +1,58 @@
+# SPEC GOLDEN — M11.16 finite span occupancy and resolved table rectangles.
+#
+# The first table has three tracks. Its header covers tracks 0–1, while Rust
+# reserves track 0 across the last two supplied rows. Thus the later cells
+# begin at x=8 and x=17; no anonymous cell appears in Rust's occupied slot.
+# Each 8px border is one terminal cell. The second table proves that an empty
+# colspan remains a real rectangle, and that CJK and a long word contribute in
+# terminal cells across their final span.
+<html>  x=0 y=0 w=80 h=21
+  <body>  x=0 y=0 w=80 h=21
+    table <table.grid>  x=1 y=1 w=21 h=9
+      table-row <tr>  x=1 y=1 w=21 h=3
+        table-cell <th …>  x=2 y=2 w=13 h=1
+          anonymous  x=2 y=2 w=13 h=1
+            line  x=2 y=2 w=13 h=1
+              #text "Language"  x=4 y=2 w=8 h=1
+        table-cell <th>  x=17 y=2 w=4 h=1
+          anonymous  x=17 y=2 w=4 h=1
+            line  x=17 y=2 w=4 h=1
+              #text "Year"  x=17 y=2 w=4 h=1
+      table-row <tr>  x=1 y=4 w=21 h=3
+        table-cell <td …>  x=2 y=5 w=4 h=4
+          anonymous  x=2 y=5 w=4 h=1
+            line  x=2 y=5 w=4 h=1
+              #text "Rust"  x=2 y=5 w=4 h=1
+        table-cell <td>  x=8 y=5 w=7 h=1
+          anonymous  x=8 y=5 w=7 h=1
+            line  x=8 y=5 w=7 h=1
+              #text "stable"  x=8 y=5 w=6 h=1
+        table-cell <td>  x=17 y=5 w=4 h=1
+          anonymous  x=17 y=5 w=4 h=1
+            line  x=17 y=5 w=4 h=1
+              #text "2015"  x=17 y=5 w=4 h=1
+      table-row <tr>  x=1 y=7 w=21 h=3
+        table-cell <td>  x=8 y=8 w=7 h=1
+          anonymous  x=8 y=8 w=7 h=1
+            line  x=8 y=8 w=7 h=1
+              #text "edition"  x=8 y=8 w=7 h=1
+        table-cell <td>  x=17 y=8 w=4 h=1
+          anonymous  x=17 y=8 w=4 h=1
+            line  x=17 y=8 w=4 h=1
+              #text "2024"  x=17 y=8 w=4 h=1
+    table <table.holes>  x=1 y=13 w=27 h=6
+      table-row <tr>  x=1 y=13 w=27 h=3
+        table-cell <td …>  x=2 y=14 w=12 h=1
+        table-cell <td>  x=16 y=14 w=11 h=1
+          anonymous  x=16 y=14 w=11 h=1
+            line  x=16 y=14 w=11 h=1
+              #text "extra"  x=16 y=14 w=5 h=1
+      table-row <tr>  x=1 y=16 w=27 h=3
+        table-cell <td>  x=2 y=17 w=4 h=1
+          anonymous  x=2 y=17 w=4 h=1
+            line  x=2 y=17 w=4 h=1
+              #text "世界"  x=2 y=17 w=4 h=1
+        table-cell <td …>  x=8 y=17 w=19 h=1
+          anonymous  x=8 y=17 w=19 h=1
+            line  x=8 y=17 w=19 h=1
+              #text "unbreakablelongword"  x=8 y=17 w=19 h=1

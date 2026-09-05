@@ -306,6 +306,22 @@ fn dump_boxes_names_a_field_box_and_its_geometry() {
 }
 
 #[test]
+fn dump_boxes_reports_positioned_final_geometry() {
+    let body = br#"<style>*{margin:0}.card{position:relative;padding:1em}.close{position:absolute;top:1em;right:1em;width:8px}</style><div class=card><a class=close href=/x>x</a><p>copy</p></div>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let boxes = String::from_utf8(out.stdout).unwrap();
+    // The root is 80 cells wide; 1em is two horizontal cells. The close link
+    // has a one-cell width and sits two cells from the card padding end.
+    assert!(
+        boxes.contains("<a.close href=\"/x\">  x=77 y=1 w=1 h=1"),
+        "{boxes}"
+    );
+    assert!(boxes.contains("#text \"copy\"  x=2 y=1 w=4 h=1"), "{boxes}");
+}
+
+#[test]
 fn dump_text_and_boxes_expose_choice_controls_without_option_prose() {
     let body = br#"<body style="margin:0"><p style="margin:0">Choice <input type=checkbox checked> <select><option>One</option><option selected>Two</option></select></p></body>"#;
     let addr = serve_once(response_with_body("200 OK", body));
@@ -360,6 +376,37 @@ fn dump_text_and_boxes_expose_table_roles_in_the_same_tree() {
         "{boxes}"
     );
     assert!(boxes.contains("field value \"go\""), "{boxes}");
+}
+
+#[test]
+fn dump_modes_expose_final_spanning_cell_geometry() {
+    let body = br#"<body style="margin:0"><table><tr><th colspan="2">Language</th><th>Year</th></tr><tr><td rowspan="2">Rust</td><td>stable</td><td>2015</td></tr><tr><td>edition</td><td>2024</td></tr></table></body>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.lines()
+            .next()
+            .is_some_and(|line| line.contains("Language") && line.contains("Year")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Ruststable") && text.contains("2015"),
+        "{text}"
+    );
+    assert!(text.contains("edition2024"), "{text}");
+
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let boxes = String::from_utf8(out.stdout).unwrap();
+    assert!(boxes.contains("table-cell <th …>"), "{boxes}");
+    assert!(boxes.contains("table-cell <td …>"), "{boxes}");
+    assert!(
+        boxes.contains("#text \"edition\""),
+        "the row-spanned first column displaced later cells incorrectly:\n{boxes}"
+    );
 }
 
 #[test]

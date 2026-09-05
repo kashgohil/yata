@@ -1,0 +1,26 @@
+# SPEC GOLDEN — positioned boxes are laid out before paint, never rediscovered there.
+#
+# The UA body margin is 2 cells horizontally and 1 vertically. `#card` has
+# 16px (= 2 cells) padding, so its content starts at (2, 1): its padding is
+# represented in the card's outer rectangle and the inspector prints the
+# content rectangle. `#close` is absolute: top/left 16px place it at (2, 1),
+# against #card's padding box, and it consumes no row before #copy. `#badge`
+# is first laid out in the inline row at (2, 2), then relative left/top 16px
+# shift its final subtree to (4, 3) without changing that row's static place.
+<html>  x=0 y=0 w=20 h=4
+  <body>  x=0 y=0 w=20 h=4
+    <div#card>  x=2 y=1 w=16 h=2
+      <div#close>  x=2 y=1 w=2 h=1
+        anonymous  x=2 y=1 w=2 h=1
+          line  x=2 y=1 w=2 h=1
+            #text "x"  x=2 y=1 w=1 h=1
+      <p#copy>  x=2 y=1 w=16 h=1
+        anonymous  x=2 y=1 w=16 h=1
+          line  x=2 y=1 w=16 h=1
+            #text "copy"  x=2 y=1 w=4 h=1
+      anonymous  x=2 y=2 w=16 h=1
+        line  x=2 y=2 w=16 h=1
+          <span#badge>  x=4 y=3 w=5 h=1
+            anonymous  x=4 y=3 w=5 h=1
+              line  x=4 y=3 w=5 h=1
+                #text "badge"  x=4 y=3 w=5 h=1

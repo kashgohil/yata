@@ -912,3 +912,22 @@ measured it and where PLAN.md §1.5 needs it.
 
 The tick-that-inserts-nothing table above was re-measured after this change and
 is unmoved: 7.62 → 7.61 ms and 3.04 → 2.98 ms, still inside the noise.
+
+---
+
+## M11.16/M11.17 — tables and positioned boxes (2026-09-06)
+
+The normal-flow HN layout path was measured interleaved against the M11.15
+checkout (`d4b6334`), release Criterion, 10 samples per run, 80 columns. The
+candidate includes both M11.16's span/grid-border work and M11.17's static
+position branch, so it is the conservative integrated comparison:
+
+| order | M11.15 median | M11.16/M11.17 median |
+| --- | ---: | ---: |
+| first pair | 203.79 µs | 203.12 µs |
+| second pair | 205.79 µs | 212.30 µs |
+
+The pair averages are 204.79 µs and 207.71 µs respectively: a 1.4% difference,
+well inside run-to-run noise. Position checks are a single style branch on the
+ordinary path; absolute children use bounded local deferred placement and do
+not create a second layout pass.
