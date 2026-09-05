@@ -350,6 +350,15 @@ fn dump_text_and_boxes_expose_table_roles_in_the_same_tree() {
     for role in ["table <table>", "table-row <tr>", "table-cell <td>"] {
         assert!(boxes.contains(role), "missing {role:?} in:\n{boxes}");
     }
+    assert!(boxes.contains("table <table>  x=0 y=0 w=9 h=2"), "{boxes}");
+    assert!(
+        boxes.contains("table-cell <th>  x=0 y=0 w=4 h=1"),
+        "{boxes}"
+    );
+    assert!(
+        boxes.contains("table-cell <th>  x=4 y=0 w=5 h=1"),
+        "{boxes}"
+    );
     assert!(boxes.contains("field value \"go\""), "{boxes}");
 }
 
