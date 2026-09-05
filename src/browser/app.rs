@@ -265,9 +265,11 @@ pub struct App {
     /// A navigation a click handler asked for (M10.11), waiting to be folded
     /// into the `Effect` the key or mouse path returns. `dispatch_click` runs
     /// inside those paths and cannot return an `Effect` of its own.
-    pending_click_navigation: Option<(FetchId, net::Request)>,
     /// `fetch()` calls a click handler made, carried out the same way.
     pending_click_fetches: Vec<(FetchId, js::FetchAsk)>,
+    /// Timer work requested by a listener in the reader action currently
+    /// resolving. It follows listener fetches out in the returned effect.
+    pending_click_timers: Vec<TimerRequest>,
     /// External scripts a click handler inserted (M11.5), and whether one of
     /// its insertions can run now — carried out the same way, because a
     /// bootstrap behind a click is the same shape as one at load.
@@ -373,6 +375,9 @@ pub struct App {
     hover: Option<NodeId>,
     /// Keyboard-focused link (`Tab` cycle), if any.
     focus: Option<NodeId>,
+    /// Value at the start of the current reader edit session. It is UI state:
+    /// markup and script writes do not create a reader `change` event.
+    field_edit_baseline: Option<(NodeId, String)>,
     /// Active link-hint overlay (`f` / `F`).
     hint: Option<HintSession>,
     /// Brief statusline message (e.g. "yanked"), cleared by the next non-yank
@@ -458,8 +463,8 @@ impl App {
             spinner: 0,
             timings: Timings::default(),
             timing_visible: false,
-            pending_click_navigation: None,
             pending_click_fetches: Vec::new(),
+            pending_click_timers: Vec::new(),
             pending_click_scripts: Vec::new(),
             pending_click_run: None,
             owed_script_errors: Vec::new(),
@@ -488,6 +493,7 @@ impl App {
             visited: HashSet::new(),
             hover: None,
             focus: None,
+            field_edit_baseline: None,
             hint: None,
             status_msg: None,
             hops: Hops::default(),
@@ -838,8 +844,12 @@ impl App {
                 let mut effect = self.run_ready_scripts(id, dom);
                 // **After** the prefix, never before: `load` means "it ran".
                 if let Some(node) = inserted {
-                    let kind = if failed { "error" } else { "load" };
-                    self.fire_script_event(id, node, kind, &mut effect);
+                    let event = if failed {
+                        js::EventDescriptor::ERROR
+                    } else {
+                        js::EventDescriptor::LOAD
+                    };
+                    self.fire_script_event(id, node, event, &mut effect);
                 }
                 effect
             }
@@ -867,7 +877,7 @@ impl App {
                     return Effect::default();
                 };
 
-                let before = (dom.version(), dom.structure_version());
+                let before = dom.change_versions();
                 let logged_before = console.entries().len();
                 js::settle_fetch(
                     host,
@@ -882,7 +892,7 @@ impl App {
                     request,
                     result,
                 );
-                let after = (dom.version(), dom.structure_version());
+                let after = dom.change_versions();
                 self.dom = Some(dom);
 
                 // Settling is a tick: one invalidation cycle, whatever the
@@ -918,7 +928,7 @@ impl App {
                     return Effect::default();
                 };
 
-                let before = (dom.version(), dom.structure_version());
+                let before = dom.change_versions();
                 let logged_before = self.console.entries().len();
                 let outcome = js::fire_timer(
                     host,
@@ -932,7 +942,7 @@ impl App {
                     },
                     id,
                 );
-                let after = (dom.version(), dom.structure_version());
+                let after = dom.change_versions();
                 self.dom = Some(dom);
                 let _ = outcome;
 
@@ -1770,7 +1780,8 @@ impl App {
     }
 
     /// The invalidation cycle for a tick that ran JavaScript (M10.6), given
-    /// the arena's `(version, structure_version)` before and after it.
+    /// the arena's `(version, structure_version, live_state_version)` before
+    /// and after it.
     ///
     /// Three outcomes, cheapest first, and the classification is the whole
     /// point — the win is in *not running* a stage, not in running it faster:
@@ -1794,9 +1805,9 @@ impl App {
     /// needed rather than a page that failed to update. That comparison is why
     /// the styled tree is cloned rather than replaced: the scoped pass writes
     /// in place, and the values the page was laid out with have to survive it.
-    fn apply_dom_changes(&mut self, before: (u64, u64), after: (u64, u64)) -> Effect {
-        let (edits_before, structure_before) = before;
-        let (edits_after, structure_after) = after;
+    fn apply_dom_changes(&mut self, before: (u64, u64, u64), after: (u64, u64, u64)) -> Effect {
+        let (edits_before, structure_before, live_before) = before;
+        let (edits_after, structure_after, live_after) = after;
         // Read unconditionally, and before the early return: the list describes
         // this tick, and one that survived into the next would narrow a restyle
         // against writes already accounted for.
@@ -1806,6 +1817,7 @@ impl App {
         }
 
         let structural = structure_after != structure_before;
+        let live_state = live_after != live_before;
         // A control's box also derives directly from HTML attributes that need
         // not participate in CSS (`checked`, `selected`, `size`, `label`, ...).
         // Any write on this small family therefore invalidates layout even when
@@ -1821,6 +1833,20 @@ impl App {
             }),
             _ => false,
         };
+        let has_attributes =
+            !matches!(changes, Some(AttrChanges::Nodes(ref nodes)) if nodes.is_empty());
+        // Sparse current values and choices feed layout directly but cannot
+        // move a selector answer. Keep them out of the CSS path entirely.
+        // A mixed script tick still goes through the ordinary structural /
+        // attribute classification, so one action has one coherent pass.
+        if live_state && !structural && !has_attributes {
+            self.relayout();
+            self.validate_select_mode();
+            self.dom_view_built = false;
+            self.boxes_view_built = false;
+            self.build_visible_inspector();
+            return redraw();
+        }
         // M11.3: an attribute-only tick recomputes the subtrees its writes can
         // have reached, not the document. Everything downstream is unchanged —
         // the comparison below is what keeps the narrowing honest.
@@ -1843,6 +1869,7 @@ impl App {
         };
 
         let needs_layout = structural
+            || live_state
             || control_attribute
             || match (&previous, &self.styles) {
                 (Some(old), Some(new)) => !old.layout_eq(new),
@@ -2402,6 +2429,7 @@ impl App {
     /// starts while the reader is mid-word.
     fn clear_focus(&mut self) {
         self.focus = None;
+        self.field_edit_baseline = None;
         if matches!(self.mode, Mode::Field { .. } | Mode::Select { .. }) {
             self.mode = Mode::Browse;
         }
@@ -2449,9 +2477,6 @@ impl App {
         // `Tab` out of a field leaves typing (see the table's Field rows): the
         // reader lands on the next focusable with every browse binding live,
         // whatever kind of thing it turned out to be.
-        if matches!(self.mode, Mode::Field { .. } | Mode::Select { .. }) {
-            self.mode = Mode::Browse;
-        }
         let Some(dom) = &self.dom else {
             return Effect::default();
         };
@@ -2485,9 +2510,69 @@ impl App {
                 }
             }
         };
-        self.focus = Some(links[next]);
+        self.transition_focus(links[next])
+    }
+
+    /// Move reader focus through the DOM event order. This is deliberately one
+    /// action even when a pending text edit contributes `change`: listeners
+    /// see the synchronous state transitions, while layout waits until all of
+    /// them have returned.
+    fn transition_focus(&mut self, next: NodeId) -> Effect {
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
+            self.focus = Some(next);
+            self.mode = Mode::Browse;
+            self.scroll_focus_into_view();
+            return redraw();
+        };
+        self.transition_focus_in_action(next);
+        self.finish_reader_action(id, before, logged_before);
         self.scroll_focus_into_view();
-        redraw()
+        self.take_click_navigation()
+    }
+
+    /// Focus-only portion of a reader action. It deliberately consumes no
+    /// DOM version, host queue or navigation request; callers can continue
+    /// with click/default-action work before finishing the transaction.
+    fn transition_focus_in_action(&mut self, next: NodeId) -> bool {
+        let old = self.focus;
+        if old == Some(next) {
+            return true;
+        }
+        if let Some((field, baseline)) = self.field_edit_baseline.take()
+            && old == Some(field)
+            && let Some(dom) = self.dom.as_ref()
+            && let NodeData::Element { tag, .. } = &dom.node(field).data
+            && layout::field::value(dom, field, tag) != baseline
+        {
+            self.dispatch_reader_event(field, js::EventDescriptor::CHANGE);
+        }
+        if let Some(old) = old {
+            self.dispatch_reader_event(old, js::EventDescriptor::BLUR);
+        }
+        // A blur listener can remove or disable the candidate. Do not hunt
+        // for a replacement in this action: the old target was genuinely
+        // blurred, and focus now has nowhere safe to land.
+        if !self
+            .dom
+            .as_ref()
+            .is_some_and(|dom| layout::dom_focusables(dom).contains(&next))
+        {
+            self.clear_focus();
+            return false;
+        }
+        self.focus = Some(next);
+        self.mode = Mode::Browse;
+        self.dispatch_reader_event(next, js::EventDescriptor::FOCUS);
+        // `focus` itself can invalidate its target. This is a silent safety
+        // repair, not a second focus transition and therefore emits no blur.
+        if !self
+            .dom
+            .as_ref()
+            .is_some_and(|dom| layout::dom_focusables(dom).contains(&next))
+        {
+            self.clear_focus();
+        }
+        self.focus == Some(next)
     }
 
     fn follow_focus(&mut self) -> Effect {
@@ -2523,7 +2608,7 @@ impl App {
         // through to the `href` path and did nothing at all, because a button
         // has no `href`.
         if form::is_submit_button(dom, focus) {
-            return self.submit_form(focus);
+            return self.activate_submit(focus);
         }
         let Some(href) = dom.attr(focus, "href") else {
             return Effect::default();
@@ -2533,6 +2618,28 @@ impl App {
             return self.take_click_navigation();
         }
         self.follow_href(&href)
+    }
+
+    /// The submit-button default is intentionally after its cancelable click.
+    /// Re-read the node afterwards: a listener may have disabled, detached or
+    /// retagged the button before its native action gets a turn.
+    fn activate_submit(&mut self, node: NodeId) -> Effect {
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
+            return Effect::default();
+        };
+        let prevented = self.dispatch_reader_event(node, js::EventDescriptor::CLICK);
+        let still_submits = self.dom.as_ref().is_some_and(|dom| {
+            dom.is_connected(node)
+                && dom.attr(node, "disabled").is_none()
+                && form::is_submit_button(dom, node)
+        });
+        let submission = if !prevented && still_submits {
+            self.submit_form_in_action(node)
+        } else {
+            None
+        };
+        self.finish_reader_action(id, before, logged_before);
+        self.resolve_submission(submission)
     }
 
     /// Submit the form `activator` is in — the one function all three ways of
@@ -2559,15 +2666,50 @@ impl App {
     ///   broken keyboard;
     /// - the action does not resolve — a page whose `action` is not a URL.
     ///
-    /// No `submit` event is dispatched and nothing can cancel this (M11.13
-    /// owns both), so DEVIATIONS.md's *"key events never reach the page"*
-    /// stays true of the key that submits a form.
     fn submit_form(&mut self, activator: NodeId) -> Effect {
-        let (Some(dom), Some(base)) = (self.dom.as_ref(), self.current_url()) else {
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
             return Effect::default();
         };
-        match form::submit(dom, &base, activator) {
-            None => Effect::default(),
+        let submission = self.submit_form_in_action(activator);
+        self.finish_reader_action(id, before, logged_before);
+        self.resolve_submission(submission)
+    }
+
+    /// Submit dispatch plus post-listener serialization, kept inside the
+    /// caller's reader action so a submit button's click and submit cannot
+    /// create two invalidation cycles.
+    fn submit_form_in_action(&mut self, activator: NodeId) -> Option<form::Submit> {
+        let form = self
+            .dom
+            .as_ref()
+            .and_then(|dom| form::owner(dom, activator))?;
+        // Field-mode Enter commits the reader's pending text edit before the
+        // form observes submission. The baseline advances even if `submit` is
+        // canceled, so a later Tab cannot report the same commit twice.
+        if let Some((field, baseline)) = self.field_edit_baseline.take()
+            && field == activator
+            && let Some(dom) = self.dom.as_ref()
+            && let NodeData::Element { tag, .. } = &dom.node(field).data
+            && layout::field::value(dom, field, tag) != baseline
+        {
+            self.dispatch_reader_event(field, js::EventDescriptor::CHANGE);
+        }
+        let prevented = self.dispatch_reader_event(form, js::EventDescriptor::SUBMIT);
+        if prevented || self.dom.as_ref().is_none_or(|dom| !dom.is_connected(form)) {
+            return None;
+        }
+        let (Some(dom), Some(base)) = (self.dom.as_ref(), self.current_url()) else {
+            return None;
+        };
+        form::submit(dom, &base, activator)
+    }
+
+    /// Resolve the native default only after its action's event sequence has
+    /// finished. A missing candidate leaves an independently queued script
+    /// navigation available.
+    fn resolve_submission(&mut self, submission: Option<form::Submit>) -> Effect {
+        match submission {
+            None => self.take_click_navigation(),
             Some(form::Submit::Unsupported(method)) => {
                 // Words for somebody who has never read PLAN.md — and short
                 // ones, because this segment is what is left of the row after
@@ -2578,16 +2720,22 @@ impl App {
                     "huge" => "form is too large".into(),
                     other => format!("can't send {other} forms"),
                 });
-                redraw()
+                let mut effect = self.take_click_navigation();
+                effect.dirty = true;
+                effect
             }
             // Typing ends here, without being asked to: `navigate` clears the
             // focus, and `clear_focus` drops the mode with it. So the browse
             // bindings are live while the new page is still loading — `q`
             // quits, and the reader is not stuck typing into a field that is
             // about to be replaced.
-            Some(form::Submit::Get(url)) => self.navigate(url, true),
+            Some(form::Submit::Get(url)) => {
+                let effect = self.navigate(url, true);
+                self.with_reader_side_effects(effect)
+            }
             Some(form::Submit::Post { url, body }) => {
-                self.navigate_with(url, net::Method::Post { body }, true)
+                let effect = self.navigate_with(url, net::Method::Post { body }, true);
+                self.with_reader_side_effects(effect)
             }
         }
     }
@@ -2610,42 +2758,56 @@ impl App {
     }
 
     fn activate_choice(&mut self, node: NodeId) -> Effect {
-        let Some(dom) = self.dom.as_ref() else {
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
             return Effect::default();
         };
+        self.activate_choice_in_action(node);
+        self.finish_reader_action(id, before, logged_before);
+        self.take_click_navigation()
+    }
+
+    /// Checkbox/radio pre-activation and its events, without consuming the
+    /// surrounding reader action.
+    fn activate_choice_in_action(&mut self, node: NodeId) -> bool {
+        let Some(dom) = self.dom.as_ref() else {
+            return false;
+        };
         let NodeData::Element { tag, .. } = &dom.node(node).data else {
-            return Effect::default();
+            return false;
         };
         let checkbox = layout::field::is_checkbox(dom, node, tag);
         let radio = layout::field::is_radio(dom, node, tag);
         if !checkbox && !radio {
-            return Effect::default();
+            return false;
         }
         if dom.attr(node, "disabled").is_some() {
-            return Effect::default();
+            return false;
         }
         let current = layout::field::checked(dom, node, tag);
-        if radio && current {
-            return Effect::default();
-        }
         let peers = if radio {
             layout::field::radio_group(dom, node)
         } else {
             vec![node]
         };
-        let Some(dom) = self.dom.as_mut() else {
-            return Effect::default();
-        };
+        let snapshot = dom.choice_state_snapshot(&peers);
         let states = peers
-            .into_iter()
-            .map(|peer| (peer, if radio { peer == node } else { !current }))
+            .iter()
+            .map(|&peer| (peer, if radio { peer == node } else { !current }))
             .collect::<Vec<_>>();
+        let Some(dom) = self.dom.as_mut() else {
+            return false;
+        };
         let changed = dom.set_choice_group(&states, "checked");
-        if changed {
-            self.after_field_edit(node)
-        } else {
-            Effect::default()
+        let prevented = self.dispatch_reader_event(node, js::EventDescriptor::CLICK);
+        if prevented {
+            if let Some(dom) = self.dom.as_mut() {
+                dom.restore_choice_state_snapshot(&snapshot);
+            }
+        } else if changed {
+            self.dispatch_reader_event(node, js::EventDescriptor::INPUT);
+            self.dispatch_reader_event(node, js::EventDescriptor::CHANGE);
         }
+        true
     }
 
     fn start_select(&mut self, node: NodeId) -> Effect {
@@ -2716,11 +2878,20 @@ impl App {
         let value = !selected.contains(cursor);
         let cursor = *cursor;
         let select = *select;
-        self.dom
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
+            return Effect::default();
+        };
+        let changed = self
+            .dom
             .as_mut()
             .expect("DOM checked above")
             .set_choice_state(cursor, "selected", value);
-        self.after_field_edit(select)
+        if changed {
+            self.dispatch_reader_event(select, js::EventDescriptor::INPUT);
+            self.dispatch_reader_event(select, js::EventDescriptor::CHANGE);
+        }
+        self.finish_reader_action(id, before, logged_before);
+        self.take_click_navigation()
     }
 
     fn commit_select(&mut self) -> Effect {
@@ -2738,18 +2909,26 @@ impl App {
             self.mode = Mode::Browse;
             return redraw();
         }
-        let dom = self.dom.as_mut().expect("DOM checked above");
         let states = options
             .into_iter()
             .map(|option| (option.node, option.node == cursor))
             .collect::<Vec<_>>();
-        let changed = dom.set_choice_group(&states, "selected");
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
+            self.mode = Mode::Browse;
+            return redraw();
+        };
+        let changed = self
+            .dom
+            .as_mut()
+            .expect("DOM checked above")
+            .set_choice_group(&states, "selected");
         self.mode = Mode::Browse;
         if changed {
-            self.after_field_edit(select)
-        } else {
-            redraw()
+            self.dispatch_reader_event(select, js::EventDescriptor::INPUT);
+            self.dispatch_reader_event(select, js::EventDescriptor::CHANGE);
         }
+        self.finish_reader_action(id, before, logged_before);
+        self.take_click_navigation()
     }
 
     /// Insert a character at the caret — the sanctioned printable-key path's
@@ -2830,14 +3009,39 @@ impl App {
     /// screen has to follow — see [`Self::after_field_edit`] for what that
     /// costs and why it is not a relayout.
     ///
-    /// No event is dispatched, by DEVIATIONS.md's rule that key events never
-    /// reach the page: no `keydown`, no `input`, no `change`. M11.13 owns them.
     fn write_field(&mut self, node: NodeId, value: &str) -> Effect {
+        if self.field_edit_baseline.is_none()
+            && let Some(dom) = self.dom.as_ref()
+            && let NodeData::Element { tag, .. } = &dom.node(node).data
+        {
+            self.field_edit_baseline = Some((node, layout::field::value(dom, node, tag)));
+        }
+        if self.js_host.is_none() {
+            let Some(dom) = self.dom.as_mut() else {
+                return Effect::default();
+            };
+            let changed = dom.set_field_value(node, value);
+            return if changed {
+                self.after_field_edit(node)
+            } else {
+                Effect::default()
+            };
+        }
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
+            return Effect::default();
+        };
         let Some(dom) = self.dom.as_mut() else {
             return Effect::default();
         };
-        dom.set_field_value(node, value);
-        self.after_field_edit(node)
+        if !dom.set_field_value(node, value) {
+            return Effect::default();
+        }
+        // The state write precedes dispatch, so the listener observes the
+        // character or deletion that caused this event. No keyboard event is
+        // synthesized: Yata's key table still owns the key itself.
+        self.dispatch_reader_event(node, js::EventDescriptor::INPUT);
+        self.finish_reader_action(id, before, logged_before);
+        self.take_click_navigation()
     }
 
     /// What a keystroke costs (M11.9 deliverable 4), and the shape of it is
@@ -2987,7 +3191,7 @@ impl App {
         let finished = self.script_queue.take_finished();
 
         let started = Instant::now();
-        let before = (dom.version(), dom.structure_version());
+        let before = dom.change_versions();
         let logged_before = self.console.entries().len();
         let url = self.current_url().unwrap_or_default();
         let _runs = js::run_prefix(
@@ -3003,7 +3207,7 @@ impl App {
             ready,
             finished,
         );
-        let after = (dom.version(), dom.structure_version());
+        let after = dom.change_versions();
         // The DOM comes straight back: the host borrowed it for the tick and
         // holds nothing now.
         self.dom = Some(dom);
@@ -3019,7 +3223,7 @@ impl App {
         effect.fetches = self.take_fetch_requests(id);
         self.adopt_inserted_scripts(id, &mut effect);
         if let Some(node) = owed {
-            self.fire_script_event(id, node, "error", &mut effect);
+            self.fire_script_event(id, node, js::EventDescriptor::ERROR, &mut effect);
         }
         // Whatever is left over asks for the turn it will be done in: one more
         // inserted body to run, or one more `error` to fire — including the
@@ -3153,14 +3357,20 @@ impl App {
     /// Only inserted scripts get this, and only external ones: a browser fires
     /// neither event for an inline script, and nothing can have registered a
     /// listener on a parsed `<script src>` before the page ran a line.
-    fn fire_script_event(&mut self, id: FetchId, node: NodeId, kind: &str, effect: &mut Effect) {
+    fn fire_script_event(
+        &mut self,
+        id: FetchId,
+        node: NodeId,
+        event: js::EventDescriptor,
+        effect: &mut Effect,
+    ) {
         if self.js_host.is_none() {
             return;
         }
         let Some(mut dom) = self.dom.take() else {
             return;
         };
-        let before = (dom.version(), dom.structure_version());
+        let before = dom.change_versions();
         let logged_before = self.console.entries().len();
         let url = self.current_url().unwrap_or_default();
         js::dispatch(
@@ -3174,9 +3384,9 @@ impl App {
                 cookies: &self.cookies,
             },
             js::Target::Node(node.0),
-            kind,
+            event,
         );
-        let after = (dom.version(), dom.structure_version());
+        let after = dom.change_versions();
         self.dom = Some(dom);
 
         effect.dirty |= self.apply_dom_changes(before, after).dirty;
@@ -3229,14 +3439,34 @@ impl App {
     /// The `Effect` for a click whose handler cancelled the default action:
     /// a redraw, plus the navigation the handler asked for if it asked for one.
     fn take_click_navigation(&mut self) -> Effect {
-        Effect {
+        let mut effect = Effect {
             dirty: true,
-            fetch: self.pending_click_navigation.take(),
             fetches: std::mem::take(&mut self.pending_click_fetches),
+            timers: std::mem::take(&mut self.pending_click_timers),
             scripts: std::mem::take(&mut self.pending_click_scripts),
             run_scripts: self.pending_click_run.take(),
             ..Effect::default()
+        };
+        self.apply_script_navigation(&mut effect);
+        effect
+    }
+
+    /// A native default navigation wins over a script navigation requested by
+    /// one of its listeners, but those listeners' fetches and inserted scripts
+    /// remain ordinary side effects of the same reader action.
+    fn with_reader_side_effects(&mut self, mut effect: Effect) -> Effect {
+        if let Some(host) = self.js_host.as_ref() {
+            let _ = host.take_navigation();
         }
+        effect.fetches.append(&mut self.pending_click_fetches);
+        effect.timers.append(&mut self.pending_click_timers);
+        effect.scripts.append(&mut self.pending_click_scripts);
+        if effect.run_scripts.is_none() {
+            effect.run_scripts = self.pending_click_run.take();
+        } else {
+            self.pending_click_run = None;
+        }
+        effect
     }
 
     /// Act on the navigation a tick asked for, if any (M10.11).
@@ -3266,8 +3496,9 @@ impl App {
         // callers: `location.hash = 'x'` scrolls exactly where a click on
         // `<a href="#x">` scrolls, because it is the same function (M11.4).
         let navigation = self.navigate(url, !request.replace);
-        if navigation.fetch.is_some() {
-            *effect = navigation;
+        if let Some(fetch) = navigation.fetch {
+            effect.fetch = Some(fetch);
+            effect.dirty |= navigation.dirty;
         } else {
             // A same-document jump hands the loop no fetch, but the viewport
             // moved, so the frame is owed a repaint.
@@ -3324,20 +3555,38 @@ impl App {
     /// listeners mutated runs one invalidation cycle (M10.6) before this
     /// returns.
     fn dispatch_click(&mut self, node: NodeId) -> bool {
-        let Some(id) = self.current_fetch else {
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
             return false;
         };
+        let prevented = self.dispatch_reader_event(node, js::EventDescriptor::CLICK);
+        self.finish_reader_action(id, before, logged_before);
+        prevented
+    }
+
+    /// Snapshot one reader action. Several native steps may dispatch through
+    /// the host after this point; one matching `finish_reader_action` consumes
+    /// their aggregate DOM edits exactly once.
+    fn begin_reader_action(&self) -> Option<(FetchId, (u64, u64, u64), usize)> {
+        let id = self.current_fetch?;
+        let dom = self.dom.as_ref()?;
+        Some((id, dom.change_versions(), self.console.entries().len()))
+    }
+
+    /// Dispatch one synchronous native event without ending its reader action.
+    /// `js::dispatch` still pumps this event's microtasks before returning.
+    fn dispatch_reader_event(&mut self, node: NodeId, event: js::EventDescriptor) -> bool {
         // No host means the page ran no script, so it has no listeners: not a
         // reason to start an engine.
         if self.js_host.is_none() {
             return false;
         }
+        let Some(id) = self.current_fetch else {
+            return false;
+        };
         let Some(mut dom) = self.dom.take() else {
             return false;
         };
 
-        let before = (dom.version(), dom.structure_version());
-        let logged_before = self.console.entries().len();
         let url = self.current_url().unwrap_or_default();
         let prevented = js::dispatch(
             &mut self.js_host,
@@ -3350,23 +3599,31 @@ impl App {
                 cookies: &self.cookies,
             },
             js::Target::Node(node.0),
-            "click",
+            event,
         );
-        let after = (dom.version(), dom.structure_version());
         self.dom = Some(dom);
+
+        prevented
+    }
+
+    /// End an action started by [`Self::begin_reader_action`].
+    fn finish_reader_action(&mut self, id: FetchId, before: (u64, u64, u64), logged_before: usize) {
+        let after = self
+            .dom
+            .as_ref()
+            .map(Dom::change_versions)
+            .unwrap_or(before);
 
         let mut effect = self.apply_dom_changes(before, after);
         self.pending_click_fetches = self.take_fetch_requests(id);
+        self.pending_click_timers = self.take_timer_requests(id);
         self.adopt_inserted_scripts(id, &mut effect);
-        self.apply_script_navigation(&mut effect);
-        self.pending_click_navigation = effect.fetch.take();
         self.pending_click_scripts = std::mem::take(&mut effect.scripts);
         self.pending_click_run = effect.run_scripts.take();
         if self.console.entries().len() != logged_before {
             self.console_view_built = false;
             self.build_visible_inspector();
         }
-        prevented
     }
 
     fn follow_href(&mut self, href: &str) -> Effect {
@@ -3426,40 +3683,83 @@ impl App {
                 _ => false,
             };
             let moved_focus = self.focus != Some(node);
-            self.focus = Some(node);
-            if submits {
-                // The focus moved whatever the submission came to, so a
-                // button in no form — or in one this engine cannot send —
-                // still owes the reader the frame that shows it is focused.
-                let effect = self.submit_form(node);
-                return Effect {
-                    dirty: effect.dirty || moved_focus,
-                    ..effect
+            // Text fields, selects and non-submit buttons have only focus and
+            // click defaults. Keep both inside one reader action so listener
+            // mutations cost one invalidation pass.
+            if !submits && !choice {
+                let Some((id, before, logged_before)) = self.begin_reader_action() else {
+                    return Effect::default();
                 };
+                if moved_focus && !self.transition_focus_in_action(node) {
+                    self.finish_reader_action(id, before, logged_before);
+                    return self.take_click_navigation();
+                }
+                self.dispatch_reader_event(node, js::EventDescriptor::CLICK);
+                self.finish_reader_action(id, before, logged_before);
+                self.scroll_focus_into_view();
+                return self.take_click_navigation();
+            }
+            if submits {
+                let Some((id, before, logged_before)) = self.begin_reader_action() else {
+                    return Effect::default();
+                };
+                if moved_focus && !self.transition_focus_in_action(node) {
+                    self.finish_reader_action(id, before, logged_before);
+                    return self.take_click_navigation();
+                }
+                let prevented = self.dispatch_reader_event(node, js::EventDescriptor::CLICK);
+                let still_submits = self.dom.as_ref().is_some_and(|dom| {
+                    dom.is_connected(node)
+                        && dom.attr(node, "disabled").is_none()
+                        && form::is_submit_button(dom, node)
+                });
+                let submission = if !prevented && still_submits {
+                    self.submit_form_in_action(node)
+                } else {
+                    None
+                };
+                self.finish_reader_action(id, before, logged_before);
+                self.scroll_focus_into_view();
+                return self.resolve_submission(submission);
             }
             if choice {
-                let effect = self.activate_choice(node);
-                return Effect {
-                    dirty: effect.dirty || moved_focus,
-                    ..effect
+                let Some((id, before, logged_before)) = self.begin_reader_action() else {
+                    return Effect::default();
                 };
+                if moved_focus && !self.transition_focus_in_action(node) {
+                    self.finish_reader_action(id, before, logged_before);
+                    return self.take_click_navigation();
+                }
+                self.activate_choice_in_action(node);
+                self.finish_reader_action(id, before, logged_before);
+                self.scroll_focus_into_view();
+                return self.take_click_navigation();
             }
-            if !moved_focus {
-                return Effect::default();
-            }
-            return redraw();
+            unreachable!("non-choice controls returned in the shared action above")
         }
         let Some((node, href)) = layout::link_at(tree, dom, x, y) else {
             return Effect::default();
         };
-        if self.dispatch_click(node) {
+        let href = href.to_string();
+        let Some((id, before, logged_before)) = self.begin_reader_action() else {
+            return Effect::default();
+        };
+        if self.focus != Some(node) && !self.transition_focus_in_action(node) {
+            self.finish_reader_action(id, before, logged_before);
+            return self.take_click_navigation();
+        }
+        let prevented = self.dispatch_reader_event(node, js::EventDescriptor::CLICK);
+        self.finish_reader_action(id, before, logged_before);
+        self.scroll_focus_into_view();
+        if prevented {
             // `preventDefault()`: the page handled the click itself. Whatever
             // its listeners changed has already been drawn — unless one of
             // them navigated, which is a page handling a click by going
             // somewhere else.
             return self.take_click_navigation();
         }
-        self.follow_href(&href)
+        let effect = self.follow_href(&href);
+        self.with_reader_side_effects(effect)
     }
 
     fn on_hover_move(&mut self, col: u16, row: u16) -> Effect {
@@ -7419,12 +7719,12 @@ mod tests {
 
         let before = {
             let dom = app.dom.as_ref().unwrap();
-            (dom.version(), dom.structure_version())
+            dom.change_versions()
         };
         app.dom.as_mut().unwrap().set_attr(second, "disabled", "");
         let after = {
             let dom = app.dom.as_ref().unwrap();
-            (dom.version(), dom.structure_version())
+            dom.change_versions()
         };
         app.apply_dom_changes(before, after);
         assert!(matches!(app.mode, Mode::Select { cursor, .. } if cursor == first));
@@ -7433,7 +7733,7 @@ mod tests {
         app.dom.as_mut().unwrap().remove(select);
         let after = {
             let dom = app.dom.as_ref().unwrap();
-            (dom.version(), dom.structure_version())
+            dom.change_versions()
         };
         app.apply_dom_changes(before, after);
         assert!(matches!(app.mode, Mode::Browse));
@@ -7494,7 +7794,7 @@ mod tests {
         let (checkbox, select, second) = (by_id(&app, "c"), by_id(&app, "s"), by_id(&app, "b"));
         let before = {
             let dom = app.dom.as_ref().unwrap();
-            (dom.version(), dom.structure_version())
+            dom.change_versions()
         };
         {
             let dom = app.dom.as_mut().unwrap();
@@ -7505,7 +7805,7 @@ mod tests {
         }
         let after = {
             let dom = app.dom.as_ref().unwrap();
-            (dom.version(), dom.structure_version())
+            dom.change_versions()
         };
         assert!(after.0 > before.0);
         let layouts = app.layouts;
@@ -7791,6 +8091,53 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_edit_writes_before_its_input_listener_and_runs_one_cycle() {
+        let (mut app, id) = scripted_app(
+            "<input id=x value=a><script>\
+             document.getElementById('x').addEventListener('input', function (e) { console.log(e.target.value); });\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing(&mut app);
+        let (styles, layouts, paints) = stages(&app);
+        app.update(key(KeyCode::Char('b'), KeyModifiers::NONE));
+        assert_eq!(stages(&app), (styles, layouts + 1, paints + 1));
+        assert_eq!(
+            app.console
+                .entries()
+                .last()
+                .map(|entry| entry.text.as_str()),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn tab_commits_text_before_blur_and_next_focus() {
+        let (mut app, id) = scripted_app(
+            "<input id=a><input id=b><script>\
+             ['a', 'b'].forEach(function (id) {\
+               var e = document.getElementById(id);\
+               ['change', 'blur', 'focus'].forEach(function (kind) {\
+                 e.addEventListener(kind, function () { console.log(kind + ':' + id); });\
+               });\
+             });</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Char('x'), KeyModifiers::NONE));
+        let at = app.console.entries().len();
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            app.console.entries()[at..]
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            ["change:a", "blur:a", "focus:b"]
+        );
+    }
+
+    #[test]
     fn the_caret_moves_and_deletes_on_the_side_it_was_asked_about() {
         let (mut app, id) = scripted_app("<p><input size=8 value=abc></p>");
         app.update(Msg::RunScripts { id });
@@ -8005,9 +8352,9 @@ mod tests {
     #[test]
     fn the_page_never_sees_a_key() {
         // DEVIATIONS.md: key events never reach the page — yata's bindings
-        // always win. No `keydown`, no `input`, no `change`: a page cannot
-        // preventDefault its way into the reader's keyboard (M11.13 owns the
-        // events a form really does fire).
+        // always win. No keyboard event reaches the page; `input` is instead
+        // the observable result of an edit (M11.13), and cannot change the
+        // keybinding that produced it.
         let (mut app, id) = scripted_app(
             "<p><input id=f size=8 value=a></p><script>\
              var f = document.getElementById('f');\
@@ -8024,16 +8371,25 @@ mod tests {
         app.update(key(KeyCode::Backspace, KeyModifiers::NONE));
         app.update(key(KeyCode::Delete, KeyModifiers::NONE));
         app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let seen = &app.console.entries()[logged..];
+        let seen = seen
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            app.console.entries().len(),
-            logged,
-            "the page saw a key event: {:?}",
-            app.console.entries()
+            seen,
+            [
+                "page saw focus",
+                "page saw input",
+                "page saw input",
+                "page saw input"
+            ],
+            "only focus transitions and real edits are observable: {seen:?}"
         );
     }
 
     #[test]
-    fn keyboard_and_mouse_choice_activation_dispatch_no_page_events() {
+    fn keyboard_and_mouse_choice_activation_dispatches_native_events() {
         let src = "<form id=f><input id=kc type=checkbox>\
                    <input id=kr type=radio name=k><input id=mc type=checkbox>\
                    <input id=mr type=radio name=m>\
@@ -8071,11 +8427,106 @@ mod tests {
         for id in ["kc", "kr", "mc", "mr"] {
             assert!(layout::field::checked(dom, by_id(&app, id), "input"));
         }
+        let entries = app.console.entries();
+        let seen = entries[logged..]
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
         assert_eq!(
-            app.console.entries().len(),
-            logged,
-            "choice activation dispatched an event: {:?}",
-            app.console.entries()
+            seen,
+            [
+                "kc:focus",
+                "kc:click",
+                "kc:input",
+                "kc:change",
+                "kc:blur",
+                "kr:focus",
+                "kr:click",
+                "kr:input",
+                "kr:change",
+                "kr:blur",
+                "mc:focus",
+                "mc:click",
+                "mc:input",
+                "mc:change",
+                "mc:blur",
+                "mr:focus",
+                "mr:click",
+                "mr:input",
+                "mr:change",
+                "ks:input",
+                "ks:change",
+                "ks:blur",
+                "ms:focus",
+                "ms:click",
+            ]
+        );
+    }
+
+    #[test]
+    fn cancelled_choice_click_restores_its_clean_live_state() {
+        let (mut app, id) = scripted_app(
+            "<input id=c type=checkbox><script>\
+             var c = document.getElementById('c');\
+             c.addEventListener('click', function (e) { console.log(c.checked); e.preventDefault() });\
+             c.addEventListener('input', function () { console.log('input') });\
+             c.addEventListener('change', function () { console.log('change') });\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let checkbox = by_id(&app, "c");
+        let dom = app.dom.as_ref().unwrap();
+        assert!(!layout::field::checked(dom, checkbox, "input"));
+        assert_eq!(dom.choice_state(checkbox), None);
+        let entries = app.console.entries();
+        assert!(entries.iter().any(|entry| entry.text == "true"));
+        assert!(!entries.iter().any(|entry| entry.text == "input"));
+        assert!(!entries.iter().any(|entry| entry.text == "change"));
+    }
+
+    #[test]
+    fn an_already_checked_radio_dispatches_click_only() {
+        let (mut app, id) = scripted_app(
+            "<input id=r type=radio name=g checked><script>\
+             var r = document.getElementById('r');\
+             ['click','input','change'].forEach(function (name) {\
+               r.addEventListener(name, function () { console.log(name) });\
+             });</script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let entries = app.console.entries();
+        let seen = entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(seen, ["click"]);
+    }
+
+    #[test]
+    fn a_blur_listener_removing_the_next_target_clears_focus_silently() {
+        let (mut app, id) = scripted_app(
+            "<input id=a><input id=b><script>\
+             document.getElementById('a').addEventListener('blur', function () {\
+               document.getElementById('b').remove();\
+             });\
+             document.getElementById('b').addEventListener('focus', function () { console.log('bad focus') });\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.focus, None);
+        assert!(
+            !app.console
+                .entries()
+                .iter()
+                .any(|entry| entry.text == "bad focus"),
+            "a detached node received focus"
         );
     }
 
@@ -8794,11 +9245,7 @@ mod tests {
     }
 
     #[test]
-    fn the_page_never_sees_a_submission() {
-        // M11.13 owns `submit`, `click` on a control, and `preventDefault`
-        // cancelling either. Until then nothing can cancel a submission and
-        // the page is not told one happened — which keeps DEVIATIONS.md's
-        // "key events never reach the page" true of the key that submits.
+    fn a_submit_listener_can_cancel_field_submission() {
         let (mut app, id) = page_from(
             "http://x/page",
             "<form id=f action=/search><input name=q value=v><button id=b>Go</button></form>\
@@ -8806,6 +9253,7 @@ mod tests {
              document.getElementById('f').addEventListener('submit', function (e) {\
                e.preventDefault(); console.log('page saw submit');\
              });\
+             document.querySelector('input').addEventListener('change', function () { console.log('page saw change') });\
              document.getElementById('b').addEventListener('click', function () {\
                console.log('page saw click');\
              });</script>",
@@ -8816,17 +9264,74 @@ mod tests {
         let logged = app.console.entries().len();
 
         start_typing_at_first_field(&mut app);
+        type_str(&mut app, "x");
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(
-            fetched(&effect),
-            Some("http://x/search?q=v"),
-            "a listener cancelled a submission it cannot see"
+        assert_eq!(fetched(&effect), None, "the canceled form navigated");
+        let entries = app.console.entries();
+        let seen = entries[logged..]
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(seen, ["page saw change", "page saw submit"]);
+    }
+
+    #[test]
+    fn a_cancelled_mouse_submit_click_never_dispatches_submit_or_navigates() {
+        let (mut app, id) = scripted_app(
+            "<form action=/sent><button id=b>Send</button></form><script>\
+             var b = document.getElementById('b');\
+             b.addEventListener('click', function (e) { console.log('click'); e.preventDefault() });\
+             b.parentNode.addEventListener('submit', function () { console.log('submit') });\
+             </script>",
         );
+        app.update(Msg::RunScripts { id });
+        let button = by_id(&app, "b");
+        let effect = click_node(&mut app, button);
+        assert_eq!(fetched(&effect), None);
+        let entries = app.console.entries();
+        let seen = entries
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(seen, ["click"]);
+    }
+
+    #[test]
+    fn submit_listener_mutations_are_serialized_after_the_event() {
+        let (mut app, id) = page_from(
+            "http://x/page",
+            "<form id=f action=/old><input id=q name=q value=old></form><script>\
+             document.getElementById('f').addEventListener('submit', function () {\
+               document.getElementById('q').value = 'new';\
+               this.setAttribute('action', '/new');\
+             });</script>",
+            60,
+            8,
+        );
+        app.update(Msg::RunScripts { id });
+        start_typing_at_first_field(&mut app);
+        let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(fetched(&effect), Some("http://x/new?q=new"));
+    }
+
+    #[test]
+    fn a_control_click_listener_sends_its_timer_request_with_the_action() {
+        let (mut app, id) = scripted_app(
+            "<input id=c type=checkbox><script>\
+             document.getElementById('c').addEventListener('click', function () { setTimeout(function () {}, 25) });\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        let checkbox = by_id(&app, "c");
+        assert!(!app.dispatch_click(checkbox));
+        let effect = app.take_click_navigation();
         assert_eq!(
-            app.console.entries().len(),
-            logged,
-            "the page saw the submission: {:?}",
-            app.console.entries()
+            effect.timers,
+            [TimerRequest::Schedule {
+                page: id,
+                id: TimerId(1),
+                delay: Duration::from_millis(25),
+            }]
         );
     }
 
@@ -8864,6 +9369,26 @@ mod tests {
             before,
             "a read-only tick ran a stage (styles, layouts, paints)"
         );
+    }
+
+    #[test]
+    fn a_script_live_value_write_relayouts_without_restyling() {
+        let (mut app, id) = scripted_app(
+            "<input id=x value=markup><script>document.getElementById('x').value = 'live';</script>",
+        );
+        let (styles, layouts, paints) = stages(&app);
+        assert_eq!(
+            stages(&app),
+            (styles, layouts, paints),
+            "building the queued script should not itself run it"
+        );
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(effect.dirty);
+        assert_eq!(stages(&app), (styles, layouts + 1, paints + 1));
+        let field = by_id(&app, "x");
+        let dom = app.dom.as_ref().unwrap();
+        assert_eq!(dom.field_value(field), Some("live"));
+        assert_eq!(dom.attr(field, "value"), Some("markup"));
     }
 
     #[test]

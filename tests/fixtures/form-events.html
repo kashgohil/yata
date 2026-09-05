@@ -1,0 +1,22 @@
+<!doctype html>
+<title>yata M11.13 form events</title>
+<form id="get" action="/search">
+  <input id="text" name="q" value="old">
+  <input id="check" type="checkbox" name="c">
+  <input id="radio-a" type="radio" name="r" value="a">
+  <input id="radio-b" type="radio" name="r" value="b">
+  <select id="single" name="s"><option>one</option><option>two</option></select>
+  <select id="multi" name="m" multiple><option>a</option><option>b</option></select>
+  <button id="submit">GET</button>
+</form>
+<form id="post" method="post" action="/save"><input name="p" value="x"><button>POST</button></form>
+<pre id="events"></pre>
+<script>
+  var out = document.getElementById('events');
+  ['text','check','radio-a','radio-b','single','multi','submit','get','post'].forEach(function (id) {
+    var el = document.getElementById(id);
+    ['focus','blur','click','input','change','submit'].forEach(function (type) {
+      el.addEventListener(type, function () { out.textContent += id + ':' + type + '\n'; });
+    });
+  });
+</script>
