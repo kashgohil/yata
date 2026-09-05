@@ -334,6 +334,26 @@ fn dump_text_and_boxes_expose_choice_controls_without_option_prose() {
 }
 
 #[test]
+fn dump_text_and_boxes_expose_table_roles_in_the_same_tree() {
+    let body = br#"<body style="margin:0"><table><tr><th>Key</th><th>Value</th></tr><tr><td><a href="/docs">docs</a></td><td><input value="go" size="2"></td></tr></table></body>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(text.lines().next(), Some("Key Value"), "{text}");
+    assert_eq!(text.lines().nth(1), Some("docs[go]"), "{text}");
+
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let boxes = String::from_utf8(out.stdout).unwrap();
+    for role in ["table <table>", "table-row <tr>", "table-cell <td>"] {
+        assert!(boxes.contains(role), "missing {role:?} in:\n{boxes}");
+    }
+    assert!(boxes.contains("field value \"go\""), "{boxes}");
+}
+
+#[test]
 fn dump_boxes_prints_the_box_tree_to_stdout() {
     // The layout stage's headless hook (M9.1): one line per box with its
     // geometry, indented like the tree — the same text F3 shows and the same

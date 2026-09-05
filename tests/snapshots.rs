@@ -523,7 +523,10 @@ fn window(grid: &str, needle: &str, before: usize, after: usize) -> String {
 /// sight. It rendered as *nothing at all* before M11.8.
 #[test]
 fn hn_search_box_is_the_width_the_page_asked_for() {
-    let grid = render_grid(&fixture("news.ycombinator.com.html"), 80, 160);
+    // Table rows now retain their own visual height, so HN's footer sits below
+    // the old 160-row inspection window. This is a document-level geometry
+    // assertion, not a viewport limit.
+    let grid = render_grid(&fixture("news.ycombinator.com.html"), 80, 1_000);
     let at = window(&grid, "Search:", 1, 1);
     let field = at
         .lines()

@@ -374,6 +374,19 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
                     format!("{:?}", b.kind)
                 }
             }
+            BoxKind::Table | BoxKind::TableRow | BoxKind::TableCell => {
+                let role = match b.kind {
+                    BoxKind::Table => "table",
+                    BoxKind::TableRow => "table-row",
+                    BoxKind::TableCell => "table-cell",
+                    _ => unreachable!("matched table role"),
+                };
+                let name = b.node.and_then(|nid| match &dom.node(nid).data {
+                    NodeData::Element { tag, attrs } => Some(element_summary(tag, attrs)),
+                    _ => None,
+                });
+                name.map_or_else(|| role.into(), |name| format!("{role} {name}"))
+            }
             BoxKind::AnonymousBlock => "anonymous".into(),
             BoxKind::Line => "line".into(),
             BoxKind::Text => {

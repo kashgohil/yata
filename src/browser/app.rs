@@ -9521,6 +9521,18 @@ mod tests {
     }
 
     #[test]
+    fn building_a_table_uses_the_normal_single_pipeline_pass() {
+        let (_app, _id, counts) = settled(
+            "<table><tr><td>rank</td><td>title</td></tr><tr><td>1.</td><td>story</td></tr></table>",
+        );
+        assert_eq!(
+            counts,
+            (1, 1, 1),
+            "table structure must not trigger a table-specific style, layout, or paint pass"
+        );
+    }
+
+    #[test]
     fn a_script_live_value_write_relayouts_without_restyling() {
         let (mut app, id) = scripted_app(
             "<input id=x value=markup><script>document.getElementById('x').value = 'live';</script>",

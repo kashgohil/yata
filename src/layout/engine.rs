@@ -364,6 +364,9 @@ impl<'a> Engine<'a> {
                     shows: c.shows,
                     disabled: c.disabled,
                 }),
+                None if tag == "table" => BoxKind::Table,
+                None if tag == "tr" => BoxKind::TableRow,
+                None if matches!(tag, "td" | "th") => BoxKind::TableCell,
                 None if lays_out_as_flex(&computed) => BoxKind::Flex,
                 None => BoxKind::Block,
             },
@@ -402,6 +405,9 @@ impl<'a> Engine<'a> {
             // `rows` lines, and no children walked: a control's contents are
             // its value, which the box already carries.
             Some(c) => c.rows,
+            None if tag == "table" => {
+                self.layout_table_contents(id, computed, box_id, heights, pre)
+            }
             None => self.layout_contents(id, tag, computed, box_id, heights, pre),
         };
 
@@ -576,6 +582,189 @@ impl<'a> Engine<'a> {
 
         self.boxes[box_id.0 as usize].children = children;
         (content_y - dims.content.y).max(0)
+    }
+
+    /// The deliberately small table model M11.14 needs before CSS table
+    /// layout exists: rows own cells, a column is the widest cell in that
+    /// position, and each cell then runs the normal formatting context at its
+    /// assigned width.  This is kept here, beside block/flex formatting, so
+    /// paint and hit testing only ever see ordinary layout boxes.
+    fn layout_table_contents(
+        &mut self,
+        id: NodeId,
+        computed: ComputedStyle,
+        box_id: BoxId,
+        heights: BlockHeight,
+        pre: bool,
+    ) -> i32 {
+        let (rows, loose_children) = self.table_rows(id);
+        if rows.is_empty() {
+            // Invalid or prose-only tables still read as they did before this
+            // milestone.  In particular, do not manufacture a cell for them.
+            return self.layout_contents(id, "table", computed, box_id, heights, pre);
+        }
+
+        let columns = rows.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
+        if columns == 0 {
+            return self.layout_contents(id, "table", computed, box_id, heights, pre);
+        }
+        let available = self.boxes[box_id.0 as usize]
+            .dimensions
+            .content
+            .width
+            .max(1);
+        let mut wanted = vec![1; columns];
+        for (_, cells) in &rows {
+            for (column, &cell) in cells.iter().enumerate() {
+                // IntrinsicSizer already measures terminal-cell widths and is
+                // memoized for this pass; table sizing must not build a second
+                // layout tree merely to ask this question.
+                wanted[column] = wanted[column].max(self.sizer.max_content_width(cell).max(1));
+            }
+        }
+        let widths = fit_table_columns(&wanted, available);
+        let table_width = widths
+            .iter()
+            .fold(0i32, |sum, width| sum.saturating_add(*width));
+        self.boxes[box_id.0 as usize].dimensions.content.width = table_width.min(available);
+        let table = self.boxes[box_id.0 as usize].dimensions.content;
+        let mut y = table.y;
+        let mut row_boxes = Vec::with_capacity(rows.len() + loose_children.len());
+        let mut previous_margin = 0;
+        // Parser repair and anonymous table objects are deliberately deferred,
+        // but a direct unexpected child must not disappear merely because its
+        // siblings formed rows. Keep it on the existing block path before the
+        // derived row subtree.
+        for child in loose_children {
+            if let Some(child_box) = self.layout_node(
+                child,
+                table.x,
+                table_width,
+                heights.specified,
+                y,
+                &mut previous_margin,
+                pre,
+            ) {
+                let margin_box = self.boxes[child_box.0 as usize].dimensions.margin_box();
+                y = margin_box.bottom();
+                previous_margin = self.boxes[child_box.0 as usize].dimensions.margin.bottom;
+                row_boxes.push(child_box);
+            }
+        }
+
+        for (row, cells) in rows {
+            let row_style = *self.styles.get(row);
+            let row_id = self.alloc(LayoutBox {
+                kind: BoxKind::TableRow,
+                node: Some(row),
+                dimensions: Dimensions {
+                    content: Rect {
+                        x: table.x,
+                        y,
+                        width: table_width,
+                        height: 0,
+                    },
+                    ..Dimensions::default()
+                },
+                children: Vec::new(),
+                text: None,
+                term_style: Style::default(),
+                computed: row_style,
+                image_src: None,
+                image_size_firm: false,
+            });
+            let mut x = table.x;
+            let mut row_height = 1;
+            let mut cell_boxes = Vec::with_capacity(cells.len());
+            for (column, cell) in cells.into_iter().enumerate() {
+                let cell_style = *self.styles.get(cell);
+                let slot = widths[column];
+                let mut dims = resolve_block_dims(&cell_style, slot, None);
+                // A table slot fixes the cell's outer horizontal budget. CSS
+                // widths and auto margins cannot make it drift into a neighbour
+                // before M11.15's real column algorithm has a say.
+                dims.margin.left = 0;
+                dims.margin.right = 0;
+                dims.content.width = (slot
+                    - dims.padding.left
+                    - dims.padding.right
+                    - dims.border.left
+                    - dims.border.right)
+                    .max(0);
+                dims.content.x = x + dims.border.left + dims.padding.left;
+                dims.content.y = y + dims.border.top + dims.padding.top;
+                dims.content.height = 0;
+                let tag = self.tag(cell).to_owned();
+                let cell_id =
+                    self.layout_box_at(cell, &tag, cell_style, dims, heights.specified, pre);
+                let cell_height = self.boxes[cell_id.0 as usize]
+                    .dimensions
+                    .margin_box()
+                    .height
+                    .max(1);
+                self.boxes[cell_id.0 as usize].dimensions.content.height = self.boxes
+                    [cell_id.0 as usize]
+                    .dimensions
+                    .content
+                    .height
+                    .max(1);
+                row_height = row_height.max(cell_height);
+                cell_boxes.push(cell_id);
+                x = x.saturating_add(slot);
+            }
+            self.boxes[row_id.0 as usize].children = cell_boxes;
+            self.boxes[row_id.0 as usize].dimensions.content.height = row_height;
+            row_boxes.push(row_id);
+            y = y.saturating_add(row_height);
+        }
+        self.boxes[box_id.0 as usize].children = row_boxes;
+        (y - table.y).max(0)
+    }
+
+    fn tag(&self, id: NodeId) -> &str {
+        match &self.dom.node(id).data {
+            NodeData::Element { tag, .. } => tag,
+            _ => "",
+        }
+    }
+
+    /// Find parser-supplied rows through harmless grouping elements, but never
+    /// cross into a nested table or into a cell. Anonymous table repair is a
+    /// later task; this traversal only derives roles already present in DOM.
+    fn table_rows(&self, table: NodeId) -> (Vec<(NodeId, Vec<NodeId>)>, Vec<NodeId>) {
+        fn visit(eng: &Engine<'_>, node: NodeId, out: &mut Vec<(NodeId, Vec<NodeId>)>) {
+            for child in eng.dom.children(node) {
+                let NodeData::Element { tag, .. } = &eng.dom.node(child).data else {
+                    continue;
+                };
+                if eng.is_hidden(child) || tag == "table" || matches!(tag.as_str(), "td" | "th") {
+                    continue;
+                }
+                if tag == "tr" {
+                    let cells = eng.dom.children(child).filter(|&cell| {
+                        !eng.is_hidden(cell) && matches!(&eng.dom.node(cell).data, NodeData::Element { tag, .. } if matches!(tag.as_str(), "td" | "th"))
+                    }).collect();
+                    out.push((child, cells));
+                } else {
+                    visit(eng, child, out);
+                }
+            }
+        }
+        let mut rows = Vec::new();
+        visit(self, table, &mut rows);
+        let loose = self
+            .dom
+            .children(table)
+            .filter(|&child| match &self.dom.node(child).data {
+                NodeData::Comment(_) | NodeData::Doctype(_) | NodeData::Document => false,
+                NodeData::Text(text) => !text.chars().all(is_html_space),
+                NodeData::Element { tag, .. } => {
+                    !self.is_hidden(child)
+                        && !matches!(tag.as_str(), "tr" | "thead" | "tbody" | "tfoot")
+                }
+            })
+            .collect();
+        (rows, loose)
     }
 
     /// A flex container's contents: css-flexbox-1 §4 (what the items are),
@@ -3714,6 +3903,38 @@ pub fn term_color(color: crate::style::values::ColorValue) -> Color {
 /// second code path on either side.
 pub(super) fn is_block_level(display: Display) -> bool {
     matches!(display, Display::Block | Display::Flex)
+}
+
+/// Shrink provisional intrinsic column widths to the containing block without
+/// ever making a present column zero-width. More columns than cells available
+/// necessarily overflow; that is the engine's existing horizontal clipping
+/// behaviour and is preferable to losing a cell's ownership altogether.
+fn fit_table_columns(wanted: &[i32], available: i32) -> Vec<i32> {
+    let minimum_total = wanted.len() as i32;
+    let target = available.max(minimum_total);
+    let wanted_total = wanted
+        .iter()
+        .fold(0i32, |sum, width| sum.saturating_add((*width).max(1)));
+    if wanted_total <= target {
+        return wanted.iter().map(|width| (*width).max(1)).collect();
+    }
+    let extra = target - minimum_total;
+    let demand = wanted_total - minimum_total;
+    let mut out: Vec<i32> = wanted
+        .iter()
+        .map(|width| 1 + (((*width).max(1) - 1) as i64 * extra as i64 / demand as i64) as i32)
+        .collect();
+    let mut left = target - out.iter().sum::<i32>();
+    for (index, width) in wanted.iter().enumerate() {
+        if left == 0 {
+            break;
+        }
+        if out[index] < *width {
+            out[index] += 1;
+            left -= 1;
+        }
+    }
+    out
 }
 
 /// Does this `display` generate an **atomic inline** — a box that joins the

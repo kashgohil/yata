@@ -76,7 +76,11 @@ fn paint_box(b: &LayoutBox, images: &ImagePixels, list: &mut DisplayList, clip: 
     match b.kind {
         // A flex container paints exactly like a block: a background fills its
         // padding box and a border outlines it, whoever placed what is inside.
-        BoxKind::Block | BoxKind::Flex => paint_decorations(b, list, clip),
+        BoxKind::Block
+        | BoxKind::Flex
+        | BoxKind::Table
+        | BoxKind::TableRow
+        | BoxKind::TableCell => paint_decorations(b, list, clip),
         // A form control is an ordinary box from the outside — its background
         // and border paint like any other — and then draws its own cells
         // (M11.8). Its frame lives in the padding, which is why the decorations

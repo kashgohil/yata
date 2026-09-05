@@ -26,6 +26,14 @@ pub enum BoxKind {
     /// exists because what is *inside* it was placed by a different algorithm,
     /// and F3 has to be able to say so.
     Flex,
+    /// A table formatting root. Its children are [`TableRow`](Self::TableRow)
+    /// boxes rather than ordinary block-flow siblings.
+    Table,
+    /// One row owned by a [`Table`](Self::Table).
+    TableRow,
+    /// One cell owned by a [`TableRow`](Self::TableRow). Its children use the
+    /// normal block/inline formatting machinery.
+    TableCell,
     /// Anonymous block wrapping consecutive inlines inside a block container.
     AnonymousBlock,
     /// One line box inside an inline formatting context.

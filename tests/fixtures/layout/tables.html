@@ -1,0 +1,21 @@
+<!-- width: 60 -->
+<style>
+  .hidden { display: none }
+  .deck { display: flex }
+  table, tr, td, th { display: block }
+</style>
+<table id="matrix">
+  <tr><th>Language</th><th>Year</th></tr>
+  <tr><td>Rust</td><td>2015</td></tr>
+  <tr><td>Longer label</td><td></td><td>extra</td></tr>
+  <tr><td>missing partner</td></tr>
+  <tr><td class="hidden">not visible</td><td>shown</td></tr>
+  <tr><td><a href="/docs">documentation</a></td><td><input value="go" size="2"></td></tr>
+</table>
+<table class="hidden"><tr><td>hidden table</td></tr></table>
+<div class="deck"><table><tr><td>flex cell</td><td>two</td></tr></table></div>
+<table><tr><td>outer <table><tr><td>nested</td><td>table</td></tr></table></td></tr></table>
+<table id="stories">
+  <tr><td>1.</td><td>▲</td><td>Story title</td></tr>
+  <tr><td></td><td></td><td>42 points · by reader</td></tr>
+</table>

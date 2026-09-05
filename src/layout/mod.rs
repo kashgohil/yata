@@ -2787,6 +2787,116 @@ mod tests {
         );
     }
 
+    #[test]
+    fn table_rows_own_cells_and_share_provisional_columns() {
+        let (dom, styles) = styled_dom(
+            "<table><tr><th>Language</th><th>Year</th></tr><tr><td>Rust</td><td></td><td>extra</td></tr></table>",
+            "table, tr, td, th { display: block }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let table = tree
+            .boxes
+            .iter()
+            .position(|b| b.kind == BoxKind::Table)
+            .unwrap();
+        let rows = &tree.boxes[table].children;
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|&row| tree.get(row).kind == BoxKind::TableRow)
+        );
+        let first = &tree.get(rows[0]).children;
+        let second = &tree.get(rows[1]).children;
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 3);
+        assert!(
+            first
+                .iter()
+                .chain(second)
+                .all(|&cell| tree.get(cell).kind == BoxKind::TableCell)
+        );
+        assert_eq!(
+            tree.get(first[0]).dimensions.content.x,
+            tree.get(second[0]).dimensions.content.x
+        );
+        assert_eq!(
+            tree.get(first[1]).dimensions.content.x,
+            tree.get(second[1]).dimensions.content.x
+        );
+        assert!(tree.get(rows[1]).dimensions.content.y > tree.get(rows[0]).dimensions.content.y);
+        assert!(
+            tree.get(second[1]).dimensions.content.height >= 1,
+            "empty cells retain a hit-testable row"
+        );
+        let dump = crate::browser::inspector::box_lines(&dom, &tree).join("\n");
+        assert!(dump.contains("table <table>"), "{dump}");
+        assert!(dump.contains("table-row <tr>"), "{dump}");
+        assert!(dump.contains("table-cell <td>"), "{dump}");
+        assert!(
+            tree.boxes.iter().any(|b| {
+                b.kind == BoxKind::Text
+                    && b.text.as_deref() == Some("Language")
+                    && b.term_style.attrs.contains(crate::term::Attrs::BOLD)
+            }),
+            "header cells retain the UA emphasis"
+        );
+        assert_eq!(
+            plain(&lines::from_tree(&tree)),
+            vec!["LanguageYear", "Rust        extra"],
+            "dump-text consumes the positioned cell tree in visual row order"
+        );
+    }
+
+    #[test]
+    fn links_and_controls_inside_cells_keep_the_existing_hit_paths() {
+        let (dom, styles) = styled_dom(
+            "<table><tr><td><a href=/docs>docs</a></td><td><input value=go size=2></td></tr></table>",
+            "table, tr, td { display: block }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let links = hit::collect_links(&tree, &dom);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].href, "/docs");
+        assert_eq!(
+            hit::link_at(&tree, &dom, links[0].x, links[0].y),
+            Some((links[0].node, "/docs".into()))
+        );
+        assert_eq!(hit::focusables(&tree, &dom).len(), 2);
+    }
+
+    #[test]
+    fn malformed_direct_table_content_remains_visible_beside_rows() {
+        let (dom, styles) = styled_dom(
+            "<table>loose prose<div>also loose</div><tr><td>cell</td></tr></table>",
+            "table, tr, td { display: block }",
+        );
+        let tree = layout_document(&dom, &styles, 40, Hidden::Respect);
+        let text = plain(&lines::from_tree(&tree)).join("");
+        for expected in ["looseprose", "alsoloose", "cell"] {
+            assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+        }
+    }
+
+    #[test]
+    fn narrow_deep_and_long_tables_stay_cell_bounded() {
+        let mut source = String::new();
+        for _ in 0..24 {
+            source.push_str("<table><tr><td>");
+        }
+        source.push_str(&"界".repeat(4_096));
+        for _ in 0..24 {
+            source.push_str("</td></tr></table>");
+        }
+        let (dom, styles) = styled_dom(&source, "table, tr, td { display: block }");
+        let tree = layout_document(&dom, &styles, 1, Hidden::Respect);
+        assert_eq!(tree.width, 1);
+        assert!(tree.height > 0);
+        assert!(
+            tree.boxes.len() < 20_000,
+            "one-cell table layout expanded without bound"
+        );
+    }
+
     mod ladder {
         use super::*;
         use std::fs;
