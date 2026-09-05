@@ -584,11 +584,10 @@ impl<'a> Engine<'a> {
         (content_y - dims.content.y).max(0)
     }
 
-    /// The deliberately small table model M11.14 needs before CSS table
-    /// layout exists: rows own cells, a column is the widest cell in that
-    /// position, and each cell then runs the normal formatting context at its
-    /// assigned width.  This is kept here, beside block/flex formatting, so
-    /// paint and hit testing only ever see ordinary layout boxes.
+    /// The no-span part of automatic table layout: cells establish a floor and
+    /// ceiling for their document column, then the table spends its available
+    /// content width between those bounds.  This stays beside block/flex
+    /// formatting so paint and hit testing only ever see ordinary layout boxes.
     fn layout_table_contents(
         &mut self,
         id: NodeId,
@@ -608,25 +607,47 @@ impl<'a> Engine<'a> {
         if columns == 0 {
             return self.layout_contents(id, "table", computed, box_id, heights, pre);
         }
-        let available = self.boxes[box_id.0 as usize]
+        // `resolve_block_dims` has already resolved the table's own width and
+        // min/max clamps. For an auto table this is the available content
+        // width; for a definite or clamped table it is the requested width.
+        let requested = self.boxes[box_id.0 as usize]
             .dimensions
             .content
             .width
             .max(1);
-        let mut wanted = vec![1; columns];
+        let mut constraints = vec![TableColumn::EMPTY; columns];
         for (_, cells) in &rows {
             for (column, &cell) in cells.iter().enumerate() {
-                // IntrinsicSizer already measures terminal-cell widths and is
-                // memoized for this pass; table sizing must not build a second
-                // layout tree merely to ask this question.
-                wanted[column] = wanted[column].max(self.sizer.max_content_width(cell).max(1));
+                let contribution = self.table_cell_contribution(cell, requested);
+                constraints[column].min = constraints[column].min.max(contribution.min);
+                constraints[column].max = constraints[column].max.max(contribution.max);
             }
         }
-        let widths = fit_table_columns(&wanted, available);
+        let min_table = constraints
+            .iter()
+            .fold(0i32, |sum, column| sum.saturating_add(column.min));
+        let max_table = constraints
+            .iter()
+            .fold(0i32, |sum, column| sum.saturating_add(column.max));
+        // Auto tables shrink-wrap between their intrinsic bounds. A definite
+        // width (including one imposed by a table min/max clamp) instead asks
+        // the distributor to spend every requested cell.
+        let target = if computed.width.is_auto()
+            && computed.min_width.is_auto()
+            && computed.max_width.is_auto()
+        {
+            requested.min(max_table).max(min_table)
+        } else {
+            requested
+        };
+        let widths = fit_table_columns(&constraints, target);
         let table_width = widths
             .iter()
             .fold(0i32, |sum, width| sum.saturating_add(*width));
-        self.boxes[box_id.0 as usize].dimensions.content.width = table_width.min(available);
+        // A table whose minima exceed the containing block deliberately
+        // overflows. Existing horizontal clipping handles it; shrinking a
+        // present column to zero would lose its cell instead.
+        self.boxes[box_id.0 as usize].dimensions.content.width = table_width;
         let table = self.boxes[box_id.0 as usize].dimensions.content;
         let mut y = table.y;
         let mut row_boxes = Vec::with_capacity(rows.len() + loose_children.len());
@@ -719,6 +740,56 @@ impl<'a> Engine<'a> {
         }
         self.boxes[box_id.0 as usize].children = row_boxes;
         (y - table.y).max(0)
+    }
+
+    /// One cell's outer horizontal intrinsic contribution. Its normal box is
+    /// still built only once below, at the column width ultimately assigned.
+    fn table_cell_contribution(&mut self, cell: NodeId, containing_width: i32) -> TableColumn {
+        let computed = *self.styles.get(cell);
+        let padding = computed
+            .padding
+            .left
+            .to_cells_h(containing_width)
+            .saturating_add(computed.padding.right.to_cells_h(containing_width));
+        let border = computed
+            .border
+            .left
+            .to_cells_h(containing_width)
+            .saturating_add(computed.border.right.to_cells_h(containing_width));
+        let axis = Axis {
+            edges: padding.saturating_add(border),
+            box_sizing: computed.box_sizing,
+        };
+        // The intrinsic sizer owns all subtree measurement (including fields,
+        // images, Unicode and nested tables). Resolve percentages here, where
+        // a table content width is finally available.
+        let (mut min, mut max) = (
+            self.sizer.min_content_width(cell),
+            self.sizer.max_content_width(cell),
+        );
+        if !computed.width.is_auto() {
+            let width = axis.content_from(computed.width.to_cells_h(containing_width));
+            min = width;
+            max = width;
+        }
+        let resolve =
+            |length: Length| (!length.is_auto()).then(|| length.to_cells_h(containing_width));
+        min = axis.clamp(
+            min,
+            resolve(computed.min_width),
+            resolve(computed.max_width),
+        );
+        max = axis.clamp(
+            max,
+            resolve(computed.min_width),
+            resolve(computed.max_width),
+        );
+        TableColumn {
+            min: min.saturating_add(axis.edges).max(1),
+            max: max.saturating_add(axis.edges).max(1),
+            used: 1,
+        }
+        .normalized()
     }
 
     fn tag(&self, id: NodeId) -> &str {
@@ -3905,36 +3976,83 @@ pub(super) fn is_block_level(display: Display) -> bool {
     matches!(display, Display::Block | Display::Flex)
 }
 
-/// Shrink provisional intrinsic column widths to the containing block without
-/// ever making a present column zero-width. More columns than cells available
-/// necessarily overflow; that is the engine's existing horizontal clipping
-/// behaviour and is preferable to losing a cell's ownership altogether.
-fn fit_table_columns(wanted: &[i32], available: i32) -> Vec<i32> {
-    let minimum_total = wanted.len() as i32;
-    let target = available.max(minimum_total);
-    let wanted_total = wanted
-        .iter()
-        .fold(0i32, |sum, width| sum.saturating_add((*width).max(1)));
-    if wanted_total <= target {
-        return wanted.iter().map(|width| (*width).max(1)).collect();
+/// The bounded local state of one no-span table column. It is intentionally
+/// not stored on layout boxes: final cell geometry is all later stages need.
+#[derive(Clone, Copy, Debug)]
+struct TableColumn {
+    min: i32,
+    max: i32,
+    used: i32,
+}
+
+impl TableColumn {
+    const EMPTY: TableColumn = TableColumn {
+        min: 1,
+        max: 1,
+        used: 1,
+    };
+
+    fn normalized(self) -> TableColumn {
+        let min = self.min.max(1);
+        TableColumn {
+            min,
+            max: self.max.max(min),
+            used: self.used.max(min),
+        }
     }
-    let extra = target - minimum_total;
-    let demand = wanted_total - minimum_total;
-    let mut out: Vec<i32> = wanted
+}
+
+/// Resolve no-span automatic-table columns. The integer quotient is assigned
+/// first, then any rounding cells go to earlier document columns, which makes
+/// repeated layout byte-identical.
+fn fit_table_columns(columns: &[TableColumn], requested: i32) -> Vec<i32> {
+    let mut columns: Vec<TableColumn> = columns
         .iter()
-        .map(|width| 1 + (((*width).max(1) - 1) as i64 * extra as i64 / demand as i64) as i32)
+        .copied()
+        .map(TableColumn::normalized)
         .collect();
-    let mut left = target - out.iter().sum::<i32>();
-    for (index, width) in wanted.iter().enumerate() {
-        if left == 0 {
-            break;
+    let sum = |f: fn(TableColumn) -> i32| {
+        columns
+            .iter()
+            .fold(0i32, |total, column| total.saturating_add(f(*column)))
+    };
+    let min_table = sum(|column| column.min);
+    let max_table = sum(|column| column.max);
+    let target = requested.max(min_table);
+
+    if target >= max_table {
+        let surplus = target.saturating_sub(max_table);
+        let count = columns.len() as i32;
+        let each = surplus / count;
+        let remainder = surplus % count;
+        for (index, column) in columns.iter_mut().enumerate() {
+            column.used = column
+                .max
+                .saturating_add(each)
+                .saturating_add((index < remainder as usize) as i32);
         }
-        if out[index] < *width {
-            out[index] += 1;
-            left -= 1;
+    } else {
+        let free = target.saturating_sub(min_table);
+        let range = max_table.saturating_sub(min_table);
+        let mut used_total = 0i32;
+        for column in &mut columns {
+            let expandable = column.max.saturating_sub(column.min);
+            let share = ((i64::from(expandable) * i64::from(free)) / i64::from(range)) as i32;
+            column.used = column.min.saturating_add(share);
+            used_total = used_total.saturating_add(column.used);
+        }
+        let mut remainder = target.saturating_sub(used_total);
+        for column in &mut columns {
+            if remainder == 0 {
+                break;
+            }
+            if column.used < column.max {
+                column.used += 1;
+                remainder -= 1;
+            }
         }
     }
-    out
+    columns.into_iter().map(|column| column.used).collect()
 }
 
 /// Does this `display` generate an **atomic inline** — a box that joins the
@@ -3961,4 +4079,39 @@ pub(super) fn is_atomic_inline(display: Display) -> bool {
 /// gets painted.
 pub(super) fn is_html_space(c: char) -> bool {
     matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0C}')
+}
+
+#[cfg(test)]
+mod table_tests {
+    use super::{TableColumn, fit_table_columns};
+
+    fn columns(bounds: &[(i32, i32)]) -> Vec<TableColumn> {
+        bounds
+            .iter()
+            .map(|&(min, max)| TableColumn {
+                min,
+                max,
+                used: min,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn columns_spend_width_between_intrinsic_bounds_in_document_order() {
+        let bounds = columns(&[(2, 2), (1, 1), (5, 17)]);
+        assert_eq!(fit_table_columns(&bounds, 20), vec![2, 1, 17]);
+        // Six free cells over unequal ranges leaves one rounding cell, and it
+        // belongs to the first expandable document column.
+        assert_eq!(
+            fit_table_columns(&columns(&[(2, 5), (1, 6)]), 8),
+            vec![4, 4]
+        );
+    }
+
+    #[test]
+    fn columns_keep_minima_and_share_explicit_surplus() {
+        let bounds = columns(&[(2, 2), (1, 1), (5, 8)]);
+        assert_eq!(fit_table_columns(&bounds, 1), vec![2, 1, 5]);
+        assert_eq!(fit_table_columns(&bounds, 17), vec![4, 3, 10]);
+    }
 }

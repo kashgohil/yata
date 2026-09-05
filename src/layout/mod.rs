@@ -2848,6 +2848,29 @@ mod tests {
     }
 
     #[test]
+    fn table_columns_keep_rank_and_vote_compact_while_title_spends_the_width() {
+        let (dom, styles) = styled_dom(
+            "<table><tr><td>1.</td><td>▲</td><td>title lorem ipsum</td></tr>\
+             <tr><td></td><td></td><td>42 points by reader</td></tr></table>",
+            "table, tr, td { display: block }",
+        );
+        let tree = layout_document(&dom, &styles, 20, Hidden::Respect);
+        let table = tree
+            .boxes
+            .iter()
+            .position(|b| b.kind == BoxKind::Table)
+            .unwrap();
+        let first = &tree.get(tree.get(BoxId(table as u32)).children[0]).children;
+        let widths: Vec<_> = first
+            .iter()
+            .map(|&cell| tree.get(cell).dimensions.margin_box_width())
+            .collect();
+        assert_eq!(&widths[..2], &[2, 1]);
+        assert_eq!(widths.iter().sum::<i32>(), 20);
+        assert!(widths[2] > widths[0] + widths[1]);
+    }
+
+    #[test]
     fn links_and_controls_inside_cells_keep_the_existing_hit_paths() {
         let (dom, styles) = styled_dom(
             "<table><tr><td><a href=/docs>docs</a></td><td><input value=go size=2></td></tr></table>",
@@ -2953,12 +2976,27 @@ mod tests {
             let mut sheets: Vec<&crate::css::Stylesheet> = inline.iter().collect();
             sheets.push(&page);
             let styles = style::style_tree(&dom, &sheets);
-            let out = layout(&dom, &styles, 80, Hidden::Respect);
+            let tree = layout_document(&dom, &styles, 80, Hidden::Respect);
+            let out = lines::from_tree(&tree);
             assert!(out.len() > 10);
             let all = plain(&out).join("\n");
             assert!(
                 all.contains("Hacker News") || all.contains("Hacker"),
                 "{all}"
+            );
+            assert!(
+                tree.boxes.iter().any(|row| {
+                    row.kind == BoxKind::TableRow && row.children.len() >= 3 && {
+                        let cells = &row.children;
+                        let widths = [
+                            tree.get(cells[0]).dimensions.margin_box_width(),
+                            tree.get(cells[1]).dimensions.margin_box_width(),
+                            tree.get(cells[2]).dimensions.margin_box_width(),
+                        ];
+                        widths[0] < widths[2] && widths[1] < widths[2]
+                    }
+                }),
+                "HN needs a compact rank/vote pair and a wider reading column"
             );
         }
 
