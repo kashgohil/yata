@@ -2667,6 +2667,17 @@ impl App {
     /// - the action does not resolve — a page whose `action` is not a URL.
     ///
     fn submit_form(&mut self, activator: NodeId) -> Effect {
+        // There is no native submit event without an owning form. Besides
+        // avoiding needless host work, this preserves the field mode exactly:
+        // Enter is a no-op for script-owned search boxes outside a form.
+        if self
+            .dom
+            .as_ref()
+            .and_then(|dom| form::owner(dom, activator))
+            .is_none()
+        {
+            return Effect::default();
+        }
         let Some((id, before, logged_before)) = self.begin_reader_action() else {
             return Effect::default();
         };
@@ -2761,9 +2772,13 @@ impl App {
         let Some((id, before, logged_before)) = self.begin_reader_action() else {
             return Effect::default();
         };
-        self.activate_choice_in_action(node);
-        self.finish_reader_action(id, before, logged_before);
-        self.take_click_navigation()
+        let changed = self.activate_choice_in_action(node);
+        let listener_changed = self.finish_reader_action(id, before, logged_before);
+        if changed || listener_changed {
+            self.take_click_navigation()
+        } else {
+            Effect::default()
+        }
     }
 
     /// Checkbox/radio pre-activation and its events, without consuming the
@@ -2803,11 +2818,14 @@ impl App {
             if let Some(dom) = self.dom.as_mut() {
                 dom.restore_choice_state_snapshot(&snapshot);
             }
+            false
         } else if changed {
             self.dispatch_reader_event(node, js::EventDescriptor::INPUT);
             self.dispatch_reader_event(node, js::EventDescriptor::CHANGE);
+            true
+        } else {
+            false
         }
-        true
     }
 
     fn start_select(&mut self, node: NodeId) -> Effect {
@@ -3607,7 +3625,12 @@ impl App {
     }
 
     /// End an action started by [`Self::begin_reader_action`].
-    fn finish_reader_action(&mut self, id: FetchId, before: (u64, u64, u64), logged_before: usize) {
+    fn finish_reader_action(
+        &mut self,
+        id: FetchId,
+        before: (u64, u64, u64),
+        logged_before: usize,
+    ) -> bool {
         let after = self
             .dom
             .as_ref()
@@ -3624,6 +3647,7 @@ impl App {
             self.console_view_built = false;
             self.build_visible_inspector();
         }
+        effect.dirty
     }
 
     fn follow_href(&mut self, href: &str) -> Effect {
