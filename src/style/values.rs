@@ -35,6 +35,26 @@ pub enum Display {
     None,
 }
 
+/// The subset of CSS positioning which has a layout-time meaning in yata.
+/// Fixed and sticky deliberately remain unsupported until the viewport owns a
+/// containing block (M11.18).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Position {
+    #[default]
+    Static,
+    Relative,
+    Absolute,
+}
+
+pub fn parse_position(value: &str) -> Option<Position> {
+    match lower(value).as_str() {
+        "static" => Some(Position::Static),
+        "relative" => Some(Position::Relative),
+        "absolute" => Some(Position::Absolute),
+        _ => None,
+    }
+}
+
 /// A CSS length as written, before layout resolves it into cells.
 ///
 /// Resolution (PLAN.md §1.4) is axis-aware:
@@ -1003,6 +1023,15 @@ mod tests {
         // outside half.
         assert_eq!(parse_display("inline-grid"), Some(Display::InlineBlock));
         assert_eq!(parse_display("bananas"), None);
+    }
+
+    #[test]
+    fn position_accepts_only_the_supported_positioning_modes() {
+        assert_eq!(parse_position("static"), Some(Position::Static));
+        assert_eq!(parse_position("RELATIVE"), Some(Position::Relative));
+        assert_eq!(parse_position("absolute"), Some(Position::Absolute));
+        assert_eq!(parse_position("fixed"), None);
+        assert_eq!(parse_position("sticky"), None);
     }
 
     #[test]

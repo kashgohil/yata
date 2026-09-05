@@ -16,7 +16,8 @@ use crate::layout::{BoxId, BoxKind, LayoutTree};
 use crate::style::Styles;
 use crate::style::values::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, ColorValue, Display, Edges, Flex, FlexBasis,
-    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, TextAlign,
+    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, Position,
+    TextAlign,
 };
 
 /// Cell caps for the variable-length parts of a line. Text gets the most room
@@ -190,6 +191,23 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
     }
     if computed.box_sizing == BoxSizing::BorderBox {
         parts.push("border-box".into());
+    }
+    if computed.position != Position::Static {
+        parts.push(match computed.position {
+            Position::Relative => "position relative".into(),
+            Position::Absolute => "position absolute".into(),
+            Position::Static => unreachable!("initial position is omitted"),
+        });
+    }
+    for (name, inset) in [
+        ("top", computed.top),
+        ("right", computed.right),
+        ("bottom", computed.bottom),
+        ("left", computed.left),
+    ] {
+        if !inset.is_auto() {
+            parts.push(format!("{name} {}", length_summary(inset)));
+        }
     }
     // M9.3: the same clause F3 prints, for the same reason — a page whose
     // content disappeared is read from these two panes together.
@@ -732,6 +750,19 @@ mod tests {
         let p = lines.iter().find(|l| l.contains("<p>")).unwrap();
         assert!(!p.contains("h "), "{p}");
         assert!(!p.contains("border-box"), "{p}");
+    }
+
+    #[test]
+    fn positioned_values_show_when_set() {
+        let lines = styled(
+            "<div>x</div>",
+            "div { position: absolute; top: 1em; right: 25%; left: 0 }",
+        );
+        let div = lines.iter().find(|l| l.contains("<div>")).unwrap();
+        assert!(div.contains("position absolute"), "{div}");
+        assert!(div.contains("top 1em"), "{div}");
+        assert!(div.contains("right 25%"), "{div}");
+        assert!(div.contains("left 0"), "{div}");
     }
 
     #[test]

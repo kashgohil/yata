@@ -22,7 +22,7 @@ use matching::RuleIndex;
 use values::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, ColorValue, Display, Edges, Flex,
     FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, Overflow,
-    TextAlign,
+    Position, TextAlign,
 };
 
 /// Dynamic matching inputs for the cascade (M6): which node is hovered, which
@@ -55,6 +55,13 @@ impl Default for StyleContext<'static> {
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct ComputedStyle {
     pub display: Display,
+    /// Positioning is non-inherited. Insets are kept as authored lengths so
+    /// layout can resolve each against the right containing-block axis.
+    pub position: Position,
+    pub top: Length,
+    pub right: Length,
+    pub bottom: Length,
+    pub left: Length,
     pub color: ColorValue,
     pub background_color: ColorValue,
     pub font_weight: FontWeight,
@@ -155,6 +162,11 @@ impl ComputedStyle {
     fn inherit(&self) -> ComputedStyle {
         ComputedStyle {
             display: Display::default(),
+            position: Position::default(),
+            top: Length::Auto,
+            right: Length::Auto,
+            bottom: Length::Auto,
+            left: Length::Auto,
             background_color: ColorValue::default(),
             color: self.color,
             font_weight: self.font_weight,
@@ -507,6 +519,11 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
     let value = declaration.value.as_str();
     match declaration.name.as_str() {
         "display" => set(&mut computed.display, values::parse_display(value)),
+        "position" => set(&mut computed.position, values::parse_position(value)),
+        "top" => set(&mut computed.top, values::parse_length(value)),
+        "right" => set(&mut computed.right, values::parse_length(value)),
+        "bottom" => set(&mut computed.bottom, values::parse_length(value)),
+        "left" => set(&mut computed.left, values::parse_length(value)),
         "color" => set(&mut computed.color, values::parse_color(value)),
         "background-color" => set(&mut computed.background_color, values::parse_color(value)),
         // The `background` shorthand, honoured for the two spellings that
@@ -931,6 +948,29 @@ mod tests {
         // the same thing `Auto`.
         let (dom, styles) = styled("<div>t</div>", "div { max-height: none }");
         assert_eq!(styles.get(find(&dom, "div")).max_height, Length::Auto);
+    }
+
+    #[test]
+    fn positioning_properties_cascade_and_do_not_inherit() {
+        let (dom, styles) = styled(
+            "<div><p>t</p></div>",
+            "div { position: relative; top: 2em; right: 25%; bottom: auto; left: 3px }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.position, Position::Relative);
+        assert_eq!(div.top, Length::Em(2.0));
+        assert_eq!(div.right, Length::Percent(25.0));
+        assert_eq!(div.left, Length::Px(3.0));
+        let p = styles.get(find(&dom, "p"));
+        assert_eq!(p.position, Position::Static);
+        assert_eq!(p.top, Length::Auto);
+
+        // An unsupported value is invalid, so the prior winner survives.
+        let (dom, styles) = styled(
+            "<div>t</div>",
+            "div { position: absolute; position: fixed }",
+        );
+        assert_eq!(styles.get(find(&dom, "div")).position, Position::Absolute);
     }
 
     #[test]
