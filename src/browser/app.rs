@@ -15811,6 +15811,45 @@ mod tests {
              (styles/layouts/paints: {narrow_stages:?})",
             summarize(&narrow),
         );
+
+        // A real `<select>` commit is candidate-only relative to the M11
+        // parent, so report its absolute settled latency instead of inventing
+        // an A/B operation the parent cannot perform.
+        let form = "<form><select id=single><option>one</option><option>two</option></select></form><script>1;</script>";
+        let select_once = || {
+            let (mut app, id) = scripted_app(form);
+            app.update(Msg::RunScripts { id });
+            app.focus = Some(by_id(&app, "single"));
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            app.update(key(KeyCode::Down, KeyModifiers::NONE));
+            let before = stages(&app);
+            let mut renderer =
+                crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let started = Instant::now();
+            app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+            app.draw(renderer.frame());
+            let _ = renderer.present(&mut std::io::sink());
+            let elapsed = started.elapsed();
+            let after = stages(&app);
+            assert_eq!(
+                (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+                (0, 0, 1)
+            );
+            elapsed
+        };
+        let _ = select_once();
+        let select: Vec<_> = (0..20).map(|_| select_once()).collect();
+        eprintln!(
+            "M11.25 settled select commit -> frame, n=20: {} (stages (0, 0, 1))",
+            summarize(&select)
+        );
+        assert!(
+            select
+                .iter()
+                .all(|sample| *sample < Duration::from_millis(10))
+        );
     }
 
     /// The first element carrying `id="x11-3-leaf"` — the paragraph
