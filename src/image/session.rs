@@ -69,6 +69,15 @@ impl ImageSession {
         self.last_sig.clear();
     }
 
+    /// The terminal's global Kitty image state was cleared by browser chrome
+    /// (for example during a tab switch). Page-local discovery survives, but
+    /// every upload and placement must be emitted again if this page is shown.
+    pub fn terminal_reset(&mut self) {
+        self.kitty_active = false;
+        self.uploaded.clear();
+        self.last_sig.clear();
+    }
+
     pub fn page_imgs(&self) -> &[ImgRef] {
         &self.page_imgs
     }

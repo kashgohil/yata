@@ -4708,6 +4708,9 @@ pub struct Browser {
     tabs: Vec<Tab>,
     active: usize,
     next_tab: u64,
+    /// Tab whose Kitty placement bookkeeping matches the terminal-global
+    /// image state.
+    kitty_tab: Option<TabId>,
 }
 
 impl Browser {
@@ -4729,6 +4732,7 @@ impl Browser {
             session,
             active: 0,
             next_tab: 2,
+            kitty_tab: Some(id),
         }
     }
 
@@ -4928,6 +4932,18 @@ impl Browser {
     }
 
     pub fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        let active = self.tabs[self.active].id;
+        if self.kitty_graphics && self.kitty_tab != Some(active) {
+            self.kitty_tab = Some(active);
+            for tab in &mut self.tabs {
+                tab.page.images.terminal_reset();
+            }
+            let mut bytes = crate::image::delete_all_images().to_vec();
+            if let Some(next) = self.tabs[self.active].page.kitty_frame_with_offset(1) {
+                bytes.extend(next);
+            }
+            return Some(bytes);
+        }
         self.tabs[self.active].page.kitty_frame_with_offset(1)
     }
 
@@ -5683,6 +5699,18 @@ mod tests {
         let mut frame = Frame::new(12, 3);
         browser.draw(&mut frame);
         assert!(frame.get(0, 0).style().attrs.contains(Attrs::REVERSE));
+    }
+
+    #[test]
+    fn switching_tabs_resets_terminal_global_kitty_placements_once() {
+        let mut browser = Browser::with_caps(20, 4, true);
+        assert!(browser.kitty_frame().is_none());
+        browser.update(ch('t'));
+        assert_eq!(
+            browser.kitty_frame().as_deref(),
+            Some(crate::image::delete_all_images())
+        );
+        assert!(browser.kitty_frame().is_none());
     }
 
     #[test]
