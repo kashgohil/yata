@@ -5012,9 +5012,7 @@ impl Browser {
             return;
         };
         let rows = self.size.1.saturating_sub(3) as usize;
-        if rows == 0 {
-            self.bookmark_first_visible = selected;
-        } else if selected < self.bookmark_first_visible {
+        if rows == 0 || selected < self.bookmark_first_visible {
             self.bookmark_first_visible = selected;
         } else if selected >= self.bookmark_first_visible.saturating_add(rows) {
             self.bookmark_first_visible = selected + 1 - rows;
