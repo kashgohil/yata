@@ -7,9 +7,7 @@ use crate::browser::fragment;
 use crate::browser::help;
 use crate::browser::hints;
 use crate::browser::history::History;
-use crate::browser::http_cache::{
-    Cache, Key as CacheKey, Metadata, Plan, Representation, RequestMode,
-};
+use crate::browser::http_cache::{Cache, Key as CacheKey, Plan, Representation, RequestMode};
 use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::search::{self, Match as SearchMatch};
@@ -318,7 +316,6 @@ pub struct App {
     cache_epoch: Instant,
     cache_key: Option<CacheKey>,
     cache_candidate: Option<CacheKey>,
-    response_metadata: Option<Metadata>,
     document_source: net::DocumentSource,
     /// Everything this page's JavaScript had to say (M10.7): console calls,
     /// uncaught exceptions, scripts skipped for their type — one ordered list,
@@ -489,7 +486,6 @@ impl App {
             cache_epoch: Instant::now(),
             cache_key: None,
             cache_candidate: None,
-            response_metadata: None,
             document_source: net::DocumentSource::Network,
             console: Console::new(),
             console_view: Viewport::default(),
@@ -581,7 +577,6 @@ impl App {
         self.hops = Hops::default();
         self.cache_key = None;
         self.cache_candidate = None;
-        self.response_metadata = None;
         self.document_source = net::DocumentSource::Network;
         self.fetch = Fetch::Loading {
             url,
@@ -657,12 +652,6 @@ impl App {
                     _ => Effect::default(),
                 }
             }
-            Msg::CacheMetadata { id, metadata } => {
-                if Some(id) == self.current_fetch {
-                    self.response_metadata = Some(metadata);
-                }
-                Effect::default()
-            }
             Msg::Loaded {
                 id,
                 url,
@@ -671,11 +660,11 @@ impl App {
                 elapsed,
                 content_type,
                 set_cookie,
+                metadata,
             } => {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
-                let metadata = self.response_metadata.take().unwrap_or_default();
                 // Only an accepted fetch records its duration (PLAN.md §4) —
                 // and it is the **whole chain**, not the last hop of one
                 // (M11.7a). A redirect that reported only its landing page
@@ -838,7 +827,6 @@ impl App {
                     _ => net::Method::Get,
                 };
                 self.cache_candidate = None;
-                self.response_metadata = None;
                 if let Fetch::Loading { method, .. } = &mut self.fetch {
                     *method = next_method.clone();
                 }
@@ -4630,6 +4618,7 @@ fn fragment_of(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::http_cache::Metadata;
     use crate::term::Color;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::io::{Read, Write};
@@ -4653,7 +4642,6 @@ mod tests {
     }
 
     fn load_cacheable(app: &mut App, id: FetchId, url: &str, body: &[u8], metadata: Metadata) {
-        app.update(Msg::CacheMetadata { id, metadata });
         app.update(Msg::Loaded {
             id,
             url: url.into(),
@@ -4662,6 +4650,7 @@ mod tests {
             elapsed: Duration::from_millis(2),
             content_type: Some("text/html".into()),
             set_cookie: Vec::new(),
+            metadata,
         });
     }
 
@@ -4789,6 +4778,7 @@ mod tests {
                 elapsed: Duration::ZERO,
                 content_type: Some("text/html".into()),
                 set_cookie: Vec::new(),
+                metadata: Default::default(),
             });
             app.update(Msg::Parsed {
                 id,
@@ -4899,10 +4889,6 @@ mod tests {
                 if_none_match: Some("W/\"one\"".into())
             }
         );
-        app.update(Msg::CacheMetadata {
-            id,
-            metadata: cache_metadata(&["max-age=60"], Some("\"two\"")),
-        });
         let reuse = app.update(Msg::Loaded {
             id,
             url: a.into(),
@@ -4911,6 +4897,7 @@ mod tests {
             elapsed: Duration::from_millis(3),
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: cache_metadata(&["max-age=60"], Some("\"two\"")),
         });
         apply_cached_effect(&mut app, reuse);
         assert!(matches!(&app.fetch, Fetch::Loaded { body, .. } if body == b"old body"));
@@ -4944,10 +4931,6 @@ mod tests {
         let reload = app.reload();
         let (id, request) = reload.fetch.expect("stale response did not validate");
         let key = CacheKey::from_request(&request).unwrap();
-        app.update(Msg::CacheMetadata {
-            id,
-            metadata: cache_metadata(&["max-age=60"], Some("\"two\"")),
-        });
         app.update(Msg::Loaded {
             id,
             url: url.into(),
@@ -4956,6 +4939,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: Some("text/html".into()),
             set_cookie: Vec::new(),
+            metadata: cache_metadata(&["max-age=60"], Some("\"two\"")),
         });
         let Plan::Hit(replaced) = app.cache.plan(&key, RequestMode::Ordinary, app.cache_now())
         else {
@@ -4973,6 +4957,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Metadata::default(),
         });
         assert!(
             matches!(&app.fetch, Fetch::Failed { reason, .. } if reason.contains("without a cached representation"))
@@ -5062,10 +5047,6 @@ mod tests {
         assert!(app.navigate(url.into(), false).fetch.is_some());
 
         let id = app.current_fetch.unwrap();
-        app.update(Msg::CacheMetadata {
-            id,
-            metadata: cache_metadata(&["max-age=60"], None),
-        });
         app.update(Msg::Loaded {
             id,
             url: url.into(),
@@ -5074,6 +5055,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: Some("text/html".into()),
             set_cookie: vec!["sid=one; Path=/".into()],
+            metadata: cache_metadata(&["max-age=60"], None),
         });
         assert!(app.navigate(url.into(), false).fetch.is_some());
     }
@@ -5102,6 +5084,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: Some("text/html".into()),
             set_cookie: vec!["sid=private; Path=/".into()],
+            metadata: Default::default(),
         });
         let back = app.history_go(true);
         let (_, request) = back.fetch.expect("logged-out bytes crossed cookie state");
@@ -5167,6 +5150,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         })
     }
 
@@ -5184,6 +5168,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         let effect = app.update(Msg::Parsed {
             id,
@@ -5562,6 +5547,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         }
     }
 
@@ -5855,6 +5841,7 @@ mod tests {
             elapsed: Duration::from_micros(12_300),
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         assert_eq!(app.timings().fetch, Some(Duration::from_micros(12_300)));
     }
@@ -5871,6 +5858,7 @@ mod tests {
             elapsed: Duration::from_micros(12_300),
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         // The overlay shows the last *completed* run (PLAN.md §4): the old
         // number stands until the new fetch lands.
@@ -5899,6 +5887,7 @@ mod tests {
             elapsed: Duration::from_micros(12_300),
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         let id = app.start_fetch("http://y/".into());
         app.update(Msg::NetError {
@@ -5928,6 +5917,7 @@ mod tests {
             elapsed: Duration::from_micros(12_300),
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.record_frame(Duration::from_micros(2_100));
         app
@@ -6853,6 +6843,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(id, fixture));
 
@@ -7632,6 +7623,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         // The landing page is accepted at all only because the generation did
         // not move: a hop that minted an id would drop its own page as stale.
@@ -7705,6 +7697,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         let screen = screen(&mut app, 60, 10);
         assert!(screen.contains("HTTP 302"), "{screen}");
@@ -7884,6 +7877,7 @@ mod tests {
             elapsed: Duration::from_millis(10),
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         // 30 + 20 + 10: the whole chain, not the 10 ms last hop. A reader
         // looking at `--timing` or `F4` has to see what the page really cost.
@@ -7900,6 +7894,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(id, html_src));
     }
@@ -9737,6 +9732,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(fetch_id, "<p>ok</p>"));
         let reloaded = app.update(ch('r'));
@@ -10532,6 +10528,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: set_cookie.iter().map(|s| s.to_string()).collect(),
+            metadata: Default::default(),
         });
         app.update(parsed(id, html));
         id
@@ -10584,6 +10581,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: vec!["sid=abc; Path=/".into()],
+            metadata: Default::default(),
         });
         let html = "<link rel=stylesheet href=/site.css>\
                     <link rel=stylesheet href=http://cdn.test/other.css>\
@@ -11279,6 +11277,7 @@ mod tests {
                 elapsed: Duration::ZERO,
                 content_type: None,
                 set_cookie,
+                metadata: Default::default(),
             });
             let effect = app.update(Msg::Parsed {
                 id,
@@ -12180,6 +12179,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(id, &body));
         assert_eq!(top_row(&app), "the target");
@@ -12216,6 +12216,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         assert_eq!(
             app.current_url().as_deref(),
@@ -12249,6 +12250,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(id, &body));
         let at_target = app.viewport.offset();
@@ -12268,6 +12270,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(next, "<p>elsewhere</p>"));
 
@@ -12282,6 +12285,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(restored, &body));
         assert_eq!(
@@ -12318,6 +12322,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(parsed(id, &body));
         assert_eq!(app.viewport.offset(), 0, "nothing named `late` existed yet");
@@ -13483,6 +13488,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(Msg::Parsed {
             id,
@@ -13504,6 +13510,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(Msg::Parsed {
             id,
@@ -13586,6 +13593,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         assert!(app.visited.contains("http://visited.test/"));
 
@@ -13599,6 +13607,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(Msg::Parsed {
             id: id2,
@@ -13658,6 +13667,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         app.update(Msg::Parsed {
             id,
@@ -13742,6 +13752,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: Some("text/html".into()),
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         assert!(app.dom.is_none());
         // A late Parsed must not clobber the error page.
@@ -13774,6 +13785,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: Some("image/png".into()),
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         assert!(app.dom.is_none());
         let mut frame = Frame::new(60, 12);

@@ -440,6 +440,7 @@ fn render_app_keys(
         elapsed: Duration::ZERO,
         content_type: None,
         set_cookie: Vec::new(),
+        metadata: Default::default(),
     });
     app.update(Msg::Parsed {
         id,

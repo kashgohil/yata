@@ -578,6 +578,7 @@ fn run_timing(url: &str) -> i32 {
         // The response's own, through the same path the TUI uses — the jar is
         // on the load path now, and `--timing` is what measures the load path.
         set_cookie: loaded.set_cookie,
+        metadata: Default::default(),
     });
     app.update(Msg::Parsed {
         id,
@@ -735,6 +736,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         // 200 'j' now scroll for real: still one coalesced redraw decision, not
         // 200 renders. (Clamping to the last page is covered by viewport tests.)
@@ -765,6 +767,7 @@ mod tests {
                     elapsed: Duration::ZERO,
                     content_type: None,
                     set_cookie: Vec::new(),
+                    metadata: Default::default(),
                 },
                 Msg::Parsed {
                     id,
@@ -828,6 +831,7 @@ mod tests {
             elapsed: Duration::ZERO,
             content_type: None,
             set_cookie: Vec::new(),
+            metadata: Default::default(),
         });
         let effect = apply_batch(
             &mut app,

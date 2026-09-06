@@ -50,12 +50,7 @@ pub enum Msg {
         /// field to carry it, "a stylesheet cannot start a session" is
         /// structural rather than a rule somebody has to remember.
         set_cookie: Vec<String>,
-    },
-    /// Selected owned document response fields. This precedes the matching
-    /// `Loaded` message on the same worker channel, keeping existing response
-    /// consumers source-compatible while preserving separate field lines.
-    CacheMetadata {
-        id: FetchId,
+        /// Selected cache fields, with repeated field lines kept separate.
         metadata: crate::browser::http_cache::Metadata,
     },
     /// One hop of a redirect chain (M11.7a): the response said to go

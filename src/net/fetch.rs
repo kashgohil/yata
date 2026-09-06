@@ -89,15 +89,6 @@ pub fn spawn_cached(
         let should_parse = is_document(response.status, response.content_type.as_deref());
         let text = should_parse.then(|| html::decode_body(&response.body));
         if tx
-            .send(Msg::CacheMetadata {
-                id,
-                metadata: response.metadata,
-            })
-            .is_err()
-        {
-            return;
-        }
-        if tx
             .send(Msg::Loaded {
                 id,
                 url,
@@ -106,6 +97,7 @@ pub fn spawn_cached(
                 elapsed,
                 content_type: response.content_type,
                 set_cookie: Vec::new(),
+                metadata: response.metadata,
             })
             .is_err()
         {
@@ -517,9 +509,6 @@ fn fetch(
             return Ok(None);
         }
     }
-    if tx.send(Msg::CacheMetadata { id, metadata }).is_err() {
-        return Ok(None);
-    }
     Ok(Some(Msg::Loaded {
         id,
         url: final_url,
@@ -528,6 +517,7 @@ fn fetch(
         elapsed: started.elapsed(),
         content_type,
         set_cookie,
+        metadata,
     }))
 }
 
@@ -725,14 +715,7 @@ mod tests {
             matches!(loaded, Msg::Loaded { .. }),
             "expected Loaded before Parsed, got {loaded:?}"
         );
-        let (metadata, progress) = before_loaded
-            .split_last()
-            .expect("no CacheMetadata before Loaded");
-        assert!(
-            matches!(metadata, Msg::CacheMetadata { .. }),
-            "expected CacheMetadata before Loaded, got {metadata:?}"
-        );
-        (progress, loaded, parsed)
+        (before_loaded, loaded, parsed)
     }
 
     /// Serve `body` as CSS on an ephemeral port, once.
@@ -932,6 +915,7 @@ mod tests {
                 elapsed: *elapsed,
                 content_type: None,
                 set_cookie: Vec::new(),
+                metadata: Default::default(),
             }
         );
         // The Parsed message carries the body's tree, built on the worker.
@@ -971,7 +955,7 @@ mod tests {
         let metadata = msgs
             .iter()
             .find_map(|msg| match msg {
-                Msg::CacheMetadata { metadata, .. } => Some(metadata),
+                Msg::Loaded { metadata, .. } => Some(metadata),
                 _ => None,
             })
             .expect("metadata did not cross the channel");
@@ -1338,6 +1322,7 @@ mod tests {
                 elapsed: *elapsed,
                 content_type: None,
                 set_cookie: Vec::new(),
+                metadata: Default::default(),
             },
             "the body must arrive decompressed, not as gzip bytes"
         );
