@@ -4975,26 +4975,28 @@ fn collect_text(dom: &Dom, node: NodeId, out: &mut String) {
 }
 
 fn sanitize_title(raw: &str) -> String {
+    fn push(out: &mut String, ch: char) -> bool {
+        if out.len() + ch.len_utf8() > MAX_TITLE_BYTES {
+            return false;
+        }
+        out.push(ch);
+        true
+    }
+
     let mut title = String::new();
     let mut space = false;
     for ch in raw.chars() {
-        if title.len() + ch.len_utf8() > MAX_TITLE_BYTES {
-            break;
-        }
         if ch.is_ascii_whitespace() {
             space = !title.is_empty();
-        } else if ch.is_control() {
-            if space && title.len() < MAX_TITLE_BYTES {
-                title.push(' ');
-            }
-            space = false;
-            title.push('�');
         } else {
-            if space && title.len() < MAX_TITLE_BYTES {
-                title.push(' ');
+            if space && !push(&mut title, ' ') {
+                break;
             }
             space = false;
-            title.push(ch);
+            let safe = if ch.is_control() { '�' } else { ch };
+            if !push(&mut title, safe) {
+                break;
+            }
         }
     }
     title.trim().to_string()
@@ -5656,6 +5658,7 @@ mod tests {
             "one two�three"
         );
         assert!(sanitize_title(&"猫".repeat(300)).len() <= MAX_TITLE_BYTES);
+        assert!(sanitize_title(&("x".repeat(511) + "\u{1b}")).len() <= MAX_TITLE_BYTES);
         for (w, h) in [(0, 0), (1, 1), (1, 2), (8, 2)] {
             let browser = Browser::new(w, h);
             let mut frame = Frame::new(w, h);
