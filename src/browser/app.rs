@@ -149,6 +149,12 @@ struct ReaderState {
     normal_anchor: Option<ScrollAnchor>,
     normal_scroll: usize,
     normal_focus: Option<NodeId>,
+    normal_layout: Option<((u16, u16), LayoutTree, bool)>,
+}
+
+struct ReaderCache {
+    view: ReaderView,
+    layout: Option<((u16, u16), LayoutTree, bool)>,
 }
 
 /// Where a page that has not been laid out yet should end up once it has.
@@ -471,6 +477,10 @@ pub struct App {
     styles: Option<Styles>,
     /// Present only while this page (and therefore this tab) is in reader mode.
     reader: Option<ReaderState>,
+    /// Last projection selected for this unchanged document. Leaving reader
+    /// mode drops its UA styles but keeps the pure analyzer result, so a later
+    /// entry does not rescore 25,000 immutable nodes.
+    reader_cache: Option<ReaderCache>,
     /// Painted form of the last layout tree. Scrolling re-emits this at a new
     /// offset without relayout (PLAN.md M5 display list).
     display_list: DisplayList,
@@ -622,6 +632,7 @@ impl App {
             sheets: Vec::new(),
             styles: None,
             reader: None,
+            reader_cache: None,
             revealed: false,
             display_list: DisplayList::default(),
             layout_tree: None,
@@ -687,6 +698,7 @@ impl App {
         // Reader mode is a presentation of one document generation.  A real
         // navigation, reload or failure never carries it into the next one.
         self.reader = None;
+        self.reader_cache = None;
         // One host per page generation: the old page's globals, closures and
         // (from M10.8) listeners go with it. Dropping the host is the whole
         // mechanism — there is nowhere for that state to survive.
@@ -1221,6 +1233,12 @@ impl App {
                 }
                 match result {
                     Ok(decoded) => {
+                        if let Some(cache) = self.reader_cache.as_mut() {
+                            cache.layout = None;
+                        }
+                        if let Some(reader) = self.reader.as_mut() {
+                            reader.normal_layout = None;
+                        }
                         let visible_in_reader = self.reader.is_none()
                             || self.layout_tree.as_ref().is_some_and(|tree| {
                                 let mut found = false;
@@ -1274,6 +1292,7 @@ impl App {
                 // Author CSS keeps the normal snapshot current underneath a
                 // reader presentation, but cannot change its active geometry.
                 if self.reader.is_some() {
+                    self.reader.as_mut().unwrap().normal_layout = None;
                     self.build_visible_inspector();
                     return Effect::default();
                 }
@@ -1563,6 +1582,7 @@ impl App {
         self.sheets.clear();
         self.styles = None;
         self.reader = None;
+        self.reader_cache = None;
         self.timings.parse = None;
         self.timings.style = None;
         self.timings.layout = None;
@@ -1596,14 +1616,14 @@ impl App {
         let top = self.viewport.offset() as i32;
         let mut best_text: Option<(NodeId, i32)> = None;
         let mut best_block: Option<(NodeId, i32)> = None;
-        tree.walk(tree.root, &mut |_, b| {
+        for b in &tree.boxes {
             let Some(node) = b.node else {
-                return;
+                continue;
             };
             let y = b.dimensions.content.y;
             let h = b.dimensions.content.height.max(1);
             if y + h <= top || y > top {
-                return;
+                continue;
             }
             match b.kind {
                 // Deeper text fragments overwrite shallower ones (walk order).
@@ -1613,22 +1633,22 @@ impl App {
                 BoxKind::Block | BoxKind::Flex => best_block = Some((node, y)),
                 _ => {}
             }
-        });
+        }
         let (node, box_y) = best_text.or(best_block)?;
         // Index among Text boxes for this node (document walk order).
         let mut text_index = 0usize;
         let mut seen = 0usize;
         let mut found = false;
-        tree.walk(tree.root, &mut |_, b| {
+        for b in &tree.boxes {
             if found || b.kind != BoxKind::Text || b.node != Some(node) {
-                return;
+                continue;
             }
             if b.dimensions.content.y == box_y {
                 text_index = seen;
                 found = true;
             }
             seen += 1;
-        });
+        }
         Some(ScrollAnchor {
             node,
             text_index,
@@ -1642,11 +1662,12 @@ impl App {
             return;
         };
         let mut text_ys: Vec<i32> = Vec::new();
-        tree.walk(tree.root, &mut |_, b| {
-            if b.kind == BoxKind::Text && b.node == Some(anchor.node) {
-                text_ys.push(b.dimensions.content.y);
-            }
-        });
+        text_ys.extend(
+            tree.boxes
+                .iter()
+                .filter(|b| b.kind == BoxKind::Text && b.node == Some(anchor.node))
+                .map(|b| b.dimensions.content.y),
+        );
         let y = text_ys
             .get(anchor.text_index)
             .copied()
@@ -1803,13 +1824,26 @@ impl App {
     /// Enter or leave the current document's semantic prose projection.
     fn toggle_reader(&mut self) -> Effect {
         self.hint = None;
-        if let Some(reader) = self.reader.take() {
+        if let Some(mut reader) = self.reader.take() {
             let anchor = reader.normal_anchor;
             let raw = reader.normal_scroll;
             let focus = reader.normal_focus;
+            let reader_layout = self
+                .layout_tree
+                .take()
+                .map(|tree| (self.size, tree, self.revealed));
+            self.reader_cache = Some(ReaderCache {
+                view: reader.view,
+                layout: reader_layout,
+            });
             self.styles_view_built = false;
             self.boxes_view_built = false;
-            self.relayout();
+            match reader.normal_layout.take() {
+                Some((size, tree, revealed)) if size == self.size => {
+                    self.reuse_layout(tree, revealed)
+                }
+                _ => self.relayout(),
+            }
             if let Some(anchor) = anchor {
                 self.restore_anchor(anchor);
             } else {
@@ -1833,9 +1867,20 @@ impl App {
             self.status_msg = Some("reader mode unavailable".into());
             return redraw();
         };
-        let Ok(view) = reader::analyze(dom, normal_styles) else {
-            self.status_msg = Some("reader mode unavailable".into());
-            return redraw();
+        let (view, cached_layout) = match self.reader_cache.take() {
+            Some(cache)
+                if cache.view.membership().len() == dom.node_count()
+                    && dom.is_connected(cache.view.root) =>
+            {
+                (cache.view, cache.layout)
+            }
+            _ => match reader::analyze(dom, normal_styles) {
+                Ok(view) => (view, None),
+                Err(_) => {
+                    self.status_msg = Some("reader mode unavailable".into());
+                    return redraw();
+                }
+            },
         };
         let normal_anchor = self.top_anchor();
         let normal_scroll = self.viewport.offset();
@@ -1850,12 +1895,17 @@ impl App {
         }
         let old_top = normal_anchor;
         let root = view.root;
+        let normal_layout = self
+            .layout_tree
+            .take()
+            .map(|tree| (self.size, tree, self.revealed));
         self.reader = Some(ReaderState {
             view,
             styles: reader_styles,
             normal_anchor,
             normal_scroll,
             normal_focus,
+            normal_layout,
         });
         if self
             .focus
@@ -1865,7 +1915,10 @@ impl App {
         }
         self.styles_view_built = false;
         self.boxes_view_built = false;
-        self.relayout();
+        match cached_layout {
+            Some((size, tree, revealed)) if size == self.size => self.reuse_layout(tree, revealed),
+            _ => self.relayout(),
+        }
         if let Some(anchor) = old_top.filter(|a| {
             self.reader
                 .as_ref()
@@ -1893,6 +1946,36 @@ impl App {
     /// pure transform costing single-digit milliseconds even on Wikipedia, and
     /// its input (the cached tree, the current width) is already here. Moving
     /// it to a worker would buy a frame of latency and cost a round trip.
+    fn reuse_layout(&mut self, mut tree: LayoutTree, revealed: bool) {
+        let Some(styles) = self
+            .reader
+            .as_ref()
+            .map(|reader| &reader.styles)
+            .or(self.styles.as_ref())
+        else {
+            return;
+        };
+        let started = Instant::now();
+        // Geometry is unchanged, but paint-only interaction state may differ
+        // from the last time this presentation was active.
+        recolour_tree(&mut tree, styles);
+        let lines = layout::lines_from_tree(&tree);
+        let pixels = self.images.pixels();
+        self.display_list = paint::paint_with(&tree, &pixels);
+        #[cfg(test)]
+        {
+            self.paints += 1;
+            self.layouts += 1;
+        }
+        self.layout_tree = Some(tree);
+        self.laid_out_size = Some(self.size);
+        self.boxes_view_built = false;
+        self.revealed = revealed;
+        self.timings.layout = Some(started.elapsed());
+        self.viewport.set_lines(lines, self.page());
+        self.build_visible_inspector();
+    }
+
     fn relayout(&mut self) {
         // Both or neither: `restyle` runs with every tree that lands, so a
         // parsed page always has computed values to lay out with.
@@ -2192,6 +2275,13 @@ impl App {
         let changes = self.dom.as_mut().map(Dom::take_attr_changes);
         if edits_after == edits_before {
             return Effect::default();
+        }
+        // The cached projection describes the pre-edit DOM. Active reader
+        // mode refreshes its own view below; an inactive cache must never be
+        // reused after any text, structure, attribute, or live-state write.
+        self.reader_cache = None;
+        if let Some(reader) = self.reader.as_mut() {
+            reader.normal_layout = None;
         }
 
         let structural = structure_after != structure_before;
