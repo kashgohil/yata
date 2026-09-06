@@ -6852,6 +6852,9 @@ mod tests {
             parsed.session_save.is_none(),
             "applying saved state rewrote it"
         );
+        assert_eq!(browser.tabs[0].page.styles_run, 1);
+        assert_eq!(browser.tabs[0].page.layouts, 1);
+        assert_eq!(browser.tabs[0].page.paints, 1);
     }
 
     #[test]
@@ -7007,6 +7010,108 @@ mod tests {
         restored.update(Msg::SessionLoaded(Ok(Some(saved))));
         assert!(restored.tabs[0].page.reader.is_none());
         assert_eq!(restored.tabs[0].page.session_scroll(), normal);
+    }
+
+    #[test]
+    fn restore_is_a_fresh_context_and_load_ack_run_no_page_stage() {
+        use crate::js::storage::Area;
+
+        let old_process = Browser::with_caps(50, 10, false);
+        let scope = js::cookies::Scope::of("https://fresh.test/").unwrap();
+        old_process
+            .session
+            .cookies
+            .write_from_script("sid=old", &scope, js::cookies::now())
+            .unwrap();
+        assert!(
+            old_process
+                .session
+                .storage
+                .set("https://fresh.test", Area::Local, "key", "old")
+        );
+
+        let mut browser = Browser::with_persistence(50, 10, false, false, true);
+        let snapshot = checkpoint(0, &[(Some("https://fresh.test/#part"), 7)]);
+        let effect = browser.update(Msg::SessionLoaded(Ok(Some(snapshot))));
+        assert_eq!(effect.documents.len(), 1);
+        let page = &browser.tabs[0].page;
+        assert_eq!((page.styles_run, page.layouts, page.paints), (0, 0, 0));
+        assert!(page.dom.is_none());
+        assert!(page.styles.is_none());
+        assert!(page.layout_tree.is_none());
+        assert!(page.js_host.is_none());
+        assert!(page.console.is_empty());
+        assert!(!page.history.can_back() && !page.history.can_forward());
+        assert!(page.focus.is_none());
+        assert!(page.hover.is_none());
+        assert!(page.search.is_none());
+        assert!(page.reader.is_none());
+        assert!(page.reader_cache.is_none());
+        assert!(matches!(page.mode, Mode::Browse));
+        assert_eq!(page.surface, Surface::Page);
+        assert_eq!(
+            browser
+                .session
+                .cookies
+                .read_for_script(&scope, js::cookies::now()),
+            ""
+        );
+        assert_eq!(
+            browser
+                .session
+                .storage
+                .get("https://fresh.test", Area::Local, "key"),
+            None
+        );
+        assert!(matches!(&effect.documents[0], DocumentWork::Fetch(..)));
+
+        let revision = browser.update(ch('q')).session_save.unwrap().0;
+        let ack = browser.update(Msg::SessionSaved {
+            revision,
+            result: Ok(()),
+        });
+        assert!(ack.documents.is_empty());
+        let page = &browser.tabs[0].page;
+        assert_eq!((page.styles_run, page.layouts, page.paints), (0, 0, 0));
+    }
+
+    #[test]
+    fn background_restore_pipeline_stays_in_its_fresh_tab() {
+        let mut browser = Browser::with_persistence(50, 10, false, false, true);
+        let effect = browser.update(Msg::SessionLoaded(Ok(Some(checkpoint(
+            1,
+            &[(Some("https://background.test/"), 0), (None, 0)],
+        )))));
+        let DocumentWork::Fetch(id, _) = effect.documents[0].clone() else {
+            panic!("fresh process cache unexpectedly hit")
+        };
+        browser.update(Msg::Loaded {
+            id,
+            url: "https://background.test/".into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        browser.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse("<title>Background</title><p>loaded</p>"),
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(browser.active, 1);
+        assert!(browser.tabs[1].page.dom.is_none());
+        assert_eq!(
+            (
+                browser.tabs[1].page.styles_run,
+                browser.tabs[1].page.layouts,
+                browser.tabs[1].page.paints,
+            ),
+            (0, 0, 0)
+        );
+        assert!(browser.tabs[0].page.dom.is_some());
+        assert_eq!(browser.tabs[0].page.layouts, 1);
     }
 
     #[test]

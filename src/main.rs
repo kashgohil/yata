@@ -828,9 +828,44 @@ fn spawn_input_thread(tx: mpsc::Sender<Msg>) {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::Arc;
+    use yata::browser::session::{SessionSnapshot, SessionTab};
 
     fn key(c: char) -> Msg {
         Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    fn saved_session() -> SessionSnapshot {
+        SessionSnapshot::new(
+            0,
+            Arc::from([SessionTab {
+                url: Some(Arc::from("https://disk.test/")),
+                scroll: 0,
+            }]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_order_makes_the_first_session_changing_input_win_restore() {
+        let mut early_input = Browser::with_persistence(80, 24, false, false, true);
+        let effect = apply_batch(
+            &mut early_input,
+            [key('t'), Msg::SessionLoaded(Ok(Some(saved_session())))].into_iter(),
+        );
+        assert!(
+            effect.documents.is_empty(),
+            "late restore started page work"
+        );
+        assert_eq!(effect.session_save.unwrap().1.tabs.len(), 2);
+
+        let mut early_restore = Browser::with_persistence(80, 24, false, false, true);
+        let effect = apply_batch(
+            &mut early_restore,
+            [Msg::SessionLoaded(Ok(Some(saved_session()))), key('t')].into_iter(),
+        );
+        assert_eq!(effect.documents.len(), 1);
+        assert_eq!(effect.session_save.unwrap().1.tabs.len(), 2);
     }
 
     #[test]
