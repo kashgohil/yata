@@ -931,3 +931,39 @@ The pair averages are 204.79 µs and 207.71 µs respectively: a 1.4% difference,
 well inside run-to-run noise. Position checks are a single style branch on the
 ordinary path; absolute children use bounded local deferred placement and do
 not create a second layout pass.
+
+---
+
+## M11.20 — document HTTP cache (2026-09-06)
+
+Release measurements on Machine A, after a discarded build/warm-up run. The
+uncached comparison alternates the old direct `start_fetch` path and the new
+cache-planned miss in one process, using the committed offline ladder bodies:
+
+    cargo test --release measure_uncached_ladder_load_with_and_without_cache_planning \
+      --lib -- --ignored --nocapture --test-threads=1
+
+| uncached document | direct baseline | cache-planned miss |
+| --- | ---: | ---: |
+| Hacker News | 1.170 ms | 1.165 ms |
+| Wikipedia | 75.735 ms | 74.866 ms |
+
+The sign is negative on both pages and the differences are ordinary run noise.
+Isolating only URL-key construction plus the empty LRU lookup puts the added
+work at **197 ns for HN** and **203 ns for Wikipedia** (20,000 operations per
+sample, 12 interleaved samples): too small to move either full-pipeline result.
+
+The deterministic loopback acceptance test measures the two useful paths with
+the same one-byte body and normal worker/channel boundary:
+
+    cargo test --release loopback_a_b_back --lib -- --nocapture --test-threads=1
+
+| local path | end-to-end |
+| --- | ---: |
+| fresh history hit: cached bytes → parse/style/layout/paint | 75 µs |
+| ETag reload: 304 round trip → stored bytes → pipeline | 673 µs |
+
+The server observes two requests across `A → B → back`, then exactly one
+conditional request for reload. These are latency observations, not thresholds;
+the structural counter assertions separately pin one downstream pipeline per
+accepted representation and no network effect on the fresh hit.

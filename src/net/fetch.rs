@@ -4,7 +4,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Instant;
 
-use crate::browser::http_cache::{Metadata, Representation};
+use crate::browser::http_cache::{MAX_FIELD_BYTES, Metadata, Representation};
 use crate::css;
 use crate::html;
 use crate::image;
@@ -545,24 +545,32 @@ fn selected_metadata(headers: &reqwest::header::HeaderMap) -> Metadata {
                 break;
             }
             match value.to_str() {
-                Ok(value) => out.push(value.to_string()),
+                Ok(value) if value.len() <= MAX_FIELD_BYTES => out.push(value.to_string()),
+                Ok(_) => unusable = true,
                 Err(_) => unusable = true,
             }
         }
         (out, unusable)
     }
+    fn one(
+        headers: &reqwest::header::HeaderMap,
+        name: reqwest::header::HeaderName,
+    ) -> (Option<String>, bool) {
+        let Some(value) = headers.get(name) else {
+            return (None, false);
+        };
+        match value.to_str() {
+            Ok(value) if value.len() <= MAX_FIELD_BYTES => (Some(value.to_string()), false),
+            Ok(_) => (None, true),
+            Err(_) => (None, false),
+        }
+    }
     let (cache_control, control_bad) = lines(headers, reqwest::header::CACHE_CONTROL);
     let (vary, vary_unusable) = lines(headers, reqwest::header::VARY);
-    let etag = headers
-        .get(reqwest::header::ETAG)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    let age = headers
-        .get(reqwest::header::AGE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let (etag, etag_bad) = one(headers, reqwest::header::ETAG);
+    let (age, age_bad) = one(headers, reqwest::header::AGE);
     let mut metadata = Metadata::bounded(cache_control, etag, age, vary, vary_unusable);
-    metadata.over_limit |= control_bad;
+    metadata.over_limit |= control_bad || etag_bad || age_bad;
     metadata
 }
 

@@ -4695,8 +4695,12 @@ mod tests {
                 .expect("document worker did not settle");
             let parsed = matches!(msg, Msg::Parsed { .. });
             let next = app.update(msg);
+            let run_scripts = next.run_scripts;
             dispatch(next, &tx);
             if parsed {
+                if let Some(id) = run_scripts {
+                    app.update(Msg::RunScripts { id });
+                }
                 return;
             }
         }
@@ -4742,11 +4746,15 @@ mod tests {
         settle_document_effect(&mut app, second);
         let back = app.history_go(true);
         assert!(back.fetch.is_none(), "history hit started a network worker");
+        let hit_started = Instant::now();
         settle_document_effect(&mut app, back);
+        let hit_elapsed = hit_started.elapsed();
         assert_eq!(seen.lock().unwrap().len(), 2, "back reached the server");
 
         let reload = app.reload();
+        let revalidation_started = Instant::now();
         settle_document_effect(&mut app, reload);
+        let revalidation_elapsed = revalidation_started.elapsed();
         let requests = seen.lock().unwrap();
         assert_eq!(requests.len(), 3);
         assert!(requests[2].starts_with("GET /a "), "{}", requests[2]);
@@ -4756,6 +4764,71 @@ mod tests {
             requests[2]
         );
         assert_eq!(app.timings.cache, Some(timing::CacheOutcome::Revalidated));
+        eprintln!(
+            "local fresh history pipeline: {:?}; local 304 roundtrip + pipeline: {:?}",
+            hit_elapsed, revalidation_elapsed
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_uncached_ladder_load_with_and_without_cache_planning() {
+        fn load_once(html: &str, url: &str, planned: bool) -> Duration {
+            let mut app = App::new(80, 24);
+            let started = Instant::now();
+            let id = if planned {
+                app.start_navigation(url.into()).fetch.unwrap().0
+            } else {
+                app.start_fetch(url.into())
+            };
+            app.update(Msg::Loaded {
+                id,
+                url: url.into(),
+                status: 200,
+                body: html.as_bytes().to_vec(),
+                elapsed: Duration::ZERO,
+                content_type: Some("text/html".into()),
+                set_cookie: Vec::new(),
+            });
+            app.update(Msg::Parsed {
+                id,
+                dom: crate::html::parse(html),
+                elapsed: Duration::ZERO,
+            });
+            started.elapsed()
+        }
+
+        for (label, url, html) in [
+            (
+                "HN",
+                "https://news.ycombinator.com/news",
+                include_str!("../../tests/fixtures/news.ycombinator.com.html"),
+            ),
+            (
+                "Wikipedia",
+                "https://en.wikipedia.org/wiki/Cat",
+                include_str!("../../tests/fixtures/en.wikipedia.org.html"),
+            ),
+        ] {
+            let mut baseline = Vec::new();
+            let mut planned = Vec::new();
+            for round in 0..8 {
+                if round % 2 == 0 {
+                    baseline.push(load_once(html, url, false));
+                    planned.push(load_once(html, url, true));
+                } else {
+                    planned.push(load_once(html, url, true));
+                    baseline.push(load_once(html, url, false));
+                }
+            }
+            baseline.sort_unstable();
+            planned.sort_unstable();
+            eprintln!(
+                "{label} uncached load: baseline {:?}, with cache planning {:?}",
+                baseline[baseline.len() / 2],
+                planned[planned.len() / 2]
+            );
+        }
     }
 
     #[test]
@@ -4856,6 +4929,124 @@ mod tests {
     }
 
     #[test]
+    fn conditional_200_replaces_old_bytes_and_unsolicited_304_is_an_error() {
+        let mut app = App::new(40, 8);
+        let url = "http://cache.test/a";
+        let first = app.start_navigation(url.into());
+        let first_id = first.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            first_id,
+            url,
+            b"old",
+            cache_metadata(&["max-age=0"], Some("\"one\"")),
+        );
+        let reload = app.reload();
+        let (id, request) = reload.fetch.expect("stale response did not validate");
+        let key = CacheKey::from_request(&request).unwrap();
+        app.update(Msg::CacheMetadata {
+            id,
+            metadata: cache_metadata(&["max-age=60"], Some("\"two\"")),
+        });
+        app.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: b"new".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+        });
+        let Plan::Hit(replaced) = app.cache.plan(&key, RequestMode::Ordinary, app.cache_now())
+        else {
+            panic!("replacement was not fresh");
+        };
+        assert_eq!(replaced.body, b"new");
+        assert_eq!(replaced.metadata.etag.as_deref(), Some("\"two\""));
+
+        let id = app.start_fetch("http://cache.test/missing".into());
+        app.update(Msg::Loaded {
+            id,
+            url: "http://cache.test/missing".into(),
+            status: 304,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        assert!(
+            matches!(&app.fetch, Fetch::Failed { reason, .. } if reason.contains("without a cached representation"))
+        );
+    }
+
+    #[test]
+    fn cached_script_navigation_builds_a_fresh_host_and_fresh_globals() {
+        let mut app = App::new(50, 8);
+        let url = "http://cache.test/script";
+        let html =
+            "<script>window.runs = (window.runs || 0) + 1; console.log(window.runs);</script>";
+        let first = app.start_navigation(url.into());
+        let first_id = first.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            first_id,
+            url,
+            html.as_bytes(),
+            cache_metadata(&["max-age=60"], None),
+        );
+        let parsed = app.update(Msg::Parsed {
+            id: first_id,
+            dom: crate::html::parse(html),
+            elapsed: Duration::ZERO,
+        });
+        app.update(Msg::RunScripts {
+            id: parsed.run_scripts.unwrap(),
+        });
+        assert_eq!(app.console.entries().last().unwrap().text, "1");
+
+        let b = app.navigate("http://cache.test/b".into(), true);
+        let b_id = b.fetch.unwrap().0;
+        load(&mut app, b_id, b"b".to_vec());
+        let back = app.history_go(true);
+        assert!(
+            app.js_host.is_none(),
+            "the prior page host survived navigation"
+        );
+        settle_document_effect(&mut app, back);
+        assert_eq!(
+            app.console.entries().last().unwrap().text,
+            "1",
+            "cached navigation resurrected the old global"
+        );
+    }
+
+    #[test]
+    fn stale_unvalidated_response_does_a_full_get_and_failure_never_serves_stale() {
+        let mut app = App::new(40, 8);
+        let url = "http://cache.test/a";
+        let first = app.start_navigation(url.into());
+        let first_id = first.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            first_id,
+            url,
+            b"stale",
+            cache_metadata(&["max-age=0"], None),
+        );
+        let retry = app.navigate(url.into(), false);
+        let (id, request) = retry.fetch.expect("stale bytes were served");
+        assert_eq!(request.method, net::Method::Get);
+        app.update(Msg::NetError {
+            id,
+            url: url.into(),
+            reason: "connection refused".into(),
+        });
+        assert!(
+            matches!(&app.fetch, Fetch::Failed { reason, .. } if reason == "connection refused")
+        );
+    }
+
+    #[test]
     fn post_and_set_cookie_responses_are_never_inserted() {
         let mut app = App::new(40, 8);
         let url = "http://cache.test/login";
@@ -4885,6 +5076,37 @@ mod tests {
             set_cookie: vec!["sid=one; Path=/".into()],
         });
         assert!(app.navigate(url.into(), false).fetch.is_some());
+    }
+
+    #[test]
+    fn a_logged_out_entry_cannot_satisfy_the_same_url_after_login() {
+        let mut app = App::new(40, 8);
+        let a = "http://cache.test/a";
+        let first = app.start_navigation(a.into());
+        let first_id = first.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            first_id,
+            a,
+            b"logged out",
+            cache_metadata(&["max-age=60"], None),
+        );
+
+        let b = app.navigate("http://cache.test/login".into(), true);
+        let b_id = b.fetch.unwrap().0;
+        app.update(Msg::Loaded {
+            id: b_id,
+            url: "http://cache.test/login".into(),
+            status: 200,
+            body: b"logged in".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: vec!["sid=private; Path=/".into()],
+        });
+        let back = app.history_go(true);
+        let (_, request) = back.fetch.expect("logged-out bytes crossed cookie state");
+        assert_eq!(request.cookie.as_deref(), Some("sid=private"));
+        assert_eq!(request.method, net::Method::Get);
     }
 
     fn ch(c: char) -> Msg {

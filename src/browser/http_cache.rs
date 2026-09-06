@@ -11,7 +11,7 @@ use crate::net;
 pub const DEFAULT_BYTES: usize = 32 * 1024 * 1024;
 pub const DEFAULT_ENTRIES: usize = 128;
 pub const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
-const MAX_FIELD_BYTES: usize = 8 * 1024;
+pub(crate) const MAX_FIELD_BYTES: usize = 8 * 1024;
 const MAX_METADATA_BYTES: usize = 64 * 1024;
 
 /// Selected response fields needed by the cache. Field lines stay separate so
@@ -59,8 +59,32 @@ impl Metadata {
             vary_unusable,
             over_limit: field_too_large,
         };
+        if field_too_large {
+            metadata
+                .cache_control
+                .retain(|value| value.len() <= MAX_FIELD_BYTES);
+            metadata.vary.retain(|value| value.len() <= MAX_FIELD_BYTES);
+            if metadata
+                .etag
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_FIELD_BYTES)
+            {
+                metadata.etag = None;
+            }
+            if metadata
+                .age
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_FIELD_BYTES)
+            {
+                metadata.age = None;
+            }
+        }
         if metadata.retained_size() > MAX_METADATA_BYTES {
             metadata.over_limit = true;
+            metadata.cache_control.clear();
+            metadata.etag = None;
+            metadata.age = None;
+            metadata.vary.clear();
         }
         metadata
     }
@@ -564,6 +588,10 @@ mod tests {
             r.metadata.vary_unusable = unusable;
             assert!(!Cache::new(1024, 4).insert(key, r, Duration::ZERO));
         }
+        let key = Key::from_request(&request("https://x.test/", Some("sid=1"))).unwrap();
+        let mut accepted = response(&["max-age=60"], None, None, b"x");
+        accepted.metadata.vary = vec!["Cookie, ACCEPT-ENCODING".into(), "User-Agent".into()];
+        assert!(Cache::new(1024, 4).insert(key, accepted, Duration::ZERO));
     }
 
     #[test]
@@ -671,6 +699,40 @@ mod tests {
                 response(&[], Some(etag), None, b"x"),
                 Duration::ZERO,
             ));
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_uncached_document_planning() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 20_000;
+        let urls = [
+            ("HN", "https://news.ycombinator.com/news"),
+            ("Wikipedia", "https://en.wikipedia.org/wiki/Cat"),
+        ];
+        let mut samples = [Vec::new(), Vec::new()];
+        for round in 0..12 {
+            for offset in 0..2 {
+                let index = (round + offset) % 2;
+                let request = request(urls[index].1, None);
+                let mut cache = Cache::new(DEFAULT_BYTES, DEFAULT_ENTRIES);
+                let started = Instant::now();
+                for _ in 0..ITERATIONS {
+                    let key = Key::from_request(black_box(&request)).unwrap();
+                    black_box(cache.plan(&key, RequestMode::Ordinary, Duration::ZERO));
+                }
+                samples[index].push(started.elapsed().as_nanos() / u128::from(ITERATIONS));
+            }
+        }
+        for (index, (label, _)) in urls.into_iter().enumerate() {
+            samples[index].sort_unstable();
+            eprintln!(
+                "{label} cache-miss planning: {} ns",
+                samples[index][samples[index].len() / 2]
+            );
         }
     }
 }
