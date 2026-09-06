@@ -561,12 +561,9 @@ pub struct App {
     /// `measure_a_tick_that_inserts_no_script` sets it.
     #[cfg(test)]
     no_insert_detection: bool,
-    /// Turns M11.9's narrowed keystroke path *on*, the same way M11.3's switch
-    /// turns its narrowing off and for the same reason: the two paths have to
-    /// be timed in one process, interleaved. The narrow one is the road not
-    /// taken — the simple path came in inside the budget — so this is off
-    /// everywhere except `measure_a_keystroke_in_a_field` and the test that
-    /// keeps the B side honest.
+    /// Turns M11.25's fixed-geometry control patch *on*. It is the shipping
+    /// path; ignored measurements turn it off to retain an interleaved full-
+    /// layout baseline on the same page and in the same process.
     #[cfg(test)]
     narrow_keystroke: bool,
     /// Images: LRU cache, page discovery, Kitty placement state (M8).
@@ -667,7 +664,7 @@ impl App {
             #[cfg(test)]
             no_insert_detection: false,
             #[cfg(test)]
-            narrow_keystroke: false,
+            narrow_keystroke: true,
             images: ImageSession::with_cache(kitty_graphics, session.images.clone()),
         }
     }
@@ -2322,7 +2319,9 @@ impl App {
                 self.build_visible_inspector();
                 return redraw();
             }
-            self.relayout();
+            if !self.control_patching_enabled() || !self.repaint_controls(None) {
+                self.relayout();
+            }
             self.validate_select_mode();
             self.dom_view_built = false;
             self.boxes_view_built = false;
@@ -3719,95 +3718,100 @@ impl App {
         self.take_click_navigation()
     }
 
-    /// What a keystroke costs (M11.9 deliverable 4), and the shape of it is
-    /// the point: **relayout, then repaint. No restyle.**
+    /// What a keystroke costs (M11.9 deliverable 4): **patch the fixed-size
+    /// control box, then repaint. No restyle or relayout.**
     ///
     /// A keystroke is not a cascade event — the value is state beside the tree
     /// and not an attribute, so no selector's answer can have moved — and
     /// `styles_run` says so in a test.
     ///
-    /// It is a *text* edit, so the page is laid out again, and that is the
-    /// simple thing rather than the fast thing. It was measured before it was
-    /// written, against the narrowing it would obviously want (patch the one
-    /// box whose text changed, since a control's box is `size` cells wide
-    /// whatever it holds, so no geometry can move):
+    /// Text controls are sized by `size`/`cols`/`rows`/CSS rather than their
+    /// current value, so changing that value cannot move geometry. M11.9's
+    /// original measurement retained the simpler full-layout path. M11.25's
+    /// fresh integrated gate no longer fit that budget, and the correctness-
+    /// checked patch path became the measured choice:
     ///
     /// ```text
     /// keypress→screen, en.wikipedia.org, 80×24, budget < 10 ms
-    ///   relayout + repaint   7.55 ms (7.37–7.89)
-    ///   patch + repaint      2.01 ms (1.98–2.09)
+    ///   relayout + repaint  11.30 ms (10.93–11.63)
+    ///   patch + repaint      3.11 ms (2.49–4.31)
     /// ```
     ///
-    /// The simple path is **inside the budget with a quarter of it to spare**,
-    /// so it ships: a second invalidation path costs a correctness obligation
-    /// (the patched tree has to be the tree a relayout would have produced) on
-    /// every future change to how a control is built, and 5 ms nobody is
-    /// waiting for does not buy that. M12's incremental layout is where this
-    /// gets cheaper for every page and not just for fields.
-    ///
-    /// The narrowing stays as the measurement's B side (see
-    /// [`Self::repaint_field`]) so the number can be taken again on a machine
-    /// that disagrees, or when a page bigger than Wikipedia's article says the
-    /// budget has moved.
+    /// The full-layout path remains as the ignored measurement's A/B baseline.
+    /// `a_patched_tree_is_the_tree_a_fresh_layout_would_have_built` carries the
+    /// correctness obligation for text and choice controls.
     fn after_field_edit(&mut self, node: NodeId) -> Effect {
-        // The A/B switch, and the only thing that reads it: the two paths have
-        // to be timed in the same process, on the same page, interleaved (this
-        // machine drifts 5–10%, so a before-commit/after-commit pair would be
-        // measuring the drift).
-        #[cfg(test)]
-        if self.narrow_keystroke && self.repaint_field(node) {
+        if self.control_patching_enabled() && self.repaint_controls(Some(node)) {
             return redraw();
         }
-        #[cfg(not(test))]
-        let _ = node;
         self.relayout();
         redraw()
     }
 
-    /// Push a control's new text into the live layout tree and repaint from it,
-    /// without laying the page out — the path
-    /// [`Self::after_field_edit`]'s numbers rejected, kept as the B side that
-    /// produced them. `false` when there is no such box.
+    fn control_patching_enabled(&self) -> bool {
+        #[cfg(test)]
+        {
+            self.narrow_keystroke
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    }
+
+    /// Push controls' current value/choice paint into the live layout tree and
+    /// repaint it without laying the page out. `only` narrows native field
+    /// edits; script/event turns may have changed more than one control.
     ///
     /// It has to be a *correct* alternative or the number it produces means
     /// nothing, so: **the patched tree is the tree a fresh layout would
     /// produce**, and
     /// `a_patched_tree_is_the_tree_a_fresh_layout_would_have_built` compares
-    /// the two rather than asserting it. That holds because everything layout
+    /// the two rather than assuming it. That holds because everything layout
     /// derives for a control's box comes from either its attributes and the
     /// cascade (`size`, `cols`, `rows`, `width`) or from the value — and the
     /// value reaches only `text` and `FieldPaint`, both rewritten here from the
     /// same `field::control` that layout calls. Nothing sizes a text field by
     /// what is in it, which is why a button — whose box *is* its label's width
     /// — is not patchable and never needs to be.
-    #[cfg(test)]
-    fn repaint_field(&mut self, node: NodeId) -> bool {
+    fn repaint_controls(&mut self, only: Option<NodeId>) -> bool {
         let (Some(dom), Some(tree)) = (self.dom.as_ref(), self.layout_tree.as_mut()) else {
             return false;
         };
-        let crate::dom::NodeData::Element { tag, .. } = &dom.node(node).data else {
-            return false;
-        };
-        let Some(control) = layout::field::control(dom, node, tag) else {
-            return false;
-        };
+        let mut found = false;
         let mut patched = false;
         for b in &mut tree.boxes {
-            if b.node != Some(node) || !matches!(b.kind, BoxKind::Field(_)) {
+            let Some(node) = b.node else { continue };
+            if only.is_some_and(|wanted| wanted != node) || !matches!(b.kind, BoxKind::Field(_)) {
                 continue;
             }
-            b.kind = BoxKind::Field(layout::FieldPaint {
+            let NodeData::Element { tag, .. } = &dom.node(node).data else {
+                continue;
+            };
+            let Some(control) = layout::field::control(dom, node, tag) else {
+                continue;
+            };
+            found = true;
+            let kind = BoxKind::Field(layout::FieldPaint {
                 shows: control.shows,
                 disabled: control.disabled,
             });
-            b.text = Some(control.text.clone());
-            patched = true;
+            let text = Some(control.text);
+            if b.kind != kind || b.text != text {
+                b.kind = kind;
+                b.text = text;
+                patched = true;
+            }
         }
-        if !patched {
+        // A hidden control may have live state but no box. Its state is still
+        // safely consumed without geometry work. A targeted native edit,
+        // however, falls back if its expected box cannot be found.
+        if !found && only.is_some() {
             return false;
         }
-        let pixels = self.images.pixels();
-        if let Some(tree) = &self.layout_tree {
+        if patched {
+            let pixels = self.images.pixels();
+            let tree = self.layout_tree.as_ref().expect("tree patched above");
             self.display_list = paint::paint_with(tree, &pixels);
             // The rasterised lines come from the same tree, and go stale the
             // same way: they are what `--dump-text` prints and what the scroll
@@ -12597,7 +12601,7 @@ mod tests {
             app.update(key(KeyCode::Char(' '), KeyModifiers::NONE)),
             redraw()
         );
-        assert_eq!(stages(&app), (styles, layouts + 1, paints + 1));
+        assert_eq!(stages(&app), (styles, layouts, paints + 1));
         assert!(app.dom.as_ref().unwrap().choice_state(third).unwrap());
     }
 
@@ -12982,9 +12986,8 @@ mod tests {
         // and the cascade must not run — which is the whole reason M11.8 put
         // the value where it did, and the counter is what says it worked.
         //
-        // A relayout each, though, deliberately: it is a text edit and the
-        // measurement said the simple path fits the budget (see
-        // `after_field_edit`).
+        // One paint each, with no relayout: current text cannot change a
+        // control's fixed geometry (see `after_field_edit`).
         let (mut app, id) = scripted_app(FORM_PAGE);
         app.update(Msg::RunScripts { id });
         start_typing(&mut app);
@@ -12992,23 +12995,21 @@ mod tests {
         type_str(&mut app, "xyz");
         assert_eq!(
             stages(&app),
-            (styles_run, layouts + 3, paints + 3),
+            (styles_run, layouts, paints + 3),
             "a keystroke restyled, or ran a stage twice"
         );
         // Moving the caret is chrome: it lays out nothing and paints nothing.
         app.update(key(KeyCode::Left, KeyModifiers::NONE));
         app.update(key(KeyCode::Home, KeyModifiers::NONE));
-        assert_eq!(stages(&app), (styles_run, layouts + 3, paints + 3));
+        assert_eq!(stages(&app), (styles_run, layouts, paints + 3));
     }
 
     #[test]
-    fn the_narrowed_keystroke_path_runs_no_layout() {
-        // The B side of the measurement, so its number means something: with
-        // the narrowing on, a keystroke lays nothing out and still puts the
-        // character on screen.
+    fn the_shipped_keystroke_path_runs_no_layout() {
+        // The shipped narrowing lays nothing out and still puts the character
+        // on screen.
         let (mut app, id) = scripted_app(FORM_PAGE);
         app.update(Msg::RunScripts { id });
-        app.narrow_keystroke = true;
         start_typing(&mut app);
         let (styles_run, layouts, paints) = stages(&app);
         type_str(&mut app, "xyz");
@@ -13027,7 +13028,7 @@ mod tests {
         start_typing(&mut app);
         let (styles, layouts, paints) = stages(&app);
         app.update(key(KeyCode::Char('b'), KeyModifiers::NONE));
-        assert_eq!(stages(&app), (styles, layouts + 1, paints + 1));
+        assert_eq!(stages(&app), (styles, layouts, paints + 1));
         assert_eq!(
             app.console
                 .entries()
@@ -13190,12 +13191,32 @@ mod tests {
         // The narrowing is the measurement's B side, and a B side that produced
         // the *wrong* tree would be no measurement at all: whatever it patches,
         // the result has to be what the shipped path would have laid out.
-        let page = "<p><input size=8 value=a> <textarea cols=6 rows=2>hi</textarea></p>";
+        let page = "<p><input size=8 value=a> <textarea cols=6 rows=2>hi</textarea>\
+                    <input type=checkbox>\
+                    <select><option>one</option><option>two</option></select></p>";
         let (mut app, id) = scripted_app(page);
         app.update(Msg::RunScripts { id });
-        app.narrow_keystroke = true;
         start_typing_at_first_field(&mut app);
         type_str(&mut app, "bc");
+
+        // Exercise both choice paint shapes too: a checkbox glyph and the
+        // currently displayed label of a fixed-width select.
+        let dom = app.dom.as_ref().unwrap();
+        let checkbox = (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&node| dom.attr(node, "type") == Some("checkbox"))
+            .unwrap();
+        let select = (0..dom.node_count() as u32)
+            .map(NodeId)
+            .find(|&node| matches!(&dom.node(node).data, NodeData::Element { tag, .. } if tag == "select"))
+            .unwrap();
+        app.mode = Mode::Browse;
+        app.focus = Some(checkbox);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.focus = Some(select);
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        app.update(key(KeyCode::Down, KeyModifiers::NONE));
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
 
         let dom = app.dom.as_ref().unwrap();
         let styles = app.styles.as_ref().unwrap();
@@ -14435,7 +14456,7 @@ mod tests {
     }
 
     #[test]
-    fn a_script_live_value_write_relayouts_without_restyling() {
+    fn a_script_live_value_write_paints_without_layout_or_restyle() {
         let (mut app, id) = scripted_app(
             "<input id=x value=markup><script>document.getElementById('x').value = 'live';</script>",
         );
@@ -14447,7 +14468,7 @@ mod tests {
         );
         let effect = app.update(Msg::RunScripts { id });
         assert!(effect.dirty);
-        assert_eq!(stages(&app), (styles, layouts + 1, paints + 1));
+        assert_eq!(stages(&app), (styles, layouts, paints + 1));
         let field = by_id(&app, "x");
         let dom = app.dom.as_ref().unwrap();
         assert_eq!(dom.field_value(field), Some("live"));
@@ -15539,10 +15560,9 @@ mod tests {
     /// field, and it has the real one (`#searchInput`) rather than one this
     /// test added. 80×24, the size a reader actually has.
     ///
-    /// **A** is the simple path, and the one that ships: a keystroke is a text
-    /// edit, so relayout and repaint, which is what `Dom::set_field_value`'s
-    /// own invalidation rule says. **B** patches the one box whose text changed
-    /// and repaints from the tree. Interleaved in one process, alternating
+    /// **A** is the retained full-layout baseline. **B**, the shipping path,
+    /// patches the one box whose text changed and repaints from the tree.
+    /// Interleaved in one process, alternating
     /// which goes first, because this machine drifts 5–10% between runs
     /// (CLAUDE.md).
     #[test]
@@ -15617,12 +15637,12 @@ mod tests {
              mean of {ROUNDS} interleaved rounds (budget < 10 ms):"
         );
         eprintln!(
-            "  relayout + repaint (ships)  {}  \
+            "  relayout + repaint (baseline)  {}  \
              (styles/layouts/paints per keystroke: {simple_stages:?})",
             summarize(&simple),
         );
         eprintln!(
-            "  patch + repaint             {}  \
+            "  patch + repaint (ships)       {}  \
              (styles/layouts/paints per keystroke: {narrow_stages:?})",
             summarize(&narrow),
         );
@@ -15695,12 +15715,12 @@ mod tests {
              mean of {ROUNDS} interleaved rounds (budget < 10 ms):"
         );
         eprintln!(
-            "  relayout + repaint (ships)  {}  \
+            "  relayout + repaint (baseline)  {}  \
              (styles/layouts/paints: {simple_stages:?})",
             summarize(&simple),
         );
         eprintln!(
-            "  patch + repaint             {}  \
+            "  patch + repaint (ships)       {}  \
              (styles/layouts/paints: {narrow_stages:?})",
             summarize(&narrow),
         );
