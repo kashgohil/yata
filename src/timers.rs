@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::msg::Msg;
-use crate::net::PageId;
+use crate::net::{PageId, TabId};
 
 /// A timer's identity within its page. Browser-compatible: a positive integer,
 /// never reused, so `clearTimeout` on a fired timer is harmless rather than a
@@ -58,11 +58,11 @@ pub enum TimerRequest {
     },
     /// `clearTimeout` / `clearInterval`.
     Cancel { page: PageId, id: TimerId },
-    /// Navigation: everything scheduled by a page other than `keep` is dead.
-    /// Phrased as "keep this one" rather than "drop that one" because the
-    /// caller is the event loop starting a new generation, which knows the id
-    /// it is starting and not necessarily the ones it is replacing.
+    /// Navigation: older generations in this tab are dead; other tabs keep
+    /// running normally.
     CancelOthers { keep: PageId },
+    /// Closing a tab eagerly removes all of its deadlines.
+    CancelTab { tab: TabId },
 }
 
 /// One scheduled deadline. Ordered by time, then by insertion — two timers due
@@ -137,7 +137,12 @@ impl Timers {
                     .retain(|Reverse(entry)| !(entry.page == page && entry.id == id));
             }
             TimerRequest::CancelOthers { keep } => {
-                schedule.heap.retain(|Reverse(entry)| entry.page == keep);
+                schedule
+                    .heap
+                    .retain(|Reverse(entry)| entry.page.tab != keep.tab || entry.page == keep);
+            }
+            TimerRequest::CancelTab { tab } => {
+                schedule.heap.retain(|Reverse(entry)| entry.page.tab != tab);
             }
         }
         // The earliest deadline may have moved closer, so the thread has to

@@ -14,6 +14,10 @@ pub enum Action {
     OpenUrl,
     /// Pre-fill the URL bar with the current page URL (M6 `O`).
     EditUrl,
+    NewTab,
+    CloseTab,
+    NextTab,
+    PreviousTab,
     ToggleDom,
     ToggleStyles,
     ToggleBoxes,
@@ -143,6 +147,18 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::End, NONE), Action::Bottom),
     browse(None, chord(KeyCode::Char('o'), NONE), Action::OpenUrl),
     browse(None, chord(KeyCode::Char('O'), NONE), Action::EditUrl),
+    browse(None, chord(KeyCode::Char('t'), NONE), Action::NewTab),
+    browse(None, chord(KeyCode::Char('x'), NONE), Action::CloseTab),
+    browse(
+        Some(chord(KeyCode::Char('g'), NONE)),
+        chord(KeyCode::Char('t'), NONE),
+        Action::NextTab,
+    ),
+    browse(
+        Some(chord(KeyCode::Char('g'), NONE)),
+        chord(KeyCode::Char('T'), NONE),
+        Action::PreviousTab,
+    ),
     // `F1`–`F4` are the DOM, styles, boxes and timing inspectors
     // (PLAN.md §3 `F1`–`F4`); Browse only — in the URL bar they are unbound.
     browse(None, chord(KeyCode::F(1), NONE), Action::ToggleDom),
@@ -511,7 +527,7 @@ mod tests {
 
     #[test]
     fn unbound_keys_do_nothing() {
-        assert_eq!(browse_key(KeyCode::Char('x'), NONE), Resolution::Unbound);
+        assert_eq!(browse_key(KeyCode::Char('z'), NONE), Resolution::Unbound);
         assert_eq!(browse_key(KeyCode::Char('q'), CTRL), Resolution::Unbound);
     }
 

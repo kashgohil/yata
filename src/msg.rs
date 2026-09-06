@@ -172,3 +172,23 @@ pub enum Msg {
         id: PageId,
     },
 }
+
+impl Msg {
+    /// Stable page address for worker/timer messages. Terminal input is
+    /// global and is therefore routed to the active tab instead.
+    pub fn page(&self) -> Option<PageId> {
+        match self {
+            Msg::Loading { id, .. }
+            | Msg::Loaded { id, .. }
+            | Msg::Redirect { id, .. }
+            | Msg::Parsed { id, .. }
+            | Msg::Stylesheet { id, .. }
+            | Msg::NetError { id, .. }
+            | Msg::Image { id, .. }
+            | Msg::Script { id, .. }
+            | Msg::RunScripts { id } => Some(*id),
+            Msg::JsFetch { page, .. } | Msg::Timer { page, .. } => Some(*page),
+            Msg::Key(_) | Msg::Mouse(_) | Msg::Resize(_, _) | Msg::InputClosed => None,
+        }
+    }
+}

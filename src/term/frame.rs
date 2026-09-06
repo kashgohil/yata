@@ -131,6 +131,22 @@ impl Frame {
         debug_assert!(self.w == other.w && self.h == other.h);
         self.cells.copy_from_slice(&other.cells);
     }
+
+    /// Copy a complete smaller frame at `top`, clipping to this frame. Used
+    /// by browser chrome to place the active page below the tab strip while
+    /// keeping page drawing unaware of terminal chrome coordinates.
+    pub fn blit_rows(&mut self, other: &Frame, top: u16) {
+        let rows = other.h.min(self.h.saturating_sub(top));
+        let cols = other.w.min(self.w);
+        for y in 0..rows {
+            for x in 0..cols {
+                let cell = other.get(x, y);
+                if cell.ch != CONT {
+                    self.set(x, top + y, cell);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

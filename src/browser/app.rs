@@ -23,7 +23,7 @@ use crate::js::storage::Storage;
 use crate::js::{self, console::Console};
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
-use crate::net::{self, PageId};
+use crate::net::{self, PageId, TabId};
 use crate::paint::{self, DisplayList};
 use crate::style::sources::{self, Source};
 use crate::style::{self, StyleContext, Styles};
@@ -80,6 +80,17 @@ pub struct Effect {
     /// the loop dispatches — which is also what keeps the pass out of the turn
     /// that has to paint.
     pub run_scripts: Option<PageId>,
+    /// Tab-set operation resolved by the page's table-driven key handling.
+    /// The outer browser owns the collection and applies it after this update.
+    pub tab: Option<TabAction>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabAction {
+    New,
+    Close,
+    Next,
+    Previous,
 }
 
 /// Link-hint session (`f` / `F`).
@@ -243,6 +254,9 @@ enum Mode {
 /// state, `draw` touches only the given frame.
 pub struct App {
     size: (u16, u16),
+    /// Stable owner of every generation this page creates. Headless/test
+    /// pages use tab zero; live tabs are constructed with a non-zero id.
+    tab: TabId,
     /// Generation counter behind `PageId`s; `start_fetch` pre-increments,
     /// so ids start at 1 and id 0 is never live.
     fetch_gen: u64,
@@ -462,8 +476,13 @@ impl App {
 
     /// Like [`new`] with an explicit Kitty graphics flag (from `term::Caps`).
     pub fn with_caps(w: u16, h: u16, kitty_graphics: bool) -> Self {
+        Self::with_tab(w, h, kitty_graphics, TabId(0))
+    }
+
+    pub(crate) fn with_tab(w: u16, h: u16, kitty_graphics: bool, tab: TabId) -> Self {
         App {
             size: (w, h),
+            tab,
             fetch_gen: 0,
             current_fetch: None,
             fetch: Fetch::Idle,
@@ -548,7 +567,7 @@ impl App {
     /// `net::spawn_fetch` — `App` itself never touches the network.
     pub fn start_fetch(&mut self, url: String) -> PageId {
         self.fetch_gen += 1;
-        let id = PageId::headless(self.fetch_gen);
+        let id = PageId::new(self.tab, self.fetch_gen);
         self.current_fetch = Some(id);
         // One host per page generation: the old page's globals, closures and
         // (from M10.8) listeners go with it. Dropping the host is the whole
@@ -1245,6 +1264,10 @@ impl App {
                 self.mode = Mode::UrlInput { buffer };
                 redraw()
             }
+            Action::NewTab => tab_action(TabAction::New),
+            Action::CloseTab => tab_action(TabAction::Close),
+            Action::NextTab => tab_action(TabAction::Next),
+            Action::PreviousTab => tab_action(TabAction::Previous),
             Action::ToggleDom => self.toggle_surface(Surface::Dom),
             Action::ToggleStyles => self.toggle_surface(Surface::Styles),
             Action::ToggleBoxes => self.toggle_surface(Surface::Boxes),
@@ -4564,6 +4587,316 @@ fn redraw() -> Effect {
     }
 }
 
+fn tab_action(tab: TabAction) -> Effect {
+    Effect {
+        dirty: true,
+        tab: Some(tab),
+        ..Effect::default()
+    }
+}
+
+pub const MAX_TABS: usize = 16;
+pub const MAX_TITLE_BYTES: usize = 512;
+
+struct Tab {
+    id: TabId,
+    page: App,
+    stale_size: bool,
+}
+
+/// One terminal browser session: ordered live pages, one active selection and
+/// one chrome surface. `App` remains the page state machine; this is the sole
+/// owner and router for the bounded tab set.
+pub struct Browser {
+    size: (u16, u16),
+    kitty_graphics: bool,
+    tabs: Vec<Tab>,
+    active: usize,
+    next_tab: u64,
+}
+
+impl Browser {
+    pub fn new(w: u16, h: u16) -> Browser {
+        Browser::with_caps(w, h, false)
+    }
+
+    pub fn with_caps(w: u16, h: u16, kitty_graphics: bool) -> Browser {
+        let id = TabId(1);
+        Browser {
+            size: (w, h),
+            kitty_graphics,
+            tabs: vec![Tab {
+                id,
+                page: App::with_tab(w, h.saturating_sub(1), kitty_graphics, id),
+                stale_size: false,
+            }],
+            active: 0,
+            next_tab: 2,
+        }
+    }
+
+    pub fn size(&self) -> (u16, u16) {
+        self.size
+    }
+
+    pub fn start_navigation(&mut self, url: String) -> Effect {
+        self.tabs[self.active].page.start_navigation(url)
+    }
+
+    pub fn update(&mut self, mut msg: Msg) -> Effect {
+        if let Some(page) = msg.page() {
+            let Some(index) = self.tabs.iter().position(|tab| tab.id == page.tab) else {
+                return Effect::default();
+            };
+            let old_label = self.tabs[index].page.tab_label();
+            let mut effect = self.tabs[index].page.update(msg);
+            if index != self.active {
+                effect.dirty =
+                    old_label != self.tabs[index].page.tab_label() && self.tab_is_visible(index);
+            }
+            effect.tab = None;
+            return effect;
+        }
+
+        match &mut msg {
+            Msg::Resize(w, h) => {
+                self.size = (*w, *h);
+                let page_h = h.saturating_sub(1);
+                for (index, tab) in self.tabs.iter_mut().enumerate() {
+                    tab.stale_size = index != self.active;
+                }
+                self.tabs[self.active].stale_size = false;
+                self.tabs[self.active].page.update(Msg::Resize(*w, page_h))
+            }
+            Msg::Mouse(mouse) => {
+                if mouse.row == 0 {
+                    return Effect::default();
+                }
+                mouse.row -= 1;
+                self.update_active(msg)
+            }
+            _ => self.update_active(msg),
+        }
+    }
+
+    fn update_active(&mut self, msg: Msg) -> Effect {
+        let mut effect = self.tabs[self.active].page.update(msg);
+        if let Some(action) = effect.tab.take() {
+            self.apply_tab_action(action, &mut effect);
+        }
+        effect
+    }
+
+    fn apply_tab_action(&mut self, action: TabAction, effect: &mut Effect) {
+        match action {
+            TabAction::New => {
+                self.open_tab();
+            }
+            TabAction::Close => {
+                let closed = self.tabs.remove(self.active).id;
+                effect.timers.push(TimerRequest::CancelTab { tab: closed });
+                if self.tabs.is_empty() {
+                    if !self.open_tab() {
+                        return;
+                    }
+                } else if self.active == self.tabs.len() {
+                    self.active -= 1;
+                }
+                self.activate_current();
+            }
+            TabAction::Next if self.tabs.len() > 1 => {
+                self.active = (self.active + 1) % self.tabs.len();
+                self.activate_current();
+            }
+            TabAction::Previous if self.tabs.len() > 1 => {
+                self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
+                self.activate_current();
+            }
+            TabAction::Next | TabAction::Previous => {}
+        }
+        for tab in &mut self.tabs {
+            tab.page.pending = None;
+        }
+    }
+
+    fn open_tab(&mut self) -> bool {
+        if self.tabs.len() == MAX_TABS {
+            self.tabs[self.active].page.status_msg = Some(format!("tab limit ({MAX_TABS})"));
+            return false;
+        }
+        let Some(next) = self.next_tab.checked_add(1) else {
+            self.tabs[self.active].page.status_msg = Some("tab id space exhausted".into());
+            return false;
+        };
+        let id = TabId(self.next_tab);
+        self.next_tab = next;
+        let mut page = App::with_tab(
+            self.size.0,
+            self.size.1.saturating_sub(1),
+            self.kitty_graphics,
+            id,
+        );
+        page.mode = Mode::UrlInput {
+            buffer: String::new(),
+        };
+        self.active = (self.active + 1).min(self.tabs.len());
+        self.tabs.insert(
+            self.active,
+            Tab {
+                id,
+                page,
+                stale_size: false,
+            },
+        );
+        true
+    }
+
+    fn activate_current(&mut self) {
+        if self.tabs[self.active].stale_size {
+            self.tabs[self.active].stale_size = false;
+            let (w, h) = self.size;
+            let _ = self.tabs[self.active]
+                .page
+                .update(Msg::Resize(w, h.saturating_sub(1)));
+        }
+    }
+
+    pub fn draw(&self, frame: &mut Frame) {
+        frame.clear();
+        self.draw_tab_strip(frame);
+        let mut page = Frame::new(frame.width(), frame.height().saturating_sub(1));
+        self.tabs[self.active].page.draw(&mut page);
+        frame.blit_rows(&page, 1);
+    }
+
+    fn draw_tab_strip(&self, frame: &mut Frame) {
+        if frame.height() == 0 || frame.width() == 0 {
+            return;
+        }
+        let labels: Vec<String> = self.tabs.iter().map(|tab| tab.page.tab_label()).collect();
+        let widths: Vec<usize> = labels.iter().map(|label| label.width() + 2).collect();
+        let available = frame.width() as usize;
+        let mut start = self.active;
+        let mut used = widths[self.active].min(available);
+        while start > 0 && used.saturating_add(widths[start - 1]) <= available {
+            start -= 1;
+            used += widths[start];
+        }
+        let mut x = 0;
+        for (index, label) in labels.iter().enumerate().skip(start) {
+            if x >= frame.width() {
+                break;
+            }
+            let style = if index == self.active {
+                reversed()
+            } else {
+                Style::default()
+            };
+            x = frame.put_str(x, 0, " ", style);
+            x = frame.put_str(x, 0, label, style);
+            x = frame.put_str(x, 0, " ", style);
+        }
+    }
+
+    fn tab_is_visible(&self, index: usize) -> bool {
+        let labels: Vec<String> = self.tabs.iter().map(|tab| tab.page.tab_label()).collect();
+        let widths: Vec<usize> = labels.iter().map(|label| label.width() + 2).collect();
+        let available = self.size.0 as usize;
+        let mut start = self.active;
+        let mut used = widths[self.active].min(available);
+        while start > 0 && used.saturating_add(widths[start - 1]) <= available {
+            start -= 1;
+            used += widths[start];
+        }
+        if index < start {
+            return false;
+        }
+        let mut drawn = 0;
+        for (candidate, width) in widths.iter().enumerate().skip(start) {
+            if drawn >= available {
+                return false;
+            }
+            if candidate == index {
+                return true;
+            }
+            drawn = drawn.saturating_add(*width);
+        }
+        false
+    }
+
+    pub fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        self.tabs[self.active].page.kitty_frame()
+    }
+
+    pub fn record_frame(&mut self, duration: Duration) {
+        self.tabs[self.active].page.record_frame(duration);
+    }
+
+    pub fn timings(&self) -> &Timings {
+        self.tabs[self.active].page.timings()
+    }
+}
+
+impl App {
+    fn tab_label(&self) -> String {
+        if let Some(dom) = &self.dom {
+            for raw in 0..dom.node_count() {
+                let id = NodeId(raw as u32);
+                if matches!(&dom.node(id).data, NodeData::Element { tag, .. } if tag == "title") {
+                    let mut title = String::new();
+                    collect_text(dom, id, &mut title);
+                    let title = sanitize_title(&title);
+                    if !title.is_empty() {
+                        return title;
+                    }
+                }
+            }
+        }
+        let Some(url) = self.current_url() else {
+            return "new tab".into();
+        };
+        reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_else(|| sanitize_title(&url))
+    }
+}
+
+fn collect_text(dom: &Dom, node: NodeId, out: &mut String) {
+    for child in dom.children(node) {
+        match &dom.node(child).data {
+            NodeData::Text(text) => out.push_str(text),
+            _ => collect_text(dom, child, out),
+        }
+    }
+}
+
+fn sanitize_title(raw: &str) -> String {
+    let mut title = String::new();
+    let mut space = false;
+    for ch in raw.chars() {
+        if title.len() + ch.len_utf8() > MAX_TITLE_BYTES {
+            break;
+        }
+        if ch.is_ascii_whitespace() {
+            space = !title.is_empty();
+        } else if ch.is_control() {
+            if space && title.len() < MAX_TITLE_BYTES {
+                title.push(' ');
+            }
+            space = false;
+            title.push('�');
+        } else {
+            if space && title.len() < MAX_TITLE_BYTES {
+                title.push(' ');
+            }
+            space = false;
+            title.push(ch);
+        }
+    }
+    title.trim().to_string()
+}
+
 /// A scroll outcome: dirty exactly when the offset moved, so a scroll at the
 /// limit is not a dead redraw.
 fn moved(changed: bool) -> Effect {
@@ -5103,6 +5436,128 @@ mod tests {
 
     fn ch(c: char) -> Msg {
         key(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn tab_operations_are_ordered_wrapping_bounded_and_never_reuse_ids() {
+        let mut browser = Browser::new(40, 8);
+        let first = browser.tabs[0].id;
+        browser.update(ch('t'));
+        let second = browser.tabs[1].id;
+        assert_ne!(first, second);
+        assert_eq!(browser.active, 1);
+        assert!(matches!(browser.tabs[1].page.mode, Mode::UrlInput { .. }));
+
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(browser.active, 0, "next did not wrap");
+        browser.update(ch('g'));
+        browser.update(ch('T'));
+        assert_eq!(browser.active, 1, "previous did not wrap");
+
+        let closed = browser.tabs[1].id;
+        let effect = browser.update(ch('x'));
+        assert_eq!(browser.active, 0);
+        assert!(matches!(
+            effect.timers.as_slice(),
+            [TimerRequest::CancelTab { tab }] if *tab == closed
+        ));
+        browser.update(ch('t'));
+        assert!(browser.tabs[1].id.0 > closed.0, "a closed id was reused");
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        while browser.tabs.len() < MAX_TABS {
+            browser.update(ch('t'));
+            browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        let active = browser.active;
+        let ids: Vec<_> = browser.tabs.iter().map(|tab| tab.id).collect();
+        browser.update(ch('t'));
+        assert_eq!(browser.active, active);
+        assert_eq!(
+            browser.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            ids
+        );
+        assert_eq!(
+            browser.tabs[active].page.status_msg.as_deref(),
+            Some("tab limit (16)")
+        );
+    }
+
+    #[test]
+    fn closing_the_only_tab_replaces_it_with_a_new_blank_identity() {
+        let mut browser = Browser::new(20, 4);
+        let old = browser.tabs[0].id;
+        browser.update(ch('x'));
+        assert_eq!(browser.tabs.len(), 1);
+        assert_ne!(browser.tabs[0].id, old);
+        assert!(matches!(browser.tabs[0].page.fetch, Fetch::Idle));
+    }
+
+    #[test]
+    fn async_messages_route_by_tab_before_the_generation_guard() {
+        let mut browser = Browser::new(30, 6);
+        let a = browser
+            .start_navigation("https://a.test/".into())
+            .fetch
+            .unwrap()
+            .0;
+        browser.update(ch('t'));
+        let b = browser
+            .start_navigation("https://b.test/".into())
+            .fetch
+            .unwrap()
+            .0;
+        assert_eq!(
+            a.generation, b.generation,
+            "the test needs colliding generations"
+        );
+        assert_ne!(a.tab, b.tab);
+
+        let effect = browser.update(Msg::Loading {
+            id: a,
+            bytes_so_far: 7,
+        });
+        assert!(!effect.dirty, "a background progress message repainted");
+        assert!(matches!(
+            browser.tabs[0].page.fetch,
+            Fetch::Loading {
+                bytes_so_far: 7,
+                ..
+            }
+        ));
+        assert!(matches!(
+            browser.tabs[1].page.fetch,
+            Fetch::Loading {
+                bytes_so_far: 0,
+                ..
+            }
+        ));
+
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        browser.update(ch('x'));
+        assert_eq!(
+            browser.update(Msg::Loading {
+                id: b,
+                bytes_so_far: 9
+            }),
+            Effect::default()
+        );
+    }
+
+    #[test]
+    fn the_strip_is_cell_safe_at_tiny_sizes_and_sanitizes_titles() {
+        assert_eq!(
+            sanitize_title("  one\n\t two\u{1b}three  "),
+            "one two�three"
+        );
+        assert!(sanitize_title(&"猫".repeat(300)).len() <= MAX_TITLE_BYTES);
+        for (w, h) in [(0, 0), (1, 1), (1, 2), (8, 2)] {
+            let browser = Browser::new(w, h);
+            let mut frame = Frame::new(w, h);
+            browser.draw(&mut frame);
+        }
     }
 
     #[test]

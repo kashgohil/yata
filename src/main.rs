@@ -6,7 +6,7 @@ use std::{env, iter, panic, process, thread};
 use crossterm::event::{self, Event};
 use crossterm::terminal;
 
-use yata::browser::app::{self, App, Effect};
+use yata::browser::app::{self, App, Browser, Effect};
 use yata::browser::{error_page, yank};
 use yata::js::console::Console;
 use yata::msg::Msg;
@@ -76,7 +76,7 @@ fn main() -> io::Result<()> {
     let (w, h) = terminal::size()?;
     let caps = term::detect_caps_from_env();
     let mut renderer = Renderer::new(w, h, caps);
-    let mut app = App::with_caps(w, h, caps.kitty);
+    let mut app = Browser::with_caps(w, h, caps.kitty);
 
     let (tx, rx) = mpsc::channel();
     if let Some(url) = url {
@@ -609,7 +609,51 @@ fn run_timing(url: &str) -> i32 {
 /// Input coalescing: apply every already-queued message, then decide **once**
 /// whether to redraw, so a flood of events costs one render, not one each.
 /// Quit short-circuits — nothing rendered or applied after it matters.
-fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
+trait UiApp {
+    fn update(&mut self, msg: Msg) -> Effect;
+    fn size(&self) -> (u16, u16);
+    fn draw(&self, frame: &mut yata::term::Frame);
+    fn kitty_frame(&mut self) -> Option<Vec<u8>>;
+    fn record_frame(&mut self, duration: Duration);
+}
+
+impl UiApp for App {
+    fn update(&mut self, msg: Msg) -> Effect {
+        App::update(self, msg)
+    }
+    fn size(&self) -> (u16, u16) {
+        App::size(self)
+    }
+    fn draw(&self, frame: &mut yata::term::Frame) {
+        App::draw(self, frame)
+    }
+    fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        App::kitty_frame(self)
+    }
+    fn record_frame(&mut self, duration: Duration) {
+        App::record_frame(self, duration)
+    }
+}
+
+impl UiApp for Browser {
+    fn update(&mut self, msg: Msg) -> Effect {
+        Browser::update(self, msg)
+    }
+    fn size(&self) -> (u16, u16) {
+        Browser::size(self)
+    }
+    fn draw(&self, frame: &mut yata::term::Frame) {
+        Browser::draw(self, frame)
+    }
+    fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        Browser::kitty_frame(self)
+    }
+    fn record_frame(&mut self, duration: Duration) {
+        Browser::record_frame(self, duration)
+    }
+}
+
+fn apply_batch(app: &mut impl UiApp, msgs: impl Iterator<Item = Msg>) -> Effect {
     let mut effect = Effect::default();
     for msg in msgs {
         let e = app.update(msg);
@@ -649,6 +693,9 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         if e.run_scripts.is_some() {
             effect.run_scripts = e.run_scripts;
         }
+        if e.tab.is_some() {
+            effect.tab = e.tab;
+        }
         if e.quit {
             effect.quit = true;
             break;
@@ -657,7 +704,7 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
     effect
 }
 
-fn render(app: &mut App, renderer: &mut Renderer, out: &mut impl Write) -> io::Result<()> {
+fn render(app: &mut impl UiApp, renderer: &mut Renderer, out: &mut impl Write) -> io::Result<()> {
     let started = Instant::now();
     // A coalesced batch of resizes syncs the renderer once, at the final size.
     let (w, h) = app.size();
