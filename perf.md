@@ -1056,3 +1056,20 @@ the worker and event loop block on condition variables/channel receive, with
 no polling or periodic wake. Functional counters separately pin zero pipeline
 stages for checkpoint load/save/ack and exactly one ordinary fresh pipeline per
 restored nonblank URL.
+
+The real interactive binary was also exercised against an isolated loopback
+server and temporary profile paths. Wikipedia was scrolled to row 20, a second
+`fixed-sticky.html` tab was opened and selected, and the browser quit normally.
+The private checkpoint was:
+
+    yata-session-v1
+    active  1
+    tab     20  http://127.0.0.1:43127/tests/fixtures/en.wikipedia.org.html
+    tab     0   http://127.0.0.1:43127/tests/fixtures/fixed-sticky.html
+
+Relaunching without a CLI URL visibly restored both tabs in order, selected
+the second, loaded both through fresh loopback requests, and retained the first
+tab's row 20 after layout. A settled sample from `top -l 3 -s 2 -pid <pid>`
+reported the process as `sleeping` at **0.0% CPU**. A second normal quit left
+the same decodable 0600 checkpoint and the process exited after its worker
+joins.

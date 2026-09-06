@@ -534,6 +534,49 @@ mod tests {
     }
 
     #[test]
+    fn oversized_named_file_is_read_only_and_preserved() {
+        let path = temp_path("session");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let oversized = vec![b'x'; MAX_FILE_BYTES + 1];
+        fs::write(&path, &oversized).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = SessionWorker::spawn_with_quiet_period(Some(path.clone()), tx, Duration::ZERO);
+        assert!(matches!(rx.recv().unwrap(), Msg::SessionLoaded(Err(_))));
+        worker.submit(1, snapshot("https://example.test/", 0));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Msg::SessionSaved {
+                revision: 1,
+                result: Err(_)
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "read-only failure retried by itself"
+        );
+        worker.shutdown();
+        assert_eq!(fs::read(&path).unwrap(), oversized);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn unavailable_persistence_acknowledges_one_error_without_retrying() {
+        let (tx, rx) = mpsc::channel();
+        let worker = SessionWorker::spawn_with_quiet_period(None, tx, Duration::ZERO);
+        assert_eq!(rx.recv().unwrap(), Msg::SessionLoaded(Ok(None)));
+        worker.submit(1, snapshot("https://example.test/", 0));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Msg::SessionSaved {
+                revision: 1,
+                result: Err(_)
+            }
+        ));
+        assert!(rx.try_recv().is_err());
+        worker.shutdown();
+    }
+
+    #[test]
     fn every_pre_rename_failure_preserves_the_named_checkpoint_and_cleans_temp() {
         let path = temp_path("session");
         fs::create_dir_all(path.parent().unwrap()).unwrap();

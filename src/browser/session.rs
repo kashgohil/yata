@@ -90,22 +90,46 @@ pub fn decode(bytes: &[u8]) -> Result<SessionSnapshot, FormatError> {
     }
     let mut active = None;
     let mut tabs = Vec::new();
-    for line in body.split(|byte| *byte == b'\n') {
+    for (line_index, line) in body.split(|byte| *byte == b'\n').enumerate() {
         if line.is_empty() {
             return Err(FormatError::new("session record is empty"));
         }
-        let fields: Vec<&[u8]> = line.split(|byte| *byte == b'\t').collect();
-        match fields.as_slice() {
-            [b"active", ordinal] => {
+        let mut fields = line.split(|byte| *byte == b'\t');
+        let kind = fields.next().expect("nonempty line has a record kind");
+        match kind {
+            b"active" => {
+                if line_index != 0 {
+                    return Err(FormatError::new("active record is not first"));
+                }
                 if active.is_some() {
                     return Err(FormatError::new("duplicate active record"));
+                }
+                let ordinal = fields
+                    .next()
+                    .ok_or_else(|| FormatError::new("active record is missing a field"))?;
+                if fields.next().is_some() {
+                    return Err(FormatError::new("active record has extra fields"));
                 }
                 active =
                     Some(parse_decimal(ordinal, (MAX_TABS - 1) as u64, "active ordinal")? as usize);
             }
-            [b"tab", scroll, url] => {
+            b"tab" => {
+                if line_index == 0 {
+                    return Err(FormatError::new(
+                        "session is missing its first active record",
+                    ));
+                }
                 if tabs.len() == MAX_TABS {
                     return Err(FormatError::new("too many session tabs"));
+                }
+                let scroll = fields
+                    .next()
+                    .ok_or_else(|| FormatError::new("tab record is missing its scroll field"))?;
+                let url = fields
+                    .next()
+                    .ok_or_else(|| FormatError::new("tab record is missing its URL field"))?;
+                if fields.next().is_some() {
+                    return Err(FormatError::new("tab record has extra fields"));
                 }
                 let scroll = parse_decimal(scroll, i32::MAX as u64, "scroll offset")? as u32;
                 let url = unescape(url, MAX_URL_BYTES)?;
@@ -121,9 +145,6 @@ pub fn decode(bytes: &[u8]) -> Result<SessionSnapshot, FormatError> {
                     Some(Arc::from(url))
                 };
                 tabs.push(SessionTab { url, scroll });
-            }
-            [kind, ..] if *kind == b"active" || *kind == b"tab" => {
-                return Err(FormatError::new("session record has the wrong field count"));
             }
             _ => return Err(FormatError::new("unknown session record kind")),
         }
@@ -281,6 +302,7 @@ mod tests {
             b"yata-session-v1\n",
             b"yata-session-v1\nactive\t0\ntab\t0\t",
             b"yata-session-v1\ntab\t0\thttps://a.test/\n",
+            b"yata-session-v1\ntab\t0\thttps://a.test/\nactive\t0\n",
             b"yata-session-v1\nactive\t0\nactive\t0\ntab\t0\t\n",
             b"yata-session-v1\nactive\t1\ntab\t0\t\n",
             b"yata-session-v1\nactive\t-1\ntab\t0\t\n",
@@ -332,6 +354,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn every_truncation_and_single_byte_corruption_is_bounded_and_panic_free() {
+        let valid = encode(
+            &SessionSnapshot::new(
+                1,
+                Arc::from([tab(Some("https://a.test/path?x=1#part"), 37), tab(None, 0)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for end in 0..valid.len() {
+            let _ = decode(&valid[..end]);
+        }
+        for at in 0..valid.len() {
+            for byte in [0, b'\t', b'\n', b'\\', b'9', 0xff] {
+                let mut corrupt = valid.clone();
+                corrupt[at] = byte;
+                let _ = decode(&corrupt);
+            }
+        }
     }
 
     #[test]

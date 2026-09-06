@@ -7115,6 +7115,33 @@ mod tests {
     }
 
     #[test]
+    fn session_read_only_never_disables_bookmark_loading_or_live_tabs() {
+        let mut browser = Browser::with_persistence(50, 10, false, true, true);
+        let tab = browser.tabs[0].id;
+        browser.update(Msg::SessionLoaded(Err("future session format".into())));
+        let mut loaded = Bookmarks::new();
+        assert_eq!(
+            loaded.add(Arc::from("https://bookmark.test/"), Arc::from("Bookmark")),
+            AddResult::Added
+        );
+        browser.update(Msg::BookmarksLoaded(Ok(loaded)));
+        assert_eq!(browser.tabs.len(), 1);
+        assert_eq!(browser.tabs[0].id, tab);
+        assert_eq!(browser.bookmarks.len(), 1);
+        assert!(matches!(
+            browser.session_persistence,
+            SessionPersistence::ReadOnly(_)
+        ));
+        assert!(matches!(
+            browser.bookmark_persistence,
+            BookmarkPersistence::Ready {
+                available: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     #[ignore = "release session restore/input measurement"]
     fn measure_session_restore_and_rapid_cjk_scroll_submission() {
         let url = "https://example.test/";
