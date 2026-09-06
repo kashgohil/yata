@@ -43,9 +43,22 @@ pub struct SessionWorker {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(test)]
+struct LoadGate {
+    released: Mutex<bool>,
+    wake: Condvar,
+    entered: Sender<()>,
+}
+
 impl SessionWorker {
     pub fn spawn(path: Option<PathBuf>, events: Sender<Msg>) -> Self {
-        Self::spawn_inner(path, events, QuietWait::Timed(QUIET_PERIOD))
+        Self::spawn_inner(
+            path,
+            events,
+            QuietWait::Timed(QUIET_PERIOD),
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -54,13 +67,27 @@ impl SessionWorker {
         events: Sender<Msg>,
         quiet_period: Duration,
     ) -> Self {
-        Self::spawn_inner(path, events, QuietWait::Timed(quiet_period))
+        Self::spawn_inner(path, events, QuietWait::Timed(quiet_period), None)
     }
 
-    fn spawn_inner(path: Option<PathBuf>, events: Sender<Msg>, quiet: QuietWait) -> Self {
+    fn spawn_inner(
+        path: Option<PathBuf>,
+        events: Sender<Msg>,
+        quiet: QuietWait,
+        #[cfg(test)] load_gate: Option<Arc<LoadGate>>,
+    ) -> Self {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker_shared = Arc::clone(&shared);
-        let thread = thread::spawn(move || run(path, events, worker_shared, quiet));
+        let thread = thread::spawn(move || {
+            run(
+                path,
+                events,
+                worker_shared,
+                quiet,
+                #[cfg(test)]
+                load_gate,
+            )
+        });
         Self {
             shared,
             thread: Some(thread),
@@ -74,7 +101,7 @@ impl SessionWorker {
     ) -> (Self, Receiver<u64>) {
         let (waiting, observed) = mpsc::channel();
         (
-            Self::spawn_inner(path, events, QuietWait::Manual(waiting)),
+            Self::spawn_inner(path, events, QuietWait::Manual(waiting), None),
             observed,
         )
     }
@@ -119,7 +146,22 @@ fn run(
     events: Sender<Msg>,
     shared: Arc<(Mutex<State>, Condvar)>,
     quiet: QuietWait,
+    #[cfg(test)] load_gate: Option<Arc<LoadGate>>,
 ) {
+    #[cfg(test)]
+    if let Some(gate) = load_gate {
+        let _ = gate.entered.send(());
+        let mut released = gate
+            .released
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = gate
+                .wake
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
     let loaded = match &path {
         Some(path) => load(path),
         None => Ok(None),
@@ -487,6 +529,81 @@ mod tests {
             load(&path).unwrap(),
             Some(snapshot("https://three.test/", 3))
         );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_save_submitted_during_load_waits_for_format_validation() {
+        let path = temp_path("session");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        save_atomic(&path, &snapshot("https://old.test/", 1)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(LoadGate {
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+            entered: entered_tx,
+        });
+        let worker = SessionWorker::spawn_inner(
+            Some(path.clone()),
+            tx,
+            QuietWait::Timed(Duration::ZERO),
+            Some(Arc::clone(&gate)),
+        );
+        entered_rx.recv().unwrap();
+        worker.submit(1, snapshot("https://new.test/", 2));
+        assert!(rx.try_recv().is_err(), "save bypassed the blocked load");
+        *gate.released.lock().unwrap() = true;
+        gate.wake.notify_one();
+
+        assert_eq!(
+            rx.recv().unwrap(),
+            Msg::SessionLoaded(Ok(Some(snapshot("https://old.test/", 1))))
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            Msg::SessionSaved {
+                revision: 1,
+                result: Ok(())
+            }
+        );
+        worker.shutdown();
+        assert_eq!(load(&path).unwrap(), Some(snapshot("https://new.test/", 2)));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_pending_save_cannot_overwrite_a_malformed_file_after_load_unblocks() {
+        let path = temp_path("session");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"yata-session-v2\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(LoadGate {
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+            entered: entered_tx,
+        });
+        let worker = SessionWorker::spawn_inner(
+            Some(path.clone()),
+            tx,
+            QuietWait::Timed(Duration::ZERO),
+            Some(Arc::clone(&gate)),
+        );
+        entered_rx.recv().unwrap();
+        worker.submit(1, snapshot("https://new.test/", 2));
+        *gate.released.lock().unwrap() = true;
+        gate.wake.notify_one();
+        assert!(matches!(rx.recv().unwrap(), Msg::SessionLoaded(Err(_))));
+        assert!(matches!(
+            rx.recv().unwrap(),
+            Msg::SessionSaved {
+                revision: 1,
+                result: Err(_)
+            }
+        ));
+        worker.shutdown();
+        assert_eq!(fs::read(&path).unwrap(), b"yata-session-v2\n");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

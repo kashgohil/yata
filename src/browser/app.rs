@@ -7142,6 +7142,48 @@ mod tests {
     }
 
     #[test]
+    fn stale_session_acknowledgements_never_mark_a_newer_snapshot_saved() {
+        let mut browser = Browser::with_persistence(50, 10, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(None)));
+        let first = browser.start_navigation("https://one.test/".into());
+        let first_revision = first.session_save.unwrap().0;
+        let second = browser.update(ch('t'));
+        let second_revision = second.session_save.unwrap().0;
+
+        let stale = browser.update(Msg::SessionSaved {
+            revision: first_revision,
+            result: Ok(()),
+        });
+        assert!(!stale.dirty);
+        assert!(matches!(
+            browser.session_persistence,
+            SessionPersistence::Ready {
+                submitted,
+                acknowledged,
+                error: None,
+                ..
+            } if submitted == second_revision && acknowledged == first_revision
+        ));
+
+        browser.update(Msg::SessionSaved {
+            revision: second_revision,
+            result: Err("disk full".into()),
+        });
+        browser.update(Msg::SessionSaved {
+            revision: first_revision,
+            result: Ok(()),
+        });
+        assert!(matches!(
+            &browser.session_persistence,
+            SessionPersistence::Ready {
+                acknowledged,
+                error: Some(error),
+                ..
+            } if *acknowledged == second_revision && error == "disk full"
+        ));
+    }
+
+    #[test]
     #[ignore = "release session restore/input measurement"]
     fn measure_session_restore_and_rapid_cjk_scroll_submission() {
         let url = "https://example.test/";
