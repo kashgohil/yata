@@ -325,9 +325,11 @@ pub fn style_reader_tree_with(dom: &Dom, included: &[bool], ctx: &StyleContext<'
     debug_assert_eq!(included.len(), dom.node_count());
     let ua = RuleIndex::build(&[ua_stylesheet()]);
     let author = RuleIndex::build(&[]);
-    let mut excluded = ComputedStyle::default();
-    excluded.display = Display::None;
-    excluded.hidden_by_ua = true;
+    let excluded = ComputedStyle {
+        display: Display::None,
+        hidden_by_ua: true,
+        ..ComputedStyle::default()
+    };
     let mut styles = Styles {
         computed: vec![excluded; dom.node_count()],
         #[cfg(test)]

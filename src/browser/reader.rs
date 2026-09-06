@@ -579,7 +579,7 @@ mod tests {
             },
         );
         for _ in 0..25_000 {
-            dom.append_child(article, NodeData::Text("x".repeat(100).into()));
+            dom.append_child(article, NodeData::Text("x".repeat(100)));
         }
         let styles = style::style_tree(&dom, &[]);
         let a = analyze(&dom, &styles).unwrap();
