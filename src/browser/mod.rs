@@ -5,6 +5,7 @@ pub mod fragment;
 pub mod help;
 pub mod hints;
 pub mod history;
+pub mod http_cache;
 pub mod inspector;
 pub mod keys;
 pub mod search;
