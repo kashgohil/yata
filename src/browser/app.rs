@@ -5029,6 +5029,11 @@ impl Browser {
             self.tabs[self.active].page.status_msg = Some("bookmarks are still loading".into());
             return redraw();
         }
+        if self.bookmark_revision == u64::MAX {
+            self.tabs[self.active].page.status_msg =
+                Some("bookmark revision space exhausted".into());
+            return redraw();
+        }
         let Some(url) = self.tabs[self.active].page.current_url() else {
             self.tabs[self.active].page.status_msg = Some("blank page cannot be bookmarked".into());
             return redraw();
@@ -5073,6 +5078,10 @@ impl Browser {
             BookmarkPersistence::Loading { .. }
         ) {
             self.bookmark_notice = Some("bookmarks are still loading".into());
+            return redraw();
+        }
+        if self.bookmark_revision == u64::MAX {
+            self.bookmark_notice = Some("bookmark revision space exhausted".into());
             return redraw();
         }
         let Some(selected) = self.bookmark_selected else {
@@ -6137,6 +6146,111 @@ mod tests {
     }
 
     #[test]
+    fn bookmark_and_document_startup_messages_are_independent_in_both_orders() {
+        for bookmarks_first in [true, false] {
+            let mut browser = Browser::with_bookmark_persistence(40, 8, false, true);
+            let effect = browser.start_navigation("https://page.test/".into());
+            let page = effect.fetch.unwrap().0;
+            let mut loaded = Bookmarks::new();
+            loaded.add(Arc::from("https://saved.test/"), Arc::from("Saved"));
+            if bookmarks_first {
+                browser.update(Msg::BookmarksLoaded(Ok(loaded)));
+                browser.update(Msg::Loading {
+                    id: page,
+                    bytes_so_far: 9,
+                });
+            } else {
+                browser.update(Msg::Loading {
+                    id: page,
+                    bytes_so_far: 9,
+                });
+                browser.update(Msg::BookmarksLoaded(Ok(loaded)));
+            }
+            assert_eq!(
+                browser.bookmarks.records()[0].url.as_ref(),
+                "https://saved.test/"
+            );
+            assert_eq!(browser.tabs[0].page.current_fetch, Some(page));
+            assert!(matches!(
+                browser.tabs[0].page.fetch,
+                Fetch::Loading {
+                    bytes_so_far: 9,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn bookmark_modal_actions_preserve_the_page_and_block_mouse_input() {
+        let mut browser = Browser::new(40, 7);
+        set_browser_page(&mut browser, 0, "https://page.test/", "Page");
+        browser
+            .bookmarks
+            .add(Arc::from("https://one.test/"), Arc::from("One"));
+        browser
+            .bookmarks
+            .add(Arc::from("https://two.test/"), Arc::from("Two"));
+        let page = &mut browser.tabs[0].page;
+        page.surface = Surface::Dom;
+        page.timing_visible = true;
+        page.focus = Some(NodeId(7));
+        page.search = Some(SearchSession {
+            query: "needle".into(),
+            matches: Vec::new(),
+            current: 0,
+        });
+        page.layouts = 11;
+        page.styles_run = 12;
+        page.paints = 13;
+        let before = (
+            page.surface,
+            page.timing_visible,
+            page.focus,
+            page.search.as_ref().unwrap().query.clone(),
+            page.layouts,
+            page.styles_run,
+            page.paints,
+            page.fetch_gen,
+        );
+
+        browser.update(ch('b'));
+        browser.update(ch('j'));
+        let mouse = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 0,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(browser.update(Msg::Mouse(mouse)), Effect::default());
+        browser.update(ch('b'));
+        let page = &browser.tabs[0].page;
+        let after = (
+            page.surface,
+            page.timing_visible,
+            page.focus,
+            page.search.as_ref().unwrap().query.clone(),
+            page.layouts,
+            page.styles_run,
+            page.paints,
+            page.fetch_gen,
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn unavailable_persistence_keeps_mutations_in_memory_without_save_work() {
+        let mut browser = Browser::with_bookmark_persistence(40, 7, false, false);
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        set_browser_page(&mut browser, 0, "https://page.test/", "Page");
+        let effect = browser.update(ch('a'));
+        assert!(effect.bookmark_save.is_none());
+        assert_eq!(browser.bookmarks.len(), 1);
+        browser.update(ch('b'));
+        assert!(browser.bookmark_status().contains("unavailable"));
+    }
+
+    #[test]
     fn tab_operations_are_ordered_wrapping_bounded_and_never_reuse_ids() {
         let mut browser = Browser::new(40, 8);
         let first = browser.tabs[0].id;
@@ -6698,6 +6812,112 @@ mod tests {
         assert_eq!(browser.tabs.len(), MAX_TABS);
         eprintln!(
             "M11.21 16-tab idle: no Browser poll/tick exists; the event loop remains on blocking recv"
+        );
+    }
+
+    /// Reproducible M11.22 release measurement. The worker has no path, so the
+    /// timed submission includes only the UI-side snapshot and short lock,
+    /// never filesystem latency.
+    #[test]
+    #[ignore = "release performance measurement"]
+    fn measure_full_bookmark_library_inputs() {
+        fn settle(browser: &mut Browser, url: &str, markup: &str) {
+            let id = browser.start_navigation(url.into()).fetch.unwrap().0;
+            browser.update(Msg::Loaded {
+                id,
+                url: url.into(),
+                status: 200,
+                body: markup.as_bytes().to_vec(),
+                elapsed: Duration::ZERO,
+                content_type: Some("text/html".into()),
+                set_cookie: vec![],
+                metadata: Metadata::default(),
+            });
+            browser.update(Msg::Parsed {
+                id,
+                dom: crate::html::parse(markup),
+                elapsed: Duration::ZERO,
+            });
+        }
+
+        let hn = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/news.ycombinator.com.html"
+        ));
+        let wikipedia = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        let mut browser = Browser::with_bookmark_persistence(120, 35, false, true);
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        settle(&mut browser, "https://news.ycombinator.com/", hn);
+        browser.update(ch('t'));
+        settle(&mut browser, "https://en.wikipedia.org/wiki/Cat", wikipedia);
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        for n in 0..MAX_BOOKMARKS {
+            assert_eq!(
+                browser.bookmarks.add(
+                    Arc::from(format!("https://saved.test/{n}#cat")),
+                    Arc::from(format!("保存した猫 {n}"))
+                ),
+                AddResult::Added
+            );
+        }
+        browser.bookmark_selected = Some(0);
+        let counters: Vec<_> = browser
+            .tabs
+            .iter()
+            .map(|tab| (tab.page.layouts, tab.page.styles_run, tab.page.paints))
+            .collect();
+        let mut frame = Frame::new(120, 35);
+
+        const DRAW_ROUNDS: u32 = 200;
+        let draw_started = Instant::now();
+        for _ in 0..DRAW_ROUNDS {
+            browser.update(ch('b'));
+            browser.draw(&mut frame);
+            browser.update(ch('j'));
+            browser.draw(&mut frame);
+            browser.update(ch('b'));
+        }
+        let draw_mean = draw_started.elapsed() / (DRAW_ROUNDS * 3);
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let worker = crate::browser::bookmark_worker::BookmarkWorker::spawn(None, event_tx);
+        let _ = event_rx.recv().unwrap();
+        const EDIT_ROUNDS: u32 = 200;
+        let urls: Vec<String> = (0..EDIT_ROUNDS)
+            .map(|n| format!("https://new.test/{n}"))
+            .collect();
+        let edit_started = Instant::now();
+        for url in urls {
+            browser.update(ch('b'));
+            browser.update(ch('G'));
+            let deleted = browser.update(ch('d')).bookmark_save.unwrap();
+            worker.submit(deleted.0, deleted.1);
+            browser.update(ch('b'));
+            browser.tabs[browser.active].page.fetch = Fetch::Loaded {
+                url,
+                status: 200,
+                body: Vec::new(),
+            };
+            let added = browser.update(ch('a')).bookmark_save.unwrap();
+            worker.submit(added.0, added.1);
+        }
+        let edit_mean = edit_started.elapsed() / (EDIT_ROUNDS * 2);
+        worker.shutdown();
+        eprintln!(
+            "M11.22 1,024-record CJK library: open/move/close + draw mean {draw_mean:?}; add/delete snapshot submission mean {edit_mean:?}"
+        );
+        assert!(draw_mean < Duration::from_millis(10));
+        assert!(edit_mean < Duration::from_millis(10));
+        assert_eq!(
+            browser
+                .tabs
+                .iter()
+                .map(|tab| (tab.page.layouts, tab.page.styles_run, tab.page.paints))
+                .collect::<Vec<_>>(),
+            counters
         );
     }
 

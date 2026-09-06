@@ -967,3 +967,26 @@ The server observes two requests across `A → B → back`, then exactly one
 conditional request for reload. These are latency observations, not thresholds;
 the structural counter assertions separately pin one downstream pipeline per
 accepted representation and no network effect on the fresh hit.
+
+---
+
+## M11.22 — bookmarks (2026-09-06)
+
+Release measurement on Machine A uses a full 1,024-record library with CJK
+titles over settled Hacker News and Wikipedia tabs. It interleaves modal
+open/move/close and cached-frame drawing, then delete/add mutations whose
+immutable snapshots are submitted through the worker's real short-lock handle
+with persistence disabled (so filesystem latency cannot enter the input turn):
+
+    cargo test --release measure_full_bookmark_library_inputs \
+      --lib -- --ignored --nocapture --test-threads=1
+
+| operation | mean per input |
+| --- | ---: |
+| bookmark open/move/close with library draw | 11.615 µs |
+| add/delete plus 1,024-record shallow snapshot submission | 7.887 µs |
+
+Both are far inside the 10 ms keypress budget. Counter assertions remain flat
+for style, layout and paint in both settled tabs throughout; persistence uses a
+condition variable and the interactive event loop returns to blocking `recv`
+after acknowledgements, so the loaded idle path has no poll or timer.

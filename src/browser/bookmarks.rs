@@ -368,6 +368,18 @@ mod tests {
         assert!(encode(&[bookmark("https://a.test/", &(title + "x"))]).is_err());
         assert!(sanitize_title(&"猫".repeat(300)).len() <= MAX_TITLE_BYTES);
         assert!(decode(&vec![b'x'; MAX_FILE_BYTES + 1]).is_err());
+
+        let prefix = "https://example.test/";
+        let exact_url = format!("{prefix}{}", "x".repeat(MAX_URL_BYTES - prefix.len()));
+        assert_eq!(exact_url.len(), MAX_URL_BYTES);
+        assert!(encode(&[bookmark(&exact_url, "title")]).is_ok());
+        assert!(encode(&[bookmark(&(exact_url + "x"), "title")]).is_err());
+
+        let mut too_many = HEADER.to_vec();
+        for n in 0..=MAX_BOOKMARKS {
+            too_many.extend_from_slice(format!("https://example.test/{n}\ttitle\n").as_bytes());
+        }
+        assert!(decode(&too_many).is_err());
     }
 
     #[test]
