@@ -6326,8 +6326,13 @@ mod tests {
         }
         dispatch(effect, &tx);
         loop {
+            // The full suite runs more than a thousand tests in parallel; a
+            // document worker can be runnable without receiving a timeslice
+            // inside the old two-second harness deadline. Keep a finite
+            // deadline for genuine worker failures without making scheduler
+            // pressure look like a cache/navigation failure.
             let msg = rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("document worker did not settle");
             let parsed = matches!(msg, Msg::Parsed { .. });
             let next = app.update(msg);
