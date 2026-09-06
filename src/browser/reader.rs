@@ -141,9 +141,10 @@ pub fn analyze(dom: &Dom, styles: &Styles) -> Result<ReaderView, ReaderError> {
             || (matches!(tag(dom, id), Some("header" | "footer")) && !article_context)
             || dom.attr(id, "role").is_some_and(pruned_role);
         let child_article_context = article_context || tag(dom, id) == Some("article");
-        let children: Vec<_> = dom.children(id).collect();
-        for child in children.into_iter().rev() {
-            stack.push((child, linked, blocks_descendants, child_article_context));
+        let mut child = dom.node(id).last_child;
+        while let Some(child_id) = child {
+            child = dom.node(child_id).prev_sibling;
+            stack.push((child_id, linked, blocks_descendants, child_article_context));
         }
     }
 
@@ -152,8 +153,13 @@ pub fn analyze(dom: &Dom, styles: &Styles) -> Result<ReaderView, ReaderError> {
     let mut summaries = vec![[Summary::default(); 2]; dom.node_count()];
     let mut best: Option<Candidate> = None;
     for (document_order, &id) in order.iter().enumerate().rev() {
+        let own_text = match &dom.node(id).data {
+            NodeData::Text(text) => normalized(text),
+            _ => Run::default(),
+        };
         for context in [false, true] {
-            let summary = summarize_node(dom, styles, &summaries, &under_link, id, context);
+            let summary =
+                summarize_node(dom, styles, &summaries, &under_link, id, context, own_text);
             summaries[id.0 as usize][usize::from(context)] = summary;
         }
 
@@ -275,6 +281,7 @@ fn summarize_node(
     under_link: &[bool],
     id: NodeId,
     article_context: bool,
+    own_text: Run,
 ) -> Summary {
     if pruned(dom, styles, id, article_context) {
         return Summary::default();
@@ -284,8 +291,8 @@ fn summarize_node(
         included_nodes: 1,
         ..Summary::default()
     };
-    if let NodeData::Text(text) = &dom.node(id).data {
-        out.text = normalized(text);
+    if matches!(dom.node(id).data, NodeData::Text(_)) {
+        out.text = own_text;
         if under_link[id.0 as usize] {
             out.link = out.text;
         }
@@ -340,9 +347,10 @@ fn project(dom: &Dom, styles: &Styles, root: NodeId) -> Vec<bool> {
         }
         included[id.0 as usize] = true;
         let child_context = article_context || tag(dom, id) == Some("article");
-        let children: Vec<_> = dom.children(id).collect();
-        for child in children.into_iter().rev() {
-            stack.push((child, child_context));
+        let mut child = dom.node(id).last_child;
+        while let Some(child_id) = child {
+            child = dom.node(child_id).prev_sibling;
+            stack.push((child_id, child_context));
         }
     }
     included
