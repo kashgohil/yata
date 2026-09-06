@@ -8173,6 +8173,17 @@ mod tests {
             );
         }
         browser.bookmark_selected = Some(0);
+        let loaded = browser.bookmarks.clone();
+        const LOAD_ROUNDS: u32 = 200;
+        let mut fresh: Vec<_> = (0..LOAD_ROUNDS)
+            .map(|_| Browser::with_bookmark_persistence(80, 24, false, true))
+            .collect();
+        let load_started = Instant::now();
+        for candidate in &mut fresh {
+            candidate.update(Msg::BookmarksLoaded(Ok(loaded.clone())));
+        }
+        let load_mean = load_started.elapsed() / LOAD_ROUNDS;
+        drop(fresh);
         let counters: Vec<_> = browser
             .tabs
             .iter()
@@ -8216,8 +8227,9 @@ mod tests {
         let edit_mean = edit_started.elapsed() / (EDIT_ROUNDS * 2);
         worker.shutdown();
         eprintln!(
-            "M11.22 1,024-record CJK library: open/move/close + draw mean {draw_mean:?}; add/delete snapshot submission mean {edit_mean:?}"
+            "M11.22 1,024-record CJK library: startup apply mean {load_mean:?}; open/move/close + draw mean {draw_mean:?}; add/delete snapshot submission mean {edit_mean:?}"
         );
+        assert!(load_mean < Duration::from_millis(10));
         assert!(draw_mean < Duration::from_millis(10));
         assert!(edit_mean < Duration::from_millis(10));
         assert_eq!(
@@ -8228,6 +8240,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             counters
         );
+
+        // Candidate-only operation: the bookmark target is intentionally not
+        // fetched inside the input budget. This measures selection → ordinary
+        // navigation plan → loading frame; cache/network settlement is timed
+        // separately by the loopback cache gate.
+        browser.update(ch('b'));
+        let navigation_started = Instant::now();
+        let navigation = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        browser.draw(&mut frame);
+        let navigation_elapsed = navigation_started.elapsed();
+        assert!(navigation.fetch.is_some());
+        eprintln!(
+            "M11.25 bookmark selection -> navigation plan + loading-frame draw: {navigation_elapsed:?}"
+        );
+        assert!(navigation_elapsed < Duration::from_millis(10));
     }
 
     #[test]
@@ -17435,6 +17462,42 @@ mod tests {
             before.1,
             "scrolling fixed/sticky output relaid out"
         );
+    }
+
+    #[test]
+    #[ignore = "release performance measurement"]
+    fn measure_ordinary_and_fixed_sticky_scroll_steps() {
+        fn one(positioned: bool) -> Duration {
+            let body: String = (0..200)
+                .map(|i| format!("<p>scroll row {i} with enough text to paint</p>"))
+                .collect();
+            let chrome = positioned.then_some(
+                "<style>.tools{position:fixed;top:0}.chapter{position:sticky;top:0}p{margin:0}</style>\
+                 <div class=tools>tools</div><div class=chapter>chapter</div>",
+            );
+            let mut app = page(80, 24, &format!("{}{body}", chrome.unwrap_or("")));
+            let before = stages(&app);
+            let mut frame = Frame::new(80, 24);
+            app.draw(&mut frame);
+            const STEPS: u32 = 2_000;
+            let started = Instant::now();
+            for step in 0..STEPS {
+                app.update(if step % 2 == 0 { ch('j') } else { ch('k') });
+                app.draw(&mut frame);
+            }
+            let elapsed = started.elapsed() / STEPS;
+            assert_eq!(stages(&app).0, before.0, "scroll restyled");
+            assert_eq!(stages(&app).1, before.1, "scroll relaid out");
+            elapsed
+        }
+
+        let ordinary = one(false);
+        let positioned = one(true);
+        eprintln!(
+            "M11.25 settled scroll key -> frame, 2,000 alternating steps: ordinary {ordinary:?}, fixed/sticky {positioned:?}"
+        );
+        assert!(ordinary < Duration::from_millis(5));
+        assert!(positioned < Duration::from_millis(5));
     }
 
     #[test]

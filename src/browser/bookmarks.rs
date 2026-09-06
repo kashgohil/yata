@@ -423,4 +423,33 @@ mod tests {
         );
         assert_eq!(resolve_path(None, Some(""), Some("relative")), None);
     }
+
+    #[test]
+    #[ignore = "release bookmark codec measurement"]
+    fn measure_maximum_bookmark_file_decode() {
+        use std::time::Instant;
+
+        let prefix = "https://example.test/";
+        let records: Vec<_> = (0..MAX_BOOKMARKS)
+            .map(|n| {
+                let suffix = format!("{n}/");
+                let url = format!(
+                    "{prefix}{suffix}{}",
+                    "x".repeat(MAX_URL_BYTES - prefix.len() - suffix.len())
+                );
+                bookmark(&url, &"猫".repeat(MAX_TITLE_BYTES / 3))
+            })
+            .collect();
+        let bytes = encode(&records).unwrap();
+        const ROUNDS: u32 = 100;
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            assert_eq!(decode(&bytes).unwrap().len(), MAX_BOOKMARKS);
+        }
+        eprintln!(
+            "M11.25 maximum 1,024-record / near-maximum URL and title bookmark decode: {:?} mean ({} bytes)",
+            started.elapsed() / ROUNDS,
+            bytes.len()
+        );
+    }
 }
