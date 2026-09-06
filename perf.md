@@ -990,3 +990,36 @@ Both are far inside the 10 ms keypress budget. Counter assertions remain flat
 for style, layout and paint in both settled tabs throughout; persistence uses a
 condition variable and the interactive event loop returns to blocking `recv`
 after acknowledgements, so the loaded idle path has no poll or timer.
+
+---
+
+## M11.23 — reader projection (2026-09-06)
+
+Machine A, release build, committed offline Wikipedia fixture, 25,596 arena
+nodes at 80×24. Two hundred enter/exit pairs run after the page is completely
+loaded; the ignored measurement retains the 10 ms assertions so a miss cannot
+silently become a new threshold:
+
+    cargo test --release --lib measure_reader_toggle_on_wikipedia \
+      -- --ignored --nocapture --test-threads=1
+
+| operation | p95 | M11.23 target |
+| --- | ---: | ---: |
+| analyze + UA-only style + reader layout/paint | 17.66 ms | < 10 ms |
+| retained-normal layout/paint | 13.40 ms | < 10 ms |
+
+The wall-clock target is **not met on this machine**. This is recorded as a
+performance deviation rather than weakening the test: the same checkout's
+standalone normal Wikipedia layout benchmark is 9.53 ms before line building,
+paint, anchor restoration, or frame work, so the mandated one-layout/one-paint
+exit cannot fit a 10 ms envelope here. Functional stage accounting remains
+exact (enter 1 reader style/1 layout/1 paint; exit 0 style/1 layout/1 paint),
+and reader-specific styling skips excluded subtrees rather than resolving all
+25,596 nodes.
+
+`/usr/bin/time -l` around the same command reports a 64,848,472-byte peak
+memory footprint for the test process, below the 100 MB Wikipedia target. The
+projection itself is one byte per arena slot (25,596 bytes here); analyzer
+summaries are temporary and dropped after activation. Both toggle effects
+carry zero document, stylesheet, image, script, or fetch work, independently
+pinned by the unit suite.
