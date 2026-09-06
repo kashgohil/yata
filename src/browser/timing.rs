@@ -5,6 +5,7 @@ use std::time::Duration;
 /// M4, …) rather than reshaping the struct.
 #[derive(Default, Debug)]
 pub struct Timings {
+    pub cache: Option<CacheOutcome>,
     /// The whole request — client build → last body byte — measured on the
     /// fetch worker and shipped as `Msg::Loaded::elapsed`.
     pub fetch: Option<Duration>,
@@ -38,17 +39,40 @@ impl Timings {
     /// single source of truth for timing output: the `F4` overlay draws
     /// exactly these rows and `--timing` prints exactly these rows.
     pub fn rows(&self) -> Vec<String> {
-        [
-            ("fetch", self.fetch),
-            ("parse", self.parse),
-            ("style", self.style),
-            ("layout", self.layout),
-            ("script", self.script),
-            ("frame", self.frame),
-        ]
-        .into_iter()
-        .filter_map(|(label, dur)| dur.map(|d| format!("{label} {}", format_ms(d))))
-        .collect()
+        let mut rows = Vec::new();
+        if let Some(outcome) = self.cache {
+            rows.push(format!("cache {}", outcome.label()));
+        }
+        rows.extend(
+            [
+                ("fetch", self.fetch),
+                ("parse", self.parse),
+                ("style", self.style),
+                ("layout", self.layout),
+                ("script", self.script),
+                ("frame", self.frame),
+            ]
+            .into_iter()
+            .filter_map(|(label, dur)| dur.map(|d| format!("{label} {}", format_ms(d)))),
+        );
+        rows
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CacheOutcome {
+    Network,
+    Hit,
+    Revalidated,
+}
+
+impl CacheOutcome {
+    fn label(self) -> &'static str {
+        match self {
+            CacheOutcome::Network => "network",
+            CacheOutcome::Hit => "cache hit",
+            CacheOutcome::Revalidated => "revalidated",
+        }
     }
 }
 
@@ -114,6 +138,7 @@ mod tests {
         // Pipeline order, not struct order or alphabetical: fetch → parse →
         // style → layout → frame is the path a page actually takes.
         let all = Timings {
+            cache: None,
             fetch: Some(Duration::from_millis(40)),
             parse: Some(Duration::from_micros(31_700)),
             style: Some(Duration::from_micros(41_100)),

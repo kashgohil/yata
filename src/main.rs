@@ -84,11 +84,13 @@ fn main() -> io::Result<()> {
         // the URL bar uses. The id makes any previous generation stale; each
         // worker owns its own Sender clone.
         let url = net::normalize_url(&url);
-        let id = app.start_fetch(url.clone());
-        // The first request of the session, and the jar is empty: `Request`
-        // carries no cookies because there are none, not because this path
-        // skips the question.
-        net::spawn_fetch(id, net::Request::bare(url), tx.clone());
+        let effect = app.start_navigation(url);
+        if let Some((id, request)) = effect.fetch {
+            net::spawn_fetch(id, request, tx.clone());
+        }
+        if let Some((id, url, response, elapsed)) = effect.cached {
+            net::spawn_cached(id, url, response, elapsed, tx.clone());
+        }
     }
     // The loop keeps `tx` alive so a URL-bar commit can spawn a fetch (below);
     // the input thread gets its own clone. Because the loop holds a sender,
@@ -119,6 +121,10 @@ fn main() -> io::Result<()> {
             // means the thread does not wake for them at all.
             timers.apply(TimerRequest::CancelOthers { keep: id });
             net::spawn_fetch(id, request, tx.clone());
+        }
+        if let Some((id, url, response, elapsed)) = effect.cached {
+            timers.apply(TimerRequest::CancelOthers { keep: id });
+            net::spawn_cached(id, url, response, elapsed, tx.clone());
         }
         for request in effect.timers {
             timers.apply(request);
@@ -607,6 +613,11 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         // stale generation, so spawning its worker would be pure waste.
         if e.fetch.is_some() {
             effect.fetch = e.fetch;
+            effect.cached = None;
+        }
+        if e.cached.is_some() {
+            effect.cached = e.cached;
+            effect.fetch = None;
         }
         // Sheets accumulate rather than replace: two parses in one batch each
         // want their own sheets fetched, and a stale generation's are dropped

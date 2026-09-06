@@ -4,6 +4,7 @@ use std::sync::mpsc::Sender;
 use std::thread;
 use std::time::Instant;
 
+use crate::browser::http_cache::{Metadata, Representation};
 use crate::css;
 use crate::html;
 use crate::image;
@@ -70,6 +71,54 @@ pub fn spawn_fetch(id: FetchId, request: Request, tx: Sender<Msg>) {
             Err((url, reason)) => {
                 let _ = tx.send(Msg::NetError { id, url, reason });
             }
+        }
+    });
+}
+
+/// Re-enter stored bytes through the same asynchronous document seam as a
+/// network response. `Loaded` is sent before parsing begins, and `Parsed`
+/// follows exactly once when the response is a supported document.
+pub fn spawn_cached(
+    id: FetchId,
+    url: String,
+    response: Representation,
+    elapsed: std::time::Duration,
+    tx: Sender<Msg>,
+) {
+    thread::spawn(move || {
+        let should_parse = is_document(response.status, response.content_type.as_deref());
+        let text = should_parse.then(|| html::decode_body(&response.body));
+        if tx
+            .send(Msg::CacheMetadata {
+                id,
+                metadata: response.metadata,
+            })
+            .is_err()
+        {
+            return;
+        }
+        if tx
+            .send(Msg::Loaded {
+                id,
+                url,
+                status: response.status,
+                body: response.body,
+                elapsed,
+                content_type: response.content_type,
+                set_cookie: Vec::new(),
+            })
+            .is_err()
+        {
+            return;
+        }
+        if let Some(text) = text {
+            let started = Instant::now();
+            let dom = html::parse(&text);
+            let _ = tx.send(Msg::Parsed {
+                id,
+                dom,
+                elapsed: started.elapsed(),
+            });
         }
     });
 }
@@ -385,7 +434,7 @@ fn fetch(
     // performs exactly one request and reports what happened (M11.7a).
     let client = document_client().map_err(|reason| (url.to_string(), reason))?;
     let builder = match &request.method {
-        Method::Get => client.get(url),
+        Method::Get | Method::Conditional { .. } => client.get(url),
         Method::Post { body } => client
             .post(url)
             .header(
@@ -394,9 +443,20 @@ fn fetch(
             )
             .body(body.clone()),
     };
-    let mut resp = with_cookies(builder, request)
-        .send()
-        .map_err(|e| (url.to_string(), describe(e)))?;
+    let mut builder = with_cookies(builder, request);
+    if let Method::Conditional {
+        no_cache,
+        if_none_match,
+    } = &request.method
+    {
+        if *no_cache {
+            builder = builder.header(reqwest::header::CACHE_CONTROL, "no-cache");
+        }
+        if let Some(etag) = if_none_match {
+            builder = builder.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+    }
+    let mut resp = builder.send().map_err(|e| (url.to_string(), describe(e)))?;
     let status = resp.status().as_u16();
     // The URL this response came from. With hops through the loop it is the
     // one we asked for; reqwest still reports it, so it stays the single
@@ -423,6 +483,7 @@ fn fetch(
         .filter_map(|value| value.to_str().ok())
         .map(str::to_string)
         .collect();
+    let metadata = selected_metadata(resp.headers());
 
     // A hop, and the worker's whole part in it: report where the response says
     // to go and stop. The body of a 3xx is a courtesy page nobody renders, so
@@ -456,6 +517,9 @@ fn fetch(
             return Ok(None);
         }
     }
+    if tx.send(Msg::CacheMetadata { id, metadata }).is_err() {
+        return Ok(None);
+    }
     Ok(Some(Msg::Loaded {
         id,
         url: final_url,
@@ -465,6 +529,41 @@ fn fetch(
         content_type,
         set_cookie,
     }))
+}
+
+fn selected_metadata(headers: &reqwest::header::HeaderMap) -> Metadata {
+    const MAX_LINES: usize = 32;
+    fn lines(
+        headers: &reqwest::header::HeaderMap,
+        name: reqwest::header::HeaderName,
+    ) -> (Vec<String>, bool) {
+        let mut out = Vec::new();
+        let mut unusable = false;
+        for value in headers.get_all(name).iter() {
+            if out.len() == MAX_LINES {
+                unusable = true;
+                break;
+            }
+            match value.to_str() {
+                Ok(value) => out.push(value.to_string()),
+                Err(_) => unusable = true,
+            }
+        }
+        (out, unusable)
+    }
+    let (cache_control, control_bad) = lines(headers, reqwest::header::CACHE_CONTROL);
+    let (vary, vary_unusable) = lines(headers, reqwest::header::VARY);
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let age = headers
+        .get(reqwest::header::AGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut metadata = Metadata::bounded(cache_control, etag, age, vary, vary_unusable);
+    metadata.over_limit |= control_bad;
+    metadata
 }
 
 /// reqwest's top-level Display is vague ("error sending request…"); the
@@ -613,10 +712,17 @@ mod tests {
             matches!(parsed, Msg::Parsed { .. }),
             "expected Parsed last, got {parsed:?}"
         );
-        let (loaded, progress) = rest.split_last().expect("no Loaded before Parsed");
+        let (loaded, before_loaded) = rest.split_last().expect("no Loaded before Parsed");
         assert!(
             matches!(loaded, Msg::Loaded { .. }),
             "expected Loaded before Parsed, got {loaded:?}"
+        );
+        let (metadata, progress) = before_loaded
+            .split_last()
+            .expect("no CacheMetadata before Loaded");
+        assert!(
+            matches!(metadata, Msg::CacheMetadata { .. }),
+            "expected CacheMetadata before Loaded, got {metadata:?}"
         );
         (progress, loaded, parsed)
     }
@@ -829,6 +935,56 @@ mod tests {
             html::debug_tree(dom).contains("#text \"hello world\""),
             "the parsed tree must contain the body text:\n{}",
             html::debug_tree(dom)
+        );
+    }
+
+    #[test]
+    fn conditional_document_headers_and_selected_metadata_cross_the_seam_exactly() {
+        let (addr, seen) = serve_capturing(1, |_| {
+            b"HTTP/1.1 304 Not Modified\r\nCache-Control: no-cache\r\n\
+              Cache-Control: max-age=\"60\"\r\nETag: W/\"one\"\r\nAge: 7\r\n\
+              Vary: Cookie, Accept-Encoding\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_vec()
+        });
+        let (tx, rx) = mpsc::channel();
+        spawn_fetch(
+            FetchId(9),
+            Request {
+                url: format!("http://{addr}/a"),
+                cookie: None,
+                method: Method::Conditional {
+                    no_cache: true,
+                    if_none_match: Some("W/\"one\"".into()),
+                },
+            },
+            tx,
+        );
+        let msgs = drain(rx);
+        let metadata = msgs
+            .iter()
+            .find_map(|msg| match msg {
+                Msg::CacheMetadata { metadata, .. } => Some(metadata),
+                _ => None,
+            })
+            .expect("metadata did not cross the channel");
+        assert_eq!(metadata.cache_control, ["no-cache", "max-age=\"60\""]);
+        assert_eq!(metadata.etag.as_deref(), Some("W/\"one\""));
+        assert_eq!(metadata.age.as_deref(), Some("7"));
+        assert_eq!(metadata.vary, ["Cookie, Accept-Encoding"]);
+        assert!(
+            matches!(msgs.last(), Some(Msg::Loaded { status: 304, body, .. }) if body.is_empty())
+        );
+
+        let request = &seen.lock().unwrap()[0];
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("cache-control: no-cache\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.contains("if-none-match: W/\"one\"\r\n"),
+            "{request}"
         );
     }
 
@@ -1114,7 +1270,10 @@ mod tests {
             let addr = serve_once(response.into_bytes());
             let (tx, rx) = mpsc::channel();
             spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/x")), tx);
-            drain(rx).remove(0)
+            drain(rx)
+                .into_iter()
+                .find(|msg| matches!(msg, Msg::Redirect { .. } | Msg::Loaded { .. }))
+                .expect("worker sent no terminal response")
         };
         for status in [301, 302, 303, 307, 308] {
             match hop(status, "Location: /next\r\n") {

@@ -7,6 +7,9 @@ use crate::browser::fragment;
 use crate::browser::help;
 use crate::browser::hints;
 use crate::browser::history::History;
+use crate::browser::http_cache::{
+    Cache, Key as CacheKey, Metadata, Plan, Representation, RequestMode,
+};
 use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::search::{self, Match as SearchMatch};
@@ -44,6 +47,9 @@ pub struct Effect {
     /// to `net::spawn_fetch`. `App` starts the fetch generation; the loop owns
     /// the worker thread. Keeps `App` pure of the network.
     pub fetch: Option<(FetchId, net::Request)>,
+    /// Stored response bytes to parse on a detached worker. Mutually exclusive
+    /// with `fetch` for one navigation.
+    pub cached: Option<(FetchId, String, Representation, Duration)>,
     /// Linked stylesheets to fetch, as (fetch id, document slot, request).
     /// The loop spawns one worker each, in the same turn — they must not queue
     /// behind one another (PLAN.md M4: fetched in parallel), and the page is
@@ -307,6 +313,13 @@ pub struct App {
     /// only and host-only; read by `document.cookie` and, since M11.7, by
     /// every request this app makes — see `App::request` and `js::cookies`.
     cookies: Jar,
+    /// Session document cache. Page teardown deliberately never clears it.
+    cache: Cache,
+    cache_epoch: Instant,
+    cache_key: Option<CacheKey>,
+    cache_candidate: Option<CacheKey>,
+    response_metadata: Option<Metadata>,
+    document_source: net::DocumentSource,
     /// Everything this page's JavaScript had to say (M10.7): console calls,
     /// uncaught exceptions, scripts skipped for their type — one ordered list,
     /// shown by `F5`. Page-local like the host: cleared on navigation, because
@@ -472,6 +485,12 @@ impl App {
             script_queue_page: None,
             storage: Storage::new(),
             cookies: Jar::new(),
+            cache: Cache::default(),
+            cache_epoch: Instant::now(),
+            cache_key: None,
+            cache_candidate: None,
+            response_metadata: None,
+            document_source: net::DocumentSource::Network,
             console: Console::new(),
             console_view: Viewport::default(),
             console_view_built: false,
@@ -560,6 +579,10 @@ impl App {
         // A chain belongs to the navigation that started it (M11.7a): a page
         // reached through three hops must not count them against the next one.
         self.hops = Hops::default();
+        self.cache_key = None;
+        self.cache_candidate = None;
+        self.response_metadata = None;
+        self.document_source = net::DocumentSource::Network;
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
@@ -634,6 +657,12 @@ impl App {
                     _ => Effect::default(),
                 }
             }
+            Msg::CacheMetadata { id, metadata } => {
+                if Some(id) == self.current_fetch {
+                    self.response_metadata = Some(metadata);
+                }
+                Effect::default()
+            }
             Msg::Loaded {
                 id,
                 url,
@@ -646,13 +675,27 @@ impl App {
                 if Some(id) != self.current_fetch {
                     return Effect::default();
                 }
+                let metadata = self.response_metadata.take().unwrap_or_default();
                 // Only an accepted fetch records its duration (PLAN.md §4) —
                 // and it is the **whole chain**, not the last hop of one
                 // (M11.7a). A redirect that reported only its landing page
                 // would show `--timing` and `F4` a fast fetch with two slow
                 // ones hidden inside it, which is the kind of wrong number that
                 // is worse than none.
-                self.timings.fetch = Some(self.hops.elapsed + elapsed);
+                match self.document_source {
+                    net::DocumentSource::Network => {
+                        self.timings.fetch = Some(self.hops.elapsed + elapsed);
+                        self.timings.cache = Some(timing::CacheOutcome::Network);
+                    }
+                    net::DocumentSource::CacheHit => {
+                        self.timings.fetch = None;
+                        self.timings.cache = Some(timing::CacheOutcome::Hit);
+                    }
+                    net::DocumentSource::Revalidated => {
+                        self.timings.fetch = Some(self.hops.elapsed + elapsed);
+                        self.timings.cache = Some(timing::CacheOutcome::Revalidated);
+                    }
+                }
                 // The session, before anything else this response does with
                 // itself (M11.7). Scoped to the URL the response *came from* —
                 // post-redirect, which is what `url` already reports — and not
@@ -673,6 +716,32 @@ impl App {
                     );
                     self.console_view_built = false;
                 }
+                if status == 304 {
+                    let Some(key) = self.cache_candidate.take() else {
+                        self.apply_error_page(
+                            url,
+                            "HTTP 304 without a cached representation".into(),
+                        );
+                        return redraw();
+                    };
+                    let response = self.cache.revalidate(&key, &metadata, self.cache_now());
+                    if !set_cookie.is_empty() {
+                        self.cache.remove(&key);
+                    }
+                    let Some(response) = response else {
+                        self.apply_error_page(
+                            url,
+                            "HTTP 304 without a cached representation".into(),
+                        );
+                        return redraw();
+                    };
+                    self.document_source = net::DocumentSource::Revalidated;
+                    return Effect {
+                        dirty: true,
+                        cached: Some((id, url, response, self.hops.elapsed + elapsed)),
+                        ..Effect::default()
+                    };
+                }
                 // Non-document responses become error pages (M7 / UX §3.7).
                 if !error_page::is_document(status, content_type.as_deref()) {
                     let reason = if !(200..300).contains(&status) {
@@ -682,6 +751,24 @@ impl App {
                     };
                     self.apply_error_page(url, reason);
                     return redraw();
+                }
+                if self.document_source == net::DocumentSource::Network
+                    && let Some(key) = self.cache_key.clone()
+                {
+                    if set_cookie.is_empty() {
+                        let _ = self.cache.insert(
+                            key,
+                            Representation {
+                                status,
+                                body: body.clone(),
+                                content_type: content_type.clone(),
+                                metadata,
+                            },
+                            self.cache_now(),
+                        );
+                    } else {
+                        self.cache.remove(&key);
+                    }
                 }
                 // A redirect drops the fragment — `Location` is joined against
                 // the previous URL and a join takes the target's fragment,
@@ -750,6 +837,8 @@ impl App {
                     Fetch::Loading { method, .. } => rewrite_method(status, method),
                     _ => net::Method::Get,
                 };
+                self.cache_candidate = None;
+                self.response_metadata = None;
                 if let Fetch::Loading { method, .. } = &mut self.fetch {
                     *method = next_method.clone();
                 }
@@ -770,6 +859,7 @@ impl App {
                 }
                 let mut request = self.request(to);
                 request.method = next_method;
+                self.cache_key = CacheKey::from_request(&request);
                 Effect {
                     dirty: true,
                     fetch: Some((id, request)),
@@ -2102,6 +2192,56 @@ impl App {
         }
     }
 
+    fn cache_now(&self) -> Duration {
+        self.cache_epoch.elapsed()
+    }
+
+    fn plan_document_request(
+        &mut self,
+        id: FetchId,
+        mut request: net::Request,
+        mode: RequestMode,
+    ) -> Effect {
+        let Some(key) = CacheKey::from_request(&request) else {
+            self.cache_key = None;
+            return Effect {
+                dirty: true,
+                fetch: Some((id, request)),
+                ..Effect::default()
+            };
+        };
+        self.cache_key = Some(key.clone());
+        match self.cache.plan(&key, mode, self.cache_now()) {
+            Plan::Hit(response) => {
+                self.document_source = net::DocumentSource::CacheHit;
+                Effect {
+                    dirty: true,
+                    cached: Some((id, request.url, response, Duration::ZERO)),
+                    ..Effect::default()
+                }
+            }
+            Plan::Revalidate { etag } => {
+                self.cache_candidate = etag.as_ref().map(|_| key);
+                if mode == RequestMode::Reload || etag.is_some() {
+                    request.method = net::Method::Conditional {
+                        no_cache: mode == RequestMode::Reload,
+                        if_none_match: etag,
+                    };
+                }
+                Effect {
+                    dirty: true,
+                    fetch: Some((id, request)),
+                    ..Effect::default()
+                }
+            }
+            Plan::Miss => Effect {
+                dirty: true,
+                fetch: Some((id, request)),
+                ..Effect::default()
+            },
+        }
+    }
+
     /// Current page URL if one is known (loaded, loading, or failed).
     fn current_url(&self) -> Option<String> {
         match &self.fetch {
@@ -2116,6 +2256,13 @@ impl App {
     /// page, push it (with scroll) onto the back stack and clear forward.
     fn navigate(&mut self, url: String, push_history: bool) -> Effect {
         self.navigate_with(url, net::Method::Get, push_history)
+    }
+
+    /// Initial CLI navigation through the same cache planner as every later
+    /// top-level GET. The empty session necessarily misses, but keeping one
+    /// entry point prevents startup from becoming a policy exception.
+    pub fn start_navigation(&mut self, url: String) -> Effect {
+        self.navigate(url, false)
     }
 
     /// A navigation that may be a POST (M11.11). GET still goes through
@@ -2155,11 +2302,15 @@ impl App {
             *slot = method.clone();
         }
         let mut request = self.request(url);
-        request.method = method;
-        Effect {
-            dirty: true,
-            fetch: Some((id, request)),
-            ..Effect::default()
+        request.method = method.clone();
+        if matches!(method, net::Method::Post { .. }) {
+            Effect {
+                dirty: true,
+                fetch: Some((id, request)),
+                ..Effect::default()
+            }
+        } else {
+            self.plan_document_request(id, request, RequestMode::Ordinary)
         }
     }
 
@@ -2258,11 +2409,8 @@ impl App {
         // After `start_fetch`, deliberately: a restored entry's URL may carry a
         // fragment, and the offset the reader left is the more specific answer.
         self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
-        Effect {
-            dirty: true,
-            fetch: Some((id, self.request(url))),
-            ..Effect::default()
-        }
+        let request = self.request(url);
+        self.plan_document_request(id, request, RequestMode::Ordinary)
     }
 
     fn history_go(&mut self, back: bool) -> Effect {
@@ -2317,11 +2465,8 @@ impl App {
         self.hint = None;
         let id = self.start_fetch(url.clone());
         self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
-        Effect {
-            dirty: true,
-            fetch: Some((id, self.request(url))),
-            ..Effect::default()
-        }
+        let request = self.request(url);
+        self.plan_document_request(id, request, RequestMode::Reload)
     }
 
     fn yank_page_url(&mut self) -> Effect {
@@ -4469,6 +4614,7 @@ fn same_document(a: &str, b: &str) -> bool {
 fn rewrite_method(status: u16, method: &net::Method) -> net::Method {
     match (status, method) {
         (301..=303, net::Method::Post { .. }) => net::Method::Get,
+        (_, net::Method::Conditional { .. }) => net::Method::Get,
         (_, method) => method.clone(),
     }
 }
@@ -4486,9 +4632,175 @@ mod tests {
     use super::*;
     use crate::term::Color;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Msg {
         Msg::Key(KeyEvent::new(code, mods))
+    }
+
+    fn cache_metadata(control: &[&str], etag: Option<&str>) -> Metadata {
+        Metadata::bounded(
+            control.iter().map(|line| line.to_string()).collect(),
+            etag.map(str::to_string),
+            None,
+            Vec::new(),
+            false,
+        )
+    }
+
+    fn load_cacheable(app: &mut App, id: FetchId, url: &str, body: &[u8], metadata: Metadata) {
+        app.update(Msg::CacheMetadata { id, metadata });
+        app.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: body.to_vec(),
+            elapsed: Duration::from_millis(2),
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+        });
+    }
+
+    fn apply_cached_effect(app: &mut App, effect: Effect) {
+        let (id, url, response, elapsed) = effect.cached.expect("expected a cache hit");
+        let (tx, rx) = mpsc::channel();
+        net::spawn_cached(id, url, response, elapsed, tx);
+        while let Ok(msg) = rx.recv_timeout(Duration::from_secs(2)) {
+            let parsed = matches!(msg, Msg::Parsed { .. });
+            app.update(msg);
+            if parsed {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_history_hit_mints_a_generation_rebuilds_and_restores_scroll_without_fetch() {
+        let mut app = App::new(40, 6);
+        let a = "http://cache.test/a";
+        let first = app.start_navigation(a.into());
+        let first_id = first.fetch.unwrap().0;
+        let body = (0..30)
+            .map(|n| format!("<div>row {n}</div>"))
+            .collect::<String>();
+        load_cacheable(
+            &mut app,
+            first_id,
+            a,
+            body.as_bytes(),
+            cache_metadata(&["max-age=60"], Some("\"a1\"")),
+        );
+        app.update(Msg::Parsed {
+            id: first_id,
+            dom: crate::html::parse(&body),
+            elapsed: Duration::ZERO,
+        });
+        assert!(app.viewport.scroll_to_offset(7));
+
+        let b = app.navigate("http://cache.test/b".into(), true);
+        let b_id = b.fetch.unwrap().0;
+        load(&mut app, b_id, b"b".to_vec());
+        let before = (app.layouts, app.styles_run, app.paints);
+
+        let back = app.history_go(true);
+        assert!(back.fetch.is_none(), "fresh A started network work");
+        let hit_id = back.cached.as_ref().unwrap().0;
+        assert_ne!(hit_id, first_id, "cache reuse resurrected a generation");
+        apply_cached_effect(&mut app, back);
+        assert_eq!(app.viewport.offset(), 7);
+        assert_eq!(
+            (app.layouts, app.styles_run, app.paints),
+            (before.0 + 1, before.1 + 1, before.2 + 1)
+        );
+        assert_eq!(app.timings.cache, Some(timing::CacheOutcome::Hit));
+        assert_eq!(app.timings.fetch, None);
+    }
+
+    #[test]
+    fn stale_etag_revalidates_exactly_and_304_reuses_the_stored_representation() {
+        let mut app = App::new(40, 8);
+        let a = "http://cache.test/a";
+        let first = app.start_navigation(a.into());
+        let first_id = first.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            first_id,
+            a,
+            b"old body",
+            cache_metadata(&[], Some("W/\"one\"")),
+        );
+
+        let b = app.navigate("http://cache.test/b".into(), true);
+        let b_id = b.fetch.unwrap().0;
+        load(&mut app, b_id, b"b".to_vec());
+        let back = app.history_go(true);
+        let (id, request) = back.fetch.expect("stale entry did not validate");
+        assert_eq!(
+            request.method,
+            net::Method::Conditional {
+                no_cache: false,
+                if_none_match: Some("W/\"one\"".into())
+            }
+        );
+        app.update(Msg::CacheMetadata {
+            id,
+            metadata: cache_metadata(&["max-age=60"], Some("\"two\"")),
+        });
+        let reuse = app.update(Msg::Loaded {
+            id,
+            url: a.into(),
+            status: 304,
+            body: Vec::new(),
+            elapsed: Duration::from_millis(3),
+            content_type: None,
+            set_cookie: Vec::new(),
+        });
+        apply_cached_effect(&mut app, reuse);
+        assert!(matches!(&app.fetch, Fetch::Loaded { body, .. } if body == b"old body"));
+        assert_eq!(app.timings.cache, Some(timing::CacheOutcome::Revalidated));
+        assert_eq!(app.timings.fetch, Some(Duration::from_millis(3)));
+
+        let reload = app.reload();
+        let (_, request) = reload.fetch.expect("reload did not validate");
+        assert_eq!(
+            request.method,
+            net::Method::Conditional {
+                no_cache: true,
+                if_none_match: Some("\"two\"".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn post_and_set_cookie_responses_are_never_inserted() {
+        let mut app = App::new(40, 8);
+        let url = "http://cache.test/login";
+        let post = app.navigate_with(url.into(), net::Method::Post { body: "x=1".into() }, false);
+        let id = post.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            id,
+            url,
+            b"post",
+            cache_metadata(&["max-age=60"], None),
+        );
+        assert!(app.navigate(url.into(), false).fetch.is_some());
+
+        let id = app.current_fetch.unwrap();
+        app.update(Msg::CacheMetadata {
+            id,
+            metadata: cache_metadata(&["max-age=60"], None),
+        });
+        app.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: b"cookie".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: vec!["sid=one; Path=/".into()],
+        });
+        assert!(app.navigate(url.into(), false).fetch.is_some());
     }
 
     fn ch(c: char) -> Msg {
@@ -5340,14 +5652,16 @@ mod tests {
             row0.starts_with("line0"),
             "body must stay visible: {row0:?}"
         );
-        assert!(row0.ends_with("fetch 12.3 ms"), "row was {row0:?}");
+        assert!(row0.ends_with("cache network"), "row was {row0:?}");
         let row1 = row_text(&frame, 1);
+        assert!(row1.ends_with("fetch 12.3 ms"), "row was {row1:?}");
+        let row2 = row_text(&frame, 2);
         assert!(
-            row1.ends_with(" frame 2.1 ms"),
-            "rows must pad to the widest row: {row1:?}"
+            row2.ends_with(" frame 2.1 ms"),
+            "rows must pad to the widest row: {row2:?}"
         );
         // The box: 13 cells wide, right-aligned to the frame edge, reversed.
-        for y in 0..2 {
+        for y in 0..3 {
             for x in 27..40 {
                 assert!(
                     frame.get(x, y).attrs.contains(Attrs::REVERSE),
@@ -5361,6 +5675,7 @@ mod tests {
         let rows = app.timings().rows();
         assert_eq!(&row0[27..], rows[0]);
         assert_eq!(row1[27..].trim_start(), rows[1]);
+        assert_eq!(row2[27..].trim_start(), rows[2]);
     }
 
     #[test]
@@ -5372,7 +5687,10 @@ mod tests {
         assert_eq!(app.update(f4()), redraw());
         let mut shown = Frame::new(40, 10);
         app.draw(&mut shown);
-        assert!(row_text(&shown, 0).ends_with("ms"), "overlay must show");
+        assert!(
+            row_text(&shown, 0).ends_with("cache network"),
+            "overlay must show"
+        );
 
         assert_eq!(app.update(f4()), redraw());
         let mut after = Frame::new(40, 10);
@@ -5410,7 +5728,7 @@ mod tests {
             if h == 2 {
                 // The one page row carries the first timing row; the second
                 // row is clipped rather than spilling onto the statusline.
-                assert!(row_text(&overlaid, 0).ends_with("fetch 12.3 ms"));
+                assert!(row_text(&overlaid, 0).ends_with("cache network"));
             }
         }
     }
@@ -12671,7 +12989,7 @@ mod tests {
         let mut frame = Frame::new(40, 6);
         app.draw(&mut frame);
         assert!(
-            row_text(&frame, 0).ends_with("fetch 12.3 ms"),
+            row_text(&frame, 0).ends_with("cache network"),
             "overlay must stay up under the URL bar"
         );
         let bottom = row_text(&frame, 5);
@@ -13754,7 +14072,8 @@ body { margin: 0 } div, p { margin: 0 }
                 "no layout row in F4: {rows:?}"
             );
             assert!(
-                rows.iter().all(|r| r.ends_with(" ms")),
+                rows.iter()
+                    .all(|r| r == "cache network" || r.ends_with(" ms")),
                 "F4 row is not a duration: {rows:?}"
             );
         }

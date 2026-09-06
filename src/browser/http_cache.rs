@@ -95,7 +95,10 @@ pub struct Key {
 
 impl Key {
     pub fn from_request(request: &net::Request) -> Option<Key> {
-        if !matches!(request.method, net::Method::Get) {
+        if !matches!(
+            request.method,
+            net::Method::Get | net::Method::Conditional { .. }
+        ) {
             return None;
         }
         let mut url = reqwest::Url::parse(&request.url).ok()?;
@@ -306,12 +309,12 @@ fn policy(metadata: &Metadata) -> Option<Policy> {
     if no_store {
         return None;
     }
-    let etag_usable = metadata.etag.as_ref().is_some_and(|tag| !tag.is_empty());
+    let etag_usable = metadata.etag.as_deref().is_some_and(usable_etag);
     if !has_max_age && !etag_usable {
         return None;
     }
-    let conflicting = max_ages.windows(2).any(|pair| pair[0] != pair[1]);
-    let max_age = if malformed_max_age || conflicting {
+    let duplicate = max_ages.len() > 1;
+    let max_age = if malformed_max_age || duplicate {
         Duration::ZERO
     } else {
         max_ages.first().copied().unwrap_or(Duration::ZERO)
@@ -325,6 +328,11 @@ fn policy(metadata: &Metadata) -> Option<Policy> {
         lifetime: max_age.saturating_sub(age),
         no_cache,
     })
+}
+
+fn usable_etag(tag: &str) -> bool {
+    let tag = tag.strip_prefix("W/").unwrap_or(tag);
+    tag.len() >= 2 && tag.starts_with('"') && tag.ends_with('"')
 }
 
 fn split_directives(line: &str) -> Vec<&str> {

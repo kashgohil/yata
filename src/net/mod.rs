@@ -1,8 +1,8 @@
 mod fetch;
 
 pub use fetch::{
-    JsResponse, MAX_FETCH_BYTES, MAX_SCRIPT_BYTES, is_document, spawn_fetch, spawn_image,
-    spawn_js_fetch, spawn_script, spawn_stylesheet,
+    JsResponse, MAX_FETCH_BYTES, MAX_SCRIPT_BYTES, is_document, spawn_cached, spawn_fetch,
+    spawn_image, spawn_js_fetch, spawn_script, spawn_stylesheet,
 };
 
 /// Default a bare URL to `https://`. The single place scheme defaulting lives,
@@ -281,6 +281,11 @@ pub struct Request {
 pub enum Method {
     #[default]
     Get,
+    /// A document GET whose cache directives were selected by the UI cache.
+    Conditional {
+        no_cache: bool,
+        if_none_match: Option<String>,
+    },
     /// `application/x-www-form-urlencoded` body. The Content-Type is implied;
     /// the worker writes it, so a GET cannot grow one by forgetting a branch.
     Post { body: String },
@@ -297,4 +302,11 @@ impl Request {
             method: Method::Get,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentSource {
+    Network,
+    CacheHit,
+    Revalidated,
 }
