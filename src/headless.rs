@@ -398,6 +398,16 @@ const HEADLESS_PAGE: u64 = 1;
 /// `width`/`height` attrs when the page gives them, placeholder-sized when it
 /// does not. Discovery still runs; without it layout drops `<img>` entirely.
 pub fn box_dump(dom: &mut Dom, base_url: Option<&str>, width: u16) -> String {
+    box_dump_with_viewport(dom, base_url, width, 1)
+}
+
+/// [`box_dump`] with an explicit page height for fixed/sticky layout goldens.
+pub fn box_dump_with_viewport(
+    dom: &mut Dom,
+    base_url: Option<&str>,
+    width: u16,
+    viewport_height: u16,
+) -> String {
     // Scripts first, and through the shared rule above: the boxes a golden
     // pins must be the boxes a reader would see, which means after the page's
     // own script has had its one pass at the tree.
@@ -406,7 +416,13 @@ pub fn box_dump(dom: &mut Dom, base_url: Option<&str>, width: u16) -> String {
     let styles = style::style_tree(dom, &sheets.iter().collect::<Vec<_>>());
     let imgs = image::discover(dom, base_url);
     let img_ctx = ImageContext::from_discovery(&imgs, &mut ImageCache::default());
-    let (tree, _revealed) = layout::layout_document_readable(dom, &styles, width, &img_ctx);
+    let (tree, _revealed) = layout::layout_document_readable_with_viewport(
+        dom,
+        &styles,
+        width,
+        viewport_height,
+        &img_ctx,
+    );
     let mut text = inspector::box_lines(dom, &tree).join("\n");
     text.push('\n');
     text

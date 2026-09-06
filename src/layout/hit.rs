@@ -37,6 +37,81 @@ pub fn hit_test(tree: &LayoutTree, x: i32, y: i32) -> Option<NodeId> {
     hit_box(tree, tree.root, x, y, Clip::NONE)
 }
 
+/// Hit-test a terminal page coordinate at a document scroll offset. Fixed and
+/// sticky adjustments come only from the layout tree; this remains a pure
+/// geometry query and never asks style or DOM code to re-resolve positioning.
+pub fn hit_test_viewport(
+    tree: &LayoutTree,
+    x: i32,
+    screen_y: i32,
+    scroll_y: i32,
+) -> Option<NodeId> {
+    hit_box_viewport(tree, tree.root, x, screen_y, scroll_y, Clip::NONE)
+}
+
+pub fn has_viewport_adjustment(tree: &LayoutTree) -> bool {
+    tree.boxes
+        .iter()
+        .any(|b| b.fixed_viewport || b.sticky.is_some())
+}
+
+pub fn link_at_viewport(
+    tree: &LayoutTree,
+    dom: &Dom,
+    x: i32,
+    screen_y: i32,
+    scroll_y: i32,
+) -> Option<(NodeId, String)> {
+    nearest_link(dom, hit_test_viewport(tree, x, screen_y, scroll_y)?)
+}
+
+fn hit_box_viewport(
+    tree: &LayoutTree,
+    id: BoxId,
+    x: i32,
+    screen_y: i32,
+    scroll_y: i32,
+    clip: Clip,
+) -> Option<NodeId> {
+    let b = tree.get(id);
+    let doc_y = positioned_doc_y(b, screen_y, scroll_y);
+    let child_clip = if b.fixed_viewport {
+        Clip::NONE
+    } else {
+        clip.inside(b)
+    };
+    let mut best = None;
+    for &child in &b.children {
+        if let Some(node) = hit_box_viewport(tree, child, x, screen_y, scroll_y, child_clip) {
+            best = Some(node);
+        }
+    }
+    if best.is_some() {
+        return best;
+    }
+    (clip.contains(x, doc_y) && contains(b.dimensions.border_box(), x, doc_y))
+        .then_some(b.node)
+        .flatten()
+}
+
+fn positioned_doc_y(b: &crate::layout::LayoutBox, screen_y: i32, scroll_y: i32) -> i32 {
+    match b.sticky {
+        Some(constraint) => {
+            let max_delta = constraint
+                .containing_end
+                .saturating_sub(constraint.static_end)
+                .max(0);
+            let delta = scroll_y
+                .saturating_add(constraint.inset)
+                .saturating_sub(constraint.static_start)
+                .clamp(0, max_delta);
+            screen_y.saturating_add(scroll_y).saturating_sub(delta)
+        }
+        None if b.fixed_viewport => screen_y,
+        None => screen_y.saturating_add(scroll_y),
+    }
+}
+
 fn hit_box(tree: &LayoutTree, id: BoxId, x: i32, y: i32, clip: Clip) -> Option<NodeId> {
     let b = tree.get(id);
     // Prefer a descendant: later paint order sits on top, and text fragments
@@ -124,6 +199,74 @@ pub fn visible_links(tree: &LayoutTree, dom: &Dom, top: i32, bottom: i32) -> Vec
         .into_iter()
         .filter(|l| l.y >= top && l.y < bottom)
         .collect()
+}
+
+/// Visible links expressed so `y - scroll` remains their final frame row for
+/// document, fixed, and sticky coordinate spaces alike.
+pub fn visible_links_viewport(
+    tree: &LayoutTree,
+    dom: &Dom,
+    scroll_y: i32,
+    page_h: i32,
+) -> Vec<LinkHit> {
+    collect_links(tree, dom)
+        .into_iter()
+        .filter_map(|mut link| {
+            let mut visual_y = None;
+            tree.walk(tree.root, &mut |_, b| {
+                if visual_y.is_some()
+                    || !b.node.is_some_and(|node| is_under(dom, node, link.node))
+                    || b.dimensions.content.x != link.x
+                    || b.dimensions.content.y != link.y
+                {
+                    return;
+                }
+                visual_y = Some(box_screen_y(b, scroll_y));
+            });
+            let y = visual_y?;
+            (y >= 0 && y < page_h).then(|| {
+                link.y = y.saturating_add(scroll_y);
+                link
+            })
+        })
+        .collect()
+}
+
+/// Final terminal row of a layout box for the current document scroll.
+pub fn box_screen_y(b: &crate::layout::LayoutBox, scroll_y: i32) -> i32 {
+    let y = b.dimensions.content.y;
+    match b.sticky {
+        Some(constraint) => {
+            let max_delta = constraint
+                .containing_end
+                .saturating_sub(constraint.static_end)
+                .max(0);
+            let delta = scroll_y
+                .saturating_add(constraint.inset)
+                .saturating_sub(constraint.static_start)
+                .clamp(0, max_delta);
+            y.saturating_sub(scroll_y).saturating_add(delta)
+        }
+        None if b.fixed_viewport => y,
+        None => y.saturating_sub(scroll_y),
+    }
+}
+
+/// Frame row for a text fragment beginning at a static layout coordinate.
+/// Search stores rectangles rather than box IDs, so this reconnects it to the
+/// already-built positioned geometry.
+pub fn text_screen_y(tree: &LayoutTree, x: i32, y: i32, scroll_y: i32) -> Option<i32> {
+    let mut out = None;
+    tree.walk(tree.root, &mut |_, b| {
+        if out.is_some() || b.kind != crate::layout::BoxKind::Text {
+            return;
+        }
+        let rect = b.dimensions.content;
+        if rect.y == y && x >= rect.x && x < rect.right() {
+            out = Some(box_screen_y(b, scroll_y));
+        }
+    });
+    out
 }
 
 /// Everything `Tab` can park on, in the order the reader meets it: links and
@@ -345,6 +488,27 @@ mod tests {
         let link = &links[0];
         let got = link_at(&tree, &dom, link.x, link.y);
         assert_eq!(got.map(|(_, h)| h).as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn viewport_hit_testing_finds_a_fixed_link_after_document_scroll() {
+        let dom =
+            html::parse("<p>one</p><p>two</p><p>three</p><a class=tools href=/fixed>fixed</a>");
+        let sheet =
+            crate::css::parse(".tools { position: fixed; top: 0; left: 0 } p { margin: 0 }");
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let tree = layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            40,
+            2,
+            Hidden::Respect,
+            &crate::image::ImageContext::default(),
+        );
+        assert_eq!(
+            link_at_viewport(&tree, &dom, 0, 0, 2).map(|(_, href)| href),
+            Some("/fixed".into())
+        );
     }
 
     fn node_with_id(dom: &crate::dom::Dom, id: &str) -> NodeId {

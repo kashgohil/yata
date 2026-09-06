@@ -1148,6 +1148,9 @@ mod tests {
             computed: crate::style::ComputedStyle::default(),
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         }
     }
 

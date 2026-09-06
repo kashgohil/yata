@@ -29,11 +29,12 @@ use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
 use crate::layout::engine::{
     Axis, FlexItemSource, Hidden, LIST_MARKER, edge_h, flex_sources, is_atomic_inline,
-    is_block_level, is_column, is_html_space, lays_out_as_flex,
+    is_block_level, is_column, is_html_space, lays_out_as_flex, lays_out_as_grid,
 };
 use crate::layout::field;
 use crate::style::Styles;
 use crate::style::values::{Display, FlexBasis, FlexWrap, Length};
+use crate::style::values::{GridMax, GridMin, GridPlacement, GridTrack, Position};
 
 /// The containing width handed to image sizing, and to nothing else.
 ///
@@ -77,6 +78,38 @@ impl Sizes {
             max: self.max.max(other.max),
         }
     }
+}
+
+fn intrinsic_grid_column(
+    pair: (GridPlacement, GridPlacement),
+    columns: usize,
+    auto: usize,
+) -> (usize, usize) {
+    let (start, span) = match pair {
+        (GridPlacement::Line(a), GridPlacement::Line(b)) if b > a => (a.saturating_sub(1), b - a),
+        (GridPlacement::Line(a), GridPlacement::Span(n)) => (a.saturating_sub(1), n),
+        (GridPlacement::Line(a), _) => (a.saturating_sub(1), 1),
+        (GridPlacement::Span(n), GridPlacement::Line(b)) => {
+            (b.saturating_sub(1).saturating_sub(n), n)
+        }
+        (GridPlacement::Auto, GridPlacement::Line(b)) => (b.saturating_sub(2), 1),
+        (GridPlacement::Span(n), _) | (_, GridPlacement::Span(n)) => (auto, n),
+        _ => (auto, 1),
+    };
+    let start = start.min(columns.saturating_sub(1));
+    let span = span.min(columns.saturating_sub(start)).max(1);
+    (start, span)
+}
+
+fn grid_track_accepts_intrinsic(track: GridTrack) -> bool {
+    matches!(
+        track,
+        GridTrack::Auto
+            | GridTrack::Fr(_)
+            | GridTrack::Fixed(Length::Percent(_))
+            | GridTrack::MinMax(GridMin::Auto, _)
+            | GridTrack::MinMax(_, GridMax::Fr(_))
+    )
 }
 
 /// One layout pass's intrinsic-size scratchpad.
@@ -196,7 +229,7 @@ impl<'a> IntrinsicSizer<'a> {
     }
 
     fn element_sizes(&mut self, node: NodeId, tag: &str) -> Sizes {
-        let computed = *self.styles.get(node);
+        let computed = self.styles.get(node).clone();
         if self.is_hidden(node) {
             // Generates no box, so it asks its parent for no width.
             return Sizes::ZERO;
@@ -242,7 +275,7 @@ impl<'a> IntrinsicSizer<'a> {
         let sizes = match &self.dom.node(node).data {
             NodeData::Element { tag, .. } => {
                 let tag = tag.clone();
-                let computed = *self.styles.get(node);
+                let computed = self.styles.get(node).clone();
                 if self.is_hidden(node) {
                     Sizes::ZERO
                 } else {
@@ -279,9 +312,91 @@ impl<'a> IntrinsicSizer<'a> {
             Sizes::both(control.cols)
         } else if lays_out_as_flex(computed) {
             self.flex_sizes(node, computed)
+        } else if lays_out_as_grid(computed) {
+            self.grid_sizes(node, computed)
         } else {
             self.children_sizes(node)
         }
+    }
+
+    /// Shrink-to-fit contribution of an `inline-grid`. Explicit columns sit
+    /// side by side, unlike a block container's children, so their intrinsic
+    /// contributions add. This is deliberately the same bounded subset as
+    /// layout: only single-column items grow an `auto`-like track, while spans
+    /// keep the width supplied by their tracks.
+    fn grid_sizes(&mut self, node: NodeId, computed: &crate::style::ComputedStyle) -> Sizes {
+        let tracks: Vec<_> = if computed.grid_template_columns.is_empty() {
+            vec![GridTrack::Auto]
+        } else {
+            computed
+                .grid_template_columns
+                .iter()
+                .copied()
+                .take(256)
+                .collect()
+        };
+        let mut columns: Vec<Sizes> = tracks
+            .iter()
+            .map(|track| match track {
+                GridTrack::Fixed(Length::Percent(_)) | GridTrack::Auto | GridTrack::Fr(_) => {
+                    Sizes::ZERO
+                }
+                GridTrack::Fixed(length) => Sizes::both(length.to_cells_h(0).max(0)),
+                GridTrack::MinMax(GridMin::Fixed(length), _) => {
+                    Sizes::both(length.to_cells_h(0).max(0))
+                }
+                GridTrack::MinMax(GridMin::Auto, _) => Sizes::ZERO,
+            })
+            .collect();
+        let mut auto_column = 0usize;
+        for child in self.dom.children(node) {
+            if self.is_hidden(child)
+                || self.styles.get(child).position == Position::Absolute
+                || self.styles.get(child).position == Position::Fixed
+                || matches!(&self.dom.node(child).data, NodeData::Text(text) if !text.chars().any(|c| !is_html_space(c)))
+            {
+                continue;
+            }
+            let placement = self.styles.get(child).grid_column;
+            let (column, span) = intrinsic_grid_column(placement, tracks.len(), auto_column);
+            if !matches!(placement.0, GridPlacement::Line(_))
+                && !matches!(placement.1, GridPlacement::Line(_))
+            {
+                auto_column = auto_column.saturating_add(span).rem_euclid(tracks.len());
+            }
+            if span != 1 {
+                continue;
+            }
+            let contribution = match self.dom.node(child).data {
+                NodeData::Element { .. } => self.sizes(child).grown_by(self.outer_edges(child)),
+                _ => self.sizes(child),
+            };
+            if grid_track_accepts_intrinsic(tracks[column]) {
+                columns[column] = columns[column].max_with(contribution);
+            }
+        }
+        for (size, track) in columns.iter_mut().zip(&tracks) {
+            if let GridTrack::MinMax(min, GridMax::Fixed(maximum)) = track {
+                let floor = match min {
+                    GridMin::Fixed(length) => length.to_cells_h(0).max(0),
+                    GridMin::Auto => 0,
+                };
+                let ceiling = maximum.to_cells_h(0).max(floor);
+                *size = Sizes {
+                    min: size.min.clamp(floor, ceiling),
+                    max: size.max.clamp(floor, ceiling),
+                };
+            }
+        }
+        let gap = edge_h(computed.gap.column, 0)
+            .max(0)
+            .saturating_mul(tracks.len().saturating_sub(1) as i32);
+        columns
+            .into_iter()
+            .fold(Sizes::both(gap), |sum, column| Sizes {
+                min: sum.min.saturating_add(column.min),
+                max: sum.max.saturating_add(column.max),
+            })
     }
 
     /// A flex container's sizes (§9.9), and the one place the *direction*
@@ -389,7 +504,7 @@ impl<'a> IntrinsicSizer<'a> {
     /// flex fraction (§9.9.1), which this module states plainly that it does
     /// not model.
     fn item_sizes(&mut self, child: NodeId) -> Sizes {
-        let computed = *self.styles.get(child);
+        let computed = self.styles.get(child).clone();
         let content = self.sizes(child);
         let Some(basis) = definite_basis(&computed) else {
             return content;

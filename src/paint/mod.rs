@@ -14,7 +14,9 @@ use std::sync::Arc;
 use crate::image::{
     DecodedImage, HalfBlockGrid, KittyPlacement, placeholder_grid, raster_halfblocks,
 };
-use crate::layout::{BoxKind, Clip, GridBorder, LayoutBox, LayoutTree, Rect, term_color};
+use crate::layout::{
+    BoxKind, Clip, GridBorder, LayoutBox, LayoutTree, Rect, StickyConstraint, term_color,
+};
 use crate::style::values::ColorValue;
 use crate::term::{Color, Style};
 
@@ -44,10 +46,37 @@ pub enum DisplayCommand {
     },
 }
 
+/// A command whose document coordinate is translated by a layout-produced
+/// sticky constraint when a frame is painted.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StickyCommand {
+    pub command: DisplayCommand,
+    pub constraint: StickyConstraint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CoordinateSpace {
+    Document,
+    FixedViewport,
+    Sticky(StickyConstraint),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PositionedCommand {
+    pub command: DisplayCommand,
+    pub space: CoordinateSpace,
+}
+
 /// Ordered draw list for one laid-out page.
 #[derive(Clone, Debug, Default)]
 pub struct DisplayList {
+    /// The authoritative paint order.  Coordinate-space tags are layout
+    /// output, so scroll-time painting never needs CSS or DOM access.
+    pub ordered: Vec<PositionedCommand>,
     pub commands: Vec<DisplayCommand>,
+    /// Commands in viewport coordinates; emitted once and reused on scroll.
+    pub fixed_commands: Vec<DisplayCommand>,
+    pub sticky_commands: Vec<StickyCommand>,
     pub width: i32,
     pub height: i32,
 }
@@ -64,6 +93,9 @@ pub fn paint(tree: &LayoutTree) -> DisplayList {
 pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
     let mut list = DisplayList {
         commands: Vec::new(),
+        ordered: Vec::new(),
+        fixed_commands: Vec::new(),
+        sticky_commands: Vec::new(),
         width: tree.width,
         height: tree.height,
     };
@@ -81,7 +113,36 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
                 && edge.y >= rect.y
                 && edge.y < rect.bottom()
         });
-        paint_box(b, images, &mut list, clip, resolved_grid)
+        let mut commands = Vec::new();
+        paint_box(b, images, &mut commands, clip, resolved_grid);
+        if b.fixed_viewport {
+            for command in commands {
+                list.ordered.push(PositionedCommand {
+                    command: command.clone(),
+                    space: CoordinateSpace::FixedViewport,
+                });
+                list.fixed_commands.push(command);
+            }
+        } else if let Some(constraint) = b.sticky {
+            for command in commands {
+                list.ordered.push(PositionedCommand {
+                    command: command.clone(),
+                    space: CoordinateSpace::Sticky(constraint),
+                });
+                list.sticky_commands.push(StickyCommand {
+                    command,
+                    constraint,
+                });
+            }
+        } else {
+            for command in commands {
+                list.ordered.push(PositionedCommand {
+                    command: command.clone(),
+                    space: CoordinateSpace::Document,
+                });
+                list.commands.push(command);
+            }
+        }
     });
     for border in &tree.grid_borders {
         let raw = if border.horizontal {
@@ -115,6 +176,11 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
                 visible.width
             };
             list.commands.push(DisplayCommand::GridBorder { border });
+            let command = DisplayCommand::GridBorder { border };
+            list.ordered.push(PositionedCommand {
+                command,
+                space: CoordinateSpace::Document,
+            });
         }
     }
     list
@@ -127,14 +193,14 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
 fn paint_box(
     b: &LayoutBox,
     images: &ImagePixels,
-    list: &mut DisplayList,
+    list: &mut Vec<DisplayCommand>,
     clip: Clip,
     resolved_table_grid: bool,
 ) {
     match b.kind {
         // A flex container paints exactly like a block: a background fills its
         // padding box and a border outlines it, whoever placed what is inside.
-        BoxKind::Block | BoxKind::Flex => paint_decorations(b, list, clip, true),
+        BoxKind::Block | BoxKind::Flex | BoxKind::Grid => paint_decorations(b, list, clip, true),
         BoxKind::Table | BoxKind::TableRow | BoxKind::TableCell => {
             paint_decorations(b, list, clip, !resolved_table_grid)
         }
@@ -146,7 +212,7 @@ fn paint_box(
             paint_decorations(b, list, clip, true);
             for run in crate::layout::field::runs(b) {
                 if let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) {
-                    list.commands.push(DisplayCommand::Text {
+                    list.push(DisplayCommand::Text {
                         x,
                         y: run.y,
                         text,
@@ -161,7 +227,7 @@ fn paint_box(
                 && let Some((x, text)) =
                     clip.trim_text(b.dimensions.content.x, b.dimensions.content.y, text)
             {
-                list.commands.push(DisplayCommand::Text {
+                list.push(DisplayCommand::Text {
                     x,
                     y: b.dimensions.content.y,
                     text,
@@ -206,7 +272,7 @@ fn paint_box(
                 // image falls back to the half-block grid — already cropped
                 // above, so it draws exactly the surviving cells.
                 let pixels = if cropped { None } else { pixels };
-                list.commands.push(DisplayCommand::Image {
+                list.push(DisplayCommand::Image {
                     rect: visible,
                     grid,
                     pixels,
@@ -215,7 +281,7 @@ fn paint_box(
                     && let Some((x, text)) =
                         clip.trim_text(rect.x, rect.y, &truncate_cells(alt, rect.width))
                 {
-                    list.commands.push(DisplayCommand::Text {
+                    list.push(DisplayCommand::Text {
                         x,
                         y: rect.y,
                         text,
@@ -235,12 +301,17 @@ fn paint_box(
 /// A box's background and border — everything it paints that is not its
 /// content. Shared by blocks, flex containers and form controls, because from
 /// the outside those differ only in what goes *inside* the padding box.
-fn paint_decorations(b: &LayoutBox, list: &mut DisplayList, clip: Clip, paint_border: bool) {
+fn paint_decorations(
+    b: &LayoutBox,
+    list: &mut Vec<DisplayCommand>,
+    clip: Clip,
+    paint_border: bool,
+) {
     // Background fills the padding box (CSS).
     if let ColorValue::Rgb(r, g, bcol) = b.computed.background_color {
         let rect = clip.apply(b.dimensions.padding_box());
         if rect.width > 0 && rect.height > 0 {
-            list.commands.push(DisplayCommand::FillRect {
+            list.push(DisplayCommand::FillRect {
                 rect,
                 color: Color::Rgb(r, g, bcol),
             });
@@ -259,7 +330,7 @@ fn paint_decorations(b: &LayoutBox, list: &mut DisplayList, clip: Clip, paint_bo
     {
         let rect = clip.apply(b.dimensions.border_box());
         if rect.width > 0 && rect.height > 0 {
-            list.commands.push(DisplayCommand::Border { rect });
+            list.push(DisplayCommand::Border { rect });
         }
     }
 }
@@ -292,12 +363,28 @@ pub fn paint_to_frame(
     page_h: u16,
 ) {
     let page_h = page_h as i32;
-    let visible = |y: i32, h: i32| y + h > scroll_y && y < scroll_y + page_h;
-
-    for cmd in &list.commands {
+    for entry in &list.ordered {
+        let command_scroll = match entry.space {
+            CoordinateSpace::Document => scroll_y,
+            CoordinateSpace::FixedViewport => 0,
+            CoordinateSpace::Sticky(constraint) => {
+                let max_delta = constraint
+                    .containing_end
+                    .saturating_sub(constraint.static_end)
+                    .max(0);
+                let delta = scroll_y
+                    .saturating_add(constraint.inset)
+                    .saturating_sub(constraint.static_start)
+                    .clamp(0, max_delta);
+                // `screen = document - scroll + delta`; retaining document
+                // geometry lets the ordinary frame loop apply the adjustment.
+                scroll_y.saturating_sub(delta)
+            }
+        };
+        let cmd = &entry.command;
         match cmd {
             DisplayCommand::FillRect { rect, color } => {
-                if !visible(rect.y, rect.height) {
+                if !(rect.y + rect.height > command_scroll && rect.y < command_scroll + page_h) {
                     continue;
                 }
                 let style = Style {
@@ -306,7 +393,7 @@ pub fn paint_to_frame(
                     attrs: crate::term::Attrs::NONE,
                 };
                 for row in rect.y..rect.y + rect.height {
-                    let screen_y = row - scroll_y;
+                    let screen_y = row - command_scroll;
                     if screen_y < 0 || screen_y >= page_h {
                         continue;
                     }
@@ -324,19 +411,19 @@ pub fn paint_to_frame(
                 }
             }
             DisplayCommand::Border { rect } => {
-                if !visible(rect.y, rect.height) {
+                if !(rect.y + rect.height > command_scroll && rect.y < command_scroll + page_h) {
                     continue;
                 }
-                draw_border(frame, origin_x, scroll_y, page_h, *rect);
+                draw_border(frame, origin_x, command_scroll, page_h, *rect);
             }
             DisplayCommand::GridBorder { border } => {
-                draw_grid_border(frame, origin_x, scroll_y, page_h, *border);
+                draw_grid_border(frame, origin_x, command_scroll, page_h, *border);
             }
             DisplayCommand::Text { x, y, text, style } => {
-                if !visible(*y, 1) {
+                if !(*y + 1 > command_scroll && *y < command_scroll + page_h) {
                     continue;
                 }
-                let screen_y = *y - scroll_y;
+                let screen_y = *y - command_scroll;
                 if screen_y < 0 || screen_y >= page_h {
                     continue;
                 }
@@ -368,12 +455,12 @@ pub fn paint_to_frame(
                 }
             }
             DisplayCommand::Image { rect, grid, .. } => {
-                if !visible(rect.y, rect.height) {
+                if !(rect.y + rect.height > command_scroll && rect.y < command_scroll + page_h) {
                     continue;
                 }
                 for row in 0..grid.height {
                     let doc_y = rect.y + row;
-                    let screen_y = doc_y - scroll_y;
+                    let screen_y = doc_y - command_scroll;
                     if screen_y < 0 || screen_y >= page_h {
                         continue;
                     }
@@ -431,7 +518,23 @@ pub fn kitty_placements(
     let frame_w = frame_w as i32;
     let mut out = Vec::new();
     let mut id = id_base.max(1);
-    for cmd in &list.commands {
+    for entry in &list.ordered {
+        let command_scroll = match entry.space {
+            CoordinateSpace::Document => scroll_y,
+            CoordinateSpace::FixedViewport => 0,
+            CoordinateSpace::Sticky(constraint) => {
+                let max_delta = constraint
+                    .containing_end
+                    .saturating_sub(constraint.static_end)
+                    .max(0);
+                let delta = scroll_y
+                    .saturating_add(constraint.inset)
+                    .saturating_sub(constraint.static_start)
+                    .clamp(0, max_delta);
+                scroll_y.saturating_sub(delta)
+            }
+        };
+        let cmd = &entry.command;
         let DisplayCommand::Image {
             rect,
             pixels: Some(pixels),
@@ -443,7 +546,7 @@ pub fn kitty_placements(
         if rect.width <= 0 || rect.height <= 0 {
             continue;
         }
-        let screen_y = rect.y - scroll_y;
+        let screen_y = rect.y - command_scroll;
         let screen_x = origin_x as i32 + rect.x;
         // Fully inside the page viewport (not status line) and the frame.
         if screen_y < 0 || screen_y + rect.height > page_h {
@@ -684,6 +787,189 @@ mod tests {
         // Scrolling by one row changes what is on screen.
         let row = |f: &Frame, y| (0..f.width()).map(|x| f.get(x, y).ch).collect::<String>();
         assert_ne!(row(&a, 0), row(&b, 0));
+    }
+
+    #[test]
+    fn fixed_commands_remain_in_the_viewport_when_scrolling() {
+        let dom = html::parse("<p>one</p><p>two</p><p>three</p><div class=tools>fixed</div>");
+        let sheet =
+            crate::css::parse(".tools { position: fixed; top: 0; left: 0; } p { margin: 0 }");
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let tree = layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            40,
+            2,
+            Hidden::Respect,
+            &ImageContext::default(),
+        );
+        let list = paint(&tree);
+        assert!(
+            !list.fixed_commands.is_empty(),
+            "fixed output must be tagged before the cached scroll path: {list:?}"
+        );
+        let mut frame = Frame::new(40, 2);
+        paint_to_frame(&list, &mut frame, 0, 2, 2);
+        let row: String = (0..frame.width()).map(|x| frame.get(x, 0).ch).collect();
+        assert!(row.contains("fixed"), "fixed text scrolled away: {row:?}");
+    }
+
+    #[test]
+    fn no_inset_fixed_box_uses_its_static_document_row() {
+        let t = tree(
+            "<p>before</p><div class=tools>fixed</div>",
+            ".tools { position: fixed } p { margin: 0 }",
+            40,
+        );
+        let list = paint(&t);
+        let y = list
+            .fixed_commands
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::Text { text, y, .. } if text == "fixed" => Some(*y),
+                _ => None,
+            });
+        assert_eq!(y, Some(1));
+    }
+
+    #[test]
+    fn fixed_vertical_percentage_uses_the_page_viewport_height() {
+        let dom = html::parse("<div class=tools>fixed</div>");
+        let sheet = crate::css::parse(".tools { position: fixed; top: 50% }");
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let tree = layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            40,
+            4,
+            Hidden::Respect,
+            &ImageContext::default(),
+        );
+        let list = paint(&tree);
+        let y = list
+            .fixed_commands
+            .iter()
+            .find_map(|command| match command {
+                DisplayCommand::Text { text, y, .. } if text == "fixed" => Some(*y),
+                _ => None,
+            });
+        assert_eq!(y, Some(2));
+    }
+
+    #[test]
+    fn fixed_opposing_insets_size_against_the_viewport() {
+        let dom = html::parse("<div class=tools>fixed</div><p>flow</p>");
+        let sheet = crate::css::parse(
+            ".tools { position: fixed; left: 8px; right: 8px; top: 0 } p { margin: 0 }",
+        );
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let tree = layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            10,
+            4,
+            Hidden::Respect,
+            &ImageContext::default(),
+        );
+        let fixed = tree
+            .boxes
+            .iter()
+            .find(|b| b.fixed_viewport && b.kind == BoxKind::Block)
+            .expect("fixed block box");
+        assert_eq!(fixed.dimensions.content.x, 1);
+        assert_eq!(fixed.dimensions.content.width, 8);
+        assert_eq!(tree.height, 1, "fixed output must not consume flow height");
+    }
+
+    #[test]
+    fn fixed_start_insets_win_over_end_insets() {
+        let dom = html::parse("<div class=tools>fixed</div>");
+        let sheet = crate::css::parse(
+            ".tools { position: fixed; left: 8px; right: 16px; top: 16px; bottom: 32px }",
+        );
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let tree = layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            10,
+            4,
+            Hidden::Respect,
+            &ImageContext::default(),
+        );
+        let fixed = tree
+            .boxes
+            .iter()
+            .find(|b| b.fixed_viewport && b.kind == BoxKind::Block)
+            .expect("fixed block box");
+        assert_eq!(fixed.dimensions.content.x, 1);
+        assert_eq!(fixed.dimensions.content.y, 1);
+    }
+
+    #[test]
+    fn sticky_commands_use_a_bounded_cached_scroll_adjustment() {
+        let t = tree(
+            "<p>one</p><div class=parent><div class=sticky>sticky</div></div><p>two</p><p>three</p>",
+            ".parent { height: 5em; margin: 0 } .sticky { position: sticky; top: 0 } p { margin: 0 }",
+            40,
+        );
+        let list = paint(&t);
+        assert!(
+            !list.sticky_commands.is_empty(),
+            "sticky output needs its layout constraint: {list:?}"
+        );
+        let constraint = list.sticky_commands[0].constraint;
+        assert_eq!(
+            constraint
+                .containing_end
+                .saturating_sub(constraint.static_end)
+                .max(0),
+            4,
+            "sticky range must stop at the containing block end"
+        );
+        let mut frame = Frame::new(40, 2);
+        paint_to_frame(&list, &mut frame, 0, 2, 2);
+        let row: String = (0..frame.width()).map(|x| frame.get(x, 0).ch).collect();
+        assert!(row.contains("sticky"), "sticky text scrolled away: {row:?}");
+    }
+
+    #[test]
+    fn oversized_sticky_box_has_no_scroll_adjustment() {
+        let dom = html::parse("<div class=sticky>one<br>two</div>");
+        let sheet = crate::css::parse(".sticky { position: sticky; top: 0 }");
+        let styles = style::style_tree(&dom, &[&sheet]);
+        let tree = layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            40,
+            1,
+            Hidden::Respect,
+            &ImageContext::default(),
+        );
+        let list = paint(&tree);
+        assert!(
+            list.sticky_commands.is_empty(),
+            "an oversized sticky box must retain static geometry: {list:?}"
+        );
+    }
+
+    #[test]
+    fn sticky_bottom_and_left_keep_their_relative_offsets() {
+        let t = tree(
+            "<div class=sticky>sticky</div>",
+            ".sticky { position: sticky; top: auto; left: 8px; bottom: 16px }",
+            40,
+        );
+        let sticky = t
+            .boxes
+            .iter()
+            .find(|b| {
+                b.kind == BoxKind::Block
+                    && b.computed.position == crate::style::values::Position::Sticky
+            })
+            .expect("sticky block");
+        assert_eq!(sticky.dimensions.content.x, 1);
+        assert_eq!(sticky.dimensions.content.y, -1);
+        assert!(sticky.sticky.is_none(), "top:auto must not stick");
     }
 
     // ---- M9.3: overflow clipping, applied while the list is built ----

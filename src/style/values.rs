@@ -32,18 +32,23 @@ pub enum Display {
     InlineBlock,
     /// Inline-level, flex container inside.
     InlineFlex,
+    /// Block-level outside, grid formatting context inside.
+    Grid,
+    /// Atomic inline outside, grid formatting context inside.
+    InlineGrid,
     None,
 }
 
 /// The subset of CSS positioning which has a layout-time meaning in yata.
-/// Fixed and sticky deliberately remain unsupported until the viewport owns a
-/// containing block (M11.18).
+/// The positioning modes supported by the layout engine.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Position {
     #[default]
     Static,
     Relative,
     Absolute,
+    Fixed,
+    Sticky,
 }
 
 pub fn parse_position(value: &str) -> Option<Position> {
@@ -51,6 +56,8 @@ pub fn parse_position(value: &str) -> Option<Position> {
         "static" => Some(Position::Static),
         "relative" => Some(Position::Relative),
         "absolute" => Some(Position::Absolute),
+        "fixed" => Some(Position::Fixed),
+        "sticky" => Some(Position::Sticky),
         _ => None,
     }
 }
@@ -315,10 +322,12 @@ pub fn parse_display(value: &str) -> Option<Display> {
         // into `InlineBlock` — the outside half is the one this engine can
         // honour, and a grid laid out as a block container is the same
         // approximation `grid` already gets.
-        "inline-block" | "inline-grid" => Some(Display::InlineBlock),
+        "inline-block" => Some(Display::InlineBlock),
+        "inline-grid" => Some(Display::InlineGrid),
         "inline-flex" => Some(Display::InlineFlex),
         "inline" | "contents" => Some(Display::Inline),
-        "block" | "flow-root" | "list-item" | "grid" | "table" | "table-row" | "table-cell"
+        "grid" => Some(Display::Grid),
+        "block" | "flow-root" | "list-item" | "table" | "table-row" | "table-cell"
         | "table-row-group" | "table-header-group" | "table-footer-group" | "table-caption"
         | "inline-table" => Some(Display::Block),
         _ => None,
@@ -607,6 +616,171 @@ pub fn parse_gaps(value: &str) -> Option<Gaps> {
             row: parse_gap(parts[0])?,
             column: parse_gap(parts[1])?,
         }),
+        _ => None,
+    }
+}
+
+// ---- Grid vocabulary (M11.19) ---------------------------------------------
+
+/// One explicit grid track. The terminal subset deliberately keeps the parsed
+/// form: percentages and `fr` need the final content width to become cells.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub enum GridTrack {
+    Fixed(Length),
+    #[default]
+    Auto,
+    Fr(f32),
+    MinMax(GridMin, GridMax),
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GridMin {
+    Fixed(Length),
+    Auto,
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum GridMax {
+    Fixed(Length),
+    Fr(f32),
+}
+
+pub type GridTracks = Vec<GridTrack>;
+
+pub fn parse_grid_tracks(value: &str) -> Option<GridTracks> {
+    fn words(s: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0usize;
+        let mut start = None;
+        for (i, c) in s.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            if c.is_whitespace() && depth == 0 {
+                if let Some(a) = start.take() {
+                    out.push(s[a..i].to_string());
+                }
+            } else if !c.is_whitespace() && start.is_none() {
+                start = Some(i);
+            }
+        }
+        if let Some(a) = start {
+            out.push(s[a..].to_string());
+        };
+        out
+    }
+    fn one(raw: &str) -> Option<GridTrack> {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("auto") {
+            return Some(GridTrack::Auto);
+        }
+        if let Some(n) = raw.strip_suffix("fr").or_else(|| raw.strip_suffix("FR")) {
+            let n: u16 = n.trim().parse().ok()?;
+            return (n > 0).then_some(GridTrack::Fr(n as f32));
+        }
+        let lower = raw.to_ascii_lowercase();
+        if lower.starts_with("minmax(") && raw.ends_with(')') {
+            let inside = &raw[7..raw.len() - 1];
+            let mut parts = inside.split(',');
+            let min = one(parts.next()?.trim())?;
+            let max = one(parts.next()?.trim())?;
+            let min = match min {
+                GridTrack::Fixed(x) => GridMin::Fixed(x),
+                GridTrack::Auto => GridMin::Auto,
+                _ => return None,
+            };
+            let max = match max {
+                GridTrack::Fixed(x) => GridMax::Fixed(x),
+                GridTrack::Fr(x) => GridMax::Fr(x),
+                _ => return None,
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            return Some(GridTrack::MinMax(min, max));
+        }
+        match parse_length(raw)? {
+            Length::Auto => None,
+            x @ (Length::Zero | Length::Px(_) | Length::Em(_) | Length::Percent(_)) if !matches!(x, Length::Px(n) | Length::Em(n) | Length::Percent(n) if n < 0.0) => {
+                Some(GridTrack::Fixed(x))
+            }
+            _ => None,
+        }
+    }
+    fn expand(token: &str, out: &mut Vec<GridTrack>) -> Option<()> {
+        let lower = token.to_ascii_lowercase();
+        if lower.starts_with("repeat(") && token.ends_with(')') {
+            let inside = &token[7..token.len() - 1];
+            let mut parts = inside.splitn(2, ',');
+            let n: usize = parts.next()?.trim().parse().ok()?;
+            let body = parse_grid_tracks(parts.next()?.trim())?;
+            if n == 0
+                || body.is_empty()
+                || n > 256
+                || out.len().saturating_add(n.saturating_mul(body.len())) > 256
+            {
+                return None;
+            }
+            for _ in 0..n {
+                out.extend_from_slice(&body);
+            }
+            Some(())
+        } else {
+            out.push(one(token)?);
+            Some(())
+        }
+    }
+    let mut out = Vec::new();
+    for token in words(value) {
+        expand(&token, &mut out)?;
+    }
+    if out.is_empty() || out.len() > 256 {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GridPlacement {
+    #[default]
+    Auto,
+    Line(usize),
+    Span(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum GridAutoFlow {
+    #[default]
+    Row,
+}
+
+pub fn parse_grid_auto_flow(value: &str) -> Option<GridAutoFlow> {
+    value
+        .trim()
+        .eq_ignore_ascii_case("row")
+        .then_some(GridAutoFlow::Row)
+}
+
+pub fn parse_grid_placement(value: &str) -> Option<GridPlacement> {
+    let v = value.trim().to_ascii_lowercase();
+    if v == "auto" {
+        return Some(GridPlacement::Auto);
+    }
+    if let Some(n) = v.strip_prefix("span ") {
+        let n: usize = n.trim().parse().ok()?;
+        return (n > 0 && n <= 256).then_some(GridPlacement::Span(n));
+    }
+    let n: usize = v.parse().ok()?;
+    (n > 0 && n <= 257).then_some(GridPlacement::Line(n))
+}
+
+pub fn parse_grid_area(value: &str) -> Option<(GridPlacement, GridPlacement)> {
+    let p: Vec<_> = value.split('/').collect();
+    match p.len() {
+        1 => Some((parse_grid_placement(p[0])?, GridPlacement::Auto)),
+        2 => Some((parse_grid_placement(p[0])?, parse_grid_placement(p[1])?)),
         _ => None,
     }
 }
@@ -1019,9 +1193,8 @@ mod tests {
         assert_eq!(parse_display("INLINE-FLEX"), Some(Display::InlineFlex));
         assert_eq!(parse_display("table-cell"), Some(Display::Block));
         assert_eq!(parse_display("inline-block"), Some(Display::InlineBlock));
-        // No mode of its own, so it keeps the nearest one that has the right
-        // outside half.
-        assert_eq!(parse_display("inline-grid"), Some(Display::InlineBlock));
+        assert_eq!(parse_display("grid"), Some(Display::Grid));
+        assert_eq!(parse_display("inline-grid"), Some(Display::InlineGrid));
         assert_eq!(parse_display("bananas"), None);
     }
 
@@ -1030,8 +1203,8 @@ mod tests {
         assert_eq!(parse_position("static"), Some(Position::Static));
         assert_eq!(parse_position("RELATIVE"), Some(Position::Relative));
         assert_eq!(parse_position("absolute"), Some(Position::Absolute));
-        assert_eq!(parse_position("fixed"), None);
-        assert_eq!(parse_position("sticky"), None);
+        assert_eq!(parse_position("fixed"), Some(Position::Fixed));
+        assert_eq!(parse_position("sticky"), Some(Position::Sticky));
     }
 
     #[test]
@@ -1495,5 +1668,28 @@ mod tests {
         // Nonzero but sub-cell rounds up so thin borders still draw.
         assert_eq!(Length::Px(1.0).to_cells_h(80), 1);
         assert_eq!(Length::Px(5.0).to_cells_h(80), 1);
+    }
+
+    #[test]
+    fn grid_tracks_repeat_minmax_and_placements_are_bounded() {
+        let tracks = parse_grid_tracks("10px repeat(2, minmax(auto, 1fr)) 25%").unwrap();
+        assert_eq!(tracks.as_slice().len(), 4);
+        assert!(matches!(
+            tracks.as_slice()[1],
+            GridTrack::MinMax(GridMin::Auto, GridMax::Fr(1.0))
+        ));
+        assert_eq!(parse_grid_placement("span 2"), Some(GridPlacement::Span(2)));
+        assert_eq!(parse_grid_auto_flow("ROW"), Some(GridAutoFlow::Row));
+        assert_eq!(parse_grid_auto_flow("column"), None);
+        assert_eq!(
+            parse_grid_area("2 / span 3"),
+            Some((GridPlacement::Line(2), GridPlacement::Span(3)))
+        );
+        assert!(parse_grid_tracks("repeat(0, 1fr)").is_none());
+        assert!(parse_grid_tracks("-1px 1fr").is_none());
+        assert!(parse_grid_tracks("1.5fr").is_none());
+        assert!(parse_grid_tracks("minmax(1fr, auto)").is_none());
+        assert!(parse_grid_tracks("minmax(auto, auto)").is_none());
+        assert!(parse_grid_placement("-1").is_none());
     }
 }

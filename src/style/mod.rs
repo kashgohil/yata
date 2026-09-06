@@ -21,8 +21,8 @@ use crate::dom::{Dom, NodeData, NodeId};
 use matching::RuleIndex;
 use values::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, ColorValue, Display, Edges, Flex,
-    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, Overflow,
-    Position, TextAlign,
+    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, GridAutoFlow, GridPlacement, GridTracks,
+    JustifyContent, Length, Overflow, Position, TextAlign,
 };
 
 /// Dynamic matching inputs for the cascade (M6): which node is hovered, which
@@ -52,7 +52,7 @@ impl Default for StyleContext<'static> {
 /// What a node looks like once the cascade and inheritance have run. `Default`
 /// is the CSS initial value of every property, which is also what a node with
 /// no matching rule and no parent gets.
-#[derive(Clone, Copy, PartialEq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct ComputedStyle {
     pub display: Display,
     /// Positioning is non-inherited. Insets are kept as authored lengths so
@@ -114,6 +114,11 @@ pub struct ComputedStyle {
     /// not reorder the DOM — hit-testing, focus and the inspectors keep seeing
     /// document order, which is what CSS says too.
     pub order: i32,
+    pub grid_template_columns: GridTracks,
+    pub grid_template_rows: GridTracks,
+    pub grid_column: (GridPlacement, GridPlacement),
+    pub grid_row: (GridPlacement, GridPlacement),
+    pub grid_auto_flow: GridAutoFlow,
     /// The winning `display` came from the user-agent sheet's `!important` —
     /// this element holds code, metadata or inert markup and is never prose
     /// (see `ua.css`). Layout's never-blank fallback honours this even when it
@@ -146,7 +151,7 @@ impl ComputedStyle {
             style.underline = false;
             style
         }
-        without_paint(*self) == without_paint(*other)
+        without_paint(self.clone()) == without_paint(other.clone())
     }
 
     /// What a child starts from: the inherited properties of its parent, with
@@ -203,6 +208,11 @@ impl ComputedStyle {
             flex: Flex::default(),
             align_self: AlignSelf::default(),
             order: 0,
+            grid_template_columns: Vec::new(),
+            grid_template_rows: Vec::new(),
+            grid_column: (GridPlacement::Auto, GridPlacement::Auto),
+            grid_row: (GridPlacement::Auto, GridPlacement::Auto),
+            grid_auto_flow: GridAutoFlow::Row,
             // Not inherited: a child of a hidden `<script>` is hidden because
             // its ancestor's subtree is skipped, not because it inherited a
             // verdict about itself.
@@ -378,7 +388,7 @@ fn inherited_from(dom: &Dom, styles: &Styles, root: NodeId) -> Option<ComputedSt
         return Some(ComputedStyle::default());
     }
     let parent = dom.node(root).parent?;
-    is_ancestor(dom, dom.root, root).then(|| *styles.get(parent))
+    is_ancestor(dom, dom.root, root).then(|| styles.get(parent).clone())
 }
 
 /// Whether `ancestor` is a strict ancestor of `id`.
@@ -413,7 +423,7 @@ fn resolve(
         // asking the text node itself.
         _ => parent.inherit(),
     };
-    out.computed[node.0 as usize] = computed;
+    out.computed[node.0 as usize] = computed.clone();
     for child in dom.children(node) {
         resolve(dom, child, &computed, ua, author, ctx, out);
     }
@@ -603,6 +613,36 @@ fn apply(computed: &mut ComputedStyle, declaration: &Declaration) -> bool {
         "flex-shrink" => set(&mut computed.flex.shrink, values::parse_flex_factor(value)),
         "flex-basis" => set(&mut computed.flex.basis, values::parse_flex_basis(value)),
         "order" => set(&mut computed.order, values::parse_order(value)),
+        "grid-template-columns" => set(
+            &mut computed.grid_template_columns,
+            values::parse_grid_tracks(value),
+        ),
+        "grid-template-rows" => set(
+            &mut computed.grid_template_rows,
+            values::parse_grid_tracks(value),
+        ),
+        "grid-column" => set(&mut computed.grid_column, values::parse_grid_area(value)),
+        "grid-row" => set(&mut computed.grid_row, values::parse_grid_area(value)),
+        "grid-column-start" => set(
+            &mut computed.grid_column.0,
+            values::parse_grid_placement(value),
+        ),
+        "grid-column-end" => set(
+            &mut computed.grid_column.1,
+            values::parse_grid_placement(value),
+        ),
+        "grid-row-start" => set(
+            &mut computed.grid_row.0,
+            values::parse_grid_placement(value),
+        ),
+        "grid-row-end" => set(
+            &mut computed.grid_row.1,
+            values::parse_grid_placement(value),
+        ),
+        "grid-auto-flow" => set(
+            &mut computed.grid_auto_flow,
+            values::parse_grid_auto_flow(value),
+        ),
         "text-decoration" | "text-decoration-line" => set(
             &mut computed.underline,
             values::parse_text_decoration(value),
@@ -966,11 +1006,44 @@ mod tests {
         assert_eq!(p.top, Length::Auto);
 
         // An unsupported value is invalid, so the prior winner survives.
+        let (dom, styles) = styled("<div>t</div>", "div { position: fixed; position: fixedly }");
+        assert_eq!(styles.get(find(&dom, "div")).position, Position::Fixed);
+    }
+
+    #[test]
+    fn grid_properties_do_not_inherit_and_invalid_values_keep_the_winner() {
+        let (dom, styles) = styled(
+            "<div><p>t</p></div>",
+            "div { display: grid; grid-template-columns: 10px 1fr; grid-template-rows: auto 2em; grid-column: 2 / span 1; grid-row: 1 / 2; grid-auto-flow: row; gap: 1em }",
+        );
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.display, Display::Grid);
+        assert_eq!(div.grid_template_columns.as_slice().len(), 2);
+        assert_eq!(div.grid_template_rows.as_slice().len(), 2);
+        assert_eq!(
+            div.grid_column,
+            (GridPlacement::Line(2), GridPlacement::Span(1))
+        );
+        assert_eq!(
+            div.grid_row,
+            (GridPlacement::Line(1), GridPlacement::Line(2))
+        );
+        assert_eq!(div.grid_auto_flow, GridAutoFlow::Row);
+        let child = styles.get(find(&dom, "p"));
+        assert!(child.grid_template_columns.is_empty());
+        assert_eq!(
+            child.grid_column,
+            (GridPlacement::Auto, GridPlacement::Auto)
+        );
+        assert_eq!(child.gap, Gaps::default());
+
         let (dom, styles) = styled(
             "<div>t</div>",
-            "div { position: absolute; position: fixed }",
+            "div { grid-template-columns: 1fr; grid-template-columns: repeat(0, 1fr); grid-column-start: 2; grid-column-start: -1 }",
         );
-        assert_eq!(styles.get(find(&dom, "div")).position, Position::Absolute);
+        let div = styles.get(find(&dom, "div"));
+        assert_eq!(div.grid_template_columns.as_slice().len(), 1);
+        assert_eq!(div.grid_column.0, GridPlacement::Line(2));
     }
 
     #[test]

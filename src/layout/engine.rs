@@ -6,7 +6,9 @@
 
 use crate::dom::{Dom, NodeData, NodeId};
 use crate::image::ImageContext;
-use crate::layout::boxes::{BoxId, BoxKind, GridBorder, LayoutBox, LayoutTree};
+use crate::layout::boxes::{
+    BoxId, BoxKind, GridBorder, GridLayout, LayoutBox, LayoutTree, StickyConstraint,
+};
 use crate::layout::field::{self, FieldPaint};
 use std::ops::Range;
 
@@ -15,11 +17,15 @@ use crate::layout::flex;
 use crate::layout::intrinsic::IntrinsicSizer;
 use crate::style::values::{
     AlignItems, BoxSizing, Display, FlexBasis, FlexDirection, FlexWrap, FontStyle, FontWeight,
-    Gaps, Length, Position, TextAlign,
+    Gaps, GridMax, GridMin, GridPlacement, GridTrack, Length, Position, TextAlign,
 };
 use crate::style::{ComputedStyle, Styles};
 use crate::term::{Attrs, Color, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+fn is_out_of_flow(position: Position) -> bool {
+    matches!(position, Position::Absolute | Position::Fixed)
+}
 
 /// The bullet the engine puts before a list item's content, and the two cells
 /// it takes.
@@ -52,7 +58,21 @@ pub fn layout_tree_with(
     hidden: Hidden,
     images: &ImageContext,
 ) -> LayoutTree {
+    layout_tree_with_viewport(dom, styles, width, 1, hidden, images)
+}
+
+/// Layout with the bounded terminal page rectangle available to viewport
+/// anchored boxes. Normal document flow remains vertically indefinite.
+pub fn layout_tree_with_viewport(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    viewport_height: u16,
+    hidden: Hidden,
+    images: &ImageContext,
+) -> LayoutTree {
     let width = width.max(1) as i32;
+    let viewport_height = viewport_height.max(1) as i32;
     let mut eng = Engine {
         dom,
         styles,
@@ -61,6 +81,7 @@ pub fn layout_tree_with(
         boxes: Vec::new(),
         sizer: IntrinsicSizer::new(dom, styles, images, hidden),
         grid_borders: Vec::new(),
+        grid_item_depth: 0,
     };
     // Synthetic root: full column width, no margins of its own. Children of
     // the document (html) are laid out into it.
@@ -72,7 +93,7 @@ pub fn layout_tree_with(
                 x: 0,
                 y: 0,
                 width,
-                height: 0,
+                height: viewport_height,
             },
             ..Dimensions::default()
         },
@@ -82,6 +103,9 @@ pub fn layout_tree_with(
         computed: ComputedStyle::default(),
         image_src: None,
         image_size_firm: false,
+        fixed_viewport: false,
+        sticky: None,
+        grid: None,
     });
     let mut y = 0i32;
     let mut prev_mb = 0i32;
@@ -91,16 +115,16 @@ pub fn layout_tree_with(
         // element therefore means "as tall as my content", never "as tall as
         // the terminal" (CSS 2.1 §10.5, and M9.2's definiteness rule).
         if matches!(dom.node(child).data, NodeData::Element { .. })
-            && styles.get(child).position == Position::Absolute
+            && is_out_of_flow(styles.get(child).position)
         {
-            if let Some(id) = eng.layout_absolute(child, root, false) {
+            if let Some(id) = eng.layout_positioned(child, root, false) {
                 eng.boxes[root.0 as usize].children.push(id);
             }
         } else if let Some(id) = eng.layout_node(child, 0, width, None, y, &mut prev_mb, false) {
             eng.boxes[root.0 as usize].children.push(id);
             let mb = eng.boxes[id.0 as usize].dimensions.margin_box();
             let dy = if styles.get(child).position == Position::Relative {
-                relative_delta(*styles.get(child), width, None).1
+                relative_delta(styles.get(child).clone(), width, None).1
             } else {
                 0
             };
@@ -120,6 +144,9 @@ pub fn layout_tree_with(
     // from leaving the page scrolling through the blank rows where its content
     // would have been. This needs the finished tree, because a clip is a fact
     // about a box's ancestors.
+    // The viewport was temporarily available as the synthetic root's height
+    // while fixed descendants resolved their insets. It is not document flow.
+    eng.boxes[root.0 as usize].dimensions.content.height = 0;
     let mut tree = LayoutTree {
         boxes: eng.boxes,
         root,
@@ -137,7 +164,51 @@ pub fn layout_tree_with(
     let height = y.max(lowest).max(0);
     tree.boxes[root.0 as usize].dimensions.content.height = height;
     tree.height = height;
+    attach_sticky_constraints(&mut tree, dom, styles, viewport_height);
     tree
+}
+
+fn attach_sticky_constraints(tree: &mut LayoutTree, dom: &Dom, styles: &Styles, viewport_h: i32) {
+    for index in 0..tree.boxes.len() {
+        let Some(node) = tree.boxes[index].node else {
+            continue;
+        };
+        let style = styles.get(node).clone();
+        let Some(inset) = (style.position == Position::Sticky)
+            .then(|| inset_v(style.top, tree.width, Some(viewport_h)))
+            .flatten()
+        else {
+            continue;
+        };
+        let static_rect = tree.boxes[index].dimensions.margin_box();
+        if static_rect.height > viewport_h {
+            continue;
+        }
+        let mut ancestor = dom.node(node).parent;
+        let mut containing_end = tree.boxes[tree.root.0 as usize].dimensions.content.bottom();
+        while let Some(parent) = ancestor {
+            if let Some(box_) = tree.boxes.iter().rev().find(|b| b.node == Some(parent)) {
+                containing_end = box_.dimensions.padding_box().bottom();
+                break;
+            }
+            ancestor = dom.node(parent).parent;
+        }
+        let constraint = StickyConstraint {
+            static_start: static_rect.y,
+            static_end: static_rect.bottom(),
+            inset,
+            containing_end,
+        };
+        mark_sticky_subtree(tree, BoxId(index as u32), constraint);
+    }
+}
+
+fn mark_sticky_subtree(tree: &mut LayoutTree, id: BoxId, constraint: StickyConstraint) {
+    tree.boxes[id.0 as usize].sticky = Some(constraint);
+    let children = tree.boxes[id.0 as usize].children.clone();
+    for child in children {
+        mark_sticky_subtree(tree, child, constraint);
+    }
 }
 
 struct Engine<'a> {
@@ -154,6 +225,10 @@ struct Engine<'a> {
     /// contents are laid out exactly once per pass and not twice.
     sizer: IntrinsicSizer<'a>,
     grid_borders: Vec<GridBorder>,
+    /// A direct grid item has already received its final inline-size. Auto
+    /// tables normally shrink-wrap, but doing that here would discard the
+    /// resolved grid cell width before table layout sees it.
+    grid_item_depth: usize,
 }
 
 impl<'a> Engine<'a> {
@@ -206,7 +281,7 @@ impl<'a> Engine<'a> {
                         node: id,
                         text: text.clone(),
                         style: term_style(self.styles.get(id)),
-                        computed: *self.styles.get(id),
+                        computed: self.styles.get(id).clone(),
                     }],
                     TextAlign::Left,
                     pre,
@@ -216,7 +291,7 @@ impl<'a> Engine<'a> {
                 if self.is_hidden(id) {
                     return None;
                 }
-                let mut computed = *self.styles.get(id);
+                let mut computed = self.styles.get(id).clone();
                 // Reveal pass: a page's own `display:none` is treated as block so
                 // its content can be read. UA-important hiding never reaches here
                 // (`is_hidden` still catches it).
@@ -231,11 +306,15 @@ impl<'a> Engine<'a> {
                     return None;
                 }
                 let laid_out = match tag.as_str() {
-                    "br" => self.layout_br(x, containing_width, y, prev_margin_bottom, computed),
-                    "hr" => self.layout_hr(x, containing_width, y, prev_margin_bottom, computed),
+                    "br" => {
+                        self.layout_br(x, containing_width, y, prev_margin_bottom, computed.clone())
+                    }
+                    "hr" => {
+                        self.layout_hr(x, containing_width, y, prev_margin_bottom, computed.clone())
+                    }
                     "img" => self.layout_img_block(
                         id,
-                        computed,
+                        computed.clone(),
                         x,
                         containing_width,
                         y,
@@ -248,7 +327,7 @@ impl<'a> Engine<'a> {
                             self.layout_block(
                                 id,
                                 tag,
-                                computed,
+                                computed.clone(),
                                 x,
                                 containing_width,
                                 containing_height,
@@ -275,7 +354,7 @@ impl<'a> Engine<'a> {
                         }
                     }
                 };
-                if computed.position == Position::Relative
+                if matches!(computed.position, Position::Relative | Position::Sticky)
                     && let Some(box_id) = laid_out
                 {
                     self.apply_relative(box_id, computed, containing_width, containing_height);
@@ -288,20 +367,30 @@ impl<'a> Engine<'a> {
     /// Layout one out-of-flow child after its in-flow siblings have chosen
     /// their static geometry.  Ownership remains with the ordinary parent;
     /// only its rectangle is selected from the nearest positioned ancestor.
-    fn layout_absolute(&mut self, id: NodeId, normal_parent: BoxId, pre: bool) -> Option<BoxId> {
+    fn layout_positioned(&mut self, id: NodeId, normal_parent: BoxId, pre: bool) -> Option<BoxId> {
         let NodeData::Element { tag, .. } = &self.dom.node(id).data else {
             return None;
         };
         if self.is_hidden(id) || field::generates_no_box(self.dom, id, tag) {
             return None;
         }
-        let (cb, cb_height) = self.containing_block(id, normal_parent);
+        let fixed = self.styles.get(id).position == Position::Fixed;
+        let (cb, cb_height) = if fixed {
+            // The synthetic root's rectangle is the terminal page viewport in
+            // this engine: fixed boxes never consult positioned ancestors.
+            (
+                self.boxes[0].dimensions.content,
+                Some(self.boxes[0].dimensions.content.height.max(1)),
+            )
+        } else {
+            self.containing_block(id, normal_parent)
+        };
         // A missing inset retains the static position the normal parent would
         // have supplied.  This differs from the containing block whenever a
         // static intermediate ancestor sits between this child and its nearest
         // positioned ancestor.
-        let static_origin = self.boxes[normal_parent.0 as usize].dimensions.content;
-        let style = *self.styles.get(id);
+        let static_origin = self.static_origin(id, normal_parent);
+        let style = self.styles.get(id).clone();
         if tag == "img" {
             let img = self.images.by_node.get(&id)?;
             let (intrinsic_w, intrinsic_h, firm) = self.images.size_for(img, cb.width.max(1));
@@ -324,7 +413,7 @@ impl<'a> Engine<'a> {
                     .map(|n| cb.bottom().saturating_sub(n).saturating_sub(intrinsic_h))
                     .unwrap_or(static_origin.y)
             });
-            return Some(self.alloc(LayoutBox {
+            let image = self.alloc(LayoutBox {
                 kind: BoxKind::Image,
                 node: Some(id),
                 dimensions: Dimensions {
@@ -342,7 +431,11 @@ impl<'a> Engine<'a> {
                 computed: style,
                 image_src: Some(img.url.clone()),
                 image_size_firm: firm,
-            }));
+                fixed_viewport: fixed,
+                sticky: None,
+                grid: None,
+            });
+            return Some(image);
         }
         let intrinsic = field::control(self.dom, id, tag).map(|c| c.cols);
         let mut dims = resolve_block_dims(&style, cb.width.max(1), intrinsic);
@@ -380,7 +473,8 @@ impl<'a> Engine<'a> {
             cb.y.saturating_add(dims.margin.top)
                 .saturating_add(dims.border.top)
                 .saturating_add(dims.padding.top);
-        let box_id = self.layout_box_at(id, tag, style, dims, cb_height, pre || tag == "pre");
+        let box_id =
+            self.layout_box_at(id, tag, style.clone(), dims, cb_height, pre || tag == "pre");
         let top = inset_v(style.top, cb.width, cb_height);
         // An end inset needs an end edge. The scrolling document root has no
         // definite vertical end, so a bottom-only child keeps its static row.
@@ -418,7 +512,39 @@ impl<'a> Engine<'a> {
             margin_x.saturating_sub(current.x),
             target_y.saturating_sub(current.y),
         );
+        if fixed {
+            self.mark_fixed_subtree(box_id);
+        }
         Some(box_id)
+    }
+
+    fn mark_fixed_subtree(&mut self, id: BoxId) {
+        self.boxes[id.0 as usize].fixed_viewport = true;
+        let children = self.boxes[id.0 as usize].children.clone();
+        for child in children {
+            self.mark_fixed_subtree(child);
+        }
+    }
+
+    /// The ordinary-flow position a positioned child would have started at.
+    /// Out-of-flow layout happens after a parent's in-flow children are known,
+    /// so their final rectangles are a stable, layout-only source for the
+    /// no-inset fallback — no second formatting pass is necessary.
+    fn static_origin(&self, id: NodeId, parent: BoxId) -> Rect {
+        let parent_box = &self.boxes[parent.0 as usize];
+        let Some(parent_node) = parent_box.node else {
+            return parent_box.dimensions.content;
+        };
+        let mut origin = parent_box.dimensions.content;
+        for sibling in self.dom.children(parent_node) {
+            if sibling == id {
+                break;
+            }
+            if let Some(box_) = self.boxes.iter().rev().find(|b| b.node == Some(sibling)) {
+                origin.y = origin.y.max(box_.dimensions.margin_box().bottom());
+            }
+        }
+        origin
     }
 
     fn containing_block(&self, id: NodeId, fallback: BoxId) -> (Rect, Option<i32>) {
@@ -468,7 +594,19 @@ impl<'a> Engine<'a> {
         width: i32,
         height: Option<i32>,
     ) {
-        let (dx, dy) = relative_delta(style, width, height);
+        let (dx, dy) = if style.position == Position::Sticky {
+            // `top` is the sticky constraint, not an initial relative shift.
+            // Start-edge horizontal sticking is outside terminal scrolling;
+            // `left`/`right` and `bottom` retain their M11.17 relative role.
+            (
+                inset_h(style.left, width)
+                    .or_else(|| inset_h(style.right, width).map(|n| -n))
+                    .unwrap_or(0),
+                inset_v(style.bottom, width, height).map_or(0, |n| -n),
+            )
+        } else {
+            relative_delta(style, width, height)
+        };
         self.shift_subtree(box_id, dx, dy);
     }
 
@@ -575,6 +713,7 @@ impl<'a> Engine<'a> {
                 None if tag == "tr" => BoxKind::TableRow,
                 None if matches!(tag, "td" | "th") => BoxKind::TableCell,
                 None if lays_out_as_flex(&computed) => BoxKind::Flex,
+                None if lays_out_as_grid(&computed) => BoxKind::Grid,
                 None => BoxKind::Block,
             },
             node: Some(id),
@@ -587,9 +726,12 @@ impl<'a> Engine<'a> {
                 Some(_) => term_style(&computed),
                 None => Style::default(),
             },
-            computed,
+            computed: computed.clone(),
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
 
         // The vertical axis (CSS 2.1 §10.5–10.7). A specified height is known
@@ -655,6 +797,9 @@ impl<'a> Engine<'a> {
         if lays_out_as_flex(&computed) {
             return self.layout_flex_contents(id, computed, box_id, heights, pre);
         }
+        if lays_out_as_grid(&computed) {
+            return self.layout_grid_contents(id, computed, box_id, heights, pre);
+        }
         let specified_height = heights.specified;
         let dims = self.boxes[box_id.0 as usize].dimensions;
 
@@ -702,7 +847,7 @@ impl<'a> Engine<'a> {
         let mut absolute_children = Vec::new();
         for child in child_ids {
             if matches!(self.dom.node(child).data, NodeData::Element { .. })
-                && self.styles.get(child).position == Position::Absolute
+                && is_out_of_flow(self.styles.get(child).position)
             {
                 absolute_children.push(child);
                 continue;
@@ -750,7 +895,12 @@ impl<'a> Engine<'a> {
                     ) {
                         let mb = self.boxes[cid.0 as usize].dimensions.margin_box();
                         let dy = if self.styles.get(child).position == Position::Relative {
-                            relative_delta(*self.styles.get(child), content_w, specified_height).1
+                            relative_delta(
+                                self.styles.get(child).clone(),
+                                content_w,
+                                specified_height,
+                            )
+                            .1
                         } else {
                             0
                         };
@@ -784,7 +934,7 @@ impl<'a> Engine<'a> {
         // cursor or its collapsed-margin state.
         let has_absolute_children = !absolute_children.is_empty();
         for child in absolute_children {
-            if let Some(abs) = self.layout_absolute(child, box_id, pre) {
+            if let Some(abs) = self.layout_positioned(child, box_id, pre) {
                 children.push(abs);
             }
         }
@@ -814,6 +964,213 @@ impl<'a> Engine<'a> {
         }
         self.boxes[box_id.0 as usize].children = children;
         (content_y - dims.content.y).max(0)
+    }
+
+    /// Explicit, row-major terminal grid.  It resolves each child exactly once
+    /// at its final column span; the small occupancy map dies with layout.
+    fn layout_grid_contents(
+        &mut self,
+        id: NodeId,
+        computed: ComputedStyle,
+        box_id: BoxId,
+        heights: BlockHeight,
+        pre: bool,
+    ) -> i32 {
+        let dims = self.boxes[box_id.0 as usize].dimensions;
+        let mut columns = if computed.grid_template_columns.as_slice().is_empty() {
+            vec![GridTrack::Auto]
+        } else {
+            computed.grid_template_columns.as_slice().to_vec()
+        };
+        columns.truncate(256);
+        let col_gap = computed.gap.column.to_cells_h(dims.content.width).max(0);
+        let row_gap = computed.gap.row.to_cells_v(dims.content.width).max(0);
+        let child_ids: Vec<_> = self
+            .dom
+            .children(id)
+            // A non-whitespace text run is an anonymous grid item.  It still
+            // becomes an ordinary anonymous block below, so no later stage
+            // needs a grid-only text representation.
+            .filter(|&n| match &self.dom.node(n).data {
+                NodeData::Element { .. } => true,
+                NodeData::Text(text) => text.chars().any(|c| !is_html_space(c)),
+                NodeData::Comment(_) | NodeData::Doctype(_) | NodeData::Document => false,
+            })
+            .collect();
+        let mut occupied: Vec<Vec<bool>> = Vec::new();
+        let mut placed = Vec::new();
+        for child in child_ids.iter().copied() {
+            let style = self.styles.get(child).clone();
+            if is_out_of_flow(style.position) {
+                continue;
+            }
+            let (mut col, mut cspan) = grid_axis(style.grid_column, columns.len());
+            let (mut row, mut rspan) = grid_axis(style.grid_row, 256);
+            if let Some(start) = col {
+                cspan = cspan.min(columns.len().saturating_sub(start)).max(1);
+            }
+            if let Some(start) = row {
+                rspan = rspan.min(256usize.saturating_sub(start)).max(1);
+            }
+            if col.is_none() || row.is_none() {
+                let mut found = None;
+                for r in 0..256usize {
+                    for c in 0..columns.len() {
+                        let rr = row.unwrap_or(r);
+                        let cc = col.unwrap_or(c);
+                        if cc + cspan <= columns.len() && grid_free(&occupied, rr, cc, rspan, cspan)
+                        {
+                            found = Some((rr, cc));
+                            break;
+                        }
+                    }
+                    if found.is_some() {
+                        break;
+                    }
+                }
+                let (r, c) = found.unwrap_or((255, 0));
+                row.get_or_insert(r);
+                col.get_or_insert(c);
+            }
+            let (row, col) = (row.unwrap_or(0), col.unwrap_or(0));
+            grid_reserve(&mut occupied, row, col, rspan, cspan);
+            placed.push((child, row, col, rspan, cspan));
+        }
+        let column_axis = GridTrackAxis::Columns {
+            width: dims.content.width,
+        };
+        let mut widths = resolve_grid_tracks(&columns, column_axis, col_gap);
+        // Auto columns use the intrinsic minimum of one-cell items. Spanning
+        // items keep their final span width but do not run a second sizing pass.
+        for &(child, _, col, _, span) in &placed {
+            if span == 1
+                && matches!(
+                    columns[col],
+                    GridTrack::Auto | GridTrack::MinMax(GridMin::Auto, _)
+                )
+            {
+                widths[col] = widths[col].max(self.sizer.min_content_width(child));
+            }
+        }
+        widths = fit_grid_tracks(&columns, widths, column_axis, col_gap);
+        let row_count = placed
+            .iter()
+            .map(|p| p.1 + p.3)
+            .max()
+            .unwrap_or(0)
+            .max(computed.grid_template_rows.as_slice().len())
+            .clamp(1, 256);
+        let mut rows = computed.grid_template_rows.as_slice().to_vec();
+        rows.resize(row_count, GridTrack::Auto);
+        let row_axis = GridTrackAxis::Rows {
+            width: dims.content.width,
+            height: heights.specified,
+        };
+        let mut row_heights = resolve_grid_tracks(&rows, row_axis, row_gap);
+        let mut children = Vec::new();
+        for &(child, row, col, rspan, cspan) in &placed {
+            let x = dims
+                .content
+                .x
+                .saturating_add(grid_offset(&widths, col, col_gap));
+            let w = grid_span(&widths, col, cspan, col_gap).max(1);
+            let mut margin = 0;
+            let direct_table = matches!(
+                &self.dom.node(child).data,
+                NodeData::Element { tag, .. } if tag == "table"
+            );
+            if direct_table {
+                self.grid_item_depth = self.grid_item_depth.saturating_add(1);
+            }
+            let laid_out = if is_atomic_inline(self.styles.get(child).display) {
+                self.layout_grid_item_root(child, x, w, pre)
+            } else {
+                self.layout_node(child, x, w, None, 0, &mut margin, pre)
+            };
+            if direct_table {
+                self.grid_item_depth = self.grid_item_depth.saturating_sub(1);
+            }
+            if let Some(cid) = laid_out {
+                let h = self.boxes[cid.0 as usize]
+                    .dimensions
+                    .margin_box()
+                    .height
+                    .max(0);
+                if rspan == 1 && grid_row_accepts_content(rows[row], heights.specified.is_some()) {
+                    row_heights[row] = row_heights[row].max(h);
+                }
+                children.push((child, cid, row, col, rspan, cspan));
+            }
+        }
+        row_heights = fit_grid_tracks(&rows, row_heights, row_axis, row_gap);
+        for &(_, cid, row, col, rspan, cspan) in &children {
+            let target_x = dims
+                .content
+                .x
+                .saturating_add(grid_offset(&widths, col, col_gap));
+            let target_y = dims
+                .content
+                .y
+                .saturating_add(grid_offset(&row_heights, row, row_gap));
+            let current = self.boxes[cid.0 as usize].dimensions.margin_box();
+            self.shift_subtree(
+                cid,
+                target_x.saturating_sub(current.x),
+                target_y.saturating_sub(current.y),
+            );
+            let _ = (rspan, cspan);
+        }
+        // Keep DOM order for paint even when explicit cells are visually reordered.
+        let mut ids: Vec<_> = children.into_iter().map(|(_, cid, ..)| cid).collect();
+        for child in self.dom.children(id) {
+            if is_out_of_flow(self.styles.get(child).position)
+                && let Some(cid) = self.layout_positioned(child, box_id, pre)
+            {
+                ids.push(cid);
+            }
+        }
+        self.order_children_by_dom(id, &mut ids);
+        self.boxes[box_id.0 as usize].children = ids;
+        self.boxes[box_id.0 as usize].grid = Some(GridLayout {
+            columns: widths,
+            rows: row_heights.clone(),
+        });
+        row_heights
+            .iter()
+            .fold(0i32, |n, h| n.saturating_add(*h))
+            .saturating_add(row_gap.saturating_mul(row_heights.len().saturating_sub(1) as i32))
+    }
+
+    /// Grid items are block formatting roots for their *inside*. The outer
+    /// inline half of an atomic inline only matters while it sits in an inline
+    /// formatting context; here it owns a cell, so build its own root rather
+    /// than flattening it into the anonymous text item path.
+    fn layout_grid_item_root(
+        &mut self,
+        id: NodeId,
+        x: i32,
+        width: i32,
+        pre: bool,
+    ) -> Option<BoxId> {
+        let NodeData::Element { tag, .. } = &self.dom.node(id).data else {
+            return None;
+        };
+        if self.is_hidden(id) {
+            return None;
+        }
+        let computed = self.styles.get(id).clone();
+        let mut dims = resolve_block_dims(&computed, width, None);
+        dims.content.x = x
+            .saturating_add(dims.margin.left)
+            .saturating_add(dims.border.left)
+            .saturating_add(dims.padding.left);
+        dims.content.y = dims.border.top.saturating_add(dims.padding.top);
+        dims.content.height = 0;
+        let box_id = self.layout_box_at(id, tag, computed.clone(), dims, None, pre || tag == "pre");
+        if matches!(computed.position, Position::Relative | Position::Sticky) {
+            self.apply_relative(box_id, computed, width, None);
+        }
+        Some(box_id)
     }
 
     /// Automatic table layout with a bounded, short-lived occupancy grid.
@@ -896,7 +1253,7 @@ impl<'a> Engine<'a> {
         // their own min/max clamp applies. `resolve_block_dims` starts a block
         // at its containing width, so using that value directly here would
         // make `min-width: 20` turn a two-cell auto table into a 40-cell one.
-        let target = if computed.width.is_auto() {
+        let target = if computed.width.is_auto() && self.grid_item_depth == 0 {
             let dims = self.boxes[box_id.0 as usize].dimensions;
             let axis = Axis {
                 edges: dims
@@ -936,9 +1293,9 @@ impl<'a> Engine<'a> {
         // derived row subtree.
         for child in loose_children {
             if matches!(self.dom.node(child).data, NodeData::Element { .. })
-                && self.styles.get(child).position == Position::Absolute
+                && is_out_of_flow(self.styles.get(child).position)
             {
-                if let Some(abs) = self.layout_absolute(child, box_id, pre) {
+                if let Some(abs) = self.layout_positioned(child, box_id, pre) {
                     row_boxes.push(abs);
                 }
                 continue;
@@ -961,7 +1318,7 @@ impl<'a> Engine<'a> {
 
         let mut row_ids = Vec::with_capacity(rows.len());
         for (row, _) in &rows {
-            let row_style = *self.styles.get(*row);
+            let row_style = self.styles.get(*row).clone();
             let row_id = self.alloc(LayoutBox {
                 kind: BoxKind::TableRow,
                 node: Some(*row),
@@ -980,6 +1337,9 @@ impl<'a> Engine<'a> {
                 computed: row_style,
                 image_src: None,
                 image_size_firm: false,
+                fixed_viewport: false,
+                sticky: None,
+                grid: None,
             });
             row_ids.push(row_id);
         }
@@ -987,7 +1347,7 @@ impl<'a> Engine<'a> {
         let mut cell_boxes = Vec::with_capacity(placements.len());
         let mut cell_heights = Vec::with_capacity(placements.len());
         for placement in &placements {
-            let cell_style = *self.styles.get(placement.cell);
+            let cell_style = self.styles.get(placement.cell).clone();
             let x = table.x.saturating_add(
                 widths[..placement.col]
                     .iter()
@@ -1085,9 +1445,9 @@ impl<'a> Engine<'a> {
         // table pass.
         for (row_index, (row, _)) in rows.iter().enumerate() {
             for cell in self.dom.children(*row) {
-                if self.styles.get(cell).position == Position::Absolute
+                if is_out_of_flow(self.styles.get(cell).position)
                     && matches!(&self.dom.node(cell).data, NodeData::Element { tag, .. } if matches!(tag.as_str(), "td" | "th"))
-                    && let Some(abs) = self.layout_absolute(cell, row_ids[row_index], pre)
+                    && let Some(abs) = self.layout_positioned(cell, row_ids[row_index], pre)
                 {
                     self.boxes[row_ids[row_index].0 as usize].children.push(abs);
                 }
@@ -1112,7 +1472,7 @@ impl<'a> Engine<'a> {
     /// One cell's outer horizontal intrinsic contribution. Its normal box is
     /// still built only once below, at the column width ultimately assigned.
     fn table_cell_contribution(&mut self, cell: NodeId, containing_width: i32) -> TableColumn {
-        let computed = *self.styles.get(cell);
+        let computed = self.styles.get(cell).clone();
         let padding = computed
             .padding
             .left
@@ -1230,21 +1590,23 @@ impl<'a> Engine<'a> {
         for r in 0..=row_count {
             for c in 0..cols {
                 if r == 0 {
-                    horizontal[r][c] = horizontal[r][c].max(edge(table_style, 0, table.width));
+                    horizontal[r][c] =
+                        horizontal[r][c].max(edge(table_style.clone(), 0, table.width));
                 }
                 if r == row_count {
-                    horizontal[r][c] = horizontal[r][c].max(edge(table_style, 2, table.width));
+                    horizontal[r][c] =
+                        horizontal[r][c].max(edge(table_style.clone(), 2, table.width));
                 }
                 if r > 0 {
                     horizontal[r][c] = horizontal[r][c].max(edge(
-                        *self.styles.get(grid.rows[r - 1].0),
+                        self.styles.get(grid.rows[r - 1].0).clone(),
                         2,
                         table.width,
                     ));
                 }
                 if r < row_count {
                     horizontal[r][c] = horizontal[r][c].max(edge(
-                        *self.styles.get(grid.rows[r].0),
+                        self.styles.get(grid.rows[r].0).clone(),
                         0,
                         table.width,
                     ));
@@ -1254,14 +1616,14 @@ impl<'a> Engine<'a> {
                 if above != below {
                     if let Some(i) = above {
                         horizontal[r][c] = horizontal[r][c].max(edge(
-                            *self.styles.get(grid.placements[i].cell),
+                            self.styles.get(grid.placements[i].cell).clone(),
                             2,
                             table.width,
                         ));
                     }
                     if let Some(i) = below {
                         horizontal[r][c] = horizontal[r][c].max(edge(
-                            *self.styles.get(grid.placements[i].cell),
+                            self.styles.get(grid.placements[i].cell).clone(),
                             0,
                             table.width,
                         ));
@@ -1272,24 +1634,24 @@ impl<'a> Engine<'a> {
         for r in 0..row_count {
             for c in 0..=cols {
                 if c == 0 {
-                    vertical[r][c] = vertical[r][c].max(edge(table_style, 3, table.width));
+                    vertical[r][c] = vertical[r][c].max(edge(table_style.clone(), 3, table.width));
                 }
                 if c == cols {
-                    vertical[r][c] = vertical[r][c].max(edge(table_style, 1, table.width));
+                    vertical[r][c] = vertical[r][c].max(edge(table_style.clone(), 1, table.width));
                 }
                 let left = if c > 0 { owner[r][c - 1] } else { None };
                 let right = if c < cols { owner[r][c] } else { None };
                 if left != right {
                     if let Some(i) = left {
                         vertical[r][c] = vertical[r][c].max(edge(
-                            *self.styles.get(grid.placements[i].cell),
+                            self.styles.get(grid.placements[i].cell).clone(),
                             1,
                             table.width,
                         ));
                     }
                     if let Some(i) = right {
                         vertical[r][c] = vertical[r][c].max(edge(
-                            *self.styles.get(grid.placements[i].cell),
+                            self.styles.get(grid.placements[i].cell).clone(),
                             3,
                             table.width,
                         ));
@@ -1365,7 +1727,7 @@ impl<'a> Engine<'a> {
                     continue;
                 };
                 if eng.is_hidden(child)
-                    || eng.styles.get(child).position == Position::Absolute
+                    || is_out_of_flow(eng.styles.get(child).position)
                     || tag == "table"
                     || matches!(tag.as_str(), "td" | "th")
                 {
@@ -1393,7 +1755,7 @@ impl<'a> Engine<'a> {
                 NodeData::Text(text) => !text.chars().all(is_html_space),
                 NodeData::Element { tag, .. } => {
                     !self.is_hidden(child)
-                        && (self.styles.get(child).position == Position::Absolute
+                        && (is_out_of_flow(self.styles.get(child).position)
                             || !matches!(tag.as_str(), "tr" | "thead" | "tbody" | "tfoot"))
                 }
             })
@@ -1653,8 +2015,8 @@ impl<'a> Engine<'a> {
         let height = if axis.vertical { inner_main } else { cross };
         for child in self.dom.children(id) {
             if matches!(self.dom.node(child).data, NodeData::Element { .. })
-                && self.styles.get(child).position == Position::Absolute
-                && let Some(abs) = self.layout_absolute(child, box_id, pre)
+                && is_out_of_flow(self.styles.get(child).position)
+                && let Some(abs) = self.layout_positioned(child, box_id, pre)
             {
                 children.push(abs);
             }
@@ -1749,7 +2111,7 @@ impl<'a> Engine<'a> {
         // arguments: its content rect (items sit inside its padding and border,
         // never against its border box), its edges, and its style.
         let dims = self.boxes[box_id.0 as usize].dimensions;
-        let container = self.boxes[box_id.0 as usize].computed;
+        let container = self.boxes[box_id.0 as usize].computed.clone();
         let content = dims.content;
         let cross_items: Vec<flex::CrossItem> = items
             .iter()
@@ -2267,7 +2629,14 @@ impl<'a> Engine<'a> {
                 dims.content.x = left + lead;
                 dims.content.y = container.y + dims.margin.top + dims.border.top + dims.padding.top;
                 dims.content.height = 0;
-                self.layout_box_at(node, &tag, item.computed, dims, containing_height, pre)
+                self.layout_box_at(
+                    node,
+                    &tag,
+                    item.computed.clone(),
+                    dims,
+                    containing_height,
+                    pre,
+                )
             }
             FlexItemSource::Text(ref nodes) => {
                 // An anonymous flex item: one inline formatting context over a
@@ -2333,7 +2702,7 @@ impl<'a> Engine<'a> {
     fn row_item(&mut self, source: FlexItemSource, axis: &FlexAxis) -> FlexItem {
         match source {
             FlexItemSource::Element(node) => {
-                let c = *self.styles.get(node);
+                let c = self.styles.get(node).clone();
                 // Measuring an inline subtree is the expensive thing flex added
                 // to the layout path, so it is asked at most once per item and
                 // only when §9.2's base size or §4.5's automatic minimum
@@ -2347,7 +2716,7 @@ impl<'a> Engine<'a> {
                     source: FlexItemSource::Element(node),
                     order: c.order,
                     metrics: item_metrics(&c, axis, content),
-                    computed: c,
+                    computed: c.clone(),
                     built: None,
                 }
             }
@@ -2361,7 +2730,7 @@ impl<'a> Engine<'a> {
                 let c = ComputedStyle::default();
                 FlexItem {
                     source: FlexItemSource::Text(nodes),
-                    computed: c,
+                    computed: c.clone(),
                     order: 0,
                     metrics: item_metrics(&c, axis, content),
                     built: None,
@@ -2399,7 +2768,7 @@ impl<'a> Engine<'a> {
     ) -> FlexItem {
         match source {
             FlexItemSource::Element(node) => {
-                let c = *self.styles.get(node);
+                let c = self.styles.get(node).clone();
                 let tag = match &self.dom.node(node).data {
                     NodeData::Element { tag, .. } => tag.clone(),
                     _ => String::new(),
@@ -2507,7 +2876,7 @@ impl<'a> Engine<'a> {
                 // gets an empty one: every item owes the tree a box, or F3 and
                 // hit-testing would stop matching the DOM.
                 let (b, content_main) = built.unwrap_or_else(|| {
-                    self.layout_box_at_measured(node, &tag, c, dims, definite_height, pre)
+                    self.layout_box_at_measured(node, &tag, c.clone(), dims, definite_height, pre)
                 });
 
                 FlexItem {
@@ -2517,7 +2886,7 @@ impl<'a> Engine<'a> {
                     // block at a fixed width has one, and min-content and
                     // max-content on this axis are the same number.
                     metrics: item_metrics(&c, axis, (content_main, content_main)),
-                    computed: c,
+                    computed: c.clone(),
                     built: Some(b),
                 }
             }
@@ -2552,7 +2921,7 @@ impl<'a> Engine<'a> {
                 let c = ComputedStyle::default();
                 FlexItem {
                     source: FlexItemSource::Text(nodes),
-                    computed: c,
+                    computed: c.clone(),
                     order: 0,
                     metrics: item_metrics(&c, axis, (content_main, content_main)),
                     built: Some(b),
@@ -2658,6 +3027,9 @@ impl<'a> Engine<'a> {
             computed: ComputedStyle::default(),
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
 
         let line_ids = if pre {
@@ -2714,6 +3086,9 @@ impl<'a> Engine<'a> {
             computed,
             image_src: Some(img.url.clone()),
             image_size_firm: firm,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         }))
     }
 
@@ -2746,6 +3121,9 @@ impl<'a> Engine<'a> {
             computed,
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
         Some(line)
     }
@@ -2797,6 +3175,9 @@ impl<'a> Engine<'a> {
             computed: ComputedStyle::default(),
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
         let box_id = self.alloc(LayoutBox {
             kind: BoxKind::Block,
@@ -2808,6 +3189,9 @@ impl<'a> Engine<'a> {
             computed,
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
         *prev_margin_bottom = dims.margin.bottom;
         Some(box_id)
@@ -2880,7 +3264,7 @@ impl<'a> Engine<'a> {
                         cells_w: *cells_w,
                         cells_h: *cells_h,
                         firm: *firm,
-                        computed: *computed,
+                        computed: computed.clone(),
                     });
                 }
                 InlineItem::Text {
@@ -3092,7 +3476,7 @@ impl<'a> Engine<'a> {
     /// `tests/fixtures/layout/spec/inline-block.boxes` pins both readings
     /// apart: its third paragraph is the one that would change.
     fn atomic_dims(&mut self, node: NodeId, containing_width: i32, available: i32) -> Dimensions {
-        let computed = *self.styles.get(node);
+        let computed = self.styles.get(node).clone();
         let mut dims = resolve_block_dims(&computed, containing_width, None);
         // An `auto` margin on an inline-level box is zero (CSS 2.1 §10.3.9),
         // not the free space of its containing block: a badge in a sentence
@@ -3141,7 +3525,7 @@ impl<'a> Engine<'a> {
         _containing_width: i32,
         pre: bool,
     ) -> Piece {
-        let computed = *self.styles.get(node);
+        let computed = self.styles.get(node).clone();
         let tag = match &self.dom.node(node).data {
             NodeData::Element { tag, .. } => tag.clone(),
             _ => String::new(),
@@ -3215,9 +3599,12 @@ impl<'a> Engine<'a> {
             children: Vec::new(),
             text: Some(alt.clone()),
             term_style: Style::default(),
-            computed: *computed,
+            computed: computed.clone(),
             image_src: Some(url.clone()),
             image_size_firm: *firm,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
         lines.push(img_id);
         *line_y += h;
@@ -3284,6 +3671,9 @@ impl<'a> Engine<'a> {
             computed: ComputedStyle::default(),
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
         // Merge adjacent same-style pieces. An atomic inline is a box, not
         // characters, so it merges with nothing on either side.
@@ -3311,8 +3701,8 @@ impl<'a> Engine<'a> {
                     let placed = self.boxes[box_id.0 as usize].dimensions.margin_box();
                     let (_, baseline) = self.atomic_rows(box_id);
                     self.shift_subtree(box_id, cx - placed.x, (baseline_row - baseline) - placed.y);
-                    let computed = self.boxes[box_id.0 as usize].computed;
-                    if computed.position == Position::Relative {
+                    let computed = self.boxes[box_id.0 as usize].computed.clone();
+                    if matches!(computed.position, Position::Relative | Position::Sticky) {
                         self.apply_relative(box_id, computed, width, None);
                     }
                     box_id
@@ -3335,6 +3725,9 @@ impl<'a> Engine<'a> {
                     computed: ComputedStyle::default(),
                     image_src: None,
                     image_size_firm: false,
+                    fixed_viewport: false,
+                    sticky: None,
+                    grid: None,
                 }),
             };
             cx += p.cells;
@@ -3468,6 +3861,9 @@ impl<'a> Engine<'a> {
             computed: ComputedStyle::default(),
             image_src: None,
             image_size_firm: false,
+            fixed_viewport: false,
+            sticky: None,
+            grid: None,
         });
         lines.push(line_id);
         *line_y += 1;
@@ -3521,7 +3917,7 @@ impl<'a> Engine<'a> {
                     node: id,
                     text: text.clone(),
                     style: term_style(self.styles.get(id)),
-                    computed: *self.styles.get(id),
+                    computed: self.styles.get(id).clone(),
                 });
             }
             NodeData::Element { tag, .. } => {
@@ -3531,7 +3927,7 @@ impl<'a> Engine<'a> {
                 // An out-of-flow inline neither leaves a text fragment nor a
                 // line-sized atomic item. Its block parent schedules it after
                 // normal flow has been laid out.
-                if self.styles.get(id).position == Position::Absolute {
+                if is_out_of_flow(self.styles.get(id).position) {
                     return;
                 }
                 if tag == "br" {
@@ -3549,7 +3945,7 @@ impl<'a> Engine<'a> {
                             cells_w: cw,
                             cells_h: ch,
                             firm,
-                            computed: *self.styles.get(id),
+                            computed: self.styles.get(id).clone(),
                         });
                     }
                     return;
@@ -3566,7 +3962,7 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let computed = self.styles.get(id);
-                if computed.position == Position::Relative {
+                if matches!(computed.position, Position::Relative | Position::Sticky) {
                     // A relative inline needs a real subtree to move after it
                     // has claimed its ordinary line space. Atomic placement is
                     // the engine's existing representation of that invariant.
@@ -3628,7 +4024,7 @@ impl<'a> Engine<'a> {
                     continue;
                 };
                 let style = eng.styles.get(child);
-                if style.position == Position::Absolute {
+                if is_out_of_flow(style.position) {
                     out.push(child);
                 } else if style.display == Display::Inline {
                     walk(eng, child, out);
@@ -4216,6 +4612,173 @@ pub(super) fn lays_out_as_flex(computed: &ComputedStyle) -> bool {
     matches!(computed.display, Display::Flex | Display::InlineFlex)
 }
 
+pub(super) fn lays_out_as_grid(computed: &ComputedStyle) -> bool {
+    matches!(computed.display, Display::Grid | Display::InlineGrid)
+}
+
+fn grid_axis(pair: (GridPlacement, GridPlacement), limit: usize) -> (Option<usize>, usize) {
+    let (start, span) = match pair {
+        (GridPlacement::Line(a), GridPlacement::Line(b)) if b > a => {
+            (Some(a.saturating_sub(1)), b - a)
+        }
+        (GridPlacement::Line(a), GridPlacement::Span(n)) => (Some(a.saturating_sub(1)), n),
+        (GridPlacement::Line(a), _) => (Some(a.saturating_sub(1)), 1),
+        (GridPlacement::Span(n), GridPlacement::Line(b)) => {
+            (Some(b.saturating_sub(1).saturating_sub(n)), n)
+        }
+        (GridPlacement::Auto, GridPlacement::Line(b)) => (Some(b.saturating_sub(2)), 1),
+        (GridPlacement::Span(n), _) | (_, GridPlacement::Span(n)) => (None, n),
+        _ => (None, 1),
+    };
+    let start = start.map(|n| n.min(limit.saturating_sub(1)));
+    let span = span.min(limit.max(1));
+    (start, span)
+}
+fn grid_free(cells: &[Vec<bool>], row: usize, col: usize, rs: usize, cs: usize) -> bool {
+    (row..row.saturating_add(rs).min(256)).all(|r| {
+        (col..col.saturating_add(cs)).all(|c| {
+            !cells
+                .get(r)
+                .and_then(|x| x.get(c))
+                .copied()
+                .unwrap_or(false)
+        })
+    })
+}
+fn grid_reserve(cells: &mut Vec<Vec<bool>>, row: usize, col: usize, rs: usize, cs: usize) {
+    let last = row.saturating_add(rs).min(256);
+    while cells.len() < last {
+        cells.push(Vec::new());
+    }
+    for occupied in cells.iter_mut().take(last).skip(row) {
+        if occupied.len() < col.saturating_add(cs) {
+            occupied.resize(col.saturating_add(cs), false);
+        }
+        for cell in occupied.iter_mut().take(col.saturating_add(cs)).skip(col) {
+            *cell = true;
+        }
+    }
+}
+fn grid_offset(tracks: &[i32], at: usize, gap: i32) -> i32 {
+    tracks
+        .iter()
+        .take(at)
+        .fold(0i32, |n, x| n.saturating_add(*x).saturating_add(gap))
+}
+fn grid_span(tracks: &[i32], at: usize, span: usize, gap: i32) -> i32 {
+    tracks
+        .iter()
+        .skip(at)
+        .take(span)
+        .fold(0i32, |n, x| n.saturating_add(*x))
+        .saturating_add(gap.saturating_mul(span.saturating_sub(1) as i32))
+}
+#[derive(Clone, Copy)]
+enum GridTrackAxis {
+    Columns { width: i32 },
+    Rows { width: i32, height: Option<i32> },
+}
+
+impl GridTrackAxis {
+    fn available(self) -> i32 {
+        match self {
+            Self::Columns { width } => width,
+            Self::Rows { height, .. } => height.unwrap_or(0),
+        }
+    }
+
+    fn length(self, value: Length) -> i32 {
+        match self {
+            Self::Columns { width } => value.to_cells_h(width),
+            Self::Rows {
+                height: Some(height),
+                ..
+            } if matches!(value, Length::Percent(_)) => value.to_lines(height),
+            Self::Rows { height: None, .. } if matches!(value, Length::Percent(_)) => 0,
+            Self::Rows { width, .. } => value.to_cells_v(width),
+        }
+    }
+}
+
+fn grid_row_accepts_content(track: GridTrack, definite_height: bool) -> bool {
+    matches!(track, GridTrack::Auto | GridTrack::MinMax(GridMin::Auto, _))
+        || (!definite_height
+            && matches!(
+                track,
+                GridTrack::Fr(_)
+                    | GridTrack::Fixed(Length::Percent(_))
+                    | GridTrack::MinMax(_, GridMax::Fr(_))
+            ))
+}
+
+fn resolve_grid_tracks(tracks: &[GridTrack], axis: GridTrackAxis, gap: i32) -> Vec<i32> {
+    let available = axis.available();
+    let free = available
+        .saturating_sub(gap.saturating_mul(tracks.len().saturating_sub(1) as i32))
+        .max(0);
+    tracks
+        .iter()
+        .map(|t| match t {
+            GridTrack::Fixed(l) => axis.length(*l).max(0),
+            GridTrack::Auto | GridTrack::Fr(_) => 0,
+            GridTrack::MinMax(GridMin::Fixed(l), _) => axis.length(*l).max(0),
+            GridTrack::MinMax(_, _) => 0,
+        })
+        .map(|n| if available > 0 { n.min(free) } else { n })
+        .collect()
+}
+fn fit_grid_tracks(
+    tracks: &[GridTrack],
+    mut used: Vec<i32>,
+    axis: GridTrackAxis,
+    gap: i32,
+) -> Vec<i32> {
+    let available = axis.available();
+    let target = available
+        .saturating_sub(gap.saturating_mul(used.len().saturating_sub(1) as i32))
+        .max(0);
+    let sum = used.iter().fold(0i32, |n, x| n.saturating_add(*x));
+    let free = target.saturating_sub(sum).max(0);
+    let factor: f32 = tracks
+        .iter()
+        .map(|t| match t {
+            GridTrack::Fr(n) => *n,
+            GridTrack::MinMax(_, GridMax::Fr(n)) => *n,
+            _ => 0.,
+        })
+        .sum();
+    if factor > 0. {
+        let mut left = free;
+        for (i, t) in tracks.iter().enumerate() {
+            let f = match t {
+                GridTrack::Fr(n) => *n,
+                GridTrack::MinMax(_, GridMax::Fr(n)) => *n,
+                _ => 0.,
+            };
+            let add = if f == 0. {
+                0
+            } else {
+                ((free as f32 * f / factor).round() as i32).min(left)
+            };
+            used[i] = used[i].saturating_add(add);
+            left = left.saturating_sub(add);
+        }
+    }
+    used.into_iter()
+        .zip(tracks)
+        .map(|(used, track)| match track {
+            GridTrack::MinMax(min, GridMax::Fixed(max)) => {
+                let floor = match min {
+                    GridMin::Fixed(value) => axis.length(*value).max(0),
+                    GridMin::Auto => 0,
+                };
+                used.min(axis.length(*max).max(floor)).max(floor)
+            }
+            _ => used.max(0),
+        })
+        .collect()
+}
+
 /// Does this flex container's main axis run down the page? Intrinsic sizing
 /// needs the answer to know whether to sum its items' widths or take the
 /// largest (M9.9); the engine gets it from [`FlexAxis`].
@@ -4643,7 +5206,7 @@ pub fn term_color(color: crate::style::values::ColorValue) -> Color {
 /// lets a flex container be a block's child, and a block a flex item, with no
 /// second code path on either side.
 pub(super) fn is_block_level(display: Display) -> bool {
-    matches!(display, Display::Block | Display::Flex)
+    matches!(display, Display::Block | Display::Flex | Display::Grid)
 }
 
 /// The bounded local state of one no-span table column. It is intentionally
@@ -4806,7 +5369,10 @@ fn fit_table_columns(columns: &[TableColumn], requested: i32) -> Vec<i32> {
 /// `inline-block` and `inline-flex` share every line of placement code and
 /// differ only in which formatting context fills the box.
 pub(super) fn is_atomic_inline(display: Display) -> bool {
-    matches!(display, Display::InlineBlock | Display::InlineFlex)
+    matches!(
+        display,
+        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+    )
 }
 
 /// Where a line may be broken: HTML whitespace, and nothing else.

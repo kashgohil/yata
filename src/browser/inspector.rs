@@ -16,8 +16,8 @@ use crate::layout::{BoxId, BoxKind, LayoutTree};
 use crate::style::Styles;
 use crate::style::values::{
     AlignContent, AlignItems, AlignSelf, BoxSizing, ColorValue, Display, Edges, Flex, FlexBasis,
-    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, JustifyContent, Length, Position,
-    TextAlign,
+    FlexDirection, FlexWrap, FontStyle, FontWeight, Gaps, GridMax, GridMin, GridPlacement,
+    GridTrack, JustifyContent, Length, Position, TextAlign,
 };
 
 /// Cell caps for the variable-length parts of a line. Text gets the most room
@@ -112,6 +112,8 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
         Display::Block => "block".to_string(),
         Display::Inline => "inline".to_string(),
         Display::InlineBlock => "inline-block".to_string(),
+        Display::Grid => "grid".to_string(),
+        Display::InlineGrid => "inline-grid".to_string(),
         Display::None => "none".to_string(),
         // A flex container prints its axis with the display keyword — `flex
         // row`, and `flex row wrap` when it wraps — because "which way does
@@ -196,6 +198,8 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
         parts.push(match computed.position {
             Position::Relative => "position relative".into(),
             Position::Absolute => "position absolute".into(),
+            Position::Fixed => "position fixed".into(),
+            Position::Sticky => "position sticky".into(),
             Position::Static => unreachable!("initial position is omitted"),
         });
     }
@@ -215,7 +219,80 @@ fn summarize(computed: &crate::style::ComputedStyle) -> String {
         parts.push(format!("overflow {o}"));
     }
     parts.extend(flex_summary(computed));
+    parts.extend(grid_summary(computed));
     parts.join(" · ")
+}
+
+/// Grid clauses follow the same “interesting only” rule as flex: a normal
+/// block does not gain noise merely because the grid longhands exist on every
+/// computed style, while F2 still exposes declarations that would otherwise
+/// be invisible until they happen to affect a grid parent.
+fn grid_summary(computed: &crate::style::ComputedStyle) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !computed.grid_template_columns.is_empty() {
+        parts.push(format!(
+            "grid-cols {}",
+            computed
+                .grid_template_columns
+                .iter()
+                .map(grid_track_summary)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    if !computed.grid_template_rows.is_empty() {
+        parts.push(format!(
+            "grid-rows {}",
+            computed
+                .grid_template_rows
+                .iter()
+                .map(grid_track_summary)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    if computed.grid_column != (GridPlacement::Auto, GridPlacement::Auto) {
+        parts.push(format!(
+            "grid-column {} / {}",
+            placement_summary(computed.grid_column.0),
+            placement_summary(computed.grid_column.1)
+        ));
+    }
+    if computed.grid_row != (GridPlacement::Auto, GridPlacement::Auto) {
+        parts.push(format!(
+            "grid-row {} / {}",
+            placement_summary(computed.grid_row.0),
+            placement_summary(computed.grid_row.1)
+        ));
+    }
+    parts
+}
+
+fn grid_track_summary(track: &GridTrack) -> String {
+    match track {
+        GridTrack::Fixed(length) => length_summary(*length),
+        GridTrack::Auto => "auto".into(),
+        GridTrack::Fr(factor) => format!("{factor}fr"),
+        GridTrack::MinMax(min, max) => {
+            let min = match min {
+                GridMin::Fixed(length) => length_summary(*length),
+                GridMin::Auto => "auto".into(),
+            };
+            let max = match max {
+                GridMax::Fixed(length) => length_summary(*length),
+                GridMax::Fr(factor) => format!("{factor}fr"),
+            };
+            format!("minmax({min}, {max})")
+        }
+    }
+}
+
+fn placement_summary(placement: GridPlacement) -> String {
+    match placement {
+        GridPlacement::Auto => "auto".into(),
+        GridPlacement::Line(line) => line.to_string(),
+        GridPlacement::Span(span) => format!("span {span}"),
+    }
 }
 
 /// The flex clauses (M9.5), in the order a page would write them: container
@@ -381,6 +458,21 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
                 }
                 label
             }
+            BoxKind::Grid => {
+                let name = b
+                    .node
+                    .and_then(|nid| match &dom.node(nid).data {
+                        NodeData::Element { tag, attrs } => Some(element_summary(tag, attrs)),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "grid".into());
+                let tracks = b
+                    .grid
+                    .as_ref()
+                    .map(|g| format!(" cols={:?} rows={:?}", g.columns, g.rows))
+                    .unwrap_or_default();
+                format!("{name} grid{tracks}")
+            }
             BoxKind::Block | BoxKind::Inline => {
                 if let Some(nid) = b.node {
                     match &dom.node(nid).data {
@@ -453,15 +545,30 @@ fn push_box(dom: &Dom, tree: &LayoutTree, id: BoxId, depth: usize, out: &mut Vec
             }
         };
         let d = b.dimensions.content;
+        let positioning = if b.fixed_viewport {
+            " fixed viewport".to_string()
+        } else if let Some(sticky) = b.sticky {
+            format!(
+                " sticky top {} range {}",
+                sticky.inset,
+                sticky
+                    .containing_end
+                    .saturating_sub(sticky.static_end)
+                    .max(0)
+            )
+        } else {
+            String::new()
+        };
         out.push(format!(
-            "{}{}  x={} y={} w={} h={}{}",
+            "{}{}  x={} y={} w={} h={}{}{}",
             "  ".repeat(depth),
             label,
             d.x,
             d.y,
             d.width,
             d.height,
-            overflow_summary(&b.computed).map_or(String::new(), |o| format!(" overflow={o}"))
+            overflow_summary(&b.computed).map_or(String::new(), |o| format!(" overflow={o}")),
+            positioning,
         ));
     }
     let child_depth = if skip_label { depth } else { depth + 1 };
@@ -709,6 +816,22 @@ mod tests {
     }
 
     #[test]
+    fn f2_explains_grid_tracks_and_item_placement() {
+        let lines = styled(
+            "<div class=g><p>item</p></div>",
+            ".g { display:grid; grid-template-columns: 10px minmax(auto, 1fr); grid-template-rows: auto 2em; gap: 1em } p { grid-column: 2 / span 1; grid-row: 1 / 2 }",
+        );
+        let grid = lines.iter().find(|line| line.contains("<div.g>")).unwrap();
+        assert!(grid.contains("grid"), "{grid}");
+        assert!(grid.contains("grid-cols 10px minmax(auto, 1fr)"), "{grid}");
+        assert!(grid.contains("grid-rows auto 2em"), "{grid}");
+        assert!(grid.contains("gap 1em"), "{grid}");
+        let item = lines.iter().find(|line| line.contains("<p>")).unwrap();
+        assert!(item.contains("grid-column 2 / span 1"), "{item}");
+        assert!(item.contains("grid-row 1 / 2"), "{item}");
+    }
+
+    #[test]
     fn hidden_elements_are_listed_as_hidden_not_omitted() {
         // The inspector's job is to explain the page, and "why is this not on
         // screen" is the question it most needs to answer.
@@ -835,6 +958,32 @@ mod tests {
             lines
                 .iter()
                 .any(|l| l.contains("#text") && l.contains("hi")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn box_lines_explain_fixed_and_sticky_adjustments() {
+        let dom = parse("<div class=fixed>f</div><div class=sticky>s</div>");
+        let sheet = crate::css::parse(
+            ".fixed { position: fixed; top: 0 } .sticky { position: sticky; top: 0 }",
+        );
+        let styles = crate::style::style_tree(&dom, &[&sheet]);
+        let tree = crate::layout::layout_document_with_viewport(
+            &dom,
+            &styles,
+            40,
+            4,
+            crate::layout::Hidden::Respect,
+            &crate::image::ImageContext::default(),
+        );
+        let lines = box_lines(&dom, &tree);
+        assert!(
+            lines.iter().any(|line| line.contains("fixed viewport")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("sticky top 0 range")),
             "{lines:?}"
         );
     }

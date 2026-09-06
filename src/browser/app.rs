@@ -1551,14 +1551,26 @@ impl App {
         let width = column(self.size.0).width;
         let img_ctx = self.images.context();
         // One layout (or two if we have to reveal a page that hid itself).
-        let tree =
-            layout::layout_document_with(dom, styles, width, layout::Hidden::Respect, &img_ctx);
+        let tree = layout::layout_document_with_viewport(
+            dom,
+            styles,
+            width,
+            self.page(),
+            layout::Hidden::Respect,
+            &img_ctx,
+        );
         let mut lines = layout::lines_from_tree(&tree);
         let (tree, revealed) = if lines.iter().any(|l| !l.spans.is_empty()) {
             (tree, false)
         } else {
-            let alt =
-                layout::layout_document_with(dom, styles, width, layout::Hidden::Reveal, &img_ctx);
+            let alt = layout::layout_document_with_viewport(
+                dom,
+                styles,
+                width,
+                self.page(),
+                layout::Hidden::Reveal,
+                &img_ctx,
+            );
             let alt_lines = layout::lines_from_tree(&alt);
             if alt_lines.iter().any(|l| !l.spans.is_empty()) {
                 lines = alt_lines;
@@ -2333,9 +2345,12 @@ impl App {
         let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
             return Effect::default();
         };
-        let top = self.viewport.offset() as i32;
-        let bottom = top + self.page() as i32;
-        let visible = layout::visible_links(tree, dom, top, bottom);
+        let visible = layout::visible_links_viewport(
+            tree,
+            dom,
+            self.viewport.offset() as i32,
+            self.page() as i32,
+        );
         if visible.is_empty() {
             return Effect::default();
         }
@@ -3678,7 +3693,7 @@ impl App {
     }
 
     fn on_click(&mut self, col: u16, row: u16) -> Effect {
-        let Some((x, y)) = self.frame_to_doc(col, row) else {
+        let Some((x, _)) = self.frame_to_doc(col, row) else {
             return Effect::default();
         };
         let (Some(dom), Some(tree)) = (&self.dom, &self.layout_tree) else {
@@ -3696,8 +3711,12 @@ impl App {
         //
         // Asked before the link walk so that a control inside an anchor takes
         // the click, which is what the reader aimed at.
-        if let Some(node) = layout::hit_test(tree, x, y).and_then(|n| layout::nearest_field(dom, n))
-        {
+        let hit = if layout::has_viewport_adjustment(tree) {
+            layout::hit_test_viewport(tree, x, row as i32, self.viewport.offset() as i32)
+        } else {
+            layout::hit_test(tree, x, self.viewport.offset() as i32 + row as i32)
+        };
+        if let Some(node) = hit.and_then(|n| layout::nearest_field(dom, n)) {
             let submits = form::is_submit_button(dom, node);
             let choice = match &dom.node(node).data {
                 NodeData::Element { tag, .. } => {
@@ -3761,7 +3780,12 @@ impl App {
             }
             unreachable!("non-choice controls returned in the shared action above")
         }
-        let Some((node, href)) = layout::link_at(tree, dom, x, y) else {
+        let link = if layout::has_viewport_adjustment(tree) {
+            layout::link_at_viewport(tree, dom, x, row as i32, self.viewport.offset() as i32)
+        } else {
+            layout::link_at(tree, dom, x, self.viewport.offset() as i32 + row as i32)
+        };
+        let Some((node, href)) = link else {
             return Effect::default();
         };
         let href = href.to_string();
@@ -3787,9 +3811,14 @@ impl App {
     }
 
     fn on_hover_move(&mut self, col: u16, row: u16) -> Effect {
-        let target = self.frame_to_doc(col, row).and_then(|(x, y)| {
+        let target = self.frame_to_doc(col, row).and_then(|(x, _)| {
             let (dom, tree) = self.dom.as_ref().zip(self.layout_tree.as_ref())?;
-            layout::hit_test(tree, x, y).map(|node| {
+            let hit = if layout::has_viewport_adjustment(tree) {
+                layout::hit_test_viewport(tree, x, row as i32, self.viewport.offset() as i32)
+            } else {
+                layout::hit_test(tree, x, self.viewport.offset() as i32 + row as i32)
+            };
+            hit.map(|node| {
                 // Hover the nearest element; for text, that is the text node —
                 // `:hover` on `a:hover` needs the anchor. Walk up to the
                 // nearest element... actually CSS :hover matches the element
@@ -3877,7 +3906,11 @@ impl App {
         let page_h = self.page() as i32;
         let style = reversed();
         for (i, m) in session.matches.iter().enumerate() {
-            let screen_y = m.y - scroll;
+            let screen_y = self
+                .layout_tree
+                .as_ref()
+                .and_then(|tree| layout::text_screen_y(tree, m.x, m.y, scroll))
+                .unwrap_or_else(|| m.y.saturating_sub(scroll));
             if screen_y < 0 || screen_y >= page_h {
                 continue;
             }
@@ -3947,7 +3980,7 @@ impl App {
             let Some((x, text)) = clip.trim_text(x, y, text) else {
                 return;
             };
-            let screen_y = y - scroll;
+            let screen_y = layout::box_screen_y(b, scroll);
             if screen_y < 0 || screen_y >= page_h {
                 return;
             }
@@ -4003,7 +4036,8 @@ impl App {
                 let Some((x, text)) = clip.trim_text(run.x, run.y, &run.text) else {
                     continue;
                 };
-                let screen_y = run.y - scroll;
+                let screen_y = layout::box_screen_y(b, scroll)
+                    .saturating_add(run.y.saturating_sub(b.dimensions.content.y));
                 let screen_x = left as i32 + x;
                 if screen_y < 0 || screen_y >= page_h || screen_x < 0 {
                     continue;
@@ -4019,7 +4053,8 @@ impl App {
             if !clip.contains(x, y) {
                 return;
             }
-            let screen_y = y - scroll;
+            let screen_y = layout::box_screen_y(b, scroll)
+                .saturating_add(y.saturating_sub(b.dimensions.content.y));
             let screen_x = left as i32 + x;
             if screen_y < 0 || screen_y >= page_h || screen_x < 0 {
                 return;
@@ -4409,8 +4444,8 @@ fn recolour_tree(tree: &mut LayoutTree, styles: &Styles) {
         let Some(node) = b.node else {
             continue;
         };
-        let computed = *styles.get(node);
-        b.computed = computed;
+        let computed = styles.get(node).clone();
+        b.computed = computed.clone();
         if b.kind == BoxKind::Text {
             b.term_style = layout::term_style(&computed);
         }
@@ -9613,6 +9648,231 @@ mod tests {
     }
 
     #[test]
+    fn a_grid_style_mutation_restyles_and_relayouts_once() {
+        let (mut app, id) = scripted_app(
+            "<style>.grid { display:grid; grid-template-columns:1fr 1fr; gap:1em } \
+             .wide { display:grid; grid-template-columns:1fr 2fr; gap:1em }</style>\
+             <div id=x class=grid><p>one</p><p>two</p></div>\
+             <script>document.getElementById('x').setAttribute('class', 'wide')</script>",
+        );
+        let before = stages(&app);
+        let effect = app.update(Msg::RunScripts { id });
+        assert!(effect.dirty);
+        assert_eq!(stages(&app), (before.0 + 1, before.1 + 1, before.2 + 1));
+    }
+
+    #[test]
+    fn a_grid_item_placement_mutation_relayouts_once_at_the_new_cell() {
+        let (mut app, id) = scripted_app(
+            "<style>body,p{margin:0}.g{display:grid;grid-template-columns:1fr 1fr}.moved{grid-column:2}</style>\
+             <div class=g><p id=x>one</p><p>two</p></div>\
+             <script>document.getElementById('x').setAttribute('class','moved')</script>",
+        );
+        let before = stages(&app);
+        app.update(Msg::RunScripts { id });
+        assert_eq!(stages(&app), (before.0 + 1, before.1 + 1, before.2 + 1));
+        let (dom, tree) = (app.dom.as_ref().unwrap(), app.layout_tree.as_ref().unwrap());
+        let moved_x = tree
+            .boxes
+            .iter()
+            .find(|b| b.node.is_some_and(|node| dom.attr(node, "id") == Some("x")))
+            .unwrap()
+            .dimensions
+            .margin_box()
+            .x;
+        assert_eq!(moved_x, 19);
+    }
+
+    #[test]
+    fn grid_scrolling_reuses_the_cached_layout() {
+        let items: String = (0..80).map(|n| format!("<p>row {n}</p>")).collect();
+        let mut app = page(
+            40,
+            8,
+            &format!(
+                "<style>.g{{display:grid;grid-template-columns:1fr 1fr}}p{{margin:0}}</style><div class=g>{items}</div>"
+            ),
+        );
+        let before = stages(&app);
+        for _ in 0..40 {
+            app.update(ch('j'));
+        }
+        assert!(app.viewport.offset() > 0);
+        assert_eq!(
+            stages(&app),
+            before,
+            "scrolling must not re-run grid placement"
+        );
+    }
+
+    #[test]
+    fn a_link_in_the_second_grid_track_is_hit_at_its_final_rectangle() {
+        let mut app = page(
+            60,
+            10,
+            "<style>body{margin:0}.g{display:grid;grid-template-columns:1fr 1fr}a{display:block}</style><div class=g><a href=/one>one</a><a href=/two>two</a></div>",
+        );
+        let dom = app.dom.as_ref().unwrap();
+        let tree = app.layout_tree.as_ref().unwrap();
+        let link = layout::collect_links(tree, dom)
+            .into_iter()
+            .find(|link| link.href == "/two")
+            .expect("grid link missing");
+        // The 60-column terminal reserves one gutter cell, leaving a 59-cell
+        // page column; the second fractional track begins at its 29th cell.
+        assert_eq!((link.x, link.y), (29, 0));
+        let left = column(app.size.0).left;
+        let effect = app.update(mouse_down((left as i32 + link.x) as u16, link.y as u16));
+        assert_eq!(
+            effect
+                .fetch
+                .as_ref()
+                .map(|(_, request)| request.url.as_str()),
+            Some("http://final/two")
+        );
+    }
+
+    #[test]
+    fn grid_links_and_fields_share_focus_and_hint_geometry() {
+        let mut app = page(
+            60,
+            10,
+            "<style>body,p{margin:0}.g{display:grid;grid-template-columns:96px 1fr}</style><div class=g><a href=/side>side</a><a href=/main>main</a><input value=query></div>",
+        );
+        let before = stages(&app);
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(focused(&app).as_deref(), Some("a /side"));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(focused(&app).as_deref(), Some("a /main"));
+        app.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(focused(&app).as_deref(), Some("input query"));
+        assert_eq!(stages(&app), before, "grid focus reran the pipeline");
+
+        app.update(ch('f'));
+        let session = app.hint.as_ref().expect("grid hints must open");
+        let hrefs: Vec<_> = session
+            .labels
+            .iter()
+            .map(|(_, link)| link.href.as_str())
+            .collect();
+        assert!(hrefs.contains(&"/side"), "{hrefs:?}");
+        assert!(hrefs.contains(&"/main"), "{hrefs:?}");
+        let main = session
+            .labels
+            .iter()
+            .find(|(_, link)| link.href == "/main")
+            .unwrap();
+        assert!(main.1.x >= 12, "second-track hint at x={}", main.1.x);
+    }
+
+    #[test]
+    fn search_highlights_text_at_its_final_grid_rectangle() {
+        let mut app = page(
+            60,
+            10,
+            "<style>body,p{margin:0}.g{display:grid;grid-template-columns:96px 1fr}</style><div class=g><p>rail</p><p>needle in the article</p></div>",
+        );
+        let before = stages(&app);
+        app.update(ch('/'));
+        for c in "needle".chars() {
+            app.update(ch(c));
+        }
+        app.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let found = &app.search.as_ref().expect("grid search missing").matches;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].x >= 12, "grid match at x={}", found[0].x);
+        let mut frame = Frame::new(60, 10);
+        app.draw(&mut frame);
+        assert!(
+            (12..59).any(|x| frame.get(x, 0).attrs.contains(Attrs::REVERSE)),
+            "search overlay missed the second grid track"
+        );
+        assert_eq!(stages(&app), before, "grid search reran the pipeline");
+    }
+
+    #[test]
+    fn decoded_image_pixels_keep_their_grid_track_rectangle() {
+        let mut app = App::new(60, 10);
+        let (id, _) = open_page(
+            &mut app,
+            r#"<style>body{margin:0}.g{display:grid;grid-template-columns:1fr 1fr}</style><div class=g><p>left</p><img src=pic.png width=16 height=32 alt=pic></div>"#,
+        );
+        let decoded = crate::image::DecodedImage::new(2, 2, vec![255; 2 * 2 * 4]);
+        app.update(Msg::Image {
+            id,
+            url: "http://site.test/dir/pic.png".into(),
+            result: Ok(decoded),
+        });
+        let rect = app
+            .display_list
+            .commands
+            .iter()
+            .find_map(|command| match command {
+                crate::paint::DisplayCommand::Image {
+                    rect,
+                    pixels: Some(_),
+                    ..
+                } => Some(*rect),
+                _ => None,
+            })
+            .expect("decoded grid image was not painted");
+        assert!(rect.x >= 29, "image did not stay in track two: {rect:?}");
+        assert_eq!((rect.width, rect.height), (2, 2));
+    }
+
+    #[test]
+    fn sticky_grid_heading_uses_cached_static_space_at_several_scroll_offsets() {
+        let rows: String = (0..40)
+            .map(|n| format!("<p class=row>row {n}</p>"))
+            .collect();
+        let mut app = page(
+            40,
+            8,
+            &format!(
+                "<style>body,p{{margin:0}}.g{{display:grid;grid-template-columns:1fr 1fr}}.head{{position:sticky;top:0;grid-column:2;grid-row:1}}.row{{grid-column:1}}</style><div class=g><p class=head>HEAD</p>{rows}</div>"
+            ),
+        );
+        let laid_out = stages(&app);
+        for target in [0, 2, 5] {
+            while app.viewport.offset() < target {
+                app.update(ch('j'));
+            }
+            let mut frame = Frame::new(40, 8);
+            app.draw(&mut frame);
+            assert!(row_text(&frame, 0).contains("HEAD"), "offset {target}");
+            assert_eq!(stages(&app), laid_out, "sticky grid scroll relaid out");
+        }
+    }
+
+    #[test]
+    fn grid_resize_relayouts_once_and_recomputes_percentage_and_fr_tracks() {
+        fn tracks(app: &App) -> Vec<i32> {
+            app.layout_tree
+                .as_ref()
+                .unwrap()
+                .boxes
+                .iter()
+                .find_map(|b| b.grid.as_ref().map(|g| g.columns.clone()))
+                .expect("grid root missing")
+        }
+
+        let mut app = page(
+            60,
+            10,
+            "<style>body,p{margin:0}.g{display:grid;grid-template-columns:25% 1fr}</style><div class=g><p>a</p><p>b</p></div>",
+        );
+        let before_tracks = tracks(&app);
+        let before = stages(&app);
+        app.update(Msg::Resize(40, 10));
+        let after_tracks = tracks(&app);
+        assert_eq!(stages(&app), (before.0, before.1 + 1, before.2 + 1));
+        assert_ne!(after_tracks, before_tracks);
+        assert_eq!(before_tracks.iter().sum::<i32>(), 58);
+        assert_eq!(after_tracks.iter().sum::<i32>(), 38);
+        assert_eq!(after_tracks, vec![10, 28]);
+    }
+
+    #[test]
     fn a_tick_that_only_touches_cookies_runs_no_stage_either() {
         // M11.6 deliverable 9, under M10.6's discipline: `document.cookie` is
         // read by the first inline script of a page, so it is on the load path
@@ -12283,6 +12543,59 @@ mod tests {
         assert_eq!(app.layouts, 2, "a resize relayouts exactly once");
         // …and the reader keeps their place instead of being thrown to the top.
         assert!(app.viewport.offset() > 0, "resize reset the scroll");
+    }
+
+    #[test]
+    fn scrolling_fixed_and_sticky_output_uses_the_cached_layout() {
+        let body: String = (0..30).map(|i| format!("<p>p{i}</p>")).collect();
+        let html = format!(
+            "<style>.tools{{position:fixed;top:0}} .chapter{{position:sticky;top:0}} p{{margin:0}}</style>\
+             <div class=tools>tools</div><div class=chapter>chapter</div>{body}"
+        );
+        let mut app = page(80, 8, &html);
+        let before = stages(&app);
+        for _ in 0..10 {
+            app.update(ch('j'));
+        }
+        assert!(app.viewport.offset() > 0, "positioned page did not scroll");
+        assert_eq!(
+            stages(&app).0,
+            before.0,
+            "scrolling fixed/sticky output restyled"
+        );
+        assert_eq!(
+            stages(&app).1,
+            before.1,
+            "scrolling fixed/sticky output relaid out"
+        );
+    }
+
+    #[test]
+    fn resizing_recomputes_fixed_viewport_percentages_once() {
+        let mut app = page(
+            80,
+            8,
+            "<style>.tools { position: fixed; top: 50% }</style><div class=tools>fixed</div>",
+        );
+        let fixed_y = |app: &App| {
+            app.layout_tree
+                .as_ref()
+                .unwrap()
+                .boxes
+                .iter()
+                .find(|b| b.fixed_viewport && b.kind == layout::BoxKind::Block)
+                .unwrap()
+                .dimensions
+                .content
+                .y
+        };
+        let before = fixed_y(&app);
+        app.update(Msg::Resize(80, 12));
+        assert_eq!(app.layouts, 2, "resize must relayout exactly once");
+        assert!(
+            fixed_y(&app) > before,
+            "fixed percentage ignored new viewport"
+        );
     }
 
     #[test]

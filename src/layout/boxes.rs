@@ -26,6 +26,9 @@ pub enum BoxKind {
     /// exists because what is *inside* it was placed by a different algorithm,
     /// and F3 has to be able to say so.
     Flex,
+    /// A grid formatting root. Placement has already produced its children’s
+    /// ordinary rectangles; later stages only read those rectangles.
+    Grid,
     /// A table formatting root. Its children are [`TableRow`](Self::TableRow)
     /// boxes rather than ordinary block-flow siblings.
     Table,
@@ -77,6 +80,32 @@ pub struct LayoutBox {
     pub image_src: Option<String>,
     /// When true, a late decode must not force relayout (attrs or known size).
     pub image_size_firm: bool,
+    /// This subtree is anchored to the terminal viewport rather than the
+    /// scrolling document (M11.18).  It is layout output, never a paint-time
+    /// style query.
+    pub fixed_viewport: bool,
+    /// The finite viewport adjustment for a sticky subtree.  The static box
+    /// geometry remains in document coordinates; paint resolves this record
+    /// for its current scroll offset.
+    pub sticky: Option<StickyConstraint>,
+    /// Resolved terminal-cell tracks for F3. This is explanation data, not an
+    /// input to paint or hit testing.
+    pub grid: Option<GridLayout>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GridLayout {
+    pub columns: Vec<i32>,
+    pub rows: Vec<i32>,
+}
+
+/// Layout-produced data necessary to resolve a `top` sticky adjustment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StickyConstraint {
+    pub static_start: i32,
+    pub static_end: i32,
+    pub inset: i32,
+    pub containing_end: i32,
 }
 
 /// The laid-out page: an arena of boxes plus the root and the content height.

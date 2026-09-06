@@ -14,14 +14,17 @@ mod hit;
 pub(crate) mod intrinsic;
 mod lines;
 
-pub use boxes::{BoxId, BoxKind, GridBorder, LayoutBox, LayoutTree};
+pub use boxes::{BoxId, BoxKind, GridBorder, LayoutBox, LayoutTree, StickyConstraint};
 pub use clip::Clip;
 pub use dimensions::{Dimensions, EdgeSizes, Rect};
-pub use engine::{Hidden, layout_tree, layout_tree_with, term_color, term_style};
+pub use engine::{
+    Hidden, layout_tree, layout_tree_with, layout_tree_with_viewport, term_color, term_style,
+};
 pub use field::{FieldPaint, Shows};
 pub use hit::{
-    LinkHit, collect_links, dom_focusables, dom_links, first_y, focusables, hit_test, is_under,
-    link_at, nearest_field, nearest_link, nearest_y, visible_links,
+    LinkHit, box_screen_y, collect_links, dom_focusables, dom_links, first_y, focusables,
+    has_viewport_adjustment, hit_test, hit_test_viewport, is_under, link_at, link_at_viewport,
+    nearest_field, nearest_link, nearest_y, text_screen_y, visible_links, visible_links_viewport,
 };
 pub use intrinsic::IntrinsicSizer;
 
@@ -72,11 +75,25 @@ pub fn layout_document_readable(
     width: u16,
     images: &ImageContext,
 ) -> (LayoutTree, bool) {
-    let tree = layout_tree_with(dom, styles, width, Hidden::Respect, images);
+    layout_document_readable_with_viewport(dom, styles, width, 1, images)
+}
+
+/// Readable layout with an explicit terminal page height for viewport-relative
+/// boxes. Ordinary document flow remains vertically indefinite.
+pub fn layout_document_readable_with_viewport(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    viewport_height: u16,
+    images: &ImageContext,
+) -> (LayoutTree, bool) {
+    let tree =
+        layout_tree_with_viewport(dom, styles, width, viewport_height, Hidden::Respect, images);
     if has_visible_content(&tree) {
         return (tree, false);
     }
-    let revealed = layout_tree_with(dom, styles, width, Hidden::Reveal, images);
+    let revealed =
+        layout_tree_with_viewport(dom, styles, width, viewport_height, Hidden::Reveal, images);
     if has_visible_content(&revealed) {
         (revealed, true)
     } else {
@@ -126,6 +143,19 @@ pub fn layout_document_with(
     images: &ImageContext,
 ) -> LayoutTree {
     layout_tree_with(dom, styles, width, hidden, images)
+}
+
+/// Like [`layout_document_with`], supplying the usable terminal page height
+/// for `position: fixed` percentage and opposing-inset resolution.
+pub fn layout_document_with_viewport(
+    dom: &Dom,
+    styles: &Styles,
+    width: u16,
+    viewport_height: u16,
+    hidden: Hidden,
+    images: &ImageContext,
+) -> LayoutTree {
+    layout_tree_with_viewport(dom, styles, width, viewport_height, hidden, images)
 }
 
 /// Rasterise a laid-out tree into display lines (viewport scroll range,
