@@ -6,7 +6,7 @@ use std::{env, iter, panic, process, thread};
 use crossterm::event::{self, Event};
 use crossterm::terminal;
 
-use yata::browser::app::{self, App, Browser, Effect};
+use yata::browser::app::{self, App, Browser, DocumentWork, Effect};
 use yata::browser::{error_page, yank};
 use yata::js::console::Console;
 use yata::msg::Msg;
@@ -125,6 +125,18 @@ fn main() -> io::Result<()> {
         if let Some((id, url, response, elapsed)) = effect.cached {
             timers.apply(TimerRequest::CancelOthers { keep: id });
             net::spawn_cached(id, url, response, elapsed, tx.clone());
+        }
+        for document in effect.documents {
+            match document {
+                DocumentWork::Fetch(id, request) => {
+                    timers.apply(TimerRequest::CancelOthers { keep: id });
+                    net::spawn_fetch(id, request, tx.clone());
+                }
+                DocumentWork::Cached(id, url, response, elapsed) => {
+                    timers.apply(TimerRequest::CancelOthers { keep: id });
+                    net::spawn_cached(id, url, response, elapsed, tx.clone());
+                }
+            }
         }
         for request in effect.timers {
             timers.apply(request);
@@ -660,14 +672,17 @@ fn apply_batch(app: &mut impl UiApp, msgs: impl Iterator<Item = Msg>) -> Effect 
         effect.dirty |= e.dirty;
         // Keep only the last fetch of the batch: an earlier commit is already a
         // stale generation, so spawning its worker would be pure waste.
-        if e.fetch.is_some() {
+        if let Some(tab) = e.fetch.as_ref().map(|(id, _)| id.tab) {
+            preserve_other_tab_document(&mut effect, tab);
             effect.fetch = e.fetch;
             effect.cached = None;
         }
-        if e.cached.is_some() {
+        if let Some(tab) = e.cached.as_ref().map(|(id, ..)| id.tab) {
+            preserve_other_tab_document(&mut effect, tab);
             effect.cached = e.cached;
             effect.fetch = None;
         }
+        effect.documents.extend(e.documents);
         // Sheets accumulate rather than replace: two parses in one batch each
         // want their own sheets fetched, and a stale generation's are dropped
         // by the id guard in `App::update`, not here.
@@ -702,6 +717,24 @@ fn apply_batch(app: &mut impl UiApp, msgs: impl Iterator<Item = Msg>) -> Effect 
         }
     }
     effect
+}
+
+fn preserve_other_tab_document(effect: &mut Effect, incoming: net::TabId) {
+    effect.documents.retain(|work| match work {
+        DocumentWork::Fetch(id, _) | DocumentWork::Cached(id, ..) => id.tab != incoming,
+    });
+    if let Some((id, request)) = effect.fetch.take()
+        && id.tab != incoming
+    {
+        effect.documents.push(DocumentWork::Fetch(id, request));
+    }
+    if let Some((id, url, response, elapsed)) = effect.cached.take()
+        && id.tab != incoming
+    {
+        effect
+            .documents
+            .push(DocumentWork::Cached(id, url, response, elapsed));
+    }
 }
 
 fn render(app: &mut impl UiApp, renderer: &mut Renderer, out: &mut impl Write) -> io::Result<()> {
@@ -925,5 +958,53 @@ mod tests {
             net::PageId::headless(2),
             "the id must be the second generation"
         );
+    }
+
+    #[test]
+    fn a_batch_keeps_document_work_for_two_different_tabs() {
+        let mut browser = Browser::new(80, 24);
+        let a = browser
+            .start_navigation("https://a.test/start".into())
+            .fetch
+            .unwrap()
+            .0;
+        browser.update(key('t'));
+        let b = browser
+            .start_navigation("https://b.test/start".into())
+            .fetch
+            .unwrap()
+            .0;
+        let effect = apply_batch(
+            &mut browser,
+            [
+                Msg::Redirect {
+                    id: a,
+                    url: "https://a.test/start".into(),
+                    to: "https://a.test/end".into(),
+                    status: 302,
+                    elapsed: Duration::ZERO,
+                    set_cookie: vec![],
+                },
+                Msg::Redirect {
+                    id: b,
+                    url: "https://b.test/start".into(),
+                    to: "https://b.test/end".into(),
+                    status: 302,
+                    elapsed: Duration::ZERO,
+                    set_cookie: vec![],
+                },
+            ]
+            .into_iter(),
+        );
+        let mut pages = effect
+            .documents
+            .iter()
+            .map(|work| match work {
+                DocumentWork::Fetch(id, _) | DocumentWork::Cached(id, ..) => id.tab,
+            })
+            .collect::<Vec<_>>();
+        pages.push(effect.fetch.expect("newest tab lost its redirect").0.tab);
+        pages.sort_by_key(|tab| tab.0);
+        assert_eq!(pages, [a.tab, b.tab]);
     }
 }

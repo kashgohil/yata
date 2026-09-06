@@ -141,7 +141,7 @@ impl ImageSession {
     pub fn kitty_frame(
         &mut self,
         list: &DisplayList,
-        origin_x: u16,
+        origin: (u16, u16),
         scroll_y: i32,
         page_h: u16,
         frame_w: u16,
@@ -154,7 +154,7 @@ impl ImageSession {
             return self.clear_kitty_screen();
         }
 
-        let placements = kitty_placements(list, origin_x, scroll_y, page_h, frame_w, 1);
+        let placements = kitty_placements(list, origin.0, scroll_y, page_h, frame_w, 1);
         if placements.is_empty() {
             return self.clear_kitty_screen();
         }
@@ -163,6 +163,7 @@ impl ImageSession {
         let mut planned: Vec<(KittyPlacement, u32, bool /* need_upload */)> = Vec::new();
         let mut sig = Vec::with_capacity(placements.len());
         for mut p in placements {
+            p.row = p.row.saturating_add(origin.1);
             let url_key = image_key(&p.image);
             let (image_id, need_upload) = match self.uploaded.get(&url_key) {
                 Some(&id) => (id, false),
@@ -246,7 +247,7 @@ mod tests {
     fn kitty_frame_is_none_when_idle() {
         let mut s = ImageSession::new(true);
         let list = DisplayList::default();
-        assert!(s.kitty_frame(&list, 0, 0, 20, 80, true).is_none());
+        assert!(s.kitty_frame(&list, (0, 0), 0, 20, 80, true).is_none());
     }
 
     #[test]
@@ -268,9 +269,9 @@ mod tests {
         let ctx = s.context();
         let tree = layout::layout_document_with(&dom, &styles, 40, layout::Hidden::Respect, &ctx);
         let list = paint::paint_with(&tree, &s.pixels());
-        let first = s.kitty_frame(&list, 0, 0, 20, 80, true);
+        let first = s.kitty_frame(&list, (0, 0), 0, 20, 80, true);
         assert!(first.is_some());
-        let second = s.kitty_frame(&list, 0, 0, 20, 80, true);
+        let second = s.kitty_frame(&list, (0, 0), 0, 20, 80, true);
         assert!(second.is_none(), "identical frame must not retransmit");
     }
 
@@ -287,7 +288,7 @@ mod tests {
         let ctx = s.context();
         let tree = layout::layout_document_with(&dom, &styles, 40, layout::Hidden::Respect, &ctx);
         let list = paint::paint_with(&tree, &s.pixels());
-        let first = s.kitty_frame(&list, 0, 0, 20, 80, true).unwrap();
+        let first = s.kitty_frame(&list, (0, 0), 0, 20, 80, true).unwrap();
         let s1 = String::from_utf8_lossy(&first);
         assert!(
             s1.contains("a=t") || s1.contains("a=T"),
@@ -295,7 +296,7 @@ mod tests {
         );
         // Shift origin → placement geometry changes while still fully on-screen.
         // Must re-place without re-encoding RGBA.
-        let second = s.kitty_frame(&list, 1, 0, 20, 80, true).unwrap();
+        let second = s.kitty_frame(&list, (1, 0), 0, 20, 80, true).unwrap();
         let s2 = String::from_utf8_lossy(&second);
         assert!(s2.contains("a=p"), "geometry change should re-place: {s2}");
         assert!(!s2.contains("f=32"), "must not retransmit pixels: {s2}");

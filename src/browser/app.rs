@@ -50,6 +50,10 @@ pub struct Effect {
     /// Stored response bytes to parse on a detached worker. Mutually exclusive
     /// with `fetch` for one navigation.
     pub cached: Option<(PageId, String, Representation, Duration)>,
+    /// Additional document work from other tabs in the same coalesced batch.
+    /// `fetch`/`cached` retain the newest work for compatibility with a single
+    /// page turn; the loop dispatches every entry here as well.
+    pub documents: Vec<DocumentWork>,
     /// Linked stylesheets to fetch, as (fetch id, document slot, request).
     /// The loop spawns one worker each, in the same turn — they must not queue
     /// behind one another (PLAN.md M4: fetched in parallel), and the page is
@@ -85,6 +89,12 @@ pub struct Effect {
     /// Tab-set operation resolved by the page's table-driven key handling.
     /// The outer browser owns the collection and applies it after this update.
     pub tab: Option<TabAction>,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DocumentWork {
+    Fetch(PageId, net::Request),
+    Cached(PageId, String, Representation, Duration),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -445,6 +455,9 @@ pub struct App {
     display_list: DisplayList,
     /// Last layout tree — F3 reads it; rebuilt only on relayout.
     layout_tree: Option<LayoutTree>,
+    /// Dimensions represented by `layout_tree`; inactive tabs can accept a
+    /// resize without rebuilding until they become visible.
+    laid_out_size: Option<(u16, u16)>,
     /// Session history (back/forward) with scroll positions (M6).
     history: History,
     /// Absolute URLs successfully loaded this session — feeds `:visited`.
@@ -587,6 +600,7 @@ impl App {
             revealed: false,
             display_list: DisplayList::default(),
             layout_tree: None,
+            laid_out_size: None,
             history: History::default(),
             visited: HashSet::new(),
             hover: None,
@@ -619,6 +633,16 @@ impl App {
 
     pub fn size(&self) -> (u16, u16) {
         self.size
+    }
+
+    fn defer_resize(&mut self, w: u16, h: u16) -> bool {
+        self.size = (w, h);
+        self.viewport.resize(w, self.page());
+        self.dom_view.resize(w, self.page());
+        self.styles_view.resize(w, self.page());
+        self.boxes_view.resize(w, self.page());
+        self.help_view.resize(w, self.page());
+        self.layout_tree.is_some() && self.laid_out_size != Some((w, h))
     }
 
     /// Visible body height: the frame minus the one-row bottom bar.
@@ -1467,6 +1491,7 @@ impl App {
         self.styles_view_built = false;
         self.boxes_view_built = false;
         self.layout_tree = None;
+        self.laid_out_size = None;
         self.display_list = DisplayList::default();
         self.sheets.clear();
         self.styles = None;
@@ -1751,6 +1776,7 @@ impl App {
             self.paints += 1;
         }
         self.layout_tree = Some(tree);
+        self.laid_out_size = Some(self.size);
         self.boxes_view_built = false;
         self.revealed = revealed;
         // The one place `App` reads the clock: fetch and parse are timed by the
@@ -2111,12 +2137,16 @@ impl App {
     /// Kitty graphics bytes for the current page view (or `None` to skip).
     /// Mutates session placement state so identical frames emit nothing.
     pub fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        self.kitty_frame_with_offset(0)
+    }
+
+    fn kitty_frame_with_offset(&mut self, row_offset: u16) -> Option<Vec<u8>> {
         let left = column(self.size.0).left;
         let scroll = self.viewport.offset() as i32;
         let on_page = self.surface == Surface::Page && self.dom.is_some();
         self.images.kitty_frame(
             &self.display_list,
-            left,
+            (left, row_offset),
             scroll,
             self.page(),
             self.size.0,
@@ -4718,6 +4748,9 @@ impl Browser {
             let old_label = self.tabs[index].page.tab_label();
             let mut effect = self.tabs[index].page.update(msg);
             if index != self.active {
+                let page = &self.tabs[index].page;
+                self.tabs[index].stale_size =
+                    page.layout_tree.is_some() && page.laid_out_size != Some(page.size);
                 effect.dirty =
                     old_label != self.tabs[index].page.tab_label() && self.tab_is_visible(index);
             }
@@ -4730,7 +4763,9 @@ impl Browser {
                 self.size = (*w, *h);
                 let page_h = h.saturating_sub(1);
                 for (index, tab) in self.tabs.iter_mut().enumerate() {
-                    tab.stale_size = index != self.active;
+                    if index != self.active {
+                        tab.stale_size = tab.page.defer_resize(*w, page_h);
+                    }
                 }
                 self.tabs[self.active].stale_size = false;
                 self.tabs[self.active].page.update(Msg::Resize(*w, page_h))
@@ -4893,7 +4928,7 @@ impl Browser {
     }
 
     pub fn kitty_frame(&mut self) -> Option<Vec<u8>> {
-        self.tabs[self.active].page.kitty_frame()
+        self.tabs[self.active].page.kitty_frame_with_offset(1)
     }
 
     pub fn record_frame(&mut self, duration: Duration) {
@@ -5626,6 +5661,25 @@ mod tests {
             let mut frame = Frame::new(w, h);
             browser.draw(&mut frame);
         }
+
+        let mut browser = Browser::new(12, 3);
+        browser.tabs[0].page.fetch = Fetch::Loaded {
+            url: "猫猫猫猫猫猫".into(),
+            status: 200,
+            body: vec![],
+        };
+        while browser.tabs.len() < MAX_TABS {
+            browser.update(ch('t'));
+            browser.tabs[browser.active].page.fetch = Fetch::Loaded {
+                url: "猫猫猫猫猫猫".into(),
+                status: 200,
+                body: vec![],
+            };
+            browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        let mut frame = Frame::new(12, 3);
+        browser.draw(&mut frame);
+        assert!(frame.get(0, 0).style().attrs.contains(Attrs::REVERSE));
     }
 
     #[test]
@@ -5741,6 +5795,107 @@ mod tests {
                 .as_deref(),
             Some("b")
         );
+    }
+
+    #[test]
+    fn switching_preserves_page_state_and_runs_no_pipeline_stage() {
+        fn settle(browser: &mut Browser, url: &str, markup: &str) -> PageId {
+            let id = browser.start_navigation(url.into()).fetch.unwrap().0;
+            browser.update(Msg::Loaded {
+                id,
+                url: url.into(),
+                status: 200,
+                body: markup.as_bytes().to_vec(),
+                elapsed: Duration::ZERO,
+                content_type: Some("text/html".into()),
+                set_cookie: vec![],
+                metadata: Metadata::default(),
+            });
+            browser.update(Msg::Parsed {
+                id,
+                dom: crate::html::parse(markup),
+                elapsed: Duration::ZERO,
+            });
+            id
+        }
+
+        let mut browser = Browser::new(30, 8);
+        settle(&mut browser, "https://a.test/", "<title>A</title><p>a</p>");
+        browser.tabs[0].page.surface = Surface::Dom;
+        browser.tabs[0].page.timing_visible = true;
+        browser.update(ch('t'));
+        settle(&mut browser, "https://b.test/", "<title>B</title><p>b</p>");
+        let before: Vec<_> = browser
+            .tabs
+            .iter()
+            .map(|tab| (tab.page.styles_run, tab.page.layouts, tab.page.paints))
+            .collect();
+
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(browser.active, 0);
+        assert_eq!(browser.tabs[0].page.surface, Surface::Dom);
+        assert!(browser.tabs[0].page.timing_visible);
+        assert_eq!(
+            browser
+                .tabs
+                .iter()
+                .map(|tab| (tab.page.styles_run, tab.page.layouts, tab.page.paints))
+                .collect::<Vec<_>>(),
+            before,
+            "an ordinary switch reran a pipeline stage"
+        );
+
+        browser.update(Msg::Resize(35, 10));
+        assert_eq!(browser.tabs[0].page.layouts, before[0].1 + 1);
+        assert_eq!(browser.tabs[1].page.layouts, before[1].1);
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(browser.tabs[1].page.layouts, before[1].1 + 1);
+        let after_deferred = browser.tabs[1].page.layouts;
+        browser.update(ch('g'));
+        browser.update(ch('T'));
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(browser.tabs[1].page.layouts, after_deferred);
+    }
+
+    #[test]
+    fn a_background_parse_after_resize_uses_the_new_geometry_once() {
+        let mut browser = Browser::new(30, 8);
+        browser.update(ch('t'));
+        let background = browser
+            .start_navigation("https://b.test/".into())
+            .fetch
+            .unwrap()
+            .0;
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(browser.active, 0);
+        browser.update(Msg::Resize(44, 12));
+        browser.update(Msg::Loaded {
+            id: background,
+            url: "https://b.test/".into(),
+            status: 200,
+            body: b"<p>background</p>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: vec![],
+            metadata: Metadata::default(),
+        });
+        browser.update(Msg::Parsed {
+            id: background,
+            dom: crate::html::parse("<p>background</p>"),
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(browser.tabs[1].page.size, (44, 11));
+        assert_eq!(browser.tabs[1].page.layouts, 1);
+        assert!(!browser.tabs[1].stale_size);
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(browser.tabs[1].page.layouts, 1);
     }
 
     #[test]
