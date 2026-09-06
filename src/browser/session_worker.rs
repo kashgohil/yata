@@ -22,6 +22,7 @@ struct Save {
 #[derive(Default, Debug)]
 struct State {
     pending: Option<Save>,
+    latest_revision: u64,
     stopping: bool,
 }
 
@@ -57,12 +58,8 @@ impl SessionWorker {
         }
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !state.stopping
-            && state
-                .pending
-                .as_ref()
-                .is_none_or(|pending| revision > pending.revision)
-        {
+        if !state.stopping && revision > state.latest_revision {
+            state.latest_revision = revision;
             state.pending = Some(Save { revision, snapshot });
             wake.notify_one();
         }
@@ -196,7 +193,7 @@ fn save_atomic_inner(
         .unwrap_or(Path::new("."));
     #[cfg(test)]
     fail_at(failure, FailurePoint::CreateParent)?;
-    fs::create_dir_all(parent).map_err(|error| path_error(path, "create parent", &error))?;
+    create_parent(parent).map_err(|error| path_error(path, "create parent", &error))?;
     let temp = temporary_path(path);
     let result = (|| {
         let mut options = OpenOptions::new();
@@ -231,6 +228,17 @@ fn save_atomic_inner(
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+fn create_parent(parent: &Path) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(parent)
 }
 
 #[cfg(test)]
@@ -340,6 +348,14 @@ mod tests {
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
         }
         let _ = fs::remove_dir_all(path.ancestors().nth(2).unwrap());
     }
@@ -362,6 +378,27 @@ mod tests {
         let saved: Vec<_> = rx.try_iter().collect();
         assert_eq!(
             saved,
+            [Msg::SessionSaved {
+                revision: 3,
+                result: Ok(())
+            }]
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_stale_submission_cannot_follow_a_newer_accepted_revision() {
+        let path = temp_path("session");
+        let (tx, rx) = mpsc::channel();
+        let worker =
+            SessionWorker::spawn_with_quiet_period(Some(path.clone()), tx, Duration::from_secs(60));
+        let _ = rx.recv().unwrap();
+        worker.submit(3, snapshot("https://new.test/", 3));
+        worker.submit(2, snapshot("https://stale.test/", 2));
+        worker.shutdown();
+        assert_eq!(load(&path).unwrap(), Some(snapshot("https://new.test/", 3)));
+        assert_eq!(
+            rx.try_iter().collect::<Vec<_>>(),
             [Msg::SessionSaved {
                 revision: 3,
                 result: Ok(())
