@@ -78,7 +78,10 @@ pub fn layout_tree_with_viewport(
         styles,
         hidden,
         images,
-        boxes: Vec::new(),
+        // A visible DOM node usually produces at least one box. Reserving the
+        // arena size avoids repeatedly moving the large `LayoutBox` values on
+        // real articles; anonymous line boxes can grow beyond this naturally.
+        boxes: Vec::with_capacity(dom.node_count()),
         sizer: IntrinsicSizer::new(dom, styles, images, hidden),
         grid_borders: Vec::new(),
         grid_item_depth: 0,

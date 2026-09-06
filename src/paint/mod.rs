@@ -92,14 +92,17 @@ pub fn paint(tree: &LayoutTree) -> DisplayList {
 /// Paint with an image pixel map (M8). Missing URLs become placeholders.
 pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
     let mut list = DisplayList {
-        commands: Vec::new(),
-        ordered: Vec::new(),
+        commands: Vec::with_capacity(tree.boxes.len()),
+        ordered: Vec::with_capacity(tree.boxes.len()),
         fixed_commands: Vec::new(),
         sticky_commands: Vec::new(),
         width: tree.width,
         height: tree.height,
     };
     let mut clips = vec![Clip::NONE; tree.boxes.len()];
+    // Most boxes emit zero or one command. Reuse one tiny staging allocation
+    // across the walk instead of allocating a fresh Vec for every box.
+    let mut commands = Vec::with_capacity(2);
     tree.walk_clipped(&mut |id, b, clip| {
         clips[id.0 as usize] = clip;
         let rect = b.dimensions.border_box();
@@ -113,10 +116,10 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
                 && edge.y >= rect.y
                 && edge.y < rect.bottom()
         });
-        let mut commands = Vec::new();
+        commands.clear();
         paint_box(b, images, &mut commands, clip, resolved_grid);
         if b.fixed_viewport {
-            for command in commands {
+            for command in commands.drain(..) {
                 list.ordered.push(PositionedCommand {
                     command: command.clone(),
                     space: CoordinateSpace::FixedViewport,
@@ -124,7 +127,7 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
                 list.fixed_commands.push(command);
             }
         } else if let Some(constraint) = b.sticky {
-            for command in commands {
+            for command in commands.drain(..) {
                 list.ordered.push(PositionedCommand {
                     command: command.clone(),
                     space: CoordinateSpace::Sticky(constraint),
@@ -135,7 +138,7 @@ pub fn paint_with(tree: &LayoutTree, images: &ImagePixels) -> DisplayList {
                 });
             }
         } else {
-            for command in commands {
+            for command in commands.drain(..) {
                 list.ordered.push(PositionedCommand {
                     command: command.clone(),
                     space: CoordinateSpace::Document,
