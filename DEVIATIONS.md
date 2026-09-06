@@ -280,8 +280,9 @@ atomic path does not call.
 
 ### yata's keybindings always win: key events never reach the page
 
-**We do:** dispatch `click` to the page, and nothing else. `keydown`, `keyup`
-and `keypress` are not bound, so a page cannot see — or capture — `j`, `f`,
+**We do:** dispatch reader-originated `click`, `focus`, `blur`, `input`,
+`change` and `submit`, plus lifecycle and inserted-script events, but never
+`keydown`, `keyup` or `keypress`. A page cannot see — or capture — `j`, `f`,
 `/`, `q` or any other key. Every keystroke belongs to the browser.
 **A browser does:** deliver every key to the focused element first, and let a
 page call `preventDefault()` on it. Gmail's `j`/`k` and every "press `/` to
@@ -375,17 +376,24 @@ take.
 **Trigger:** a page that depends on an `async` script running before an earlier
 one, which is a race a browser also loses.
 
-### A script inserted by a script never runs
+### Inserted scripts use a bounded, later-turn queue
 
-**We do:** build the execution queue once, from the parsed document.
-`document.body.appendChild(scriptElement)` adds an element and nothing else —
-no fetch, no execution.
-**A browser does:** fetch and run it.
-**Why:** the queue is what makes execution order independent of arrival order
-(M10.10), and a script that can extend the queue while it drains reopens
-exactly the ordering question the queue answers.
-**Trigger:** a ladder page whose content arrives through a script it injects —
-which is how a great deal of third-party JavaScript bootstraps itself.
+**We do:** run a connected `<script>` inserted directly with `appendChild` or
+`insertBefore`, or activated by assigning `src`, in a later event-loop turn.
+Inserted scripts run when ready rather than waiting behind document slots, and
+at most 32 are adopted per page. A script inside an inserted subtree, one
+created through `innerHTML`, or a clone taken from `<template>` remains inert;
+an inserted external script does not delay the document's `load` event.
+**A browser does:** discover executable scripts throughout inserted subtrees,
+applies the HTML scripting flags to clones and fragment parsing, and lets a
+fetched classic script delay `load`; ordering depends on parser-insertion and
+`async` state.
+**Why:** direct insertions cross a bounded host-to-loop queue without making
+every subtree insertion an unbounded walk or re-entering JavaScript from the
+tick that performed the mutation.
+**Trigger:** a page whose application bootstrap is nested in an inserted
+wrapper/template clone, or whose initialization depends on an inserted classic
+script completing before `load`.
 
 ### Scripts are not blocked on pending stylesheets
 
@@ -438,9 +446,10 @@ element and renders them wrong.
 
 ### Collections are snapshots, not live
 
-**We do:** return a plain array from `children` and `querySelectorAll`. It
-never updates, and `for (const c of el.children) c.remove()` visits every
-element exactly once.
+**We do:** return plain arrays from `children`, `querySelectorAll`,
+`getElementsByTagName`, `getElementsByClassName` and `selectedOptions`. They
+never update and expose no `namedItem`; `for (const c of el.children)
+c.remove()` visits every element exactly once.
 **A browser does:** return live `HTMLCollection`/`NodeList` objects that change
 underneath an iteration — which is why that same loop skips every other
 element in a browser.
@@ -449,14 +458,55 @@ famous property is being a bug generator.
 **Trigger:** a page that depends on a collection updating — holding one across
 a mutation and expecting the new nodes.
 
+### A script's reflected `src` is not resolved
+
+**We do:** return the `<script>` element's attribute text from `el.src`, while
+the fetch path resolves that text against the document URL.
+**A browser does:** expose an absolute resolved URL from the `src` property.
+**Why:** all subresource resolution remains in the browser loop; duplicating it
+inside the JavaScript binding could make the reflected and fetched URLs
+disagree.
+**Trigger:** a page that compares or rewrites a relative script URL through
+the reflected property.
+
+### Fragment side effects settle after the assigning tick
+
+**We do:** apply `location.hash` after the script turn, so the assigning script
+reads the old URL until the next tick. A target is resolved once; a target with
+no box falls back to its nearest laid-out ancestor, and no `:target` state is
+cascaded.
+**A browser does:** expose the new hash synchronously, scroll to the target
+under its rendered-fragment rules, and match `:target`; later insertion does
+not generally repeat an already-completed fragment navigation.
+**Why:** navigation is a host effect applied after JavaScript returns, and the
+layout tree cannot distinguish merged visible inline content from every
+unboxed target. Retrying would move a reader after they had begun reading.
+**Trigger:** a page reads back a just-assigned hash, styles essential content
+with `:target`, or needs an unboxed target to land somewhere other than its
+laid-out ancestor.
+
+### Scoped restyle assumes selectors depend only on a node and its ancestors
+
+**We do:** after bounded attribute-only mutations, recascade only the changed
+subtrees and their descendants.
+**A browser does:** preserve results for
+the full selector language, including selectors whose result depends on a
+sibling or descendant elsewhere.
+**Why:** yata currently has descendant/child combinators and ancestor-derived
+state only, so the narrowed walk is equivalent and keeps a leaf mutation under
+the interaction budget.
+**Trigger:** adding sibling combinators, `:has()`, `:target`, or any selector
+whose answer depends outside the changed subtree requires redesigning the
+invalidation boundary first.
+
 ### There is no `Node` interface, no CSSOM, and no `getComputedStyle`
 
 **We do:** hand out one kind of handle. `document.createTextNode` returns one
 for a text node — so a page can create, append and read text nodes — but
 nothing else ever yields one: no query returns a text node, `children` is
 elements only, and comments are never exposed at all. There is no `Node`
-interface behind the handle, so `childNodes`, `nodeType`, `firstChild` and
-`parentNode` do not exist, and a text-node handle answers `tagName` with
+interface behind the handle, so `childNodes`, `nodeType` and `firstChild` do
+not exist (`parentNode` does), and a text-node handle answers `tagName` with
 `null`. `el.style.color` does not exist either (though `setAttribute('style',
 …)` works and reaches computed values), and neither does `getComputedStyle`.
 **A browser does:** all of it.
@@ -465,28 +515,17 @@ what the ladder needs rather than what the DOM has.
 **Trigger:** a page whose layout depends on reading back a computed value —
 measuring an element and positioning against it.
 
-### Attribute selectors do not parse, in CSS or in `querySelector`
+### Attribute-selector values have no case-sensitivity flag
 
-**We do:** reject `[attr]` — the CSS parser has never supported it (M4), and
-`querySelector` reuses that parser, so `querySelector('script[data-x]')` throws
-`SyntaxError`.
-**A browser does:** support the whole selector grammar.
-**Why:** one selector syntax and one matcher is the rule; the gap is M4's, and
-M10 inherited it rather than growing a second parser.
-**Trigger:** already met — danluu.com's analytics script calls
-`querySelector('script[data-cf-beacon]')` and throws. The fix belongs in the
-CSS parser, where it fixes the cascade at the same time.
-
-### `getElementsByTagName` and `getElementsByClassName` are absent
-
-**We do:** not implement them. M10.4 left them out on the evidence available
-then — no ladder fixture appeared to need them.
-**A browser does:** implement both, returning live collections.
-**Why:** they were judged unnecessary, and that judgement is now known to be
-wrong: motherfuckingwebsite.com's Google Analytics snippet calls
-`getElementsByTagName` and throws at its fourth line.
-**Trigger:** already met. This is the clearest single fix M11 could make to how
-much of the real web runs.
+**We do:** support presence, exact, word, hyphen and substring attribute
+selectors in CSS and DOM queries, but always compare values case-sensitively;
+the trailing `i` flag is rejected.
+**A browser does:** accept `i` (and `s`) flags that explicitly select ASCII
+case-insensitive or case-sensitive value matching.
+**Why:** the selector parser has one bounded value-comparison path and no flag
+state; silently accepting `i` would produce the wrong match set.
+**Trigger:** a ladder page whose styling or DOM query depends on a selector
+such as `[href="X" i]`.
 
 ### Named element globals are absent
 
@@ -497,21 +536,22 @@ much of the real web runs.
 
 ## Events
 
-### Key events never reach the page — yata's bindings always win
+### Events exist only at native surfaces yata owns
 
-*(See the entry above under JavaScript (M10.8), which states this in full.)*
-
-### Only `click`, `DOMContentLoaded` and `load` exist
-
-**We do:** dispatch those three. No `mousemove`/`mouseover` (so `:hover` stays
-a style-only concept a page cannot observe), no `submit`/`change` (forms are
-M11), no `focus`/`blur`, and no synthetic dispatch — there is no `el.click()`
-or `dispatchEvent`, which is what keeps the dispatcher private to the engine.
-**A browser does:** dispatch the whole event set, and lets a page raise its
-own.
-**Why:** these three are what the ladder's interaction needs; every other
-event is surface without a caller.
-**Trigger:** a page whose only interaction is a form or a hover menu.
+**We do:** dispatch `click`, `focus`, `blur`, `input`, `change`, `submit`,
+`DOMContentLoaded`, document `load`, and inserted-script `load`/`error`.
+There are no mouse-move/hover, unload-family, or synthetic events; no
+`dispatchEvent`, `el.click()`, `form.submit()` or `requestSubmit()`, and no
+inline/`on*` handler properties except inserted scripts' `onload`/`onerror`.
+Cross-document teardown silently drops the old host.
+**A browser does:** expose the general event and programmatic-activation
+models, handler attributes/properties, and teardown events.
+**Why:** native actions are bounded messages owned by the browser loop; a
+general page-created event/action queue needs its own re-entrancy and
+navigation policy.
+**Trigger:** a ladder page whose only activation is programmatic, whose form
+logic uses handler properties, or whose correctness depends on teardown or
+hover events.
 
 ## Timers
 
@@ -551,30 +591,250 @@ storage is a tracking surface a browser for *reading* does not need.
 **Trigger:** a page whose usefulness depends on remembering across runs — a
 reader-mode preference, a login.
 
-### `fetch` is same-origin only, and never sends credentials
+### `fetch` is same-origin only and has a small credentials model
 
 **We do:** reject a cross-origin `fetch` with a console line the reader can
-see, and send no credentials with any request.
-**A browser does:** send the request and let CORS decide who may *read* the
-response; it sends cookies when the page asks.
+see. Same-origin and `include` send matching cookies; `omit` does not, so
+`include` has no behavior beyond `same-origin`.
+**A browser does:** send cross-origin requests and let CORS decide who may
+*read* the response; `include` may send credentials cross-origin.
 **Why:** we have no CORS implementation, and `fetch` reads bodies — so allowing
 arbitrary cross-origin reads would let any page pull whatever the reader's
 network position can reach (an intranet, a localhost service) and post it back
-out. No credentials because there are none: cookies are M11.
+out.
 **Trigger:** a ladder page whose content comes from an API on another host. The
 fix then is real CORS — preflights, `Access-Control-*`, opaque responses — not
 a flag, because the restriction exists precisely because we cannot tell an
 allowed read from a forbidden one.
 
-### No cookies, no `history.pushState`, no `XMLHttpRequest`
+### No `history.pushState` or `XMLHttpRequest`
 
-**We do:** leave all three undefined rather than stubbed.
+**We do:** leave both undefined rather than stubbed.
 **A browser does:** implement them.
 **Why:** a page can feature-detect an absence; it cannot detect a `pushState`
-that silently does nothing. Cookies are M11's; `pushState` needs URL rewriting
-without a fetch, which is a bigger idea than a binding.
+that silently does nothing. `pushState` needs URL rewriting without a fetch,
+which is a bigger idea than a binding.
 **Trigger:** for `XMLHttpRequest`, a page that uses it instead of `fetch` —
 still common in older code.
+
+## Cookies, requests, forms, and controls (M11.6–M11.13)
+
+### Cookies are bounded process state
+
+**We do:** keep at most 50 cookies per host (4 KiB each) in process memory;
+`Domain` is parsed but every cookie remains host-only. Document responses and
+redirect hops may set them. Subresource responses cannot, and an HTTP page's
+HTTPS subresource is treated as cross-origin for credentials even when the
+host matches.
+**A browser does:** persist eligible cookies, implement domain/public-suffix
+rules, accepts subresource response cookies, and scopes cookies by domain/path
+with `Secure` rather than suppressing all mixed-scheme origin credentials.
+**Why:** persistence and safe superdomain cookies require a profile policy and
+public-suffix data; subresource messages deliberately carry no session-mutating
+headers, and the same-origin fetch boundary is scheme + host + port.
+**Trigger:** a site requires yesterday's login, shares login between sibling
+hosts, sets its session through a subresource, or mixes HTTP and HTTPS for an
+authenticated same-host resource.
+
+### Redirect requests are fresh loop work
+
+**We do:** report each document hop to the event loop, apply its cookies, and
+spawn a fresh request/client. Subresources still follow redirects inside one
+worker, so hop cookies are lost and path-specific cookies are not recomputed.
+**A browser does:** reuse connection pools and apply cookie policy at every
+document and subresource hop.
+**Why:** a document hop changes reader-visible navigation/session state and
+must be loop-owned; subresources retain their bounded one-worker path. A fresh
+client is the current worker ownership boundary.
+**Trigger:** a redirected stylesheet/script/image/fetch depends on a hop cookie
+or changed path scope, or connection setup dominates a real navigation budget.
+
+### Form submission is URL-encoded and never replayed
+
+**We do:** support GET and `application/x-www-form-urlencoded` POST. Reload and
+forward after POST issue GET and never retain/replay the body; multipart and
+text/plain are refused. Submitter `formaction`, `formmethod` and `formenctype`
+are ignored, and an invalid method is refused instead of defaulting to GET.
+**A browser does:** can prompt before resubmission, supports the other
+encodings and submitter overrides, and uses GET as the invalid-value default.
+**Why:** history stores only URL and scroll, so credentials never enter a
+checkpoint; unsupported encodings/methods fail visibly instead of silently
+changing the request.
+**Trigger:** a ladder flow needs upload/plain encoding, a submitter override,
+or legitimate POST replay.
+
+### Terminal implicit submission and control interaction are deliberate
+
+**We do:** Enter submits any ancestral form, including a multi-field
+button-less form, and omits a default submit button's name/value unless that
+button was activated. Enter in a textarea submits rather than inserting a new
+line. Selects use an in-page keyboard mode; reset, label activation,
+`form=""`, disabled-fieldset propagation, file/specialized controls and
+clipboard/selection editing are absent.
+**A browser does:** apply the one-field/default-submitter algorithm, edit
+textarea newlines, presents a platform select UI, and implements those form and
+editing surfaces.
+**Why:** a keyboard-only reader needs one discoverable way to send a form and
+one explicit mode-exit rule; controls without a safe bounded terminal action
+are not guessed.
+**Trigger:** a site cannot be used because it relies on a default submitter,
+textarea line entry, labels/external ownership/reset, or an unsupported
+specialized control.
+
+### Live form properties expose a bounded Web IDL subset
+
+**We do:** expose live value/checked/selected state and the native events above;
+`selectedOptions` is a snapshot, `selectedIndex` uses finite truncation rather
+than full Web IDL `long` coercion, and submit events have no `submitter`.
+Programmatic activation/handler properties and stateful control pseudo-classes
+are absent.
+**A browser does:** provide live collections, Web IDL conversions, submitter,
+activation APIs/handlers, and selectors such as `:checked` and `:focus`.
+**Why:** the shipped bindings cover bounded reader-originated native actions
+without introducing a general re-entrant action queue or mutating markup to
+mirror UI state.
+**Trigger:** page logic observes choices through a held collection, depends on
+full coercion/`submitter`, activates a control in script, or styles essential
+state through a control pseudo-class.
+
+## Tables and positioned/grid layout (M11.14–M11.19)
+
+### Tables are DOM-derived terminal grids
+
+**We do:** derive table/row/cell roles only from HTML elements, honor bounded
+HTML `colspan`/`rowspan`, choose shared auto-sized terminal columns, and paint
+one width-based shared edge. There are no anonymous table objects, CSS
+`display: table-*`, captions/columns, fixed layout, spacing/default cell
+padding, HTML width, parser repair, border style/color conflict resolution, or
+accessibility table APIs.
+**A browser does:** construct the CSS table formatting model, repair malformed
+table markup, runs standard auto/fixed algorithms and collapsed/separate border
+models, and exposes semantic accessibility structure.
+**Why:** final cell rectangles and edges remain bounded layout output in cells;
+inventing anonymous structure or semantics from a repaired tree would exceed
+the DOM-derived model shipped in M11.
+**Trigger:** a page loses or overlaps data because its table depends on CSS
+roles, captions/columns/fixed sizing/spacing, styled border conflicts, parser
+repair, or accessibility navigation.
+
+### Positioned boxes use physical terminal-cell equations
+
+**We do:** support static/relative/absolute with physical insets. Absolute
+containing blocks are the nearest non-static ancestor's padding box, otherwise
+the synthetic document root's content box; flex/grid/table/overflow do not
+implicitly establish one. Start insets win, auto size between opposing insets
+is bounded to at least one cell, and DOM order is paint order.
+**A browser does:** implement the full over-constraint/shrink-to-fit equations,
+logical insets, additional containing-block creators, stacking contexts,
+`z-index`, transforms and anchors.
+**Why:** the single terminal layout pass must produce positive bounded final
+rectangles without a compositor or second sizing pass.
+**Trigger:** essential content is sized/placed differently because it relies on
+a non-position containing block, logical/transform geometry, full auto-margin
+equations, or stacking order.
+
+### Fixed and sticky use one page viewport
+
+**We do:** fix boxes to the terminal page viewport. Sticky adjustment happens
+from cached display-list geometry for document scrolling and physical
+top/left start edges only; nested scrollers and end/dual-edge constraints are
+unsupported.
+**A browser does:** distinguish layout/visual viewports and support sticky
+constraints inside scroll containers on both edges, with stacking contexts and
+transform effects.
+**Why:** yata has one viewport and one document scroll offset; scroll must not
+restyle or relayout.
+**Trigger:** mobile viewport distinctions, a nested scroller, bottom/right
+sticky, or stacking/transform behavior makes primary chrome unreachable.
+
+### Grid is an explicit row-major terminal subset
+
+**We do:** support bounded fixed/percentage/auto/fr tracks, `minmax`, numeric
+`repeat`, gaps, positive lines/spans, and sparse DOM-order row auto-placement
+with implicit auto rows. There are no intrinsic min/max-content algorithms,
+named lines/areas, negative lines, dense/column flow, implicit columns,
+auto-fill/fit, ordering, subgrid, masonry, grid stacking, or scroll-container
+semantics.
+**A browser does:** implement the complete multi-phase track sizing and
+placement model plus those features.
+**Why:** explicit cell geometry can be resolved once into the ordinary box
+tree and reused consistently by paint, hit testing, inspectors and scroll.
+**Trigger:** a ladder page's main content is wrong because it depends on a
+missing intrinsic, named/dense/implicit/subgrid, stacking, or scrolling rule.
+
+## Cache, tabs, bookmarks, reader mode, and restore (M11.20–M11.24)
+
+### The HTTP cache stores document representations, not pages
+
+**We do:** keep a bounded private in-memory document-only cache. Freshness is
+`max-age`/`no-cache`/`no-store` plus `Age`; validation is ETag/If-None-Match;
+unsupported `Vary` disables storage. Redirects, POSTs, subresources and script
+fetches are excluded, and stale entries are never served on error.
+**A browser does:** use persistent general caches with Date/Expires/heuristics,
+Last-Modified, broader Vary handling, stale policies, and separately may keep
+live page state in a back/forward cache.
+**Why:** raw bytes can safely rebuild a fresh runtime through the normal
+pipeline without persisting credentials or live state.
+**Trigger:** offline/restart use, Last-Modified/Expires-only content, a safe
+unsupported Vary case, or a required stale-on-error response exposes the gap.
+
+### Tabs are bounded live contexts in one process
+
+**We do:** keep at most 16 ordered live tabs on one UI thread/channel/renderer.
+Cookies, document/decoded-image caches and localStorage are shared; page state
+and sessionStorage are tab-local. Background work continues, closing does not
+cancel network work, and stable tab identity drops late results. Operations are
+keyboard-only; there is no suspension/isolation, miss coalescing, reorder,
+duplicate/reopen/pin, mouse tabs, `window.open`, or `_blank` support.
+**A browser does:** offer richer tab APIs/UI and commonly isolate, suspend,
+cancels or discards background contexts.
+**Why:** page-addressed generations make one bounded event loop deterministic
+without letting equal tab-local generations cross contexts.
+**Trigger:** a background tab harms responsiveness/resources, a late worker is
+not inert, or a site/workflow requires browser tab APIs or richer operations.
+
+### Bookmarks are a bounded private local list
+
+**We do:** store at most 1,024 newest-first URL/title snapshots in one atomic
+versioned file loaded once. There is no live watching, locking/merge, standard
+interchange, sync, folders/tags/edit/search/sort/favicons/bookmarklets, or title
+refresh; concurrent processes are last-successful-writer-wins.
+**A browser does:** generally offers richer organization/interchange/sync and
+coordinates its profile database.
+**Why:** a small immutable snapshot lets a dedicated worker persist without
+blocking the UI or exposing a shared profile format.
+**Trigger:** concurrent processes lose changes or readers need interchange,
+sync, organization, editing/search, or current titles.
+
+### Reader mode is a live-DOM prose projection
+
+**We do:** deterministically select and prune a bounded subtree, apply UA-only
+reader styling, and keep node identity/live mutations without rewriting the
+DOM. It is not general article extraction, sanitization, script isolation, or
+saved/offline reading.
+**A browser does:** reader products may use broader extraction/sanitization and
+can provide an isolated or saved reading document.
+**Why:** projecting the live arena preserves focus/search/fragments/events and
+tab ownership while leaving the normal page intact.
+**Trigger:** a plausible article selects the wrong prose/chrome, hostile page
+script makes the projection unsafe, or offline/saved reading becomes a product
+claim.
+
+### Session restore is a fresh-navigation recipe
+
+**We do:** persist up to 16 ordered current URLs, active ordinal and bounded
+normal-page scroll in one private atomic file. Restore performs ordinary fresh
+navigations and omits history, titles, runtime/DOM, cookies/storage/caches,
+forms/focus/search/inspectors and reader mode. A CLI URL or early session
+mutation wins over a late load; saves coalesce for 250 ms and abrupt
+termination may lose the newest snapshot.
+**A browser does:** can restore richer live/history state, arbitrate profiles
+and crashes, and coordinate multiple processes.
+**Why:** shallow checkpoints are cheap to submit to a dedicated worker and
+never serialize credentials or live engine internals.
+**Trigger:** restart must preserve history/live state/offline bytes, users need
+restore arbitration/profile UI, or abrupt/multi-process use loses unacceptable
+state.
 
 ## Budgets
 
@@ -612,10 +872,7 @@ bite us later" is the question this file answers.
 
 | Missing | What happens instead | Trigger |
 |---|---|---|
-| `position: absolute` / `fixed` / `sticky` | the box stays in flow | a ladder page whose nav or dialog lands in the middle of the article |
 | floats (`float`, `clear`) | the box is a plain block | a page whose sidebar or pull-quote stacks instead of sitting beside the text |
-| `grid` | blockifies; `inline-grid` folds into `inline-block` | a page whose main layout is grid and stacks into one column |
-| tables | blockify — no column widths, no row/cell sizing | a data table whose columns do not line up |
 | `white-space` | ignored; only the `<pre>` **tag** preserves whitespace | a page using `white-space: pre` or `nowrap` on anything else |
 | `line-height` | one line box is one row | a page that reserves vertical space with `line-height` |
 | writing modes, `direction` | LTR only | any RTL page |

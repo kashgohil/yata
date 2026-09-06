@@ -512,6 +512,20 @@ mod tests {
     }
 
     #[test]
+    fn attribute_selector_flags_are_rejected_instead_of_ignored() {
+        assert_eq!(parse("a[href='X' i] { color: red }").rules.len(), 0);
+        assert_eq!(parse("a[href='X' s] { color: red }").rules.len(), 0);
+        assert_eq!(parse("a[href='X'] { color: red }").rules.len(), 1);
+    }
+
+    #[test]
+    fn attribute_selector_values_are_identifiers_or_strings() {
+        assert_eq!(parse("a[type=text] { color: red }").rules.len(), 1);
+        assert_eq!(parse("a[href$='.html'] { color: red }").rules.len(), 1);
+        assert_eq!(parse("a[href$=.html] { color: red }").rules.len(), 0);
+    }
+
+    #[test]
     fn type_selectors_lowercase_but_class_and_id_keep_case() {
         let rule = one("DIV.Foo#Bar { color: red }");
         assert_eq!(

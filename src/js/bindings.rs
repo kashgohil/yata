@@ -2637,6 +2637,10 @@ mod tests {
         assert_eq!(value("document.querySelectorAll('#wrap p').length"), "2");
         assert_eq!(value("document.querySelectorAll('p.note, b').length"), "2");
         assert_eq!(value("document.querySelector('.outer').id"), "\"wrap\"");
+        assert_eq!(
+            value("document.querySelector('[class~=note]').textContent"),
+            "\"hello world\""
+        );
     }
 
     #[test]
