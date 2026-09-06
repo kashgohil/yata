@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::browser::bookmarks::sanitize_title;
 use crate::browser::error_page;
 use crate::browser::form;
 use crate::browser::fragment;
@@ -4690,7 +4691,7 @@ fn tab_action(tab: TabAction) -> Effect {
 }
 
 pub const MAX_TABS: usize = 16;
-pub const MAX_TITLE_BYTES: usize = 512;
+pub use crate::browser::bookmarks::MAX_TITLE_BYTES;
 
 struct Tab {
     id: TabId,
@@ -4988,34 +4989,6 @@ fn collect_text(dom: &Dom, node: NodeId, out: &mut String) {
             _ => collect_text(dom, child, out),
         }
     }
-}
-
-fn sanitize_title(raw: &str) -> String {
-    fn push(out: &mut String, ch: char) -> bool {
-        if out.len() + ch.len_utf8() > MAX_TITLE_BYTES {
-            return false;
-        }
-        out.push(ch);
-        true
-    }
-
-    let mut title = String::new();
-    let mut space = false;
-    for ch in raw.chars() {
-        if ch.is_ascii_whitespace() {
-            space = !title.is_empty();
-        } else {
-            if space && !push(&mut title, ' ') {
-                break;
-            }
-            space = false;
-            let safe = if ch.is_control() { '�' } else { ch };
-            if !push(&mut title, safe) {
-                break;
-            }
-        }
-    }
-    title.trim().to_string()
 }
 
 /// A scroll outcome: dirty exactly when the offset moved, so a scroll at the
