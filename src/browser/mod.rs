@@ -10,6 +10,7 @@ pub mod history;
 pub mod http_cache;
 pub mod inspector;
 pub mod keys;
+pub mod reader;
 pub mod search;
 pub mod statusline;
 pub mod timing;
