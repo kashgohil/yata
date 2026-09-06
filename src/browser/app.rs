@@ -6268,8 +6268,10 @@ mod tests {
     use crate::browser::http_cache::Metadata;
     use crate::term::Color;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashSet;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -10464,6 +10466,504 @@ mod tests {
         browser.update(parsed(id, html));
         browser.update(Msg::RunScripts { id });
         id
+    }
+
+    fn dispatch_m11_integration_effect(
+        browser: &mut Browser,
+        mut effect: Effect,
+        tx: &mpsc::Sender<Msg>,
+        bookmarks: &crate::browser::bookmark_worker::BookmarkWorker,
+        session: &crate::browser::session_worker::SessionWorker,
+        pending: &mut HashSet<PageId>,
+    ) {
+        loop {
+            if let Some((revision, records)) = effect.bookmark_save.take() {
+                bookmarks.submit(revision, records);
+            }
+            if let Some((revision, snapshot)) = effect.session_save.take() {
+                session.submit(revision, snapshot);
+            }
+            if let Some((id, request)) = effect.fetch.take() {
+                // Redirect continuations deliberately reuse the page id.
+                pending.insert(id);
+                net::spawn_fetch(id, request, tx.clone());
+            }
+            if let Some((id, url, response, elapsed)) = effect.cached.take() {
+                pending.insert(id);
+                net::spawn_cached(id, url, response, elapsed, tx.clone());
+            }
+            for work in std::mem::take(&mut effect.documents) {
+                match work {
+                    DocumentWork::Fetch(id, request) => {
+                        pending.insert(id);
+                        net::spawn_fetch(id, request, tx.clone());
+                    }
+                    DocumentWork::Cached(id, url, response, elapsed) => {
+                        pending.insert(id);
+                        net::spawn_cached(id, url, response, elapsed, tx.clone());
+                    }
+                }
+            }
+            assert!(effect.sheets.is_empty());
+            assert!(effect.images.is_empty());
+            assert!(effect.scripts.is_empty());
+            assert!(effect.fetches.is_empty());
+            let Some(id) = effect.run_scripts.take() else {
+                break;
+            };
+            effect = browser.update(Msg::RunScripts { id });
+        }
+    }
+
+    fn settle_m11_integration_documents(
+        browser: &mut Browser,
+        effect: Effect,
+        tx: &mpsc::Sender<Msg>,
+        rx: &mpsc::Receiver<Msg>,
+        bookmarks: &crate::browser::bookmark_worker::BookmarkWorker,
+        session: &crate::browser::session_worker::SessionWorker,
+    ) {
+        let mut pending = HashSet::new();
+        dispatch_m11_integration_effect(browser, effect, tx, bookmarks, session, &mut pending);
+        while !pending.is_empty() {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("M11 integration work did not settle");
+            if let Some(id) = msg.page() {
+                let tab = browser
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.id == id.tab)
+                    .expect("a message addressed a tab that is not live");
+                assert_eq!(
+                    tab.page.fetch_gen, id.generation,
+                    "a message crossed equal tab-local generations"
+                );
+                if matches!(msg, Msg::Parsed { .. }) {
+                    assert!(pending.remove(&id), "an unrequested parse settled: {id:?}");
+                }
+                assert!(
+                    !matches!(msg, Msg::NetError { .. }),
+                    "loopback fetch failed"
+                );
+            }
+            let next = browser.update(msg);
+            dispatch_m11_integration_effect(browser, next, tx, bookmarks, session, &mut pending);
+        }
+    }
+
+    fn integration_frame(browser: &Browser, width: u16, height: u16) -> String {
+        let mut frame = Frame::new(width, height);
+        browser.draw(&mut frame);
+        // Persistence acknowledgements may change the final status row without
+        // changing the page. The committed snapshot is the stable rendered
+        // presentation: tab strip plus every page row above that status.
+        (0..height.saturating_sub(1))
+            .map(|y| row_text(&frame, y).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    }
+
+    #[test]
+    fn m11_daily_driver_boundaries_hold_in_one_loopback_session_and_restart() {
+        use crate::browser::bookmark_worker::BookmarkWorker;
+        use crate::browser::session_worker::SessionWorker;
+        use crate::js::storage::Area;
+
+        static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+        let temp = std::env::temp_dir().join(format!(
+            "yata-m11-25-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let bookmark_path = temp.join("bookmarks");
+        let session_path = temp.join("session");
+
+        let fixture = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/m11-integration.html"
+        ));
+        let article = format!(
+            "<title>Terminal browser field notes</title><header>DISPATCH READER</header>\
+             <article><h1>Terminal browser field notes</h1>\
+             <p>The integration needle appears in this readable opening paragraph.</p>\
+             <p><a href='/member'>Open the subscriber edition</a></p>{}</article>",
+            (0..48)
+                .map(|n| format!(
+                    "<p>Field note {n}: a complete daily-driver flow remains readable.</p>"
+                ))
+                .collect::<String>()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let server_requests = Arc::clone(&requests);
+        let server = thread::spawn(move || {
+            for _ in 0..7 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 2048];
+                let header_end = loop {
+                    if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break at + 4;
+                    }
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0, "request ended before its headers");
+                    request.extend_from_slice(&buf[..n]);
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(n > 0, "request ended before its body");
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                server_requests.lock().unwrap().push(request.clone());
+                let (status, extra, body) = if request.starts_with("GET / ") {
+                    ("200 OK", "Cache-Control: max-age=60\r\n", fixture)
+                } else if request.starts_with("GET /side ") {
+                    (
+                        "200 OK",
+                        "",
+                        "<title>Side desk</title><p>Second tab copy.</p>",
+                    )
+                } else if request.starts_with("POST /subscribe ") {
+                    assert!(request.ends_with("q=terminal&daily=yes&topic=rust&send=1"));
+                    assert!(request.contains("cookie: observed=terminal-rust-true"));
+                    (
+                        "302 Found",
+                        "Location: /article\r\nSet-Cookie: sid=m11; Path=/\r\n",
+                        "",
+                    )
+                } else if request.starts_with("GET /article ") {
+                    ("200 OK", "Cache-Control: max-age=60\r\n", article.as_str())
+                } else if request.starts_with("GET /member ") {
+                    assert!(request.contains("cookie: observed=terminal-rust-true; sid=m11"));
+                    ("200 OK", "", "<title>Member edition</title><p>member</p>")
+                } else {
+                    panic!("unexpected integration request: {request}");
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/html\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let bookmark_worker = BookmarkWorker::spawn(Some(bookmark_path.clone()), tx.clone());
+        let session_worker = SessionWorker::spawn(Some(session_path.clone()), tx.clone());
+        let mut browser = Browser::with_persistence(64, 16, false, true, true);
+        for _ in 0..2 {
+            let effect = browser.update(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            settle_m11_integration_documents(
+                &mut browser,
+                effect,
+                &tx,
+                &rx,
+                &bookmark_worker,
+                &session_worker,
+            );
+        }
+
+        let home = format!("http://{addr}/");
+        let side = format!("http://{addr}/side");
+        let article_url = format!("http://{addr}/article");
+        let home_navigation = browser.start_navigation(home);
+        settle_m11_integration_documents(
+            &mut browser,
+            home_navigation,
+            &tx,
+            &rx,
+            &bookmark_worker,
+            &session_worker,
+        );
+        let page = &browser.tabs[0].page;
+        let dom = page.dom.as_ref().unwrap();
+        let styles = page.styles.as_ref().unwrap();
+        assert_eq!(
+            styles.get(by_id(page, "masthead")).position,
+            crate::style::values::Position::Sticky
+        );
+        assert_eq!(
+            styles.get(by_id(page, "article-grid")).display,
+            crate::style::values::Display::Grid
+        );
+        assert_eq!(
+            styles.get(by_id(page, "live-badge")).position,
+            crate::style::values::Position::Absolute
+        );
+        let table = by_id(page, "article-table");
+        assert!(
+            page.layout_tree
+                .as_ref()
+                .unwrap()
+                .boxes
+                .iter()
+                .any(|box_| box_.node == Some(table) && box_.kind == layout::BoxKind::Table)
+        );
+        assert_eq!(dom.attr(table, "id"), Some("article-table"));
+        let query = by_id(&browser.tabs[0].page, "query");
+        browser.tabs[0].page.focus = Some(query);
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "terminal".chars() {
+            browser.update(ch(c));
+        }
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let daily = by_id(&browser.tabs[0].page, "daily");
+        browser.tabs[0].page.focus = Some(daily);
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let topic = by_id(&browser.tabs[0].page, "topic");
+        browser.tabs[0].page.focus = Some(topic);
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        browser.update(key(KeyCode::Down, KeyModifiers::NONE));
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let new_tab = browser.update(ch('t'));
+        dispatch_m11_integration_effect(
+            &mut browser,
+            new_tab,
+            &tx,
+            &bookmark_worker,
+            &session_worker,
+            &mut HashSet::new(),
+        );
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        let side_navigation = browser.start_navigation(side);
+        settle_m11_integration_documents(
+            &mut browser,
+            side_navigation,
+            &tx,
+            &rx,
+            &bookmark_worker,
+            &session_worker,
+        );
+        browser.update(ch('g'));
+        let previous_tab = browser.update(ch('T'));
+        dispatch_m11_integration_effect(
+            &mut browser,
+            previous_tab,
+            &tx,
+            &bookmark_worker,
+            &session_worker,
+            &mut HashSet::new(),
+        );
+        assert_eq!(browser.active, 0);
+        assert_eq!(
+            layout::field::value(browser.tabs[0].page.dom.as_ref().unwrap(), query, "input"),
+            "terminal"
+        );
+        assert!(layout::field::checked(
+            browser.tabs[0].page.dom.as_ref().unwrap(),
+            daily,
+            "input"
+        ));
+        let dom = browser.tabs[0].page.dom.as_ref().unwrap();
+        let options = layout::field::options(dom, topic);
+        let selected = layout::field::selected_options(dom, topic, &options);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(dom.attr(selected[0], "value"), Some("rust"));
+
+        browser.tabs[0].page.focus = Some(by_id(&browser.tabs[0].page, "send"));
+        let submitted = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        settle_m11_integration_documents(
+            &mut browser,
+            submitted,
+            &tx,
+            &rx,
+            &bookmark_worker,
+            &session_worker,
+        );
+        assert_eq!(
+            browser.tabs[0].page.current_url().as_deref(),
+            Some(article_url.as_str())
+        );
+        for _ in 0..5 {
+            let scrolled = browser.update(ch('j'));
+            dispatch_m11_integration_effect(
+                &mut browser,
+                scrolled,
+                &tx,
+                &bookmark_worker,
+                &session_worker,
+                &mut HashSet::new(),
+            );
+        }
+        let first_scroll = browser.tabs[0].page.viewport.offset();
+        assert!(first_scroll > 0);
+        let bookmarked = browser.update(ch('a'));
+        dispatch_m11_integration_effect(
+            &mut browser,
+            bookmarked,
+            &tx,
+            &bookmark_worker,
+            &session_worker,
+            &mut HashSet::new(),
+        );
+
+        let member_navigation = browser.tabs[0]
+            .page
+            .navigate(format!("http://{addr}/member"), true);
+        settle_m11_integration_documents(
+            &mut browser,
+            member_navigation,
+            &tx,
+            &rx,
+            &bookmark_worker,
+            &session_worker,
+        );
+        let back_to_article = browser.update(ch('H'));
+        settle_m11_integration_documents(
+            &mut browser,
+            back_to_article,
+            &tx,
+            &rx,
+            &bookmark_worker,
+            &session_worker,
+        );
+        browser.update(ch('g'));
+        let next_tab = browser.update(ch('t'));
+        dispatch_m11_integration_effect(
+            &mut browser,
+            next_tab,
+            &tx,
+            &bookmark_worker,
+            &session_worker,
+            &mut HashSet::new(),
+        );
+        assert_eq!(browser.active, 1);
+        browser.update(ch('b'));
+        let opened = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        settle_m11_integration_documents(
+            &mut browser,
+            opened,
+            &tx,
+            &rx,
+            &bookmark_worker,
+            &session_worker,
+        );
+        assert_eq!(
+            browser.tabs[0].page.current_url().as_deref(),
+            Some(article_url.as_str())
+        );
+        assert_eq!(browser.tabs[0].page.viewport.offset(), first_scroll);
+        assert_eq!(
+            browser.tabs[1].page.current_url().as_deref(),
+            Some(article_url.as_str())
+        );
+
+        browser.update(ch('R'));
+        assert!(browser.tabs[1].page.reader.is_some());
+        browser.update(ch('/'));
+        for c in "needle".chars() {
+            browser.update(ch(c));
+        }
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            integration_frame(&browser, 64, 16),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/snapshots/m11-integration-settled.txt"
+            ))
+        );
+        browser.update(ch('R'));
+        assert!(browser.tabs[1].page.reader.is_none());
+
+        let expected = browser.session_snapshot();
+        let quit = browser.update(ch('q'));
+        dispatch_m11_integration_effect(
+            &mut browser,
+            quit,
+            &tx,
+            &bookmark_worker,
+            &session_worker,
+            &mut HashSet::new(),
+        );
+        bookmark_worker.shutdown();
+        session_worker.shutdown();
+        drop(browser);
+
+        let (fresh_tx, fresh_rx) = mpsc::channel();
+        let fresh_bookmarks = BookmarkWorker::spawn(Some(bookmark_path), fresh_tx.clone());
+        let fresh_session = SessionWorker::spawn(Some(session_path), fresh_tx.clone());
+        let mut restored = Browser::with_persistence(64, 16, false, true, true);
+        let mut restore_effect = None;
+        for _ in 0..2 {
+            let effect = restored.update(fresh_rx.recv_timeout(Duration::from_secs(10)).unwrap());
+            if !effect.documents.is_empty() {
+                assert!(restore_effect.replace(effect).is_none());
+            }
+        }
+        let restore_effect = restore_effect.expect("fresh session worker did not restore tabs");
+        assert_eq!(restore_effect.documents.len(), 2);
+        assert!(
+            restore_effect
+                .documents
+                .iter()
+                .all(|work| matches!(work, DocumentWork::Fetch(..))),
+            "a process-local cache survived restart"
+        );
+        assert_eq!(restored.session_snapshot(), expected);
+        assert_eq!(restored.bookmarks.len(), 1);
+        assert!(restored.tabs.iter().all(|tab| tab.page.reader.is_none()));
+        assert_eq!(
+            restored.session.cookies.read_for_script(
+                &js::cookies::Scope::of(&article_url).unwrap(),
+                js::cookies::now()
+            ),
+            ""
+        );
+        assert_eq!(
+            restored
+                .session
+                .storage
+                .get(&format!("http://{addr}"), Area::Local, "anything"),
+            None
+        );
+        settle_m11_integration_documents(
+            &mut restored,
+            restore_effect,
+            &fresh_tx,
+            &fresh_rx,
+            &fresh_bookmarks,
+            &fresh_session,
+        );
+        assert_eq!(restored.active, expected.active);
+        assert_eq!(
+            restored.tabs[0].page.viewport.offset(),
+            expected.tabs[0].scroll as usize
+        );
+        assert_eq!(
+            restored.tabs[1].page.viewport.offset(),
+            expected.tabs[1].scroll as usize
+        );
+        assert!(restored.tabs.iter().all(|tab| !tab.page.history.can_back()));
+        fresh_bookmarks.shutdown();
+        fresh_session.shutdown();
+        server.join().unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.starts_with("GET /article "))
+                .count(),
+            3,
+            "bookmark open should cache-hit; fresh restore should fetch twice"
+        );
+        std::fs::remove_dir_all(&temp).unwrap();
     }
 
     const READER_PAGE: &str = "<style>body{display:grid;color:red} article{display:none;position:fixed;width:9999px} p{border:8px solid}</style>\

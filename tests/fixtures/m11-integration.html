@@ -1,0 +1,49 @@
+<!doctype html>
+<html>
+<head>
+  <title>Dispatch desk</title>
+  <style>
+    body { margin: 0; }
+    header { position: sticky; top: 0; background: #202830; color: white; }
+    main { display: grid; grid-template-columns: 2fr 1fr; gap: 1em; }
+    .desk { position: relative; }
+    .badge { position: absolute; top: 0; right: 0; }
+    table { border: 1px solid; width: 100%; }
+    th, td { border: 1px solid; }
+  </style>
+</head>
+<body>
+  <header id="masthead">THE DAILY DISPATCH — subscriber desk</header>
+  <main id="article-grid">
+    <section class="desk">
+      <span id="live-badge" class="badge">LIVE</span>
+      <h1>Today's articles</h1>
+      <table id="article-table">
+        <tr><th>Desk</th><th>Article</th></tr>
+        <tr><td>Systems</td><td><a href="/article">A small browser grows up</a></td></tr>
+        <tr><td colspan="2">Independent reporting for terminal readers.</td></tr>
+      </table>
+    </section>
+    <form id="briefing" method="post" action="/subscribe">
+      <h2>Build a briefing</h2>
+      <input id="query" name="q" value="">
+      <input id="daily" type="checkbox" name="daily" value="yes">
+      <select id="topic" name="topic">
+        <option value="web">Web</option>
+        <option value="rust">Rust</option>
+      </select>
+      <button id="send" name="send" value="1">Read briefing</button>
+    </form>
+  </main>
+  <script>
+    document.getElementById('briefing').addEventListener('submit', function () {
+      document.cookie = 'observed=' + document.getElementById('query').value + '-' +
+                        document.getElementById('topic').value + '-' +
+                        document.getElementById('daily').checked + '; Path=/';
+      console.log('submit ' + document.getElementById('query').value +
+                  ' daily=' + document.getElementById('daily').checked +
+                  ' topic=' + document.getElementById('topic').value);
+    });
+  </script>
+</body>
+</html>
