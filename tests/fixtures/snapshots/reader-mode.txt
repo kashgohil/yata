@@ -1,0 +1,27 @@
+Semantic reader title
+
+By Example Writer
+
+
+First paragraph with emphasis and an included link.
+
+
+    • first list item
+    • second list item
+
+
+    A useful quotation.
+
+
+let answer = 42;
+
+
+diagram alternative▀
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+Figure caption
+
+Small table
+ Name Value
+answer42
+Article notes

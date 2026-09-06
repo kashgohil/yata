@@ -40,6 +40,24 @@ fn render_frame(html: &str, width: u16, height: u16) -> Frame {
     frame
 }
 
+fn render_reader_frame(html: &str, width: u16, height: u16) -> Frame {
+    let dom = html::parse(html);
+    let sheets = style::sources::inline_sheets(&dom);
+    let refs: Vec<_> = sheets.iter().collect();
+    let normal = style::style_tree(&dom, &refs);
+    let view = yata::browser::reader::analyze(&dom, &normal).unwrap();
+    let styles =
+        style::style_reader_tree_with(&dom, view.membership(), &style::StyleContext::default());
+    let images = yata::image::discover(&dom, Some("http://fixture.test/"));
+    let mut cache = yata::image::ImageCache::default();
+    let image_context = yata::image::ImageContext::from_discovery(&images, &mut cache);
+    let tree = layout::layout_document_with(&dom, &styles, width, Hidden::Reveal, &image_context);
+    let list = paint::paint(&tree);
+    let mut frame = Frame::new(width, height);
+    paint::paint_to_frame(&list, &mut frame, 0, 0, height);
+    frame
+}
+
 /// One character per cell, chosen by `of`; rows joined by `\n`.
 fn grid_text(frame: &Frame, width: u16, height: u16, of: impl Fn(Cell) -> char) -> String {
     let mut out = String::new();
@@ -127,6 +145,47 @@ fn motherfuckingwebsite_snapshot() {
     let grid = render_grid(&fixture("motherfuckingwebsite.com.html"), 80, 40);
     assert!(grid.to_lowercase().contains("motherfucking"));
     assert_snapshot("motherfuckingwebsite.com", &grid);
+}
+
+#[test]
+fn reader_mode_normal_and_projection_snapshots() {
+    let html = fixture("reader-mode.html");
+    let normal = grid_text(&render_frame(&html, 60, 28), 60, 28, |c| {
+        if c.ch == '\0' { ' ' } else { c.ch }
+    });
+    let reader = grid_text(&render_reader_frame(&html, 60, 28), 60, 28, |c| {
+        if c.ch == '\0' { ' ' } else { c.ch }
+    });
+    assert!(normal.contains("MENU LINK"), "{normal}");
+    assert!(!normal.contains("Semantic reader title"));
+    assert!(reader.contains("Semantic reader title"));
+    for excluded in [
+        "PAGE HEADER",
+        "MENU LINK",
+        "RELATED CHROME",
+        "FORM CHROME",
+        "PAGE FOOTER",
+    ] {
+        assert!(
+            !reader.contains(excluded),
+            "reader leaked {excluded}:\n{reader}"
+        );
+    }
+    for included in [
+        "By Example Writer",
+        "A useful quotation",
+        "let answer = 42",
+        "diagram alternative",
+        "Small table",
+        "Article notes",
+    ] {
+        assert!(
+            reader.contains(included),
+            "reader lost {included}:\n{reader}"
+        );
+    }
+    assert_snapshot("reader-mode-normal", &normal);
+    assert_snapshot("reader-mode", &reader);
 }
 
 #[test]

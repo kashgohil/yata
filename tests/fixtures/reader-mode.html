@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+  <title>Reader fixture title</title>
+  <style>
+    body { display: grid; grid-template-columns: 12px 1fr; color: red; }
+    article { display: none; position: fixed; width: 9999px; border: 8px solid blue; }
+    p { display: flex; background: green; }
+  </style>
+</head>
+<body>
+  <header>PAGE HEADER</header>
+  <nav><a href="/menu">MENU LINK</a></nav>
+  <article id="story">
+    <header><h1>Semantic reader title</h1><p>By Example Writer</p></header>
+    <p>First paragraph with <em>emphasis</em> and an <a href="/article-link">included link</a>.</p>
+    <ul><li>first list item</li><li>second list item</li></ul>
+    <blockquote>A useful quotation.</blockquote>
+    <pre>let answer = 42;</pre>
+    <figure><img src="already-known.png" alt="diagram alternative"><figcaption>Figure caption</figcaption></figure>
+    <table><caption>Small table</caption><tr><th>Name</th><th>Value</th></tr><tr><td>answer</td><td>42</td></tr></table>
+    <aside>RELATED CHROME</aside>
+    <form><input value="FORM CHROME"><button>SUBMIT CHROME</button></form>
+    <footer>Article notes</footer>
+  </article>
+  <footer>PAGE FOOTER</footer>
+  <script>
+    setTimeout(function () {
+      var prose = document.createElement('p');
+      prose.textContent = 'Timer prose';
+      document.getElementById('story').appendChild(prose);
+      var chrome = document.createElement('nav');
+      chrome.textContent = 'Timer chrome';
+      document.body.appendChild(chrome);
+    }, 10);
+  </script>
+</body>
+</html>
