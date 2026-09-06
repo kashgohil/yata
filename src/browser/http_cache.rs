@@ -459,6 +459,7 @@ mod tests {
         for control in [
             vec!["max-age=nope"],
             vec!["max-age=60, max-age=61"],
+            vec!["max-age=60, max-age=60"],
             vec!["max-age=60, max-age"],
         ] {
             let mut cache = Cache::new(1024, 4);
@@ -614,5 +615,62 @@ mod tests {
             response(&["max-age=60"], None, None, &vec![0; MAX_BODY_BYTES + 1]),
             Duration::ZERO,
         ));
+    }
+
+    #[test]
+    fn a_304_merges_present_fields_and_no_store_removes_after_current_reuse() {
+        let key = Key::from_request(&request("https://x.test/", None)).unwrap();
+        let mut cache = Cache::new(1024, 4);
+        assert!(cache.insert(
+            key.clone(),
+            response(&["max-age=0"], Some("W/\"one\""), None, b"old"),
+            Duration::ZERO,
+        ));
+        let update = Metadata::bounded(
+            vec!["max-age=60".into()],
+            Some("\"two\"".into()),
+            Some("5".into()),
+            Vec::new(),
+            false,
+        );
+        let merged = cache
+            .revalidate(&key, &update, Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(merged.body, b"old");
+        assert_eq!(merged.metadata.etag.as_deref(), Some("\"two\""));
+        assert!(matches!(
+            cache.plan(&key, RequestMode::Ordinary, Duration::from_secs(64)),
+            Plan::Hit(_)
+        ));
+
+        let no_store = Metadata::bounded(vec!["no-store".into()], None, None, Vec::new(), false);
+        let current = cache
+            .revalidate(&key, &no_store, Duration::from_secs(20))
+            .unwrap();
+        assert_eq!(current.body, b"old", "the current 304 may reuse its body");
+        assert!(matches!(
+            cache.plan(&key, RequestMode::Ordinary, Duration::from_secs(20)),
+            Plan::Miss
+        ));
+    }
+
+    #[test]
+    fn only_syntactically_usable_entity_tags_are_validators() {
+        for etag in ["", "one", "W/one", "w/\"one\""] {
+            let key = Key::from_request(&request("https://x.test/", None)).unwrap();
+            assert!(!Cache::new(1024, 4).insert(
+                key,
+                response(&[], Some(etag), None, b"x"),
+                Duration::ZERO,
+            ));
+        }
+        for etag in ["\"strong\"", "W/\"weak\""] {
+            let key = Key::from_request(&request("https://x.test/", None)).unwrap();
+            assert!(Cache::new(1024, 4).insert(
+                key,
+                response(&[], Some(etag), None, b"x"),
+                Duration::ZERO,
+            ));
+        }
     }
 }

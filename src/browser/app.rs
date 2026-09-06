@@ -4632,7 +4632,11 @@ mod tests {
     use super::*;
     use crate::term::Color;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     fn key(code: KeyCode, mods: KeyModifiers) -> Msg {
         Msg::Key(KeyEvent::new(code, mods))
@@ -4672,6 +4676,86 @@ mod tests {
                 break;
             }
         }
+    }
+
+    fn settle_document_effect(app: &mut App, effect: Effect) {
+        let (tx, rx) = mpsc::channel();
+        fn dispatch(effect: Effect, tx: &mpsc::Sender<Msg>) {
+            if let Some((id, request)) = effect.fetch {
+                net::spawn_fetch(id, request, tx.clone());
+            }
+            if let Some((id, url, response, elapsed)) = effect.cached {
+                net::spawn_cached(id, url, response, elapsed, tx.clone());
+            }
+        }
+        dispatch(effect, &tx);
+        loop {
+            let msg = rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("document worker did not settle");
+            let parsed = matches!(msg, Msg::Parsed { .. });
+            let next = app.update(msg);
+            dispatch(next, &tx);
+            if parsed {
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn loopback_a_b_back_skips_a_network_request_and_reload_validates() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = seen.clone();
+        thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut buf).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                server_seen.lock().unwrap().push(request.clone());
+                let response = if request.starts_with("GET /b ") {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 1\r\nConnection: close\r\n\r\nb".to_string()
+                } else if request.contains("if-none-match: \"one\"") {
+                    "HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=60\r\nETag: \"one\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+                } else {
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: max-age=60\r\nETag: \"one\"\r\nContent-Length: 1\r\nConnection: close\r\n\r\na".to_string()
+                };
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+
+        let mut app = App::new(40, 8);
+        let a = format!("http://{addr}/a");
+        let b = format!("http://{addr}/b");
+        let first = app.start_navigation(a.clone());
+        settle_document_effect(&mut app, first);
+        let second = app.navigate(b, true);
+        settle_document_effect(&mut app, second);
+        let back = app.history_go(true);
+        assert!(back.fetch.is_none(), "history hit started a network worker");
+        settle_document_effect(&mut app, back);
+        assert_eq!(seen.lock().unwrap().len(), 2, "back reached the server");
+
+        let reload = app.reload();
+        settle_document_effect(&mut app, reload);
+        let requests = seen.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET /a "), "{}", requests[2]);
+        assert!(
+            requests[2].contains("if-none-match: \"one\""),
+            "{}",
+            requests[2]
+        );
+        assert_eq!(app.timings.cache, Some(timing::CacheOutcome::Revalidated));
     }
 
     #[test]

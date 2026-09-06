@@ -169,4 +169,20 @@ mod tests {
         assert_eq!(format_ms(Duration::from_micros(50)), "0.1 ms");
         assert_eq!(format_ms(Duration::from_millis(1234)), "1234.0 ms");
     }
+
+    #[test]
+    fn cache_outcomes_are_machine_readable_and_a_hit_is_not_a_fake_fetch() {
+        let hit = Timings {
+            cache: Some(CacheOutcome::Hit),
+            parse: Some(Duration::from_millis(1)),
+            ..Timings::default()
+        };
+        assert_eq!(hit.rows(), ["cache cache hit", "parse 1.0 ms"]);
+        let validated = Timings {
+            cache: Some(CacheOutcome::Revalidated),
+            fetch: Some(Duration::from_millis(3)),
+            ..Timings::default()
+        };
+        assert_eq!(validated.rows(), ["cache revalidated", "fetch 3.0 ms"]);
+    }
 }
