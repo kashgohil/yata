@@ -6249,6 +6249,74 @@ mod tests {
     }
 
     #[test]
+    fn full_library_frame_keeps_last_selection_visible_cell_safe_and_reversed() {
+        let mut browser = Browser::new(80, 6);
+        for n in 0..MAX_BOOKMARKS {
+            let title: Arc<str> = if n == MAX_BOOKMARKS - 1 {
+                Arc::from("duplicate\u{1b} 猫猫猫 title")
+            } else {
+                Arc::from("duplicate 猫猫猫 title")
+            };
+            assert_eq!(
+                browser.bookmarks.add(
+                    Arc::from(format!("https://example.test/a-very-long-location/{n}")),
+                    title,
+                ),
+                AddResult::Added
+            );
+        }
+        browser.bookmark_selected = Some(0);
+        browser.update(ch('b'));
+        browser.update(ch('G'));
+        let mut frame = Frame::new(80, 6);
+        browser.draw(&mut frame);
+        assert_eq!(browser.bookmark_selected, Some(MAX_BOOKMARKS - 1));
+        assert_eq!(browser.bookmark_first_visible, MAX_BOOKMARKS - 3);
+        assert!(row_text(&frame, 4).contains("https://example.test/"));
+        assert!(
+            frame.get(0, 4).attrs.contains(Attrs::REVERSE),
+            "selected record was not reversed"
+        );
+        for y in 0..frame.height() {
+            assert_ne!(frame.get(frame.width() - 1, y).ch, '\0');
+        }
+    }
+
+    #[test]
+    fn bookmark_modal_hides_and_restores_the_kitty_side_channel_once() {
+        let mut browser = Browser::with_caps(20, 5, true);
+        browser.update(ch('b'));
+        assert_eq!(
+            browser.kitty_frame().as_deref(),
+            Some(crate::image::delete_all_images())
+        );
+        assert!(browser.kitty_frame().is_none());
+        browser.update(ch('b'));
+        assert!(browser.kitty_frame().is_none());
+        assert!(!browser.kitty_hidden_by_bookmarks);
+    }
+
+    #[test]
+    fn stale_success_cannot_clear_the_newest_save_error() {
+        let mut browser = Browser::with_bookmark_persistence(40, 7, false, true);
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        set_browser_page(&mut browser, 0, "https://one.test/", "One");
+        let first = browser.update(ch('a')).bookmark_save.unwrap().0;
+        set_browser_page(&mut browser, 0, "https://two.test/", "Two");
+        let second = browser.update(ch('a')).bookmark_save.unwrap().0;
+        browser.update(Msg::BookmarksSaved {
+            revision: second,
+            result: Err("newest failed".into()),
+        });
+        browser.update(Msg::BookmarksSaved {
+            revision: first,
+            result: Ok(()),
+        });
+        browser.bookmark_notice = None;
+        assert!(browser.bookmark_status().contains("newest failed"));
+    }
+
+    #[test]
     fn tab_operations_are_ordered_wrapping_bounded_and_never_reuse_ids() {
         let mut browser = Browser::new(40, 8);
         let first = browser.tabs[0].id;

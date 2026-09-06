@@ -45,11 +45,14 @@ impl Bookmarks {
     }
 
     pub fn add(&mut self, url: Arc<str>, title: Arc<str>) -> AddResult {
-        if validate_record(&url, &title).is_err() {
+        if url.is_empty() || url.len() > MAX_URL_BYTES || !valid_url(&url) {
             return AddResult::Invalid;
         }
         if self.records.iter().any(|record| record.url == url) {
             return AddResult::Duplicate;
+        }
+        if title.is_empty() || title.len() > MAX_TITLE_BYTES {
+            return AddResult::Invalid;
         }
         if self.records.len() == MAX_BOOKMARKS {
             return AddResult::Full;

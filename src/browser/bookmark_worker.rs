@@ -166,11 +166,36 @@ fn load(path: &Path) -> Result<Bookmarks, String> {
 }
 
 fn save_atomic(path: &Path, records: &[Bookmark]) -> Result<(), String> {
+    save_atomic_inner(
+        path,
+        records,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailurePoint {
+    CreateParent,
+    Open,
+    Write,
+    Sync,
+    Rename,
+}
+
+fn save_atomic_inner(
+    path: &Path,
+    records: &[Bookmark],
+    #[cfg(test)] failure: Option<FailurePoint>,
+) -> Result<(), String> {
     let bytes = bookmarks::encode(records).map_err(|error| error.to_string())?;
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
+    #[cfg(test)]
+    fail_at(failure, FailurePoint::CreateParent)?;
     fs::create_dir_all(parent).map_err(|error| path_error(path, "create parent", &error))?;
     let temp = temporary_path(path);
     let result = (|| {
@@ -181,15 +206,23 @@ fn save_atomic(path: &Path, records: &[Bookmark]) -> Result<(), String> {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(replacement_mode(path));
         }
+        #[cfg(test)]
+        fail_at(failure, FailurePoint::Open)?;
         let mut file = options
             .open(&temp)
             .map_err(|error| path_error(path, "open temporary file", &error))?;
+        #[cfg(test)]
+        fail_at(failure, FailurePoint::Write)?;
         file.write_all(&bytes)
             .map_err(|error| path_error(path, "write", &error))?;
         file.flush()
             .map_err(|error| path_error(path, "flush", &error))?;
+        #[cfg(test)]
+        fail_at(failure, FailurePoint::Sync)?;
         file.sync_all()
             .map_err(|error| path_error(path, "sync", &error))?;
+        #[cfg(test)]
+        fail_at(failure, FailurePoint::Rename)?;
         fs::rename(&temp, path).map_err(|error| path_error(path, "replace", &error))?;
         sync_directory(parent).map_err(|error| path_error(path, "sync parent", &error))?;
         Ok(())
@@ -198,6 +231,15 @@ fn save_atomic(path: &Path, records: &[Bookmark]) -> Result<(), String> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+#[cfg(test)]
+fn fail_at(actual: Option<FailurePoint>, expected: FailurePoint) -> Result<(), String> {
+    if actual == Some(expected) {
+        Err(format!("injected {expected:?} failure"))
+    } else {
+        Ok(())
+    }
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -403,6 +445,56 @@ mod tests {
         ));
         worker.shutdown();
         assert_eq!(fs::read(&path).unwrap(), old);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn every_pre_replace_failure_preserves_old_bytes_and_cleans_the_temporary_file() {
+        for point in [
+            FailurePoint::CreateParent,
+            FailurePoint::Open,
+            FailurePoint::Write,
+            FailurePoint::Sync,
+            FailurePoint::Rename,
+        ] {
+            let path = temp_path(&format!("{point:?}/bookmarks"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let old = bookmarks::encode(&[record("https://old.test/", "Old")]).unwrap();
+            fs::write(&path, &old).unwrap();
+            let result =
+                save_atomic_inner(&path, &[record("https://new.test/", "New")], Some(point));
+            assert!(result.is_err(), "{point:?} unexpectedly succeeded");
+            assert_eq!(fs::read(&path).unwrap(), old, "{point:?} replaced old data");
+            assert!(
+                !temporary_path(&path).exists(),
+                "{point:?} left a temporary file"
+            );
+            let _ = fs::remove_dir_all(path.ancestors().nth(2).unwrap());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_does_not_broaden_an_existing_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_path("bookmarks");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            bookmarks::encode(&[record("https://old.test/", "Old")]).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        save_atomic(&path, &[record("https://new.test/", "New")]).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(
+            load(&path).unwrap().records(),
+            &[record("https://new.test/", "New")]
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
