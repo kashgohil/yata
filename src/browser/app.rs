@@ -18,6 +18,7 @@ use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
 use crate::browser::reader::{self, ReaderView};
 use crate::browser::search::{self, Match as SearchMatch};
+use crate::browser::session::{SessionSnapshot, SessionTab};
 use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
@@ -97,6 +98,8 @@ pub struct Effect {
     /// An immutable bookmark snapshot for the event loop to submit through
     /// the worker's short-lock handle.
     pub bookmark_save: Option<(u64, Arc<[crate::browser::bookmarks::Bookmark]>)>,
+    /// A shallow checkpoint for the session worker's latest-wins slot.
+    pub session_save: Option<(u64, SessionSnapshot)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -2718,6 +2721,21 @@ impl App {
         }
     }
 
+    /// The ordinary-page row represented by a checkpoint. Reader mode keeps
+    /// its normal viewport here; a pending restore is already the intended
+    /// row even before the new document has geometry.
+    fn session_scroll(&self) -> u32 {
+        let offset = match self.pending_scroll.as_ref() {
+            Some((id, PendingScroll::Offset(offset))) if Some(*id) == self.current_fetch => *offset,
+            Some((id, PendingScroll::Fragment(_))) if Some(*id) == self.current_fetch => 0,
+            _ => self
+                .reader
+                .as_ref()
+                .map_or_else(|| self.viewport.offset(), |reader| reader.normal_scroll),
+        };
+        offset.min(i32::MAX as usize) as u32
+    }
+
     /// Start a navigation. When `push_history` is true and there is a current
     /// page, push it (with scroll) onto the back stack and clear forward.
     fn navigate(&mut self, url: String, push_history: bool) -> Effect {
@@ -5087,6 +5105,30 @@ enum BookmarkPersistence {
     ReadOnly(String),
 }
 
+#[derive(Debug)]
+enum SessionPersistence {
+    Loading {
+        available: bool,
+        submitted: u64,
+    },
+    Ready {
+        available: bool,
+        submitted: u64,
+        acknowledged: u64,
+        error: Option<String>,
+    },
+    ReadOnly(String),
+}
+
+#[derive(PartialEq, Eq)]
+struct SessionFingerprint {
+    active: usize,
+    tabs: usize,
+    url: Option<String>,
+    scroll: u32,
+    generation: u64,
+}
+
 /// One terminal browser session: ordered live pages, one active selection and
 /// one chrome surface. `App` remains the page state machine; this is the sole
 /// owner and router for the bounded tab set.
@@ -5108,6 +5150,9 @@ pub struct Browser {
     bookmark_revision: u64,
     bookmark_notice: Option<String>,
     bookmark_persistence: BookmarkPersistence,
+    session_revision: u64,
+    session_untouched: bool,
+    session_persistence: SessionPersistence,
 }
 
 impl Browser {
@@ -5116,7 +5161,7 @@ impl Browser {
     }
 
     pub fn with_caps(w: u16, h: u16, kitty_graphics: bool) -> Browser {
-        Self::build(w, h, kitty_graphics, false, false)
+        Self::build(w, h, kitty_graphics, false, false, false, false)
     }
 
     /// Interactive construction begins visibly loading until its worker sends
@@ -5128,10 +5173,36 @@ impl Browser {
         kitty_graphics: bool,
         available: bool,
     ) -> Browser {
-        Self::build(w, h, kitty_graphics, true, available)
+        Self::build(w, h, kitty_graphics, true, available, false, false)
     }
 
-    fn build(w: u16, h: u16, kitty_graphics: bool, loading: bool, available: bool) -> Browser {
+    pub fn with_persistence(
+        w: u16,
+        h: u16,
+        kitty_graphics: bool,
+        bookmarks_available: bool,
+        session_available: bool,
+    ) -> Browser {
+        Self::build(
+            w,
+            h,
+            kitty_graphics,
+            true,
+            bookmarks_available,
+            true,
+            session_available,
+        )
+    }
+
+    fn build(
+        w: u16,
+        h: u16,
+        kitty_graphics: bool,
+        bookmark_loading: bool,
+        bookmarks_available: bool,
+        session_loading: bool,
+        session_available: bool,
+    ) -> Browser {
         let id = TabId(1);
         let session = BrowserSession::new();
         Browser {
@@ -5153,10 +5224,27 @@ impl Browser {
             bookmark_first_visible: 0,
             bookmark_revision: 0,
             bookmark_notice: None,
-            bookmark_persistence: if loading {
-                BookmarkPersistence::Loading { available }
+            bookmark_persistence: if bookmark_loading {
+                BookmarkPersistence::Loading {
+                    available: bookmarks_available,
+                }
             } else {
                 BookmarkPersistence::Ready {
+                    available: false,
+                    submitted: 0,
+                    acknowledged: 0,
+                    error: None,
+                }
+            },
+            session_revision: 0,
+            session_untouched: true,
+            session_persistence: if session_loading {
+                SessionPersistence::Loading {
+                    available: session_available,
+                    submitted: 0,
+                }
+            } else {
+                SessionPersistence::Ready {
                     available: false,
                     submitted: 0,
                     acknowledged: 0,
@@ -5171,11 +5259,17 @@ impl Browser {
     }
 
     pub fn start_navigation(&mut self, url: String) -> Effect {
-        self.tabs[self.active].page.start_navigation(url)
+        let effect = self.tabs[self.active].page.start_navigation(url);
+        self.session_untouched = false;
+        self.session_mutated(effect)
     }
 
     pub fn update(&mut self, mut msg: Msg) -> Effect {
         msg = match msg {
+            Msg::SessionLoaded(result) => return self.session_loaded(result),
+            Msg::SessionSaved { revision, result } => {
+                return self.session_saved(revision, result);
+            }
             Msg::BookmarksLoaded(result) => return self.bookmarks_loaded(result),
             Msg::BookmarksSaved { revision, result } => {
                 return self.bookmarks_saved(revision, result);
@@ -5186,6 +5280,18 @@ impl Browser {
             let Some(index) = self.tabs.iter().position(|tab| tab.id == page.tab) else {
                 return Effect::default();
             };
+            let relevant = matches!(
+                msg,
+                Msg::Redirect { .. }
+                    | Msg::Loaded { .. }
+                    | Msg::Parsed { .. }
+                    | Msg::NetError { .. }
+                    | Msg::Script { .. }
+                    | Msg::JsFetch { .. }
+                    | Msg::Timer { .. }
+                    | Msg::RunScripts { .. }
+            );
+            let before = relevant.then(|| self.page_fingerprint(index));
             let old_label = self.tabs[index].page.tab_label();
             let mut effect = self.tabs[index].page.update(msg);
             if index != self.active || self.bookmark_library {
@@ -5196,12 +5302,19 @@ impl Browser {
                     old_label != self.tabs[index].page.tab_label() && self.tab_is_visible(index);
             }
             effect.tab = None;
+            if before.is_some_and(|before| before != self.page_fingerprint(index)) {
+                self.session_untouched = false;
+                return self.session_mutated(effect);
+            }
             return effect;
         }
 
+        let before = self.session_fingerprint();
+
         if let Msg::Key(event) = &msg {
             if self.bookmark_library {
-                return self.on_bookmark_key(event);
+                let effect = self.on_bookmark_key(event);
+                return self.finish_session_input(before, effect);
             }
             if self.tabs[self.active].page.accepts_browser_chrome_keys()
                 && let Resolution::Action(action) = keys::resolve(
@@ -5212,18 +5325,19 @@ impl Browser {
                 && matches!(action, Action::AddBookmark | Action::ToggleBookmarks)
             {
                 self.tabs[self.active].page.pending = None;
-                return match action {
+                let effect = match action {
                     Action::AddBookmark => self.add_active_bookmark(),
                     Action::ToggleBookmarks => self.open_bookmark_library(),
                     _ => unreachable!(),
                 };
+                return self.finish_session_input(before, effect);
             }
         }
         if self.bookmark_library && matches!(msg, Msg::Mouse(_)) {
-            return Effect::default();
+            return self.finish_session_input(before, Effect::default());
         }
 
-        match &mut msg {
+        let effect = match &mut msg {
             Msg::Resize(w, h) => {
                 self.size = (*w, *h);
                 self.keep_bookmark_visible();
@@ -5238,12 +5352,177 @@ impl Browser {
             }
             Msg::Mouse(mouse) => {
                 if mouse.row == 0 {
-                    return Effect::default();
+                    return self.finish_session_input(before, Effect::default());
                 }
                 mouse.row -= 1;
                 self.update_active(msg)
             }
             _ => self.update_active(msg),
+        };
+        self.finish_session_input(before, effect)
+    }
+
+    fn session_fingerprint(&self) -> SessionFingerprint {
+        let page = &self.tabs[self.active].page;
+        SessionFingerprint {
+            active: self.active,
+            tabs: self.tabs.len(),
+            url: page.current_url(),
+            scroll: page.session_scroll(),
+            generation: page.fetch_gen,
+        }
+    }
+
+    fn page_fingerprint(&self, index: usize) -> (Option<String>, u32, u64) {
+        let page = &self.tabs[index].page;
+        (page.current_url(), page.session_scroll(), page.fetch_gen)
+    }
+
+    fn finish_session_input(&mut self, before: SessionFingerprint, effect: Effect) -> Effect {
+        if effect.quit || before != self.session_fingerprint() {
+            self.session_untouched = false;
+            self.session_mutated(effect)
+        } else {
+            effect
+        }
+    }
+
+    fn session_snapshot(&self) -> SessionSnapshot {
+        let tabs: Vec<_> = self
+            .tabs
+            .iter()
+            .map(|tab| SessionTab {
+                url: tab.page.current_url().map(Arc::from),
+                scroll: tab.page.session_scroll(),
+            })
+            .collect();
+        SessionSnapshot::new(self.active, Arc::from(tabs))
+            .expect("live bounded tabs always form a valid session snapshot")
+    }
+
+    fn session_mutated(&mut self, mut effect: Effect) -> Effect {
+        let Some(revision) = self.session_revision.checked_add(1) else {
+            if !matches!(self.session_persistence, SessionPersistence::ReadOnly(_)) {
+                self.session_persistence =
+                    SessionPersistence::ReadOnly("session revision space exhausted".into());
+            }
+            effect.dirty = true;
+            return effect;
+        };
+        self.session_revision = revision;
+        let available = match &mut self.session_persistence {
+            SessionPersistence::Loading {
+                available,
+                submitted,
+            } => {
+                *submitted = revision;
+                *available
+            }
+            SessionPersistence::Ready {
+                available,
+                submitted,
+                error,
+                ..
+            } => {
+                *submitted = revision;
+                *error = None;
+                *available
+            }
+            SessionPersistence::ReadOnly(_) => false,
+        };
+        if available {
+            effect.session_save = Some((revision, self.session_snapshot()));
+        }
+        effect
+    }
+
+    fn session_loaded(&mut self, result: Result<Option<SessionSnapshot>, String>) -> Effect {
+        let (available, submitted) = match self.session_persistence {
+            SessionPersistence::Loading {
+                available,
+                submitted,
+            } => (available, submitted),
+            _ => return Effect::default(),
+        };
+        match result {
+            Err(error) => {
+                self.session_persistence = SessionPersistence::ReadOnly(bounded(error));
+                redraw()
+            }
+            Ok(snapshot) => {
+                self.session_persistence = SessionPersistence::Ready {
+                    available,
+                    submitted,
+                    acknowledged: 0,
+                    error: None,
+                };
+                if self.session_untouched
+                    && let Some(snapshot) = snapshot
+                {
+                    return self.restore_session(snapshot);
+                }
+                redraw()
+            }
+        }
+    }
+
+    fn session_saved(&mut self, revision: u64, result: Result<(), String>) -> Effect {
+        let SessionPersistence::Ready {
+            submitted,
+            acknowledged,
+            error,
+            ..
+        } = &mut self.session_persistence
+        else {
+            return Effect::default();
+        };
+        if revision < *acknowledged {
+            return Effect::default();
+        }
+        *acknowledged = revision;
+        if revision == *submitted {
+            *error = result.err().map(bounded);
+            return redraw();
+        }
+        Effect::default()
+    }
+
+    fn restore_session(&mut self, snapshot: SessionSnapshot) -> Effect {
+        let mut tabs = Vec::with_capacity(snapshot.tabs.len());
+        let mut documents = Vec::new();
+        for record in snapshot.tabs.iter() {
+            let id = TabId(self.next_tab);
+            self.next_tab = self.next_tab.saturating_add(1);
+            let mut page = App::with_session(
+                self.size.0,
+                self.size.1.saturating_sub(1),
+                self.kitty_graphics,
+                id,
+                &self.session,
+            );
+            if let Some(url) = &record.url {
+                let effect = page.navigate_restore(url.to_string(), record.scroll as usize);
+                if let Some((id, request)) = effect.fetch {
+                    documents.push(DocumentWork::Fetch(id, request));
+                }
+                if let Some((id, url, response, elapsed)) = effect.cached {
+                    documents.push(DocumentWork::Cached(id, url, response, elapsed));
+                }
+            }
+            tabs.push(Tab {
+                id,
+                page,
+                stale_size: false,
+            });
+        }
+        self.tabs = tabs;
+        self.active = snapshot.active;
+        self.kitty_tab = Some(self.tabs[self.active].id);
+        self.session_untouched = false;
+        Effect {
+            dirty: true,
+            documents,
+            ..Effect::default()
         }
     }
 
@@ -5582,16 +5861,17 @@ impl Browser {
         };
         let page = &self.tabs[self.active].page;
         let page_middle = page.status_middle();
-        let bookmark_middle = format!(
-            "{} bookmark{} · {}",
+        let browser_middle = format!(
+            "{} bookmark{} · {} · {}",
             self.bookmarks.len(),
             if self.bookmarks.len() == 1 { "" } else { "s" },
-            self.bookmark_status()
+            self.bookmark_status(),
+            self.session_status(),
         );
         let middle = if page_middle.is_empty() {
-            bookmark_middle
+            browser_middle
         } else {
-            format!("{page_middle} · {bookmark_middle}")
+            format!("{page_middle} · {browser_middle}")
         };
         let row = statusline::compose(
             frame.width() as usize,
@@ -5692,6 +5972,26 @@ impl Browser {
                 ..
             } if submitted > acknowledged => "saving bookmarks".into(),
             BookmarkPersistence::Ready { .. } => "saved".into(),
+        }
+    }
+
+    fn session_status(&self) -> String {
+        match &self.session_persistence {
+            SessionPersistence::Loading { .. } => "restoring session".into(),
+            SessionPersistence::ReadOnly(error) => format!("session read-only · {error}"),
+            SessionPersistence::Ready {
+                available: false, ..
+            } => "session unavailable".into(),
+            SessionPersistence::Ready {
+                error: Some(error), ..
+            } => format!("session unsaved · {error}"),
+            SessionPersistence::Ready {
+                submitted,
+                acknowledged,
+                error: None,
+                ..
+            } if submitted > acknowledged => "saving session".into(),
+            SessionPersistence::Ready { .. } => "session saved".into(),
         }
     }
 
@@ -6413,6 +6713,169 @@ mod tests {
         browser.tabs[index].page.dom = Some(crate::html::parse(&format!(
             "<title>{title}</title><p>page</p>"
         )));
+    }
+
+    fn checkpoint(active: usize, records: &[(Option<&str>, u32)]) -> SessionSnapshot {
+        SessionSnapshot::new(
+            active,
+            Arc::from(
+                records
+                    .iter()
+                    .map(|(url, scroll)| SessionTab {
+                        url: url.map(Arc::from),
+                        scroll: *scroll,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn untouched_startup_restores_order_with_fresh_ids_and_addressed_work() {
+        let mut browser = Browser::with_persistence(60, 8, false, true, true);
+        let bootstrap = browser.tabs[0].id;
+        let saved = checkpoint(
+            1,
+            &[
+                (Some("https://one.test/#part"), 37),
+                (None, 0),
+                (Some("https://three.test/"), 0),
+            ],
+        );
+        let effect = browser.update(Msg::SessionLoaded(Ok(Some(saved))));
+        assert_eq!(browser.tabs.len(), 3);
+        assert_eq!(browser.active, 1);
+        assert!(browser.tabs.iter().all(|tab| tab.id != bootstrap));
+        assert_eq!(
+            browser
+                .tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            3
+        );
+        assert_eq!(
+            browser.tabs[0].page.current_url().as_deref(),
+            Some("https://one.test/#part")
+        );
+        assert_eq!(browser.tabs[1].page.current_url(), None);
+        assert_eq!(
+            browser.tabs[2].page.current_url().as_deref(),
+            Some("https://three.test/")
+        );
+        assert_eq!(effect.documents.len(), 2);
+        for work in &effect.documents {
+            let (DocumentWork::Fetch(id, _) | DocumentWork::Cached(id, ..)) = work;
+            assert_eq!(id.generation, 1);
+            assert!(browser.tabs.iter().any(|tab| tab.id == id.tab));
+        }
+        assert!(effect.session_save.is_none());
+    }
+
+    #[test]
+    fn restored_offset_beats_fragment_once_and_checkpoints_while_loading() {
+        let mut browser = Browser::with_persistence(40, 8, false, false, true);
+        let saved = checkpoint(0, &[(Some("https://long.test/#bottom"), 12)]);
+        let effect = browser.update(Msg::SessionLoaded(Ok(Some(saved.clone()))));
+        assert_eq!(browser.session_snapshot(), saved);
+        let DocumentWork::Fetch(id, _) = &effect.documents[0] else {
+            panic!("fresh process cache unexpectedly hit")
+        };
+        let id = *id;
+        browser.update(Msg::Loaded {
+            id,
+            url: "https://long.test/#bottom".into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        let html = (0..40)
+            .map(|n| {
+                format!(
+                    "<p id='{}'>row {n}</p>",
+                    if n == 39 { "bottom" } else { "x" }
+                )
+            })
+            .collect::<String>();
+        let parsed = browser.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(&html),
+            elapsed: Duration::ZERO,
+        });
+        assert_eq!(browser.tabs[0].page.viewport.offset(), 12);
+        assert!(browser.tabs[0].page.pending_scroll.is_none());
+        assert!(
+            parsed.session_save.is_none(),
+            "applying saved state rewrote it"
+        );
+    }
+
+    #[test]
+    fn cli_and_early_session_mutations_win_but_chrome_only_actions_do_not() {
+        let disk = checkpoint(0, &[(Some("https://disk.test/"), 0)]);
+
+        let mut cli = Browser::with_persistence(40, 8, false, false, true);
+        let start = cli.start_navigation("https://cli.test/".into());
+        assert!(start.session_save.is_some());
+        let late = cli.update(Msg::SessionLoaded(Ok(Some(disk.clone()))));
+        assert!(late.documents.is_empty());
+        assert_eq!(cli.tabs.len(), 1);
+        assert_eq!(
+            cli.tabs[0].page.current_url().as_deref(),
+            Some("https://cli.test/")
+        );
+
+        let mut changed = Browser::with_persistence(40, 8, false, false, true);
+        assert!(changed.update(ch('t')).session_save.is_some());
+        changed.update(Msg::SessionLoaded(Ok(Some(disk.clone()))));
+        assert_eq!(changed.tabs.len(), 2);
+
+        let mut chrome = Browser::with_persistence(40, 8, false, false, true);
+        assert!(chrome.update(ch('?')).session_save.is_none());
+        let restored = chrome.update(Msg::SessionLoaded(Ok(Some(disk))));
+        assert_eq!(restored.documents.len(), 1);
+        assert_eq!(
+            chrome.tabs[0].page.current_url().as_deref(),
+            Some("https://disk.test/")
+        );
+    }
+
+    #[test]
+    fn session_revisions_follow_projection_not_page_or_reader_chrome() {
+        let mut browser = Browser::with_persistence(40, 8, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(None)));
+        let navigation = browser.start_navigation("https://page.test/".into());
+        assert_eq!(navigation.session_save.as_ref().map(|save| save.0), Some(1));
+        let id = navigation.fetch.unwrap().0;
+        browser.update(Msg::Loaded {
+            id,
+            url: "https://page.test/".into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        let parsed = browser.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse("<main><h1>Title</h1><p>body</p></main>"),
+            elapsed: Duration::ZERO,
+        });
+        assert!(parsed.session_save.is_none());
+        assert!(browser.update(ch('?')).session_save.is_none());
+        assert!(browser.update(ch('?')).session_save.is_none());
+        let reader = browser.update(ch('R'));
+        assert!(reader.session_save.is_none());
+        assert_eq!(browser.session_revision, 1);
+
+        let quit = browser.update(ch('q'));
+        assert_eq!(quit.session_save.as_ref().map(|save| save.0), Some(2));
     }
 
     #[test]

@@ -9,6 +9,8 @@ use crossterm::terminal;
 use yata::browser::app::{self, App, Browser, DocumentWork, Effect};
 use yata::browser::bookmark_worker::BookmarkWorker;
 use yata::browser::bookmarks;
+use yata::browser::session;
+use yata::browser::session_worker::SessionWorker;
 use yata::browser::{error_page, yank};
 use yata::js::console::Console;
 use yata::msg::Msg;
@@ -84,14 +86,29 @@ fn main() -> io::Result<()> {
         env::var("HOME").ok().as_deref(),
     );
     let bookmark_worker = BookmarkWorker::spawn(bookmark_path.clone(), tx.clone());
+    let session_path = session::resolve_path(
+        env::var("YATA_SESSION_PATH").ok().as_deref(),
+        env::var("XDG_DATA_HOME").ok().as_deref(),
+        env::var("HOME").ok().as_deref(),
+    );
+    let session_worker = SessionWorker::spawn(session_path.clone(), tx.clone());
     let mut renderer = Renderer::new(w, h, caps);
-    let mut app = Browser::with_bookmark_persistence(w, h, caps.kitty, bookmark_path.is_some());
+    let mut app = Browser::with_persistence(
+        w,
+        h,
+        caps.kitty,
+        bookmark_path.is_some(),
+        session_path.is_some(),
+    );
     if let Some(url) = url {
         // Scheme defaulting for the CLI argument goes through the same helper
         // the URL bar uses. The id makes any previous generation stale; each
         // worker owns its own Sender clone.
         let url = net::normalize_url(&url);
         let effect = app.start_navigation(url);
+        if let Some((revision, snapshot)) = effect.session_save.clone() {
+            session_worker.submit(revision, snapshot);
+        }
         if let Some((id, request)) = effect.fetch {
             net::spawn_fetch(id, request, tx.clone());
         }
@@ -119,6 +136,9 @@ fn main() -> io::Result<()> {
         let effect = apply_batch(&mut app, batch);
         if let Some((revision, records)) = effect.bookmark_save.clone() {
             bookmark_worker.submit(revision, records);
+        }
+        if let Some((revision, snapshot)) = effect.session_save.clone() {
+            session_worker.submit(revision, snapshot);
         }
         if effect.quit {
             break;
@@ -199,6 +219,7 @@ fn main() -> io::Result<()> {
     }
     drop(screen);
     bookmark_worker.shutdown();
+    session_worker.shutdown();
     Ok(())
 }
 
@@ -725,6 +746,9 @@ fn apply_batch(app: &mut impl UiApp, msgs: impl Iterator<Item = Msg>) -> Effect 
         }
         if e.bookmark_save.is_some() {
             effect.bookmark_save = e.bookmark_save;
+        }
+        if e.session_save.is_some() {
+            effect.session_save = e.session_save;
         }
         if e.quit {
             effect.quit = true;

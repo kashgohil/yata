@@ -76,7 +76,7 @@ fn yata(args: &[&str]) -> Output {
 }
 
 #[test]
-fn every_headless_mode_ignores_the_bookmark_path() {
+fn every_headless_mode_ignores_all_persistence_paths() {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     for mode in [
         "--dump",
@@ -87,15 +87,16 @@ fn every_headless_mode_ignores_the_bookmark_path() {
         "--timing",
     ] {
         let addr = serve_once(response_with_body("200 OK", b"<p>headless</p>"));
-        let path = std::env::temp_dir()
-            .join(format!(
-                "yata-headless-bookmarks-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ))
-            .join("never/bookmarks");
+        let root = std::env::temp_dir().join(format!(
+            "yata-headless-persistence-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let bookmark_path = root.join("bookmarks/never/bookmarks");
+        let session_path = root.join("session/never/session");
         let output = Command::new(env!("CARGO_BIN_EXE_yata"))
-            .env("YATA_BOOKMARKS_PATH", &path)
+            .env("YATA_BOOKMARKS_PATH", &bookmark_path)
+            .env("YATA_SESSION_PATH", &session_path)
             .args([mode, &format!("http://{addr}/")])
             .output()
             .unwrap();
@@ -105,11 +106,9 @@ fn every_headless_mode_ignores_the_bookmark_path() {
             "{mode}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!path.exists(), "{mode} created the bookmark file");
-        assert!(
-            !path.parent().unwrap().exists(),
-            "{mode} created bookmark directories"
-        );
+        assert!(!bookmark_path.exists(), "{mode} created the bookmark file");
+        assert!(!session_path.exists(), "{mode} created the session file");
+        assert!(!root.exists(), "{mode} created persistence directories");
     }
 }
 
