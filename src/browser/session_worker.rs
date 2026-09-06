@@ -4,6 +4,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+#[cfg(test)]
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -24,6 +26,14 @@ struct State {
     pending: Option<Save>,
     latest_revision: u64,
     stopping: bool,
+    #[cfg(test)]
+    settled_revision: Option<u64>,
+}
+
+enum QuietWait {
+    Timed(Duration),
+    #[cfg(test)]
+    Manual(Sender<u64>),
 }
 
 /// Submission only replaces shallow in-memory state. The owned thread holds
@@ -35,21 +45,46 @@ pub struct SessionWorker {
 
 impl SessionWorker {
     pub fn spawn(path: Option<PathBuf>, events: Sender<Msg>) -> Self {
-        Self::spawn_with_quiet_period(path, events, QUIET_PERIOD)
+        Self::spawn_inner(path, events, QuietWait::Timed(QUIET_PERIOD))
     }
 
+    #[cfg(test)]
     fn spawn_with_quiet_period(
         path: Option<PathBuf>,
         events: Sender<Msg>,
         quiet_period: Duration,
     ) -> Self {
+        Self::spawn_inner(path, events, QuietWait::Timed(quiet_period))
+    }
+
+    fn spawn_inner(path: Option<PathBuf>, events: Sender<Msg>, quiet: QuietWait) -> Self {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker_shared = Arc::clone(&shared);
-        let thread = thread::spawn(move || run(path, events, worker_shared, quiet_period));
+        let thread = thread::spawn(move || run(path, events, worker_shared, quiet));
         Self {
             shared,
             thread: Some(thread),
         }
+    }
+
+    #[cfg(test)]
+    fn spawn_with_manual_clock(
+        path: Option<PathBuf>,
+        events: Sender<Msg>,
+    ) -> (Self, Receiver<u64>) {
+        let (waiting, observed) = mpsc::channel();
+        (
+            Self::spawn_inner(path, events, QuietWait::Manual(waiting)),
+            observed,
+        )
+    }
+
+    #[cfg(test)]
+    fn settle_revision(&self, revision: u64) {
+        let (lock, wake) = &*self.shared;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.settled_revision = Some(revision);
+        wake.notify_one();
     }
 
     pub fn submit(&self, revision: u64, snapshot: SessionSnapshot) {
@@ -83,7 +118,7 @@ fn run(
     path: Option<PathBuf>,
     events: Sender<Msg>,
     shared: Arc<(Mutex<State>, Condvar)>,
-    quiet_period: Duration,
+    quiet: QuietWait,
 ) {
     let loaded = match &path {
         Some(path) => load(path),
@@ -101,16 +136,39 @@ fn run(
                     .wait(state)
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
             }
-            while !state.stopping && state.pending.is_some() && !quiet_period.is_zero() {
+            while !state.stopping && state.pending.is_some() {
                 let pending_revision = state.pending.as_ref().map(|save| save.revision);
-                let (next, timeout) = wake
-                    .wait_timeout(state, quiet_period)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                state = next;
-                if timeout.timed_out()
-                    && state.pending.as_ref().map(|save| save.revision) == pending_revision
-                {
-                    break;
+                match &quiet {
+                    QuietWait::Timed(period) => {
+                        if period.is_zero() {
+                            break;
+                        }
+                        let (next, timeout) = wake
+                            .wait_timeout(state, *period)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state = next;
+                        if timeout.timed_out()
+                            && state.pending.as_ref().map(|save| save.revision) == pending_revision
+                        {
+                            break;
+                        }
+                    }
+                    #[cfg(test)]
+                    QuietWait::Manual(waiting) => {
+                        let revision = pending_revision.expect("pending save has a revision");
+                        let _ = waiting.send(revision);
+                        while !state.stopping
+                            && state.pending.as_ref().map(|save| save.revision) == Some(revision)
+                            && state.settled_revision != Some(revision)
+                        {
+                            state = wake
+                                .wait(state)
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        }
+                        if state.stopping || state.settled_revision == Some(revision) {
+                            break;
+                        }
+                    }
                 }
             }
             match state.pending.take() {
@@ -177,8 +235,10 @@ enum FailurePoint {
     CreateParent,
     Open,
     Write,
+    Flush,
     Sync,
     Rename,
+    DirectorySync,
 }
 
 fn save_atomic_inner(
@@ -212,6 +272,8 @@ fn save_atomic_inner(
         fail_at(failure, FailurePoint::Write)?;
         file.write_all(&bytes)
             .map_err(|error| path_error(path, "write", &error))?;
+        #[cfg(test)]
+        fail_at(failure, FailurePoint::Flush)?;
         file.flush()
             .map_err(|error| path_error(path, "flush", &error))?;
         #[cfg(test)]
@@ -221,6 +283,8 @@ fn save_atomic_inner(
         #[cfg(test)]
         fail_at(failure, FailurePoint::Rename)?;
         fs::rename(&temp, path).map_err(|error| path_error(path, "replace", &error))?;
+        #[cfg(test)]
+        fail_at(failure, FailurePoint::DirectorySync)?;
         sync_directory(parent).map_err(|error| path_error(path, "sync parent", &error))?;
         Ok(())
     })();
@@ -387,6 +451,46 @@ mod tests {
     }
 
     #[test]
+    fn manual_clock_proves_each_activity_resets_the_quiet_deadline() {
+        let path = temp_path("session");
+        let (tx, rx) = mpsc::channel();
+        let (worker, waiting) = SessionWorker::spawn_with_manual_clock(Some(path.clone()), tx);
+        let _ = rx.recv().unwrap();
+
+        worker.submit(1, snapshot("https://one.test/", 1));
+        assert_eq!(waiting.recv().unwrap(), 1);
+        worker.submit(2, snapshot("https://two.test/", 2));
+        worker.submit(3, snapshot("https://three.test/", 3));
+        let mut observed = waiting.recv().unwrap();
+        while observed != 3 {
+            observed = waiting.recv().unwrap();
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a revision saved before quiet settled"
+        );
+
+        worker.settle_revision(3);
+        assert_eq!(
+            rx.recv().unwrap(),
+            Msg::SessionSaved {
+                revision: 3,
+                result: Ok(())
+            }
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a coalesced revision was acknowledged"
+        );
+        worker.shutdown();
+        assert_eq!(
+            load(&path).unwrap(),
+            Some(snapshot("https://three.test/", 3))
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn a_stale_submission_cannot_follow_a_newer_accepted_revision() {
         let path = temp_path("session");
         let (tx, rx) = mpsc::channel();
@@ -439,6 +543,7 @@ mod tests {
             FailurePoint::CreateParent,
             FailurePoint::Open,
             FailurePoint::Write,
+            FailurePoint::Flush,
             FailurePoint::Sync,
             FailurePoint::Rename,
         ] {
@@ -448,6 +553,16 @@ mod tests {
             assert_eq!(load(&path).unwrap(), Some(old.clone()), "{point:?}");
             assert!(!temporary_path(&path).exists(), "{point:?}");
         }
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn directory_sync_failure_reports_unsaved_but_leaves_a_decodable_named_file() {
+        let path = temp_path("session");
+        let next = snapshot("https://new.test/", 9);
+        assert!(save_atomic_inner(&path, &next, Some(FailurePoint::DirectorySync)).is_err());
+        assert_eq!(load(&path).unwrap(), Some(next));
+        assert!(!temporary_path(&path).exists());
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
