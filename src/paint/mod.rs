@@ -440,6 +440,7 @@ pub fn paint_to_frame(
                 // Draw char by char so a background fill already under this
                 // row keeps its bg (text style usually has bg:Default).
                 let mut cx = screen_x;
+                let mut last_contrast = None;
                 for ch in text.chars() {
                     let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
                     if w == 0 {
@@ -451,6 +452,19 @@ pub fn paint_to_frame(
                         if st.bg == Color::Default {
                             st.bg = existing.bg;
                         }
+                        let pair = (st.fg, st.bg);
+                        st.fg = match last_contrast {
+                            Some((foreground, background, readable))
+                                if (foreground, background) == pair =>
+                            {
+                                readable
+                            }
+                            _ => {
+                                let readable = readable_foreground(st.fg, st.bg);
+                                last_contrast = Some((st.fg, st.bg, readable));
+                                readable
+                            }
+                        };
                         frame.set(cx as u16, screen_y as u16, crate::term::Cell::new(ch, st));
                     }
                     cx += w;
@@ -504,6 +518,51 @@ pub fn paint_to_frame(
             }
         }
     }
+}
+
+/// Keep terminal text readable once the page background underneath it is
+/// known. `Color::Default` is theme-aware only while the terminal's own
+/// background remains in use; over an authored fill it can become white on
+/// white (dark terminal theme) or black on black (light theme). The same seam
+/// repairs authored RGB pairs below WCAG's normal-text contrast threshold.
+fn readable_foreground(foreground: Color, background: Color) -> Color {
+    let Color::Rgb(br, bg, bb) = background else {
+        return foreground;
+    };
+    let background_luminance = relative_luminance(br, bg, bb);
+    let black_contrast = (background_luminance + 0.05) / 0.05;
+    let white_contrast = 1.05 / (background_luminance + 0.05);
+    let fallback = if black_contrast >= white_contrast {
+        Color::Rgb(0, 0, 0)
+    } else {
+        Color::Rgb(255, 255, 255)
+    };
+    match foreground {
+        Color::Default => fallback,
+        Color::Rgb(fr, fg, fb) => {
+            let foreground_luminance = relative_luminance(fr, fg, fb);
+            let lighter = foreground_luminance.max(background_luminance);
+            let darker = foreground_luminance.min(background_luminance);
+            if (lighter + 0.05) / (darker + 0.05) < 4.5 {
+                fallback
+            } else {
+                foreground
+            }
+        }
+        Color::Ansi(_) => foreground,
+    }
+}
+
+fn relative_luminance(r: u8, g: u8, b: u8) -> f32 {
+    fn linear(channel: u8) -> f32 {
+        let channel = f32::from(channel) / 255.0;
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
 }
 
 /// Collect Kitty placements for **fully** visible image commands.
@@ -751,6 +810,55 @@ mod tests {
                 .any(|c| matches!(c, DisplayCommand::FillRect { .. })),
             "{list:?}"
         );
+    }
+
+    #[test]
+    fn terminal_default_text_becomes_black_on_an_authored_white_background() {
+        // Modern pages commonly put their foreground in an unsupported
+        // `var()`. On a dark terminal the fallback foreground is white, but
+        // the independently supported background is still white.
+        let t = tree(
+            "<p>readable</p>",
+            "body { background: #fff; color: var(--site-text) } p { margin: 0 }",
+            20,
+        );
+        let list = paint(&t);
+        let mut frame = Frame::new(20, 2);
+        paint_to_frame(&list, &mut frame, 0, 0, 2);
+        let cell = frame.get(0, 0);
+        assert_eq!(cell.ch, 'r');
+        assert_eq!(cell.fg, Color::Rgb(0, 0, 0));
+        assert_eq!(cell.bg, Color::Rgb(255, 255, 255));
+    }
+
+    #[test]
+    fn terminal_default_text_becomes_white_on_an_authored_dark_background() {
+        let t = tree(
+            "<p>readable</p>",
+            "body { background: #111; color: var(--site-text) } p { margin: 0 }",
+            20,
+        );
+        let list = paint(&t);
+        let mut frame = Frame::new(20, 2);
+        paint_to_frame(&list, &mut frame, 0, 0, 2);
+        let cell = frame.get(0, 0);
+        assert_eq!(cell.fg, Color::Rgb(255, 255, 255));
+        assert_eq!(cell.bg, Color::Rgb(0x11, 0x11, 0x11));
+    }
+
+    #[test]
+    fn an_authored_low_contrast_pair_is_repaired_at_compositing_time() {
+        let t = tree(
+            "<p>readable</p>",
+            "body { background: #fff; color: #999 } p { margin: 0 }",
+            20,
+        );
+        let list = paint(&t);
+        let mut frame = Frame::new(20, 2);
+        paint_to_frame(&list, &mut frame, 0, 0, 2);
+        let cell = frame.get(0, 0);
+        assert_eq!(cell.fg, Color::Rgb(0, 0, 0));
+        assert_eq!(cell.bg, Color::Rgb(255, 255, 255));
     }
 
     #[test]
