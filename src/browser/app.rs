@@ -6049,6 +6049,81 @@ mod tests {
         assert_eq!(browser.tabs[1].page.layouts, after_deferred);
     }
 
+    /// Release-only measurement for M11.21's hot path. The ignored shape
+    /// keeps ordinary debug test runs deterministic while leaving the exact
+    /// HN/Wikipedia interleaving reproducible with:
+    /// `cargo test --release measure_settled_tab_switches -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "release performance measurement"]
+    fn measure_settled_tab_switches() {
+        fn settle(browser: &mut Browser, url: &str, markup: &str) {
+            let id = browser.start_navigation(url.into()).fetch.unwrap().0;
+            browser.update(Msg::Loaded {
+                id,
+                url: url.into(),
+                status: 200,
+                body: markup.as_bytes().to_vec(),
+                elapsed: Duration::ZERO,
+                content_type: Some("text/html".into()),
+                set_cookie: vec![],
+                metadata: Metadata::default(),
+            });
+            browser.update(Msg::Parsed {
+                id,
+                dom: crate::html::parse(markup),
+                elapsed: Duration::ZERO,
+            });
+        }
+
+        let hn = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/news.ycombinator.com.html"
+        ));
+        let wikipedia = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ))
+        .replace("<script", "<script type=\"text/x-not-run\"");
+        let mut browser = Browser::new(120, 35);
+        settle(&mut browser, "https://news.ycombinator.com/", hn);
+        browser.update(ch('t'));
+        settle(
+            &mut browser,
+            "https://en.wikipedia.org/wiki/Rust",
+            &wikipedia,
+        );
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        const ROUNDS: u32 = 200;
+        let mut frame = Frame::new(120, 35);
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            browser.update(ch('g'));
+            let effect = browser.update(ch('t'));
+            assert!(effect.dirty);
+            browser.draw(&mut frame);
+        }
+        let elapsed = started.elapsed();
+        let mean = elapsed / ROUNDS;
+        eprintln!(
+            "M11.21 settled HN/Wikipedia switch + cached-frame draw: \
+             {ROUNDS} interleaved rounds in {elapsed:?}, mean {mean:?}"
+        );
+        assert!(
+            mean < Duration::from_millis(10),
+            "settled tab switch exceeded PLAN.md's 10 ms input budget: {mean:?}"
+        );
+
+        while browser.tabs.len() < MAX_TABS {
+            browser.update(ch('t'));
+            browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        assert_eq!(browser.tabs.len(), MAX_TABS);
+        eprintln!(
+            "M11.21 16-tab idle: no Browser poll/tick exists; the event loop remains on blocking recv"
+        );
+    }
+
     #[test]
     fn a_background_parse_after_resize_uses_the_new_geometry_once() {
         let mut browser = Browser::new(30, 8);
