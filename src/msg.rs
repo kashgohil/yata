@@ -5,7 +5,7 @@ use crossterm::event::{KeyEvent, MouseEvent};
 use crate::css::Stylesheet;
 use crate::dom::Dom;
 use crate::image::DecodedImage;
-use crate::net::{FetchId, JsResponse};
+use crate::net::{JsResponse, PageId};
 use crate::timers::TimerId;
 
 /// Everything the UI thread reacts to arrives as one of these over the single
@@ -21,7 +21,7 @@ pub enum Msg {
     InputClosed,
     /// Progress: the fetch worker has `bytes_so_far` of the body.
     Loading {
-        id: FetchId,
+        id: PageId,
         bytes_so_far: u64,
     },
     /// Terminal success: final URL after redirects, HTTP status, raw bytes
@@ -29,7 +29,7 @@ pub enum Msg {
     /// (client build → last body byte), measured on the worker so the app
     /// stays pure of `Instant::now()`.
     Loaded {
-        id: FetchId,
+        id: PageId,
         url: String,
         status: u16,
         body: Vec<u8>,
@@ -77,7 +77,7 @@ pub enum Msg {
     /// a POST to GET, 307/308 keep it. Without the status the loop cannot pick
     /// a row, and a login's 302 would POST the password at `/app`.
     Redirect {
-        id: FetchId,
+        id: PageId,
         url: String,
         to: String,
         status: u16,
@@ -92,7 +92,7 @@ pub enum Msg {
     /// never blocks, not even on a slow parse); the duration is measured on
     /// the worker for the same reason `Loaded::elapsed` is.
     Parsed {
-        id: FetchId,
+        id: PageId,
         dom: Dom,
         elapsed: Duration,
     },
@@ -106,13 +106,13 @@ pub enum Msg {
     /// slot resolves to nothing and the rest of the cascade proceeds. Parsing
     /// happens on the worker for the same reason the HTML parse does.
     Stylesheet {
-        id: FetchId,
+        id: PageId,
         slot: usize,
         sheet: Option<Stylesheet>,
     },
     /// Terminal failure — bad URL, DNS, connect, TLS, mid-body disconnect.
     NetError {
-        id: FetchId,
+        id: PageId,
         url: String,
         reason: String,
     },
@@ -120,7 +120,7 @@ pub enum Msg {
     /// never becomes an error page. `id` is the page generation that requested
     /// the fetch so a late arrival after navigation is ignored.
     Image {
-        id: FetchId,
+        id: PageId,
         url: String,
         result: Result<DecodedImage, String>,
     },
@@ -133,7 +133,7 @@ pub enum Msg {
     /// missing stylesheet that is a *degraded page*, not an error page: the
     /// slot settles empty and the rest of the queue proceeds.
     Script {
-        id: FetchId,
+        id: PageId,
         slot: usize,
         source: Option<String>,
     },
@@ -146,7 +146,7 @@ pub enum Msg {
     /// `Err` means the request never completed. A 404 is `Ok` with
     /// `ok: false`, because that is what `fetch` resolves to.
     JsFetch {
-        page: FetchId,
+        page: PageId,
         request: u64,
         result: Result<JsResponse, String>,
     },
@@ -156,7 +156,7 @@ pub enum Msg {
     /// generation that scheduled it, so a message for a page the user has left
     /// is dropped by the same guard every other message uses.
     Timer {
-        page: FetchId,
+        page: PageId,
         id: TimerId,
     },
     /// Run this page's `<script>` elements in document order (M10.2).
@@ -169,6 +169,6 @@ pub enum Msg {
     /// generation, so a pass queued for a page the user has navigated away
     /// from is dropped by the same guard every other message uses.
     RunScripts {
-        id: FetchId,
+        id: PageId,
     },
 }

@@ -23,7 +23,7 @@ use crate::js::storage::Storage;
 use crate::js::{self, console::Console};
 use crate::layout::{self, BoxKind, LayoutTree};
 use crate::msg::Msg;
-use crate::net::{self, FetchId};
+use crate::net::{self, PageId};
 use crate::paint::{self, DisplayList};
 use crate::style::sources::{self, Source};
 use crate::style::{self, StyleContext, Styles};
@@ -44,31 +44,31 @@ pub struct Effect {
     /// plus whatever `Cookie:` header the jar decided on) for the loop to hand
     /// to `net::spawn_fetch`. `App` starts the fetch generation; the loop owns
     /// the worker thread. Keeps `App` pure of the network.
-    pub fetch: Option<(FetchId, net::Request)>,
+    pub fetch: Option<(PageId, net::Request)>,
     /// Stored response bytes to parse on a detached worker. Mutually exclusive
     /// with `fetch` for one navigation.
-    pub cached: Option<(FetchId, String, Representation, Duration)>,
+    pub cached: Option<(PageId, String, Representation, Duration)>,
     /// Linked stylesheets to fetch, as (fetch id, document slot, request).
     /// The loop spawns one worker each, in the same turn — they must not queue
     /// behind one another (PLAN.md M4: fetched in parallel), and the page is
     /// already on screen while they run. Same discipline as `fetch`: `App`
     /// decides, the loop spawns.
-    pub sheets: Vec<(FetchId, usize, net::Request)>,
+    pub sheets: Vec<(PageId, usize, net::Request)>,
     /// Text to put on the system clipboard via OSC 52 (M6 yank). Written by
     /// the event loop, not through the cell buffer.
     pub yank: Option<String>,
-    /// Image requests to make (page FetchId, request). Parallel workers, same
+    /// Image requests to make (page PageId, request). Parallel workers, same
     /// discipline as stylesheets (M8).
-    pub images: Vec<(FetchId, net::Request)>,
+    pub images: Vec<(PageId, net::Request)>,
     /// External scripts to fetch, as (fetch id, document slot, request) — one
     /// worker each, exactly like `sheets`. The slots were allocated in
     /// document order before any fetch started, so arrival order cannot change
     /// execution order (M10.10).
-    pub scripts: Vec<(FetchId, usize, net::Request)>,
+    pub scripts: Vec<(PageId, usize, net::Request)>,
     /// `fetch()` calls this page's script asked for (M10.12), as (page, request
     /// id, method, url, headers, body) for the loop to spawn. Same discipline
     /// as everything else: `App` decides, the loop dispatches.
-    pub fetches: Vec<(FetchId, js::FetchAsk)>,
+    pub fetches: Vec<(PageId, js::FetchAsk)>,
     /// Timer work this page's script asked for (M10.9), for the loop to hand
     /// to the timer thread. Same discipline as `fetch` and `sheets`: `App`
     /// decides, the loop dispatches — nothing in `App` or `src/js/` touches a
@@ -79,7 +79,7 @@ pub struct Effect {
     /// been rendered. Same discipline as `fetch` and `sheets`: `App` decides,
     /// the loop dispatches — which is also what keeps the pass out of the turn
     /// that has to paint.
-    pub run_scripts: Option<FetchId>,
+    pub run_scripts: Option<PageId>,
 }
 
 /// Link-hint session (`f` / `F`).
@@ -243,11 +243,11 @@ enum Mode {
 /// state, `draw` touches only the given frame.
 pub struct App {
     size: (u16, u16),
-    /// Generation counter behind `FetchId`s; `start_fetch` pre-increments,
+    /// Generation counter behind `PageId`s; `start_fetch` pre-increments,
     /// so ids start at 1 and id 0 is never live.
     fetch_gen: u64,
     /// The only fetch whose messages matter; anything else is stale.
-    current_fetch: Option<FetchId>,
+    current_fetch: Option<PageId>,
     fetch: Fetch,
     mode: Mode,
     /// The first chord of a two-key sequence, waiting for the second. No timer
@@ -270,15 +270,15 @@ pub struct App {
     /// into the `Effect` the key or mouse path returns. `dispatch_click` runs
     /// inside those paths and cannot return an `Effect` of its own.
     /// `fetch()` calls a click handler made, carried out the same way.
-    pending_click_fetches: Vec<(FetchId, js::FetchAsk)>,
+    pending_click_fetches: Vec<(PageId, js::FetchAsk)>,
     /// Timer work requested by a listener in the reader action currently
     /// resolving. It follows listener fetches out in the returned effect.
     pending_click_timers: Vec<TimerRequest>,
     /// External scripts a click handler inserted (M11.5), and whether one of
     /// its insertions can run now — carried out the same way, because a
     /// bootstrap behind a click is the same shape as one at load.
-    pending_click_scripts: Vec<(FetchId, usize, net::Request)>,
-    pending_click_run: Option<FetchId>,
+    pending_click_scripts: Vec<(PageId, usize, net::Request)>,
+    pending_click_run: Option<PageId>,
     /// Inserted `<script>` elements owed an `error` because their URL will
     /// never resolve (M11.5), fired one per turn by `run_ready_scripts`.
     ///
@@ -300,7 +300,7 @@ pub struct App {
     /// thing preventing a second `Msg::RunScripts` today is that one call site
     /// produces it — a guard that vanishes the moment anything else wants a
     /// script pass.
-    script_queue_page: Option<FetchId>,
+    script_queue_page: Option<PageId>,
     /// Every origin's `localStorage`/`sessionStorage` for this session
     /// (M10.11). Lives here rather than in the host because a host is dropped
     /// on every navigation and two pages on one origin must see the same data.
@@ -397,9 +397,9 @@ pub struct App {
     hops: Hops,
     /// Where to scroll after the first layout of a *specific* fetch generation
     /// (history back/forward, reload, a fragment on a cross-document link).
-    /// Tied to `FetchId` so a resize while the old page is still on screen
+    /// Tied to `PageId` so a resize while the old page is still on screen
     /// cannot consume the restore.
-    pending_scroll: Option<(FetchId, PendingScroll)>,
+    pending_scroll: Option<(PageId, PendingScroll)>,
     /// Active in-page search (`/` … Enter), if any.
     search: Option<SearchSession>,
     /// Scrollable help overlay content (`?`).
@@ -546,9 +546,9 @@ impl App {
     /// Begin a new fetch generation for `url`: prior fetches become stale and
     /// their messages will be ignored. The caller passes the returned id to
     /// `net::spawn_fetch` — `App` itself never touches the network.
-    pub fn start_fetch(&mut self, url: String) -> FetchId {
+    pub fn start_fetch(&mut self, url: String) -> PageId {
         self.fetch_gen += 1;
-        let id = FetchId(self.fetch_gen);
+        let id = PageId::headless(self.fetch_gen);
         self.current_fetch = Some(id);
         // One host per page generation: the old page's globals, closures and
         // (from M10.8) listeners go with it. Dropping the host is the whole
@@ -801,7 +801,7 @@ impl App {
                 // change, so the fragment the reader clicked still lands, the
                 // timers this page scheduled are still its own, and the
                 // stylesheet already in flight is still accepted. Minting a new
-                // `FetchId` here would silently discard all three.
+                // `PageId` here would silently discard all three.
                 self.hops.count += 1;
                 self.hops.elapsed += elapsed;
                 if self.hops.count > MAX_REDIRECTS {
@@ -961,7 +961,7 @@ impl App {
                     host,
                     &mut dom,
                     &js::PageContext {
-                        page: page.0,
+                        page: page.generation,
                         url: &url,
                         console: &console,
                         storage: &storage,
@@ -1012,7 +1012,7 @@ impl App {
                     host,
                     &mut dom,
                     &js::PageContext {
-                        page: page.0,
+                        page: page.generation,
                         url: &url,
                         console: &console,
                         storage: &storage,
@@ -1042,7 +1042,7 @@ impl App {
                 // only, and a generation change cancels the pending cycle —
                 // checked here, before any stage runs, because relayouting a
                 // page the user has already left is wasted work at best and
-                // the wrong page at worst. It is the same `FetchId` guard
+                // the wrong page at worst. It is the same `PageId` guard
                 // every other message uses.
                 if Some(id) != self.current_fetch {
                     return Effect::default();
@@ -1580,7 +1580,7 @@ impl App {
     }
 
     /// Discover `<img>` tags and return absolute URLs that still need a fetch.
-    fn adopt_images(&mut self, id: FetchId) -> Vec<(FetchId, net::Request)> {
+    fn adopt_images(&mut self, id: PageId) -> Vec<(PageId, net::Request)> {
         let Some(dom) = &self.dom else {
             return Vec::new();
         };
@@ -1711,7 +1711,7 @@ impl App {
     /// here — the round trip to a worker would cost more than the parse. The
     /// measured worst case in the fixtures is Wikipedia's 21 blocks; the
     /// number is in perf.md.
-    fn adopt_sources(&mut self, id: FetchId) -> Vec<(FetchId, usize, net::Request)> {
+    fn adopt_sources(&mut self, id: PageId) -> Vec<(PageId, usize, net::Request)> {
         let Some(dom) = &self.dom else {
             return Vec::new();
         };
@@ -2186,7 +2186,7 @@ impl App {
 
     fn plan_document_request(
         &mut self,
-        id: FetchId,
+        id: PageId,
         mut request: net::Request,
         mode: RequestMode,
     ) -> Effect {
@@ -2366,7 +2366,7 @@ impl App {
     }
 
     /// Replace the URL this page is known by, without touching the fetch
-    /// generation: no new `FetchId`, no `Fetch` transition, so the sheets,
+    /// generation: no new `PageId`, no `Fetch` transition, so the sheets,
     /// images and scripts already in flight are not cancelled — the page did
     /// not reload. The `Fetch` variant is the only place a page URL lives
     /// (`current_url` reads it and nothing else), so it is the only place a
@@ -2797,7 +2797,7 @@ impl App {
     ///
     /// **A submission is a navigation, and there is only one of those.**
     /// `navigate` already owns everything one needs — history so `H` comes
-    /// back, a fresh `FetchId` so a stale response cannot land on the wrong
+    /// back, a fresh `PageId` so a stale response cannot land on the wrong
     /// page, `App::request` so the jar attaches the cookies (M11.7), and
     /// redirects through the event loop (M11.7a) so the `Set-Cookie` on the 302
     /// a search or a login answers with is not lost. Nothing here fetches, and
@@ -3341,7 +3341,7 @@ impl App {
     /// `Effect`. Called by the script pass and by every arriving body, so a
     /// prefix that completes late goes through exactly the same path as the
     /// first one.
-    fn run_ready_scripts(&mut self, id: FetchId, mut dom: Dom) -> Effect {
+    fn run_ready_scripts(&mut self, id: PageId, mut dom: Dom) -> Effect {
         // Taken before anything runs, so that an `error` this turn *discovers*
         // is fired by the next one rather than inside this one (M11.5). One
         // per turn: a handler costs a budget, and the reader's keys are served
@@ -3364,7 +3364,7 @@ impl App {
             &mut self.js_host,
             &mut dom,
             &js::PageContext {
-                page: id.0,
+                page: id.generation,
                 url: &url,
                 console: &self.console,
                 storage: &self.storage,
@@ -3431,7 +3431,7 @@ impl App {
     /// `<script src>` uses. Re-entering the engine from inside the tick that
     /// inserted the script is exactly the `document.write` re-entrancy bug
     /// M10.2's model exists to make impossible.
-    fn adopt_inserted_scripts(&mut self, id: FetchId, effect: &mut Effect) {
+    fn adopt_inserted_scripts(&mut self, id: PageId, effect: &mut Effect) {
         // The A side of the interleaved measurement, and its only reader.
         #[cfg(test)]
         if self.no_insert_detection {
@@ -3484,7 +3484,7 @@ impl App {
                 js::queue::Inserted::Ready => ready = true,
                 js::queue::Inserted::Fetch(external) => {
                     // The same resolution every other external script gets, so
-                    // a dynamic one inherits the `FetchId` guard, the
+                    // a dynamic one inherits the `PageId` guard, the
                     // `MAX_SCRIPT_BYTES` cap and the settles-empty behaviour.
                     // An empty answer means the URL will not resolve and the
                     // slot has already settled — which is an `error` for the
@@ -3525,7 +3525,7 @@ impl App {
     /// listener on a parsed `<script src>` before the page ran a line.
     fn fire_script_event(
         &mut self,
-        id: FetchId,
+        id: PageId,
         node: NodeId,
         event: js::EventDescriptor,
         effect: &mut Effect,
@@ -3543,7 +3543,7 @@ impl App {
             &mut self.js_host,
             &mut dom,
             &js::PageContext {
-                page: id.0,
+                page: id.generation,
                 url: &url,
                 console: &self.console,
                 storage: &self.storage,
@@ -3574,9 +3574,9 @@ impl App {
     /// rather than waiting forever.
     fn resolve_script_urls(
         &mut self,
-        id: FetchId,
+        id: PageId,
         externals: Vec<crate::js::queue::External>,
-    ) -> Vec<(FetchId, usize, net::Request)> {
+    ) -> Vec<(PageId, usize, net::Request)> {
         let base = self.current_url();
         let mut out = Vec::new();
         for external in externals {
@@ -3683,7 +3683,7 @@ impl App {
 
     /// The `fetch()` calls a tick asked for, tagged with the generation that
     /// asked so a response can be matched back to it.
-    fn take_fetch_requests(&mut self, page: FetchId) -> Vec<(FetchId, js::FetchAsk)> {
+    fn take_fetch_requests(&mut self, page: PageId) -> Vec<(PageId, js::FetchAsk)> {
         self.js_host
             .as_ref()
             .map(|host| {
@@ -3697,7 +3697,7 @@ impl App {
 
     /// Turn the timer work a tick asked for into requests the loop can hand to
     /// the timer thread, tagged with the generation that asked.
-    fn take_timer_requests(&mut self, page: FetchId) -> Vec<TimerRequest> {
+    fn take_timer_requests(&mut self, page: PageId) -> Vec<TimerRequest> {
         let Some(host) = self.js_host.as_ref() else {
             return Vec::new();
         };
@@ -3741,7 +3741,7 @@ impl App {
     /// Snapshot one reader action. Several native steps may dispatch through
     /// the host after this point; one matching `finish_reader_action` consumes
     /// their aggregate DOM edits exactly once.
-    fn begin_reader_action(&self) -> Option<(FetchId, (u64, u64, u64), usize)> {
+    fn begin_reader_action(&self) -> Option<(PageId, (u64, u64, u64), usize)> {
         let id = self.current_fetch?;
         let dom = self.dom.as_ref()?;
         Some((id, dom.change_versions(), self.console.entries().len()))
@@ -3767,7 +3767,7 @@ impl App {
             &mut self.js_host,
             &mut dom,
             &js::PageContext {
-                page: id.0,
+                page: id.generation,
                 url: &url,
                 console: &self.console,
                 storage: &self.storage,
@@ -3784,7 +3784,7 @@ impl App {
     /// End an action started by [`Self::begin_reader_action`].
     fn finish_reader_action(
         &mut self,
-        id: FetchId,
+        id: PageId,
         before: (u64, u64, u64),
         logged_before: usize,
     ) -> bool {
@@ -4650,7 +4650,7 @@ mod tests {
         )
     }
 
-    fn load_cacheable(app: &mut App, id: FetchId, url: &str, body: &[u8], metadata: Metadata) {
+    fn load_cacheable(app: &mut App, id: PageId, url: &str, body: &[u8], metadata: Metadata) {
         app.update(Msg::Loaded {
             id,
             url: url.into(),
@@ -5150,7 +5150,7 @@ mod tests {
             .into_bytes()
     }
 
-    fn load(app: &mut App, id: FetchId, body: Vec<u8>) -> Effect {
+    fn load(app: &mut App, id: PageId, body: Vec<u8>) -> Effect {
         app.update(Msg::Loaded {
             id,
             url: "http://final/".into(),
@@ -5167,7 +5167,7 @@ mod tests {
 
     /// Load and parse `html` as one page, returning the `Parsed` effect (which
     /// carries the linked sheets the loop would spawn workers for).
-    fn open_page(app: &mut App, html_src: &str) -> (FetchId, Effect) {
+    fn open_page(app: &mut App, html_src: &str) -> (PageId, Effect) {
         let id = app.start_fetch("http://site.test/dir/page".into());
         app.update(Msg::Loaded {
             id,
@@ -5547,7 +5547,7 @@ mod tests {
         redraw()
     }
 
-    fn loaded(id: FetchId, status: u16, body_len: usize) -> Msg {
+    fn loaded(id: PageId, status: u16, body_len: usize) -> Msg {
         Msg::Loaded {
             id,
             url: "http://final/".into(),
@@ -6090,7 +6090,7 @@ mod tests {
         key(KeyCode::F(3), KeyModifiers::NONE)
     }
 
-    fn parsed(id: FetchId, html: &str) -> Msg {
+    fn parsed(id: PageId, html: &str) -> Msg {
         Msg::Parsed {
             id,
             dom: crate::html::parse(html),
@@ -6101,7 +6101,7 @@ mod tests {
     // ---- the script pass (M10.2) ------------------------------------------
 
     /// A page that has been fetched and parsed, ready for its script pass.
-    fn scripted_app(html: &str) -> (App, FetchId) {
+    fn scripted_app(html: &str) -> (App, PageId) {
         let mut app = App::new(40, 10);
         let id = app.start_fetch("http://x/".into());
         load(&mut app, id, html.as_bytes().to_vec());
@@ -6530,7 +6530,7 @@ mod tests {
     /// A page loaded from `http://final/` (what `load` reports), parsed, with
     /// its script pass run — so the queue exists and its externals have been
     /// requested.
-    fn page_with_scripts(html: &str) -> (App, FetchId, Effect) {
+    fn page_with_scripts(html: &str) -> (App, PageId, Effect) {
         let (mut app, id) = scripted_app(html);
         let effect = app.update(Msg::RunScripts { id });
         (app, id, effect)
@@ -6746,7 +6746,7 @@ mod tests {
     }
 
     /// The script pass and every turn it asks for after it.
-    fn run_turns(app: &mut App, id: FetchId) -> usize {
+    fn run_turns(app: &mut App, id: PageId) -> usize {
         let first = app.update(Msg::RunScripts { id });
         drain_turns(app, first)
     }
@@ -7209,7 +7209,7 @@ mod tests {
     #[test]
     fn a_timer_for_a_superseded_page_never_runs() {
         // Deliverable 4: navigation drops the host and its callbacks, and a
-        // message already in flight is dropped by the `FetchId` guard.
+        // message already in flight is dropped by the `PageId` guard.
         let (mut app, first) = scripted_app(
             "<p id=out>x</p><script>setTimeout(function () {\
                document.getElementById('out').textContent = 'from the old page';\
@@ -7284,7 +7284,7 @@ mod tests {
     // ---- events (M10.8) ---------------------------------------------------
 
     /// A loaded page whose script has run, ready to be clicked.
-    fn live_page(w: u16, h: u16, html: &str) -> (App, FetchId) {
+    fn live_page(w: u16, h: u16, html: &str) -> (App, PageId) {
         let mut app = App::new(w, h);
         let id = app.start_fetch("http://x/".into());
         load(&mut app, id, html.as_bytes().to_vec());
@@ -7553,11 +7553,11 @@ mod tests {
     // ---- redirects through the loop (M11.7a) ------------------------------
 
     /// One hop, as the worker reports it. 302 is the login-shaped default.
-    fn hop(id: FetchId, from: &str, to: &str, set_cookie: &[&str]) -> Msg {
+    fn hop(id: PageId, from: &str, to: &str, set_cookie: &[&str]) -> Msg {
         hop_at(id, from, to, 302, set_cookie)
     }
 
-    fn hop_at(id: FetchId, from: &str, to: &str, status: u16, set_cookie: &[&str]) -> Msg {
+    fn hop_at(id: PageId, from: &str, to: &str, status: u16, set_cookie: &[&str]) -> Msg {
         Msg::Redirect {
             id,
             url: from.into(),
@@ -7894,7 +7894,7 @@ mod tests {
     }
 
     /// Load a page at a specific URL, the way a landing page arrives.
-    fn load_at(app: &mut App, id: FetchId, url: &str, html_src: &str) {
+    fn load_at(app: &mut App, id: PageId, url: &str, html_src: &str) {
         app.update(Msg::Loaded {
             id,
             url: url.into(),
@@ -9266,7 +9266,7 @@ mod tests {
 
     /// A page loaded from `url` and parsed, in an app of the given size — the
     /// shape a navigation has, with the URL an `action` resolves against.
-    fn page_from(url: &str, html: &str, w: u16, h: u16) -> (App, FetchId) {
+    fn page_from(url: &str, html: &str, w: u16, h: u16) -> (App, PageId) {
         let mut app = App::new(w, h);
         let id = load_with_cookies(&mut app, url, html, &[]);
         (app, id)
@@ -9550,7 +9550,7 @@ mod tests {
         }
     }
 
-    fn login_page() -> (App, FetchId) {
+    fn login_page() -> (App, PageId) {
         let mut app = App::new(80, 8);
         let id = load_with_cookies(
             &mut app,
@@ -9566,7 +9566,7 @@ mod tests {
     fn a_login_shaped_post_hops_to_get_with_the_cookie() {
         // **The acceptance case.** POST /login with the fields in the body
         // and the jar's `Cookie:` for that URL, then a 302 that hands out a
-        // session, then GET /app carrying it — same FetchId, no body on the
+        // session, then GET /app carrying it — same PageId, no body on the
         // hop, history pointing at the form page.
         let (mut app, _) = login_page();
         let before = stages(&app);
@@ -9969,7 +9969,7 @@ mod tests {
         // And no pipeline stage ran here: the pipeline runs when the response
         // lands, exactly as it does for a link.
         assert_eq!(stages(&app), before);
-        // The `FetchId` guard is the current generation's, so a response from
+        // The `PageId` guard is the current generation's, so a response from
         // the page we just left cannot land on the search results.
         assert_eq!(
             effect.fetch.as_ref().map(|(fetch, _)| *fetch),
@@ -10183,7 +10183,7 @@ mod tests {
 
     /// A page that has been parsed and had its script pass run, with the
     /// counters read after everything has settled.
-    fn settled(html: &str) -> (App, FetchId, (usize, usize, usize)) {
+    fn settled(html: &str) -> (App, PageId, (usize, usize, usize)) {
         let (mut app, id) = scripted_app(html);
         app.update(Msg::RunScripts { id });
         let counts = stages(&app);
@@ -10527,7 +10527,7 @@ mod tests {
     /// Load `html` from `url` with the response's `Set-Cookie` lines, and
     /// parse it — the shape a real navigation has, with the cookies where a
     /// real response puts them.
-    fn load_with_cookies(app: &mut App, url: &str, html: &str, set_cookie: &[&str]) -> FetchId {
+    fn load_with_cookies(app: &mut App, url: &str, html: &str, set_cookie: &[&str]) -> PageId {
         let id = app.start_fetch(url.to_string());
         app.update(Msg::Loaded {
             id,
@@ -10599,7 +10599,7 @@ mod tests {
                     <script src=https://www.google-analytics.com/analytics.js></script>";
         let effect = app.update(parsed(effect_id, html));
 
-        let cookie_for = |requests: &[(FetchId, net::Request)], url: &str| {
+        let cookie_for = |requests: &[(PageId, net::Request)], url: &str| {
             requests
                 .iter()
                 .find(|(_, request)| request.url == url)
@@ -10608,7 +10608,7 @@ mod tests {
                 .cookie
                 .clone()
         };
-        let sheets: Vec<(FetchId, net::Request)> = effect
+        let sheets: Vec<(PageId, net::Request)> = effect
             .sheets
             .iter()
             .map(|(id, _, request)| (*id, request.clone()))
@@ -10626,7 +10626,7 @@ mod tests {
 
         // Scripts are requested by the pass, not by the parse.
         let effect = app.update(Msg::RunScripts { id: effect_id });
-        let scripts: Vec<(FetchId, net::Request)> = effect
+        let scripts: Vec<(PageId, net::Request)> = effect
             .scripts
             .iter()
             .map(|(id, _, request)| (*id, request.clone()))
@@ -10808,7 +10808,7 @@ mod tests {
     fn a_superseded_generations_tick_runs_no_stage() {
         // Deliverable 6's ordering rule: mutations belong to the generation
         // that made them, and a generation change cancels the pending cycle.
-        // The guard is the same `FetchId` check every other message uses, and
+        // The guard is the same `PageId` check every other message uses, and
         // it must fire *before* any stage runs — a relayout of a page the user
         // has already left is wasted work at best and the wrong page at worst.
         let (mut app, first) = scripted_app(
@@ -10983,7 +10983,7 @@ mod tests {
     // ---- scoped restyle (M11.3) -------------------------------------------
 
     /// Nodes styled by one tick, and the whole document's size for comparison.
-    fn tick_styled(app: &mut App, id: FetchId) -> (usize, usize) {
+    fn tick_styled(app: &mut App, id: PageId) -> (usize, usize) {
         let before = app.nodes_styled;
         app.update(Msg::RunScripts { id });
         (
@@ -11124,7 +11124,7 @@ mod tests {
     /// One full turn of the path a click will take once M10.8 dispatches one:
     /// the tick, the invalidation it triggers, the draw, and the present.
     /// Returns the wall clock for all of it.
-    fn timed_js_turn(app: &mut App, id: FetchId) -> Duration {
+    fn timed_js_turn(app: &mut App, id: PageId) -> Duration {
         // Built outside the measurement: the event loop keeps one renderer for
         // the life of the process, so its construction is not on the path.
         let mut renderer = crate::term::Renderer::new(80, 24, crate::term::detect_caps_from_env());
@@ -13375,7 +13375,7 @@ mod tests {
         let (id, url) = effect.fetch.expect("click must navigate");
         // `page` loads with post-redirect URL `http://final/` (see `load`).
         assert_eq!(url.url, "http://final/docs");
-        assert_eq!(id, FetchId(2)); // generation after the initial load
+        assert_eq!(id, PageId::headless(2)); // generation after the initial load
     }
 
     #[test]

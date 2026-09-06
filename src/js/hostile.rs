@@ -374,7 +374,7 @@ mod chain {
     use crate::js::SCRIPT_BUDGET;
     use crate::js::queue::MAX_INSERTED_SCRIPTS;
     use crate::msg::Msg;
-    use crate::net::FetchId;
+    use crate::net::PageId;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::{Duration, Instant};
 
@@ -390,7 +390,7 @@ mod chain {
          };\
          link();</script>";
 
-    fn loaded(html: &str) -> (App, FetchId) {
+    fn loaded(html: &str) -> (App, PageId) {
         let mut app = App::new(80, 24);
         let id = app.start_fetch("http://hostile.test/".into());
         app.update(Msg::Loaded {

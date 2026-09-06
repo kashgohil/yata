@@ -18,7 +18,7 @@ use crate::js::console::Console;
 use crate::js::{self, ScriptRun};
 use crate::layout;
 use crate::msg::Msg;
-use crate::net::{self, FetchId};
+use crate::net::{self, PageId};
 use crate::style;
 
 /// The document-order script pass, headless (M10.2).
@@ -105,7 +105,7 @@ fn run_scripts_from(
                 // `<script src>` gets — including nothing at all when the
                 // script comes from another origin.
                 let request = script_request(cookies, base_url, url);
-                net::spawn_script(FetchId(1), external.slot, request, tx.clone());
+                net::spawn_script(PageId::headless(1), external.slot, request, tx.clone());
                 in_flight += 1;
             }
             None => {
@@ -211,7 +211,7 @@ fn run_scripts_from(
                 .unwrap_or_default()
             {
                 net::spawn_js_fetch(
-                    FetchId(1),
+                    PageId::headless(1),
                     ask.request,
                     // The binding already asked the jar, because
                     // `credentials` is its option to read (M11.7).
@@ -330,7 +330,7 @@ fn adopt_inserted_scripts(
             match base_url.and_then(|base| net::resolve_url(base, &external.url)) {
                 Some(url) => {
                     let request = script_request(cookies, base_url, url);
-                    net::spawn_script(FetchId(1), external.slot, request, tx.clone());
+                    net::spawn_script(PageId::headless(1), external.slot, request, tx.clone());
                     *in_flight += 1;
                 }
                 None => {

@@ -9,7 +9,7 @@ use crate::css;
 use crate::html;
 use crate::image;
 use crate::msg::Msg;
-use crate::net::{FetchId, Method, Request};
+use crate::net::{Method, PageId, Request};
 
 /// Read size per chunk: small enough that progress messages arrive steadily
 /// on slow links, large enough that syscall overhead is irrelevant.
@@ -32,7 +32,7 @@ const CHUNK: usize = 16 * 1024;
 /// (~tens of ms) would blow the keypress→screen budget if the UI thread did
 /// it. `Loaded` goes out first so a document body shows without waiting on
 /// the parse.
-pub fn spawn_fetch(id: FetchId, request: Request, tx: Sender<Msg>) {
+pub fn spawn_fetch(id: PageId, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
         match fetch(id, &request, &tx) {
             // A hop is terminal for *this* worker: it reports where the
@@ -79,7 +79,7 @@ pub fn spawn_fetch(id: FetchId, request: Request, tx: Sender<Msg>) {
 /// network response. `Loaded` is sent before parsing begins, and `Parsed`
 /// follows exactly once when the response is a supported document.
 pub fn spawn_cached(
-    id: FetchId,
+    id: PageId,
     url: String,
     response: Representation,
     elapsed: std::time::Duration,
@@ -151,7 +151,7 @@ pub fn is_document(status: u16, content_type: Option<&str>) -> bool {
 /// response yields `None`; the page is then styled by whatever else it has,
 /// which is what "render unstyled, then restyle" means when a sheet is missing
 /// rather than slow.
-pub fn spawn_stylesheet(id: FetchId, slot: usize, request: Request, tx: Sender<Msg>) {
+pub fn spawn_stylesheet(id: PageId, slot: usize, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
         let sheet = match get(&request) {
             // A 404's body is an error page, not CSS; parsing it would put
@@ -183,7 +183,7 @@ pub const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
 /// status, or a body past [`MAX_SCRIPT_BYTES`]. The page is degraded, never an
 /// error page — a missing script is the same class of problem as a missing
 /// stylesheet.
-pub fn spawn_script(id: FetchId, slot: usize, request: Request, tx: Sender<Msg>) {
+pub fn spawn_script(id: PageId, slot: usize, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
         let source = match get(&request) {
             // A 404's body is an error page, not JavaScript. Running it would
@@ -227,7 +227,7 @@ pub struct JsResponse {
 /// for a 404, which pages get wrong constantly and so must we not. `Err` here
 /// means the request never completed at all.
 pub fn spawn_js_fetch(
-    page: FetchId,
+    page: PageId,
     request: u64,
     ask: Request,
     method: String,
@@ -308,7 +308,7 @@ fn js_request(
 /// Fetch and decode one `<img>` on a detached worker (M8). One `Msg::Image`
 /// goes out — success or soft failure. Never an error page: a broken image is
 /// a degraded page, not a navigation failure.
-pub fn spawn_image(id: FetchId, request: Request, tx: Sender<Msg>) {
+pub fn spawn_image(id: PageId, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
         let result = match get(&request) {
             Ok((status, body)) if (200..300).contains(&status) => image::decode(&body),
@@ -411,11 +411,7 @@ fn redirect_target(
 /// failure (bad URL, DNS, connect, TLS, mid-body disconnect). The error's url
 /// is the most precise one known at the point of failure: the requested URL
 /// until headers arrive, the post-redirect final URL after.
-fn fetch(
-    id: FetchId,
-    request: &Request,
-    tx: &Sender<Msg>,
-) -> Result<Option<Msg>, (String, String)> {
+fn fetch(id: PageId, request: &Request, tx: &Sender<Msg>) -> Result<Option<Msg>, (String, String)> {
     let url = request.url.as_str();
     // Timed on the worker, where the request happens: the duration reaches
     // the app as message data, so the app never reads the clock. The span is
@@ -776,7 +772,7 @@ mod tests {
         let addr = serve_css("HTTP/1.1 200 OK", "a:link { color: #000 } p { color: red }");
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(7),
+            PageId::headless(7),
             3,
             Request::bare(format!("http://{addr}/news.css")),
             tx,
@@ -786,7 +782,7 @@ mod tests {
         assert_eq!(msgs.len(), 1, "one message and nothing else: {msgs:?}");
         match &msgs[0] {
             Msg::Stylesheet { id, slot, sheet } => {
-                assert_eq!(*id, FetchId(7));
+                assert_eq!(*id, PageId::headless(7));
                 // The slot travels with the sheet: it is the document position
                 // the cascade needs, not the arrival order.
                 assert_eq!(*slot, 3);
@@ -804,7 +800,7 @@ mod tests {
         let addr = serve_css("HTTP/1.1 404 Not Found", "<html>nope</html>");
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(8),
+            PageId::headless(8),
             0,
             Request::bare(format!("http://{addr}/missing.css")),
             tx,
@@ -812,10 +808,10 @@ mod tests {
         assert!(matches!(
             drain(rx).as_slice(),
             [Msg::Stylesheet {
-                id: FetchId(8),
+                id,
                 slot: 0,
                 sheet: None
-            }]
+            }] if *id == PageId::headless(8)
         ));
 
         // A closed port is the same story: a degraded page, not an error page.
@@ -825,7 +821,7 @@ mod tests {
             .unwrap();
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(9),
+            PageId::headless(9),
             1,
             Request::bare(format!("http://{dead}/x.css")),
             tx,
@@ -833,10 +829,10 @@ mod tests {
         assert!(matches!(
             drain(rx).as_slice(),
             [Msg::Stylesheet {
-                id: FetchId(9),
+                id,
                 slot: 1,
                 sheet: None
-            }]
+            }] if *id == PageId::headless(9)
         ));
     }
 
@@ -848,13 +844,13 @@ mod tests {
         let addr = serve_two_but_only_after_both_connect("p { color: red }");
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(10),
+            PageId::headless(10),
             0,
             Request::bare(format!("http://{addr}/a.css")),
             tx.clone(),
         );
         spawn_stylesheet(
-            FetchId(10),
+            PageId::headless(10),
             1,
             Request::bare(format!("http://{addr}/b.css")),
             tx,
@@ -884,7 +880,7 @@ mod tests {
         );
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(1), Request::bare(url.clone()), tx);
+        spawn_fetch(PageId::headless(1), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         let (progress, loaded, parsed) = split_success(&msgs);
@@ -896,7 +892,7 @@ mod tests {
         for msg in progress {
             match msg {
                 Msg::Loading { id, bytes_so_far } => {
-                    assert_eq!(*id, FetchId(1));
+                    assert_eq!(*id, PageId::headless(1));
                     assert!(*bytes_so_far > prev, "byte counts must grow");
                     prev = *bytes_so_far;
                 }
@@ -915,7 +911,7 @@ mod tests {
         assert_eq!(
             *loaded,
             Msg::Loaded {
-                id: FetchId(1),
+                id: PageId::headless(1),
                 url,
                 status: 200,
                 body: b"hello world".to_vec(),
@@ -929,7 +925,7 @@ mod tests {
         let Msg::Parsed { id, dom, .. } = parsed else {
             unreachable!()
         };
-        assert_eq!(*id, FetchId(1));
+        assert_eq!(*id, PageId::headless(1));
         assert!(
             html::debug_tree(dom).contains("#text \"hello world\""),
             "the parsed tree must contain the body text:\n{}",
@@ -947,7 +943,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
-            FetchId(9),
+            PageId::headless(9),
             Request {
                 url: format!("http://{addr}/a"),
                 cookie: None,
@@ -1021,7 +1017,7 @@ mod tests {
             .unwrap();
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(2), Request::bare(url.clone()), tx);
+        spawn_fetch(PageId::headless(2), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         assert_eq!(msgs.len(), 1, "exactly one message expected, got {msgs:?}");
@@ -1031,7 +1027,7 @@ mod tests {
                 url: reported,
                 reason,
             } => {
-                assert_eq!(*id, FetchId(2));
+                assert_eq!(*id, PageId::headless(2));
                 assert_eq!(*reported, url);
                 assert!(!reason.is_empty(), "reason must be human-readable");
             }
@@ -1047,7 +1043,7 @@ mod tests {
         );
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(4), Request::bare(url.clone()), tx);
+        spawn_fetch(PageId::headless(4), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         let (last, progress) = msgs.split_last().expect("worker sent nothing");
@@ -1055,7 +1051,13 @@ mod tests {
         // produced Loading messages; only the terminal message is pinned.
         for msg in progress {
             assert!(
-                matches!(msg, Msg::Loading { id: FetchId(4), .. }),
+                matches!(
+                    msg,
+                    Msg::Loading {
+                        id,
+                        ..
+                    } if *id == PageId::headless(4)
+                ),
                 "expected only Loading before NetError, got {msg:?}"
             );
         }
@@ -1065,7 +1067,7 @@ mod tests {
                 url: reported,
                 reason,
             } => {
-                assert_eq!(*id, FetchId(4));
+                assert_eq!(*id, PageId::headless(4));
                 assert_eq!(*reported, url);
                 assert!(!reason.is_empty(), "reason must be human-readable");
             }
@@ -1091,7 +1093,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
-            FetchId(5),
+            PageId::headless(5),
             Request::bare(format!("http://{addr}/start")),
             tx,
         );
@@ -1113,7 +1115,7 @@ mod tests {
         else {
             panic!("expected Redirect, got {:?}", msgs[0]);
         };
-        assert_eq!(*id, FetchId(5));
+        assert_eq!(*id, PageId::headless(5));
         assert_eq!(*url, format!("http://{addr}/start"));
         assert_eq!(*to, format!("http://{addr}/final"));
         assert_eq!(*status, 302);
@@ -1134,7 +1136,7 @@ mod tests {
         let (addr, seen) = serve_capturing(1, |_| ok_body("ok"));
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
-            FetchId(1),
+            PageId::headless(1),
             Request {
                 url: format!("http://{addr}/login"),
                 cookie: Some("sid=abc".into()),
@@ -1171,7 +1173,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
-            FetchId(1),
+            PageId::headless(1),
             Request {
                 url: format!("http://{addr}/login"),
                 cookie: None,
@@ -1218,7 +1220,7 @@ mod tests {
         });
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
-            FetchId(1),
+            PageId::headless(1),
             Request {
                 url: format!("http://{addr}/login"),
                 cookie: Some("sid=pre".into()),
@@ -1236,7 +1238,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         spawn_fetch(
-            FetchId(1),
+            PageId::headless(1),
             Request {
                 url: to.clone(),
                 cookie: Some("sid=abc".into()),
@@ -1272,7 +1274,7 @@ mod tests {
         // has to fail safely. `NetError` becomes an error page with a reason on
         // it; nothing here may panic or hang (CLAUDE.md).
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(1), Request::bare("file:///etc/hosts"), tx);
+        spawn_fetch(PageId::headless(1), Request::bare("file:///etc/hosts"), tx);
         let msgs = drain(rx);
         assert!(
             matches!(msgs.as_slice(), [Msg::NetError { .. }]),
@@ -1293,7 +1295,11 @@ mod tests {
             );
             let addr = serve_once(response.into_bytes());
             let (tx, rx) = mpsc::channel();
-            spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/x")), tx);
+            spawn_fetch(
+                PageId::headless(1),
+                Request::bare(format!("http://{addr}/x")),
+                tx,
+            );
             drain(rx)
                 .into_iter()
                 .find(|msg| matches!(msg, Msg::Redirect { .. } | Msg::Loaded { .. }))
@@ -1337,7 +1343,7 @@ mod tests {
         let addr = serve_once(response);
         let url = format!("http://{addr}/");
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(6), Request::bare(url.clone()), tx);
+        spawn_fetch(PageId::headless(6), Request::bare(url.clone()), tx);
 
         let msgs = drain(rx);
         let (_, loaded, _) = split_success(&msgs);
@@ -1347,7 +1353,7 @@ mod tests {
         assert_eq!(
             *loaded,
             Msg::Loaded {
-                id: FetchId(6),
+                id: PageId::headless(6),
                 url,
                 status: 200,
                 body: b"hello world".to_vec(),
@@ -1363,13 +1369,17 @@ mod tests {
     #[test]
     fn bad_url_sends_exactly_one_net_error() {
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(3), Request::bare("not a url".to_string()), tx);
+        spawn_fetch(
+            PageId::headless(3),
+            Request::bare("not a url".to_string()),
+            tx,
+        );
         let msgs = drain(rx);
         assert_eq!(msgs.len(), 1, "exactly one message expected, got {msgs:?}");
         assert!(matches!(
             &msgs[0],
-            Msg::NetError { id: FetchId(3), url, reason }
-                if url == "not a url" && !reason.is_empty()
+            Msg::NetError { id, url, reason }
+                if *id == PageId::headless(3) && url == "not a url" && !reason.is_empty()
         ));
     }
 
@@ -1382,7 +1392,11 @@ mod tests {
                 .to_vec(),
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(20), Request::bare(format!("http://{addr}/")), tx);
+        spawn_fetch(
+            PageId::headless(20),
+            Request::bare(format!("http://{addr}/")),
+            tx,
+        );
         let msgs = drain(rx);
         assert!(
             msgs.iter()
@@ -1400,7 +1414,11 @@ mod tests {
                 .to_vec(),
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(21), Request::bare(format!("http://{addr}/")), tx);
+        spawn_fetch(
+            PageId::headless(21),
+            Request::bare(format!("http://{addr}/")),
+            tx,
+        );
         let msgs = drain(rx);
         assert!(
             msgs.iter().any(|m| matches!(
@@ -1436,16 +1454,16 @@ mod tests {
         };
 
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(1), request("/doc"), tx);
+        spawn_fetch(PageId::headless(1), request("/doc"), tx);
         drain(rx);
         let (tx, rx) = mpsc::channel();
-        spawn_stylesheet(FetchId(1), 0, request("/x.css"), tx);
+        spawn_stylesheet(PageId::headless(1), 0, request("/x.css"), tx);
         drain(rx);
         let (tx, rx) = mpsc::channel();
-        spawn_script(FetchId(1), 0, request("/x.js"), tx);
+        spawn_script(PageId::headless(1), 0, request("/x.js"), tx);
         drain(rx);
         let (tx, rx) = mpsc::channel();
-        spawn_image(FetchId(1), request("/x.png"), tx);
+        spawn_image(PageId::headless(1), request("/x.png"), tx);
         drain(rx);
 
         let seen = seen.lock().unwrap();
@@ -1466,7 +1484,7 @@ mod tests {
         let (addr, seen) = serve_capturing(1, |_| ok_body("x"));
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(1),
+            PageId::headless(1),
             0,
             Request::bare(format!("http://{addr}/x.css")),
             tx,
@@ -1488,7 +1506,11 @@ mod tests {
                 .to_vec(),
         );
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/")), tx);
+        spawn_fetch(
+            PageId::headless(1),
+            Request::bare(format!("http://{addr}/")),
+            tx,
+        );
         let msgs = drain(rx);
         let (_, loaded, _) = split_success(&msgs);
         let Msg::Loaded { set_cookie, .. } = loaded else {
@@ -1512,7 +1534,11 @@ mod tests {
         response.extend_from_slice(b"Content-Length: 2\r\nConnection: close\r\n\r\nhi");
         let addr = serve_once(response);
         let (tx, rx) = mpsc::channel();
-        spawn_fetch(FetchId(1), Request::bare(format!("http://{addr}/")), tx);
+        spawn_fetch(
+            PageId::headless(1),
+            Request::bare(format!("http://{addr}/")),
+            tx,
+        );
         let msgs = drain(rx);
         let (_, loaded, _) = split_success(&msgs);
         let Msg::Loaded { set_cookie, .. } = loaded else {
@@ -1533,7 +1559,7 @@ mod tests {
         let addr = serve_once(with_cookie.to_vec());
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(1),
+            PageId::headless(1),
             0,
             Request::bare(format!("http://{addr}/x.css")),
             tx,
@@ -1542,10 +1568,10 @@ mod tests {
             matches!(
                 drain(rx).as_slice(),
                 [Msg::Stylesheet {
-                    id: FetchId(1),
+                    id,
                     slot: 0,
                     sheet: Some(_)
-                }]
+                }] if *id == PageId::headless(1)
             ),
             "a stylesheet response carried something new"
         );
@@ -1553,7 +1579,7 @@ mod tests {
         let addr = serve_once(with_cookie.to_vec());
         let (tx, rx) = mpsc::channel();
         spawn_script(
-            FetchId(1),
+            PageId::headless(1),
             0,
             Request::bare(format!("http://{addr}/x.js")),
             tx,
@@ -1561,10 +1587,10 @@ mod tests {
         assert!(matches!(
             drain(rx).as_slice(),
             [Msg::Script {
-                id: FetchId(1),
+                id,
                 slot: 0,
                 source: Some(_)
-            }]
+            }] if *id == PageId::headless(1)
         ));
     }
 
@@ -1622,14 +1648,14 @@ mod tests {
             let started = Instant::now();
             let (tx, rx) = mpsc::channel();
             spawn_fetch(
-                FetchId(1),
+                PageId::headless(1),
                 Request::bare(format!("http://{addr}/start")),
                 tx.clone(),
             );
             loop {
                 match rx.recv().expect("a terminal message") {
                     Msg::Redirect { to, .. } => {
-                        spawn_fetch(FetchId(1), Request::bare(to), tx.clone());
+                        spawn_fetch(PageId::headless(1), Request::bare(to), tx.clone());
                     }
                     Msg::Loaded { .. } => break,
                     _ => {}
@@ -1727,7 +1753,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel();
         spawn_stylesheet(
-            FetchId(1),
+            PageId::headless(1),
             0,
             Request {
                 url: format!("http://{start}/start.css"),
@@ -1754,7 +1780,7 @@ mod tests {
         let (addr, seen) = serve_capturing(2, |_| ok_body("{}"));
         let (tx, rx) = mpsc::channel();
         spawn_js_fetch(
-            FetchId(1),
+            PageId::headless(1),
             1,
             Request::bare(format!("http://{addr}/a")),
             "GET".to_string(),
@@ -1770,7 +1796,7 @@ mod tests {
         // never two `Cookie` headers, which a server is free to read either of.
         let (tx, rx) = mpsc::channel();
         spawn_js_fetch(
-            FetchId(1),
+            PageId::headless(1),
             2,
             Request {
                 url: format!("http://{addr}/b"),

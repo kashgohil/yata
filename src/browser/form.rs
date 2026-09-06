@@ -4,7 +4,7 @@
 //! here is a pure function of the DOM plus the control that was activated; it
 //! fetches nothing, mutates nothing and reads nothing downstream of the tree.
 //! `App::submit_form` takes what this produces to `App::navigate` — the
-//! same path a link click takes, so a submission gets history, the `FetchId`
+//! same path a link click takes, so a submission gets history, the `PageId`
 //! guard, the jar's `Cookie:` header (M11.7) and redirects through the event
 //! loop (M11.7a) without any of it being written twice. GET puts the data set
 //! on the URL; POST puts it on the body and leaves the action URL alone.

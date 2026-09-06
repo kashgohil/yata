@@ -246,11 +246,32 @@ mod tests {
     }
 }
 
-/// One generation of fetching. `App` owns the counter and hands out ids; the
-/// event loop drops any net message whose id isn't the current generation, so
-/// a slow stale fetch can never clobber a newer one.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct FetchId(pub u64);
+/// Stable identity of a live tab. Zero is reserved for headless tools, which
+/// deliberately have no tab set or chrome.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TabId(pub u64);
+
+/// One document generation inside one stable tab.
+///
+/// Both facts travel together through every worker and timer path. A vector
+/// index can change when a tab closes, and a generation number can collide in
+/// two tabs, so neither fact is sufficient on its own.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PageId {
+    pub tab: TabId,
+    pub generation: u64,
+}
+
+impl PageId {
+    pub const fn new(tab: TabId, generation: u64) -> PageId {
+        PageId { tab, generation }
+    }
+
+    /// Identity used by single-navigation headless modes.
+    pub const fn headless(generation: u64) -> PageId {
+        PageId::new(TabId(0), generation)
+    }
+}
 
 /// One request a worker is to make: where to, the `Cookie:` header the jar
 /// decided it may carry (M11.7), and — for a document — the method.

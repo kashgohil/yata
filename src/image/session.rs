@@ -14,7 +14,7 @@ use super::kitty::{
 use super::{DecodedImage, ImageContext, ImgRef, discover};
 use crate::dom::Dom;
 use crate::layout::{BoxKind, LayoutTree};
-use crate::net::FetchId;
+use crate::net::PageId;
 use crate::paint::{DisplayList, ImagePixels, kitty_placements};
 
 /// One browsing session's images: global LRU + current page + Kitty uploads.
@@ -70,7 +70,7 @@ impl ImageSession {
     }
 
     /// Discover imgs and return absolute URLs that still need a network fetch.
-    pub fn adopt(&mut self, dom: &Dom, base: Option<&str>, id: FetchId) -> Vec<(FetchId, String)> {
+    pub fn adopt(&mut self, dom: &Dom, base: Option<&str>, id: PageId) -> Vec<(PageId, String)> {
         self.page_imgs = discover(dom, base);
         let mut pending = Vec::new();
         let mut seen = HashSet::new();
@@ -246,7 +246,7 @@ mod tests {
         let mut s = ImageSession::new(true);
         let dom = html::parse(r#"<img src="https://ex/a.png" width="16" height="16">"#);
         let styles = style::style_tree(&dom, &[]);
-        s.adopt(&dom, Some("https://ex/"), FetchId(1));
+        s.adopt(&dom, Some("https://ex/"), PageId::headless(1));
         s.insert(
             "https://ex/a.png".into(),
             DecodedImage::new(
@@ -271,7 +271,7 @@ mod tests {
         let mut s = ImageSession::new(true);
         let dom = html::parse(r#"<img src="https://ex/a.png" width="16" height="32">"#);
         let styles = style::style_tree(&dom, &[]);
-        s.adopt(&dom, Some("https://ex/"), FetchId(1));
+        s.adopt(&dom, Some("https://ex/"), PageId::headless(1));
         s.insert(
             "https://ex/a.png".into(),
             DecodedImage::new(2, 2, vec![255; 16]),

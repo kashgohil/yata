@@ -117,7 +117,7 @@ fn main() -> io::Result<()> {
         // loop's only job is to spawn the worker with its own Sender clone.
         if let Some((id, request)) = effect.fetch {
             // A new generation: everything the old page scheduled is dead. The
-            // `FetchId` guard would drop those messages anyway; cancelling
+            // `PageId` guard would drop those messages anyway; cancelling
             // means the thread does not wake for them at all.
             timers.apply(TimerRequest::CancelOthers { keep: id });
             net::spawn_fetch(id, request, tx.clone());
@@ -271,7 +271,7 @@ struct Loaded {
 fn headless_fetch(url: &str, session: &Session) -> Result<(Loaded, mpsc::Receiver<Msg>), String> {
     let (tx, rx) = mpsc::channel();
     net::spawn_fetch(
-        net::FetchId(1),
+        net::PageId::headless(1),
         // The first request of the run, and the jar is empty: it carries no
         // cookies because there are none, not because this path skips asking.
         session.request(net::normalize_url(url)),
@@ -322,7 +322,11 @@ fn headless_fetch(url: &str, session: &Session) -> Result<(Loaded, mpsc::Receive
                 // The session first, then the request that carries it: the
                 // ordering is the task, and it is the same one `App` follows.
                 session.apply(&url, &set_cookie);
-                net::spawn_fetch(net::FetchId(1), session.request(to.clone()), tx.clone());
+                net::spawn_fetch(
+                    net::PageId::headless(1),
+                    session.request(to.clone()),
+                    tx.clone(),
+                );
                 hops.push(Hop {
                     url,
                     to,
@@ -625,10 +629,10 @@ fn apply_batch(app: &mut App, msgs: impl Iterator<Item = Msg>) -> Effect {
         // by the id guard in `App::update`, not here.
         effect.sheets.extend(e.sheets);
         // Images accumulate like sheets: each parse in a batch may request its
-        // own URLs; stale generations are dropped by the FetchId guard in App.
+        // own URLs; stale generations are dropped by the PageId guard in App.
         effect.images.extend(e.images);
         // Scripts accumulate like sheets and images: each parse in a batch may
-        // request its own, and stale generations are dropped by the `FetchId`
+        // request its own, and stale generations are dropped by the `PageId`
         // guard in `App`, not here.
         effect.scripts.extend(e.scripts);
         effect.fetches.extend(e.fetches);
@@ -869,6 +873,10 @@ mod tests {
         let effect = apply_batch(&mut app, msgs.into_iter());
         let (id, url) = effect.fetch.expect("a commit must surface a fetch");
         assert_eq!(url.url, "https://b.com", "an earlier commit leaked through");
-        assert_eq!(id, net::FetchId(2), "the id must be the second generation");
+        assert_eq!(
+            id,
+            net::PageId::headless(2),
+            "the id must be the second generation"
+        );
     }
 }

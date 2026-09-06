@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::msg::Msg;
-use crate::net::FetchId;
+use crate::net::PageId;
 
 /// A timer's identity within its page. Browser-compatible: a positive integer,
 /// never reused, so `clearTimeout` on a fired timer is harmless rather than a
@@ -52,17 +52,17 @@ pub const MIN_DELAY: Duration = Duration::from_millis(4);
 pub enum TimerRequest {
     /// Fire once, `delay` from now (clamped to [`MIN_DELAY`]).
     Schedule {
-        page: FetchId,
+        page: PageId,
         id: TimerId,
         delay: Duration,
     },
     /// `clearTimeout` / `clearInterval`.
-    Cancel { page: FetchId, id: TimerId },
+    Cancel { page: PageId, id: TimerId },
     /// Navigation: everything scheduled by a page other than `keep` is dead.
     /// Phrased as "keep this one" rather than "drop that one" because the
     /// caller is the event loop starting a new generation, which knows the id
     /// it is starting and not necessarily the ones it is replacing.
-    CancelOthers { keep: FetchId },
+    CancelOthers { keep: PageId },
 }
 
 /// One scheduled deadline. Ordered by time, then by insertion — two timers due
@@ -72,7 +72,7 @@ pub enum TimerRequest {
 struct Entry {
     due: Instant,
     seq: u64,
-    page: FetchId,
+    page: PageId,
     id: TimerId,
 }
 
@@ -217,8 +217,8 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    fn page() -> FetchId {
-        FetchId(1)
+    fn page() -> PageId {
+        PageId::headless(1)
     }
 
     #[test]
@@ -299,21 +299,23 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let timers = Timers::spawn(tx);
         timers.apply(TimerRequest::Schedule {
-            page: FetchId(1),
+            page: PageId::headless(1),
             id: TimerId(1),
             delay: Duration::from_millis(20),
         });
         timers.apply(TimerRequest::Schedule {
-            page: FetchId(2),
+            page: PageId::headless(2),
             id: TimerId(1),
             delay: Duration::from_millis(20),
         });
-        timers.apply(TimerRequest::CancelOthers { keep: FetchId(2) });
+        timers.apply(TimerRequest::CancelOthers {
+            keep: PageId::headless(2),
+        });
 
         let Ok(Msg::Timer { page, .. }) = rx.recv_timeout(Duration::from_secs(2)) else {
             panic!("the new page's timer never fired");
         };
-        assert_eq!(page, FetchId(2));
+        assert_eq!(page, PageId::headless(2));
         assert_eq!(timers.pending(), 0);
         assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
     }
