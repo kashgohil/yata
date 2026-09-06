@@ -100,6 +100,31 @@ yata                          # empty session; open a URL with o
 | `--dump` | Fetch and print the response body, then exit (no TUI) |
 | `--timing` | Print per-stage pipeline timings to stderr and exit |
 
+### HTTP configuration
+
+yata identifies itself truthfully as `yata/<version>`, asks for content types
+appropriate to documents and subresources, and defaults to
+`Accept-Language: en-US,en;q=0.5`. These launch-time environment variables can
+adjust requests when a site or locale needs something different:
+
+| Variable | Purpose |
+|----------|---------|
+| `YATA_USER_AGENT` | Replace the default user-agent string |
+| `YATA_ACCEPT_LANGUAGE` | Replace the preferred language list |
+| `YATA_HTTP_HEADERS` | Add up to 16 newline-separated `Name: value` headers |
+
+For example:
+
+```bash
+YATA_ACCEPT_LANGUAGE='en-IN,en;q=0.8' yata https://example.com
+YATA_HTTP_HEADERS=$'DNT: 1\nX-Debug: yes' yata
+```
+
+Request-owned and unsafe transport headers such as `Host`, `Cookie`,
+`Referer`, `Content-Length`, and `User-Agent` are ignored in
+`YATA_HTTP_HEADERS`; use the dedicated user-agent variable when needed.
+Cookies remain private to the running browser session.
+
 ### Status line
 
 One persistent row at the bottom of the screen:

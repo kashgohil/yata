@@ -5,16 +5,22 @@ pub use fetch::{
     spawn_image, spawn_js_fetch, spawn_script, spawn_stylesheet,
 };
 
-/// Default a bare URL to `https://`. The single place scheme defaulting lives,
-/// applied to both the CLI argument and URL-bar input before either reaches the
-/// fetch worker. Nothing fancier: no search fallback, no validation — a garbage
-/// URL still becomes a `NetError`.
+/// Default a bare URL to `https://` and canonicalize a valid HTTP(S) URL. The
+/// single place normalization lives, applied to both the CLI argument and
+/// URL-bar input before either reaches the fetch worker. Invalid input is kept
+/// for the worker to turn into a visible `NetError` rather than being guessed.
 pub fn normalize_url(input: &str) -> String {
     let trimmed = input.trim();
-    if trimmed.contains("://") {
+    let candidate = if trimmed.contains("://") {
         trimmed.to_string()
     } else {
         format!("https://{trimmed}")
+    };
+    match reqwest::Url::parse(&candidate) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host_str().is_some() => {
+            url.to_string()
+        }
+        _ => candidate,
     }
 }
 
@@ -28,6 +34,33 @@ pub fn normalize_url(input: &str) -> String {
 pub fn resolve_url(base: &str, href: &str) -> Option<String> {
     let base = reqwest::Url::parse(base).ok()?;
     Some(base.join(href.trim()).ok()?.to_string())
+}
+
+/// The `Referer` value for a request initiated by `source`, following the
+/// useful, privacy-preserving part of `strict-origin-when-cross-origin`:
+/// same-origin requests receive the full source URL, cross-origin requests
+/// receive only its origin, and an HTTPS page never identifies itself to an
+/// HTTP target. Credentials and fragments are never sent.
+pub fn referrer_for(source: &str, target: &str) -> Option<String> {
+    let mut source = reqwest::Url::parse(source).ok()?;
+    let target = reqwest::Url::parse(target).ok()?;
+    if !matches!(source.scheme(), "http" | "https")
+        || !matches!(target.scheme(), "http" | "https")
+        || source.host_str().is_none()
+        || target.host_str().is_none()
+        || (source.scheme() == "https" && target.scheme() == "http")
+    {
+        return None;
+    }
+    source.set_username("").ok()?;
+    source.set_password(None).ok()?;
+    source.set_fragment(None);
+    if source.origin() == target.origin() {
+        return Some(source.to_string());
+    }
+    source.set_path("/");
+    source.set_query(None);
+    Some(source.to_string())
 }
 
 /// The same URL with its query string **replaced** by `query` (M11.10).
@@ -120,7 +153,28 @@ pub fn form_urlencode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{form_urlencode, normalize_url, percent_decode, resolve_url};
+    use super::{form_urlencode, normalize_url, percent_decode, referrer_for, resolve_url};
+
+    #[test]
+    fn referrers_are_full_same_origin_origin_only_cross_origin_and_never_downgraded() {
+        assert_eq!(
+            referrer_for(
+                "https://alice:secret@example.com/a?q=1#private",
+                "https://example.com/b"
+            )
+            .as_deref(),
+            Some("https://example.com/a?q=1")
+        );
+        assert_eq!(
+            referrer_for("https://example.com/a?q=1#private", "https://cdn.example/x").as_deref(),
+            Some("https://example.com/")
+        );
+        assert_eq!(
+            referrer_for("https://example.com/a", "http://example.com/b"),
+            None
+        );
+        assert_eq!(referrer_for("not a url", "https://example.com/"), None);
+    }
 
     #[test]
     fn hrefs_resolve_against_the_page_url() {
@@ -232,16 +286,16 @@ mod tests {
 
     #[test]
     fn bare_host_gets_https() {
-        assert_eq!(normalize_url("danluu.com"), "https://danluu.com");
-        assert_eq!(normalize_url("  example.com "), "https://example.com");
+        assert_eq!(normalize_url("danluu.com"), "https://danluu.com/");
+        assert_eq!(normalize_url("  example.com "), "https://example.com/");
     }
 
     #[test]
-    fn explicit_scheme_is_left_alone() {
+    fn explicit_scheme_is_canonicalized() {
         assert_eq!(normalize_url("http://x/"), "http://x/");
         assert_eq!(
             normalize_url("https://en.wikipedia.org"),
-            "https://en.wikipedia.org"
+            "https://en.wikipedia.org/"
         );
     }
 }
@@ -274,7 +328,8 @@ impl PageId {
 }
 
 /// One request a worker is to make: where to, the `Cookie:` header the jar
-/// decided it may carry (M11.7), and — for a document — the method.
+/// decided it may carry (M11.7), the sanitized page referrer, and — for a
+/// document — the method.
 ///
 /// A type rather than a second parameter on five functions, because the
 /// pairing is the whole point. The jar is `Rc<RefCell<…>>` and therefore
@@ -293,6 +348,9 @@ pub struct Request {
     /// The `Cookie:` header value, or `None` for a request that carries none —
     /// cross-origin, or a jar with nothing that matches.
     pub cookie: Option<String>,
+    /// A pre-sanitized `Referer:` value, or `None` for direct navigation and
+    /// requests whose source must not be disclosed.
+    pub referrer: Option<String>,
     pub method: Method,
 }
 
@@ -320,6 +378,7 @@ impl Request {
         Request {
             url: url.into(),
             cookie: None,
+            referrer: None,
             method: Method::Get,
         }
     }

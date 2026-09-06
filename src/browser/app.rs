@@ -267,6 +267,9 @@ enum Fetch {
     Loading {
         url: String,
         bytes_so_far: u64,
+        /// Sanitized source identity carried unchanged through redirect hops.
+        /// `None` for address-bar, CLI and restored-history navigations.
+        referrer: Option<String>,
         /// The document request this generation last asked the loop to send
         /// (M11.11). A hop rewrites it in place so `POST → 307 → POST → 303 →
         /// GET` does not resurrect the body after the 303. `Loaded` does not
@@ -730,6 +733,7 @@ impl App {
         self.fetch = Fetch::Loading {
             url,
             bytes_so_far: 0,
+            referrer: None,
             method: net::Method::Get,
         };
         self.spinner = 0;
@@ -971,9 +975,11 @@ impl App {
                     self.console_view_built = false;
                 }
                 // `rewrite_method` — a login's 302 must not keep POST.
-                let next_method = match &self.fetch {
-                    Fetch::Loading { method, .. } => rewrite_method(status, method),
-                    _ => net::Method::Get,
+                let (next_method, referrer) = match &self.fetch {
+                    Fetch::Loading {
+                        method, referrer, ..
+                    } => (rewrite_method(status, method), referrer.clone()),
+                    _ => (net::Method::Get, None),
                 };
                 self.cache_candidate = None;
                 if let Fetch::Loading { method, .. } = &mut self.fetch {
@@ -994,7 +1000,7 @@ impl App {
                 if let Some(fragment) = fragment_of(&to).filter(|f| !f.is_empty()) {
                     self.pending_scroll = Some((id, PendingScroll::Fragment(fragment.to_string())));
                 }
-                let mut request = self.request(to);
+                let mut request = self.request_with_referrer(to, referrer);
                 request.method = next_method;
                 self.cache_key = CacheKey::from_request(&request);
                 Effect {
@@ -2622,9 +2628,12 @@ impl App {
     fn commit(&mut self) -> Effect {
         match &self.mode {
             Mode::UrlInput { buffer } => {
+                if buffer.trim().is_empty() {
+                    return Effect::default();
+                }
                 let url = net::normalize_url(buffer);
                 self.mode = Mode::Browse;
-                self.navigate(url, true)
+                self.navigate_direct(url, true)
             }
             Mode::SearchInput { buffer } => {
                 let query = buffer.clone();
@@ -2651,11 +2660,19 @@ impl App {
     /// and a page's own cookies have to survive being navigated to from
     /// somewhere else.
     fn request(&self, url: String) -> net::Request {
+        let referrer = self
+            .current_url_ref()
+            .and_then(|source| net::referrer_for(source, &url));
+        self.request_with_referrer(url, referrer)
+    }
+
+    fn request_with_referrer(&self, url: String, referrer: Option<String>) -> net::Request {
         let page = self.current_url().unwrap_or_default();
         let cookie = js::cookies::header_for(&self.cookies, &page, &url, js::cookies::now());
         net::Request {
             url,
             cookie,
+            referrer,
             method: net::Method::Get,
         }
     }
@@ -2745,16 +2762,36 @@ impl App {
         self.navigate_with(url, net::Method::Get, push_history)
     }
 
+    /// Browser-chrome navigation: URL bar, CLI startup, bookmark and history
+    /// restore. Unlike a link or form, it has no page source to disclose.
+    fn navigate_direct(&mut self, url: String, push_history: bool) -> Effect {
+        self.navigate_with_source(url, net::Method::Get, push_history, None)
+    }
+
     /// Initial CLI navigation through the same cache planner as every later
     /// top-level GET. The empty session necessarily misses, but keeping one
     /// entry point prevents startup from becoming a policy exception.
     pub fn start_navigation(&mut self, url: String) -> Effect {
-        self.navigate(url, false)
+        self.navigate_direct(url, false)
     }
 
     /// A navigation that may be a POST (M11.11). GET still goes through
     /// [`Self::navigate`]; this is the one path, with a method.
     fn navigate_with(&mut self, url: String, method: net::Method, push_history: bool) -> Effect {
+        let source = self.current_url();
+        self.navigate_with_source(url, method, push_history, source)
+    }
+
+    fn navigate_with_source(
+        &mut self,
+        url: String,
+        method: net::Method,
+        push_history: bool,
+        source: Option<String>,
+    ) -> Effect {
+        let referrer = source
+            .as_deref()
+            .and_then(|source| net::referrer_for(source, &url));
         if let Some(cur) = self.current_url() {
             // Same document (a pure fragment change): no fetch, no new
             // generation — a scroll and a URL. Checked before `push_history`
@@ -2785,10 +2822,16 @@ impl App {
         self.search = None;
         self.status_msg = None;
         let id = self.start_fetch(url.clone());
-        if let Fetch::Loading { method: slot, .. } = &mut self.fetch {
+        if let Fetch::Loading {
+            method: slot,
+            referrer: request_referrer,
+            ..
+        } = &mut self.fetch
+        {
             *slot = method.clone();
+            *request_referrer = referrer.clone();
         }
-        let mut request = self.request(url);
+        let mut request = self.request_with_referrer(url, referrer);
         request.method = method.clone();
         if matches!(method, net::Method::Post { .. }) {
             Effect {
@@ -2905,7 +2948,7 @@ impl App {
         // After `start_fetch`, deliberately: a restored entry's URL may carry a
         // fragment, and the offset the reader left is the more specific answer.
         self.pending_scroll = Some((id, PendingScroll::Offset(scroll)));
-        let request = self.request(url);
+        let request = self.request_with_referrer(url, None);
         self.plan_document_request(id, request, RequestMode::Ordinary)
     }
 
@@ -5398,24 +5441,30 @@ impl Browser {
 
     fn page_projection_changed(&self, index: usize, before: &(Option<Arc<str>>, u32, u64)) -> bool {
         let page = &self.tabs[index].page;
-        before.0.as_deref() != page.current_url_ref()
-            || before.1 != page.session_scroll()
-            || before.2 != page.fetch_gen
+        let (url, scroll) = Self::checkpoint_projection(page);
+        before.0 != url || before.1 != scroll || before.2 != page.fetch_gen
+    }
+
+    fn checkpoint_projection(page: &App) -> (Option<Arc<str>>, u32) {
+        match page.current_url_ref().filter(|url| valid_url(url)) {
+            Some(url) => (Some(Arc::from(url)), page.session_scroll()),
+            None => (None, 0),
+        }
     }
 
     fn sync_tab_projection(&mut self, index: usize) {
         let tab = &mut self.tabs[index];
-        tab.checkpoint_url = tab.page.current_url_ref().map(Arc::from);
-        tab.checkpoint_scroll = tab.page.session_scroll();
+        (tab.checkpoint_url, tab.checkpoint_scroll) = Self::checkpoint_projection(&tab.page);
     }
 
     fn finish_session_input(&mut self, before: SessionFingerprint, effect: Effect) -> Effect {
         let active_page = &self.tabs[self.active].page;
+        let (url, scroll) = Self::checkpoint_projection(active_page);
         let changed = effect.quit
             || before.active != self.active
             || before.tabs != self.tabs.len()
-            || before.url.as_deref() != active_page.current_url_ref()
-            || before.scroll != active_page.session_scroll()
+            || before.url != url
+            || before.scroll != scroll
             || before.generation != active_page.fetch_gen;
         if changed {
             self.sync_tab_projection(self.active);
@@ -5650,7 +5699,7 @@ impl Browser {
                 };
                 let url = record.url.to_string();
                 self.bookmark_library = false;
-                self.tabs[self.active].page.navigate(url, true)
+                self.tabs[self.active].page.navigate_direct(url, true)
             }
             Action::BookmarkDelete => self.delete_selected_bookmark(),
             _ => Effect::default(),
@@ -5895,7 +5944,12 @@ impl Browser {
         let mut page = Frame::new(frame.width(), frame.height().saturating_sub(1));
         self.tabs[self.active].page.draw(&mut page);
         frame.blit_rows(&page, 1);
-        self.draw_browser_status(frame);
+        if !matches!(
+            self.tabs[self.active].page.mode,
+            Mode::UrlInput { .. } | Mode::SearchInput { .. }
+        ) {
+            self.draw_browser_status(frame);
+        }
     }
 
     fn draw_browser_status(&self, frame: &mut Frame) {
@@ -6351,6 +6405,34 @@ mod tests {
                 return;
             }
         }
+    }
+
+    #[test]
+    fn page_navigation_sends_a_sanitized_referrer_but_direct_navigation_does_not() {
+        let mut app = App::new(80, 24);
+        let source = "https://site.test/article?q=1#comments";
+        let id = app.start_fetch(source.into());
+        load_cacheable(&mut app, id, source, b"<p>source</p>", Metadata::default());
+
+        let link = app.navigate("https://elsewhere.test/next".into(), true);
+        let (id, request) = link.fetch.expect("link navigation must fetch");
+        assert_eq!(request.referrer.as_deref(), Some("https://site.test/"));
+
+        let hop = app.update(Msg::Redirect {
+            id,
+            url: "https://elsewhere.test/next".into(),
+            to: "https://landing.test/".into(),
+            status: 302,
+            elapsed: Duration::from_millis(1),
+            set_cookie: Vec::new(),
+        });
+        assert_eq!(
+            hop.fetch.unwrap().1.referrer.as_deref(),
+            Some("https://site.test/")
+        );
+
+        let direct = app.start_navigation("https://typed.test/".into());
+        assert_eq!(direct.fetch.unwrap().1.referrer, None);
     }
 
     #[test]
@@ -7607,6 +7689,69 @@ mod tests {
     }
 
     #[test]
+    fn blank_persistent_start_shows_the_url_prompt_and_commits_a_bare_host() {
+        let mut browser = Browser::with_persistence(40, 8, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(None)));
+
+        assert!(browser.update(ch('o')).dirty);
+        let mut frame = Frame::new(40, 8);
+        browser.draw(&mut frame);
+        let prompt = row_text(&frame, 7);
+        assert!(
+            prompt.contains("open: "),
+            "URL prompt was hidden: {prompt:?}"
+        );
+        assert!(prompt.contains(CURSOR), "URL cursor was hidden: {prompt:?}");
+
+        let empty = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(empty.fetch.is_none());
+        assert!(empty.session_save.is_none());
+        assert!(matches!(browser.tabs[0].page.mode, Mode::UrlInput { .. }));
+
+        for c in "example.com".chars() {
+            browser.update(ch(c));
+        }
+        let committed = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (_, request) = committed
+            .fetch
+            .as_ref()
+            .expect("bare host did not navigate");
+        assert_eq!(request.url, "https://example.com/");
+        let (_, snapshot) = committed
+            .session_save
+            .as_ref()
+            .expect("valid navigation was not checkpointed");
+        crate::browser::session::encode(snapshot).expect("live URL made an invalid checkpoint");
+    }
+
+    #[test]
+    fn malformed_navigation_is_not_written_to_the_session_or_repeatedly_saved() {
+        let mut browser = Browser::with_persistence(40, 8, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(None)));
+        let navigation = browser.start_navigation("https://".into());
+        let (id, _) = navigation
+            .fetch
+            .expect("malformed URL still reaches the worker");
+        let (_, snapshot) = navigation
+            .session_save
+            .expect("the changed generation gets one checkpoint");
+        assert_eq!(
+            snapshot.tabs[0],
+            SessionTab {
+                url: None,
+                scroll: 0
+            }
+        );
+
+        let failed = browser.update(Msg::NetError {
+            id,
+            url: "https://".into(),
+            reason: "builder error".into(),
+        });
+        assert!(failed.session_save.is_none());
+    }
+
+    #[test]
     fn closing_the_only_tab_replaces_it_with_a_new_blank_identity() {
         let mut browser = Browser::new(20, 4);
         let old = browser.tabs[0].id;
@@ -8447,6 +8592,12 @@ mod tests {
         Some(crate::css::parse(css))
     }
 
+    fn referred_request(url: &str, referrer: &str) -> net::Request {
+        let mut request = net::Request::bare(url);
+        request.referrer = Some(referrer.to_string());
+        request
+    }
+
     const RED: crate::style::values::ColorValue = crate::style::values::ColorValue::Rgb(255, 0, 0);
     const BLUE: crate::style::values::ColorValue = crate::style::values::ColorValue::Rgb(0, 0, 255);
 
@@ -8463,8 +8614,16 @@ mod tests {
         assert_eq!(
             effect.sheets,
             vec![
-                (id, 0, net::Request::bare("http://site.test/dir/a.css")),
-                (id, 1, net::Request::bare("http://site.test/b.css")),
+                (
+                    id,
+                    0,
+                    referred_request("http://site.test/dir/a.css", "http://site.test/dir/page",),
+                ),
+                (
+                    id,
+                    1,
+                    referred_request("http://site.test/b.css", "http://site.test/dir/page"),
+                ),
             ]
         );
         // And the page is on screen already: nothing waited for a round trip.
@@ -8755,7 +8914,7 @@ mod tests {
         }
         let effect = app.update(key(KeyCode::Enter, KeyModifiers::NONE));
         let (id, url) = effect.fetch.expect("commit must return a fetch");
-        assert_eq!(url.url, "https://danluu.com", "scheme defaulting applied");
+        assert_eq!(url.url, "https://danluu.com/", "scheme defaulting applied");
         assert!(effect.dirty);
 
         // The row now shows the new fetch loading.
@@ -8763,7 +8922,7 @@ mod tests {
         app.draw(&mut frame);
         let row = row_text(&frame, 5);
         assert!(row.contains("loading…"), "row was {row:?}");
-        assert!(row.contains("https://danluu.com"), "row was {row:?}");
+        assert!(row.contains("https://danluu.com/"), "row was {row:?}");
 
         // A Loaded for that id lands normally (generation is live).
         assert_eq!(load(&mut app, id, body(3)), redraw());
@@ -9804,8 +9963,16 @@ mod tests {
         assert_eq!(
             effect.scripts,
             [
-                (id, 0, net::Request::bare("http://final/a.js")),
-                (id, 2, net::Request::bare("http://final/b.js")),
+                (
+                    id,
+                    0,
+                    referred_request("http://final/a.js", "http://final/"),
+                ),
+                (
+                    id,
+                    2,
+                    referred_request("http://final/b.js", "http://final/"),
+                ),
             ],
             "slots are allocated in document order, before any fetch starts"
         );
@@ -10105,8 +10272,9 @@ mod tests {
         }
         assert_eq!(
             asked,
-            [net::Request::bare(
-                "https://www.google-analytics.com/analytics.js"
+            [referred_request(
+                "https://www.google-analytics.com/analytics.js",
+                "https://motherfuckingwebsite.com/",
             )],
             "the loader asked for {asked:?}"
         );
@@ -10154,7 +10322,11 @@ mod tests {
         let effect = app.update(Msg::RunScripts { id });
         assert_eq!(
             effect.scripts,
-            [(id, 1, net::Request::bare("http://final/lib.js"))]
+            [(
+                id,
+                1,
+                referred_request("http://final/lib.js", "http://final/")
+            )]
         );
         assert!(
             logged(&app).is_empty(),

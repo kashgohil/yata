@@ -1331,6 +1331,7 @@ pub fn install<'js>(
                 queue.requests.borrow_mut().push(FetchAsk {
                     request: request as u64,
                     ask: crate::net::Request {
+                        referrer: crate::net::referrer_for(&page_url, &resolved),
                         url: resolved,
                         cookie,
                         method: crate::net::Method::Get,

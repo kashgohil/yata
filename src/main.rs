@@ -274,6 +274,7 @@ impl Session {
         net::Request {
             url,
             cookie,
+            referrer: None,
             method: net::Method::Get,
         }
     }
@@ -1026,7 +1027,10 @@ mod tests {
         let mut app = App::new(80, 24);
         let effect = apply_batch(&mut app, msgs.into_iter());
         let (id, url) = effect.fetch.expect("a commit must surface a fetch");
-        assert_eq!(url.url, "https://b.com", "an earlier commit leaked through");
+        assert_eq!(
+            url.url, "https://b.com/",
+            "an earlier commit leaked through"
+        );
         assert_eq!(
             id,
             net::PageId::headless(2),

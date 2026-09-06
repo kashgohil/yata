@@ -376,6 +376,7 @@ fn script_request(
         crate::js::cookies::now(),
     );
     net::Request {
+        referrer: base_url.and_then(|base| crate::net::referrer_for(base, &url)),
         url,
         cookie,
         method: net::Method::Get,

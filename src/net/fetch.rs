@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::io::Read;
-use std::sync::mpsc::Sender;
+use std::sync::{OnceLock, mpsc::Sender};
 use std::thread;
 use std::time::Instant;
 
@@ -14,6 +14,12 @@ use crate::net::{Method, PageId, Request};
 /// Read size per chunk: small enough that progress messages arrive steadily
 /// on slow links, large enough that syscall overhead is irrelevant.
 const CHUNK: usize = 16 * 1024;
+const ACCEPT_DOCUMENT: &str =
+    "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5";
+const ACCEPT_STYLESHEET: &str = "text/css,*/*;q=0.1";
+const ACCEPT_SCRIPT: &str =
+    "text/javascript,application/javascript,application/ecmascript,*/*;q=0.1";
+const ACCEPT_IMAGE: &str = "image/webp,image/png,image/jpeg,image/gif,*/*;q=0.1";
 
 /// Fetch `url` on a detached worker thread; returns immediately. The worker
 /// talks to the rest of the program only by sending `Msg`s into `tx`:
@@ -153,7 +159,7 @@ pub fn is_document(status: u16, content_type: Option<&str>) -> bool {
 /// rather than slow.
 pub fn spawn_stylesheet(id: PageId, slot: usize, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        let sheet = match get(&request) {
+        let sheet = match get(&request, ACCEPT_STYLESHEET) {
             // A 404's body is an error page, not CSS; parsing it would put
             // whatever HTML-shaped garbage recovers into the cascade.
             Ok((status, body)) if (200..300).contains(&status) => {
@@ -185,7 +191,7 @@ pub const MAX_SCRIPT_BYTES: usize = 4 * 1024 * 1024;
 /// stylesheet.
 pub fn spawn_script(id: PageId, slot: usize, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        let source = match get(&request) {
+        let source = match get(&request, ACCEPT_SCRIPT) {
             // A 404's body is an error page, not JavaScript. Running it would
             // put whatever HTML-shaped garbage recovers into the engine.
             Ok((status, body)) if (200..300).contains(&status) => {
@@ -257,17 +263,26 @@ fn js_request(
         "POST" => client.post(url),
         _ => client.get(url),
     };
+    req = with_request_headers(req, ask, "*/*");
+    let mut authored = reqwest::header::HeaderMap::new();
     for (name, value) in headers {
-        // `Cookie` is a forbidden header name in `fetch()`, and here it has to
-        // be: the jar decides what this request carries, and a page allowed to
-        // write the header itself could send a `Secure` or `HttpOnly` cookie
-        // back to its own server that `credentials: 'omit'` had just refused.
-        if name.eq_ignore_ascii_case("cookie") {
+        // Credentials, source identity and transport framing belong to the
+        // browser. A page cannot forge them around the jar/referrer policy or
+        // make reqwest talk to a host other than the URL it approved.
+        if request_owned_header(name) {
             continue;
         }
-        req = req.header(name.as_str(), value.as_str());
+        let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) else {
+            continue;
+        };
+        authored.insert(name, value);
     }
-    let mut req = with_cookies(req, ask);
+    // `headers` replaces defaults with page-authored values for fields fetch
+    // is allowed to control (notably `Accept` and `Content-Type`).
+    let mut req = req.headers(authored);
     if let Some(body) = body {
         req = req.body(body.to_string());
     }
@@ -310,7 +325,7 @@ fn js_request(
 /// a degraded page, not a navigation failure.
 pub fn spawn_image(id: PageId, request: Request, tx: Sender<Msg>) {
     thread::spawn(move || {
-        let result = match get(&request) {
+        let result = match get(&request, ACCEPT_IMAGE) {
             Ok((status, body)) if (200..300).contains(&status) => image::decode(&body),
             Ok((status, _)) => Err(format!("HTTP {status}")),
             Err(e) => Err(e),
@@ -331,8 +346,8 @@ pub fn spawn_image(id: PageId, request: Request, tx: Sender<Msg>) {
 /// carries a `Set-Cookie`, which is what makes "a subresource cannot start a
 /// session" structural rather than a rule somebody has to remember (M11.7,
 /// deliverable 2).
-fn get(request: &Request) -> Result<(u16, Vec<u8>), String> {
-    let mut resp = with_cookies(client()?.get(&request.url), request)
+fn get(request: &Request, accept: &'static str) -> Result<(u16, Vec<u8>), String> {
+    let mut resp = with_request_headers(client()?.get(&request.url), request, accept)
         .send()
         .map_err(describe)?;
     let status = resp.status().as_u16();
@@ -341,25 +356,30 @@ fn get(request: &Request) -> Result<(u16, Vec<u8>), String> {
     Ok((status, body))
 }
 
-/// Put the `Cookie:` header on a request, if the jar gave it one. The one
-/// place a cookie becomes a header — every worker goes through it, so a
-/// request path added later has to walk past it to send nothing.
-fn with_cookies(
+/// Add the browser-owned request headers. This is the one place a cookie or
+/// referrer becomes a header — every worker goes through it, so a new request
+/// path cannot silently omit their policy decisions.
+fn with_request_headers(
     builder: reqwest::blocking::RequestBuilder,
     request: &Request,
+    accept: &'static str,
 ) -> reqwest::blocking::RequestBuilder {
+    let mut builder = builder.header(reqwest::header::ACCEPT, accept);
+    if let Some(referrer) = &request.referrer {
+        builder = builder.header(reqwest::header::REFERER, referrer);
+    }
     match &request.cookie {
         Some(cookie) => builder.header(reqwest::header::COOKIE, cookie),
         None => builder,
     }
 }
 
-/// One blocking client. Built on the worker, never on the UI thread; defaults
-/// follow redirects and (via the gzip feature) transparently decompress.
+/// A process-wide blocking client. Its first caller builds it on a worker;
+/// later workers clone the cheap handle and share its connection pool. The
+/// defaults follow redirects and transparently decompress gzip responses.
 fn client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .build()
-        .map_err(describe)
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT.get_or_init(|| build_client(true)).clone()
 }
 
 /// The **document** client: identical, except that it does not follow
@@ -377,10 +397,81 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 /// recomputation no ladder page has asked for. When one turns up, it arrives
 /// then.
 fn document_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(describe)
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    CLIENT.get_or_init(|| build_client(false)).clone()
+}
+
+fn build_client(follow_redirects: bool) -> Result<reqwest::blocking::Client, String> {
+    let mut defaults = reqwest::header::HeaderMap::new();
+    let language = std::env::var("YATA_ACCEPT_LANGUAGE")
+        .ok()
+        .filter(|value| value.len() <= 256)
+        .and_then(|value| reqwest::header::HeaderValue::from_str(&value).ok())
+        .unwrap_or_else(|| reqwest::header::HeaderValue::from_static("en-US,en;q=0.5"));
+    defaults.insert(reqwest::header::ACCEPT_LANGUAGE, language);
+    if let Ok(raw) = std::env::var("YATA_HTTP_HEADERS") {
+        defaults.extend(configured_headers(&raw));
+    }
+    let user_agent = std::env::var("YATA_USER_AGENT")
+        .ok()
+        .filter(|value| value.len() <= 256 && reqwest::header::HeaderValue::from_str(value).is_ok())
+        .unwrap_or_else(|| format!("yata/{}", env!("CARGO_PKG_VERSION")));
+    let mut builder = reqwest::blocking::Client::builder()
+        .user_agent(user_agent)
+        .default_headers(defaults);
+    if !follow_redirects {
+        builder = builder.redirect(reqwest::redirect::Policy::none());
+    }
+    builder.build().map_err(describe)
+}
+
+/// Parse bounded `Name: value` lines from `YATA_HTTP_HEADERS`. Request-owned,
+/// credential and hop-by-hop headers cannot be overridden here; malformed or
+/// excessive entries are ignored rather than making the browser unstartable.
+fn configured_headers(raw: &str) -> reqwest::header::HeaderMap {
+    const MAX_HEADERS: usize = 16;
+    const MAX_BYTES: usize = 8 * 1024;
+    let mut headers = reqwest::header::HeaderMap::new();
+    if raw.len() > MAX_BYTES {
+        return headers;
+    }
+    for line in raw.lines().take(MAX_HEADERS) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.trim().as_bytes()) else {
+            continue;
+        };
+        if matches!(name.as_str(), "accept" | "accept-language")
+            || request_owned_header(name.as_str())
+        {
+            continue;
+        }
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value.trim()) else {
+            continue;
+        };
+        headers.insert(name, value);
+    }
+    headers
+}
+
+fn request_owned_header(name: &str) -> bool {
+    [
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "cookie",
+        "host",
+        "proxy-authorization",
+        "referer",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+    ]
+    .iter()
+    .any(|owned| name.eq_ignore_ascii_case(owned))
 }
 
 /// Where a 3xx says to go, resolved against the URL that produced it — or
@@ -431,7 +522,7 @@ fn fetch(id: PageId, request: &Request, tx: &Sender<Msg>) -> Result<Option<Msg>,
             )
             .body(body.clone()),
     };
-    let mut builder = with_cookies(builder, request);
+    let mut builder = with_request_headers(builder, request, ACCEPT_DOCUMENT);
     if let Method::Conditional {
         no_cache,
         if_none_match,
@@ -673,10 +764,13 @@ mod tests {
 
     /// The `Cookie:` header a captured request carried, if any.
     fn cookie_header(request: &str) -> Option<&str> {
+        header(request, "cookie")
+    }
+
+    fn header<'a>(request: &'a str, wanted: &str) -> Option<&'a str> {
         request.lines().find_map(|line| {
-            line.strip_prefix("cookie: ")
-                .or_else(|| line.strip_prefix("Cookie: "))
-                .map(str::trim)
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case(wanted).then(|| value.trim())
         })
     }
 
@@ -947,6 +1041,7 @@ mod tests {
             Request {
                 url: format!("http://{addr}/a"),
                 cookie: None,
+                referrer: None,
                 method: Method::Conditional {
                     no_cache: true,
                     if_none_match: Some("W/\"one\"".into()),
@@ -1140,6 +1235,7 @@ mod tests {
             Request {
                 url: format!("http://{addr}/login"),
                 cookie: Some("sid=abc".into()),
+                referrer: None,
                 method: Method::Post {
                     body: "acct=pg&pw=secret".into(),
                 },
@@ -1177,6 +1273,7 @@ mod tests {
             Request {
                 url: format!("http://{addr}/login"),
                 cookie: None,
+                referrer: None,
                 method: Method::Post {
                     body: "acct=pg&pw=secret".into(),
                 },
@@ -1224,6 +1321,7 @@ mod tests {
             Request {
                 url: format!("http://{addr}/login"),
                 cookie: Some("sid=pre".into()),
+                referrer: None,
                 method: Method::Post {
                     body: "acct=pg&pw=secret".into(),
                 },
@@ -1242,6 +1340,7 @@ mod tests {
             Request {
                 url: to.clone(),
                 cookie: Some("sid=abc".into()),
+                referrer: None,
                 method: Method::Get,
             },
             tx,
@@ -1450,6 +1549,7 @@ mod tests {
         let request = |path: &str| Request {
             url: format!("http://{addr}{path}"),
             cookie: Some("sid=abc".to_string()),
+            referrer: None,
             method: crate::net::Method::Get,
         };
 
@@ -1475,6 +1575,42 @@ mod tests {
                 "a worker dropped its Cookie header: {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn document_requests_identify_yata_negotiate_html_and_send_the_given_referrer() {
+        let (addr, seen) = serve_capturing(1, |_| ok_body("<p>ok</p>"));
+        let (tx, rx) = mpsc::channel();
+        let mut request = Request::bare(format!("http://{addr}/doc"));
+        request.referrer = Some("http://source.test/article".into());
+        spawn_fetch(PageId::headless(1), request, tx);
+        drain(rx);
+
+        let seen = seen.lock().unwrap();
+        let request = &seen[0];
+        assert_eq!(
+            header(request, "user-agent"),
+            Some(concat!("yata/", env!("CARGO_PKG_VERSION")))
+        );
+        assert_eq!(header(request, "accept"), Some(ACCEPT_DOCUMENT));
+        assert_eq!(header(request, "accept-language"), Some("en-US,en;q=0.5"));
+        assert_eq!(
+            header(request, "referer"),
+            Some("http://source.test/article")
+        );
+    }
+
+    #[test]
+    fn configured_headers_are_bounded_and_cannot_replace_request_owned_fields() {
+        let raw = "DNT: 1\nX-Yata-Test: yes\nCookie: stolen=1\nHost: attacker.test\n\
+                   Referer: https://attacker.test/\nUser-Agent: fake\nMalformed";
+        let headers = configured_headers(raw);
+        assert_eq!(headers.get("dnt").unwrap(), "1");
+        assert_eq!(headers.get("x-yata-test").unwrap(), "yes");
+        for forbidden in ["cookie", "host", "referer", "user-agent"] {
+            assert!(headers.get(forbidden).is_none(), "accepted {forbidden}");
+        }
+        assert!(configured_headers(&"x".repeat(8 * 1024 + 1)).is_empty());
     }
 
     #[test]
@@ -1758,6 +1894,7 @@ mod tests {
             Request {
                 url: format!("http://{start}/start.css"),
                 cookie: Some("sid=abc".to_string()),
+                referrer: None,
                 method: crate::net::Method::Get,
             },
             tx,
@@ -1774,18 +1911,23 @@ mod tests {
     }
 
     #[test]
-    fn a_page_cannot_write_its_own_cookie_header_through_fetch() {
-        // `Cookie` is a forbidden header name in `fetch()`, and here it has to
-        // be: without this, `credentials: 'omit'` would be a suggestion.
+    fn a_page_cannot_forge_browser_owned_headers_through_fetch() {
+        // `Cookie` and `Referer` are browser-owned in fetch(), and here they
+        // have to be: without that, credentials/referrer policy is a
+        // suggestion.
         let (addr, seen) = serve_capturing(2, |_| ok_body("{}"));
         let (tx, rx) = mpsc::channel();
+        let mut request = Request::bare(format!("http://{addr}/a"));
+        request.referrer = Some("http://trusted.test/source".into());
         spawn_js_fetch(
             PageId::headless(1),
             1,
-            Request::bare(format!("http://{addr}/a")),
+            request,
             "GET".to_string(),
             vec![
                 ("Cookie".to_string(), "sid=forged".to_string()),
+                ("Referer".to_string(), "http://attacker.test/".to_string()),
+                ("User-Agent".to_string(), "forged".to_string()),
                 ("X-Ok".to_string(), "kept".to_string()),
             ],
             None,
@@ -1801,6 +1943,7 @@ mod tests {
             Request {
                 url: format!("http://{addr}/b"),
                 cookie: Some("sid=real".to_string()),
+                referrer: None,
                 method: crate::net::Method::Get,
             },
             "GET".to_string(),
@@ -1812,6 +1955,11 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         assert_eq!(cookie_header(&seen[0]), None, "{:?}", seen[0]);
+        assert_eq!(
+            header(&seen[0], "referer"),
+            Some("http://trusted.test/source")
+        );
+        assert_ne!(header(&seen[0], "user-agent"), Some("forged"));
         assert!(seen[0].contains("kept"), "an ordinary header was dropped");
         assert_eq!(cookie_header(&seen[1]), Some("sid=real"), "{:?}", seen[1]);
         assert_eq!(
