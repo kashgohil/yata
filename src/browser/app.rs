@@ -5953,9 +5953,49 @@ mod tests {
         }
 
         let mut browser = Browser::new(30, 8);
-        settle(&mut browser, "https://a.test/", "<title>A</title><p>a</p>");
+        let a_markup = format!(
+            "<title>A</title><input value=seed>\
+             <script>window.tabState = 41; console.log(window.tabState);</script>{}",
+            (0..40)
+                .map(|line| format!("<p>retained line {line}</p>"))
+                .collect::<String>()
+        );
+        let a_id = settle(&mut browser, "https://a.test/", &a_markup);
+        browser.update(Msg::RunScripts { id: a_id });
+        browser.update(key(KeyCode::Tab, KeyModifiers::NONE));
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        browser.update(ch('Z'));
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        for _ in 0..3 {
+            browser.update(ch('j'));
+        }
+        browser.update(ch('/'));
+        for c in "line".chars() {
+            browser.update(ch(c));
+        }
+        browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
         browser.tabs[0].page.surface = Surface::Dom;
         browser.tabs[0].page.timing_visible = true;
+        browser.tabs[0]
+            .page
+            .history
+            .push("https://a.test/previous".into(), 2);
+        let a_offset = browser.tabs[0].page.viewport.offset();
+        let a_focus = browser.tabs[0].page.focus;
+        let a_field = browser.tabs[0]
+            .page
+            .focused_field()
+            .expect("input was not retained as focused")
+            .1;
+        let a_search = browser.tabs[0]
+            .page
+            .search
+            .as_ref()
+            .expect("settled search")
+            .query
+            .clone();
+        let a_console = browser.tabs[0].page.console.entries();
+        assert!(browser.tabs[0].page.js_host.is_some());
         browser.update(ch('t'));
         settle(&mut browser, "https://b.test/", "<title>B</title><p>b</p>");
         let before: Vec<_> = browser
@@ -5972,6 +6012,19 @@ mod tests {
         assert!(switched.documents.is_empty());
         assert_eq!(browser.tabs[0].page.surface, Surface::Dom);
         assert!(browser.tabs[0].page.timing_visible);
+        assert_eq!(browser.tabs[0].page.viewport.offset(), a_offset);
+        assert_eq!(browser.tabs[0].page.focus, a_focus);
+        assert_eq!(browser.tabs[0].page.focused_field().unwrap().1, a_field);
+        assert_eq!(a_field, "seedZ");
+        assert_eq!(
+            browser.tabs[0].page.search.as_ref().unwrap().query,
+            a_search
+        );
+        assert_eq!(a_search, "line");
+        assert_eq!(browser.tabs[0].page.console.entries(), a_console);
+        assert_eq!(a_console.last().unwrap().text, "41");
+        assert!(browser.tabs[0].page.js_host.is_some());
+        assert!(browser.tabs[0].page.history.can_back());
         assert_eq!(
             browser
                 .tabs
