@@ -59,6 +59,7 @@ pub fn action_help(action: Action) -> &'static str {
         Action::HistoryBack => "history back",
         Action::HistoryForward => "history forward",
         Action::Reload => "reload",
+        Action::ToggleReader => "reader mode",
         Action::YankUrl => "yank page URL",
         Action::OpenSearch => "search in page",
         Action::SearchNext => "next search match",

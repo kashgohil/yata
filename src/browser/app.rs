@@ -16,6 +16,7 @@ use crate::browser::history::History;
 use crate::browser::http_cache::{Cache, Key as CacheKey, Plan, Representation, RequestMode};
 use crate::browser::inspector;
 use crate::browser::keys::{self, Action, Chord, Resolution};
+use crate::browser::reader::{self, ReaderView};
 use crate::browser::search::{self, Match as SearchMatch};
 use crate::browser::statusline;
 use crate::browser::timing::{self, Timings};
@@ -137,6 +138,17 @@ struct ScrollAnchor {
     text_index: usize,
     /// Document y of that fragment before the resize (fallback for rewrap).
     box_y: i32,
+}
+
+/// Presentation state layered over one live page.  Normal computed styles stay
+/// in `App::styles`; this owns only the temporary UA-only snapshot and enough
+/// UI state to return to the exact normal reading position.
+struct ReaderState {
+    view: ReaderView,
+    styles: Styles,
+    normal_anchor: Option<ScrollAnchor>,
+    normal_scroll: usize,
+    normal_focus: Option<NodeId>,
 }
 
 /// Where a page that has not been laid out yet should end up once it has.
@@ -457,6 +469,8 @@ pub struct App {
     /// Recomputed as each one lands — the page renders with what it has and
     /// restyles, rather than blocking on a round trip (UX §3.2).
     styles: Option<Styles>,
+    /// Present only while this page (and therefore this tab) is in reader mode.
+    reader: Option<ReaderState>,
     /// Painted form of the last layout tree. Scrolling re-emits this at a new
     /// offset without relayout (PLAN.md M5 display list).
     display_list: DisplayList,
@@ -504,6 +518,9 @@ pub struct App {
     /// the page and decides to do nothing should cost nothing (M10.6).
     #[cfg(test)]
     styles_run: usize,
+    /// UA-only reader style passes, separated from retained-normal restyles.
+    #[cfg(test)]
+    reader_styles_run: usize,
     /// How many *nodes* those restyles resolved (M11.3). `styles_run` counts
     /// passes and so cannot tell a subtree from a document — this is the only
     /// counter that says the scoped path really was scoped, and the difference
@@ -604,6 +621,7 @@ impl App {
             surface: Surface::Page,
             sheets: Vec::new(),
             styles: None,
+            reader: None,
             revealed: false,
             display_list: DisplayList::default(),
             layout_tree: None,
@@ -624,6 +642,8 @@ impl App {
             layouts: 0,
             #[cfg(test)]
             styles_run: 0,
+            #[cfg(test)]
+            reader_styles_run: 0,
             #[cfg(test)]
             nodes_styled: 0,
             #[cfg(test)]
@@ -664,6 +684,9 @@ impl App {
         self.fetch_gen += 1;
         let id = PageId::new(self.tab, self.fetch_gen);
         self.current_fetch = Some(id);
+        // Reader mode is a presentation of one document generation.  A real
+        // navigation, reload or failure never carries it into the next one.
+        self.reader = None;
         // One host per page generation: the old page's globals, closures and
         // (from M10.8) listeners go with it. Dropping the host is the whole
         // mechanism — there is nowhere for that state to survive.
@@ -1198,9 +1221,24 @@ impl App {
                 }
                 match result {
                     Ok(decoded) => {
+                        let visible_in_reader = self.reader.is_none()
+                            || self.layout_tree.as_ref().is_some_and(|tree| {
+                                let mut found = false;
+                                tree.walk(tree.root, &mut |_, b| {
+                                    if b.kind == BoxKind::Image
+                                        && b.image_src.as_deref() == Some(url.as_str())
+                                    {
+                                        found = true;
+                                    }
+                                });
+                                found
+                            });
                         let need_relayout =
                             self.images.needs_relayout(&url, self.layout_tree.as_ref());
                         self.images.insert(url, decoded);
+                        if !visible_in_reader {
+                            return Effect::default();
+                        }
                         if need_relayout {
                             self.relayout();
                         } else {
@@ -1227,8 +1265,18 @@ impl App {
                 // than leaving it pending forever: the page is degraded, not
                 // broken, and the cascade proceeds with what it has.
                 *entry = Some(sheet.unwrap_or_default());
+                let active_style_timing = self.reader.as_ref().map(|_| self.timings.style);
                 self.restyle();
+                if let Some(timing) = active_style_timing {
+                    self.timings.style = timing;
+                }
                 self.styles_view_built = false;
+                // Author CSS keeps the normal snapshot current underneath a
+                // reader presentation, but cannot change its active geometry.
+                if self.reader.is_some() {
+                    self.build_visible_inspector();
+                    return Effect::default();
+                }
                 // Relayout first so F3/F2 rebuild (at end of relayout) sees the
                 // new tree and styles — not the pre-sheet geometry.
                 self.relayout();
@@ -1430,6 +1478,7 @@ impl App {
             Action::HistoryBack => self.history_go(true),
             Action::HistoryForward => self.history_go(false),
             Action::Reload => self.reload(),
+            Action::ToggleReader => self.toggle_reader(),
             Action::YankUrl => self.yank_page_url(),
             Action::OpenSearch => {
                 self.hint = None;
@@ -1513,6 +1562,7 @@ impl App {
         self.display_list = DisplayList::default();
         self.sheets.clear();
         self.styles = None;
+        self.reader = None;
         self.timings.parse = None;
         self.timings.style = None;
         self.timings.layout = None;
@@ -1740,6 +1790,100 @@ impl App {
         }
     }
 
+    fn reader_style_snapshot(&self, dom: &Dom, view: &ReaderView) -> Styles {
+        let base = self.current_url();
+        let ctx = StyleContext {
+            hover: self.hover.filter(|node| view.includes(*node)),
+            visited: &self.visited,
+            base_url: base.as_deref(),
+        };
+        style::style_reader_tree_with(dom, view.membership(), &ctx)
+    }
+
+    /// Enter or leave the current document's semantic prose projection.
+    fn toggle_reader(&mut self) -> Effect {
+        self.hint = None;
+        if let Some(reader) = self.reader.take() {
+            let anchor = reader.normal_anchor;
+            let raw = reader.normal_scroll;
+            let focus = reader.normal_focus;
+            self.styles_view_built = false;
+            self.boxes_view_built = false;
+            self.relayout();
+            if let Some(anchor) = anchor {
+                self.restore_anchor(anchor);
+            } else {
+                let _ = self.viewport.scroll_to_offset(raw);
+            }
+            if let (Some(node), Some(dom), Some(tree)) =
+                (focus, self.dom.as_ref(), self.layout_tree.as_ref())
+                && dom.is_connected(node)
+                && layout::focusables(tree, dom).contains(&node)
+            {
+                self.focus = Some(node);
+            } else {
+                self.focus = None;
+            }
+            self.recompute_search_matches();
+            self.build_visible_inspector();
+            return redraw();
+        }
+
+        let (Some(dom), Some(normal_styles)) = (self.dom.as_ref(), self.styles.as_ref()) else {
+            self.status_msg = Some("reader mode unavailable".into());
+            return redraw();
+        };
+        let Ok(view) = reader::analyze(dom, normal_styles) else {
+            self.status_msg = Some("reader mode unavailable".into());
+            return redraw();
+        };
+        let normal_anchor = self.top_anchor();
+        let normal_scroll = self.viewport.offset();
+        let normal_focus = self.focus;
+        let started = Instant::now();
+        let reader_styles = self.reader_style_snapshot(dom, &view);
+        self.timings.style = Some(started.elapsed());
+        #[cfg(test)]
+        {
+            self.reader_styles_run += 1;
+            self.nodes_styled += reader_styles.nodes_styled();
+        }
+        let old_top = normal_anchor;
+        let root = view.root;
+        self.reader = Some(ReaderState {
+            view,
+            styles: reader_styles,
+            normal_anchor,
+            normal_scroll,
+            normal_focus,
+        });
+        if self
+            .focus
+            .is_some_and(|node| !self.reader.as_ref().unwrap().view.includes(node))
+        {
+            self.focus = None;
+        }
+        self.styles_view_built = false;
+        self.boxes_view_built = false;
+        self.relayout();
+        if let Some(anchor) = old_top.filter(|a| {
+            self.reader
+                .as_ref()
+                .is_some_and(|reader| reader.view.includes(a.node))
+        }) {
+            self.restore_anchor(anchor);
+        } else if let Some(tree) = &self.layout_tree
+            && let Some(y) = layout::first_y(tree, root)
+        {
+            let _ = self.viewport.scroll_to_offset(y.max(0) as usize);
+        } else {
+            let _ = self.viewport.scroll_to_top();
+        }
+        self.recompute_search_matches();
+        self.build_visible_inspector();
+        redraw()
+    }
+
     /// Lay the cached tree out at the current column width and hand the lines
     /// to the page surface. Called from exactly two places — a parse landing
     /// and a resize — and never from the scroll path, which only moves an
@@ -1752,23 +1896,36 @@ impl App {
     fn relayout(&mut self) {
         // Both or neither: `restyle` runs with every tree that lands, so a
         // parsed page always has computed values to lay out with.
-        let (Some(dom), Some(styles)) = (&self.dom, &self.styles) else {
+        let Some(dom) = &self.dom else {
             return;
+        };
+        let styles = match &self.reader {
+            Some(reader) => &reader.styles,
+            None => match &self.styles {
+                Some(styles) => styles,
+                None => return,
+            },
         };
         let started = Instant::now();
         let width = column(self.size.0).width;
         let img_ctx = self.images.context();
         // One layout (or two if we have to reveal a page that hid itself).
+        let hidden = if self.reader.is_some() {
+            layout::Hidden::Reveal
+        } else {
+            layout::Hidden::Respect
+        };
         let tree = layout::layout_document_with_viewport(
             dom,
             styles,
             width,
             self.page(),
-            layout::Hidden::Respect,
+            hidden,
             &img_ctx,
         );
         let mut lines = layout::lines_from_tree(&tree);
-        let (tree, revealed) = if lines.iter().any(|l| !l.spans.is_empty()) {
+        let (tree, revealed) = if self.reader.is_some() || lines.iter().any(|l| !l.spans.is_empty())
+        {
             (tree, false)
         } else {
             let alt = layout::layout_document_with_viewport(
@@ -2061,6 +2218,14 @@ impl App {
         // A mixed script tick still goes through the ordinary structural /
         // attribute classification, so one action has one coherent pass.
         if live_state && !structural && !has_attributes {
+            if self.reader.is_some() {
+                // Every live-value control is structurally pruned from reader
+                // mode. Keep the normal DOM state for exit, with no active
+                // reader geometry or paint work.
+                self.dom_view_built = false;
+                self.build_visible_inspector();
+                return redraw();
+            }
             self.relayout();
             self.validate_select_mode();
             self.dom_view_built = false;
@@ -2088,6 +2253,66 @@ impl App {
                 previous
             }
         };
+
+        if let Some(mut active) = self.reader.take() {
+            let refreshed = self
+                .dom
+                .as_ref()
+                .zip(self.styles.as_ref())
+                .and_then(|(dom, styles)| reader::refresh(dom, styles, &active.view).ok());
+            let Some(view) = refreshed else {
+                // The selected arena node left the live document. Return to
+                // the retained normal presentation once, at its saved place.
+                let anchor = active.normal_anchor;
+                let raw = active.normal_scroll;
+                self.relayout();
+                if let Some(anchor) = anchor {
+                    self.restore_anchor(anchor);
+                } else {
+                    let _ = self.viewport.scroll_to_offset(raw);
+                }
+                self.focus = active.normal_focus.filter(|node| {
+                    self.dom.as_ref().is_some_and(|dom| dom.is_connected(*node))
+                        && self.layout_tree.as_ref().is_some_and(|tree| {
+                            self.dom
+                                .as_ref()
+                                .is_some_and(|dom| layout::focusables(tree, dom).contains(node))
+                        })
+                });
+                self.status_msg = Some("reader mode ended: content was removed".into());
+                self.recompute_search_matches();
+                self.dom_view_built = false;
+                self.styles_view_built = false;
+                self.boxes_view_built = false;
+                self.build_visible_inspector();
+                return redraw();
+            };
+            let projected_changed = !active.view.same_projected_content(&view);
+            active.view = view;
+            if projected_changed {
+                let started = Instant::now();
+                if let Some(dom) = &self.dom {
+                    active.styles = self.reader_style_snapshot(dom, &active.view);
+                    self.timings.style = Some(started.elapsed());
+                    #[cfg(test)]
+                    {
+                        self.reader_styles_run += 1;
+                        self.nodes_styled += active.styles.nodes_styled();
+                    }
+                }
+            }
+            self.reader = Some(active);
+            self.dom_view_built = false;
+            self.styles_view_built = false;
+            self.boxes_view_built = false;
+            if projected_changed {
+                self.relayout();
+                self.recompute_search_matches();
+            } else {
+                self.build_visible_inspector();
+            }
+            return redraw();
+        }
 
         let needs_layout = structural
             || live_state
@@ -2125,6 +2350,19 @@ impl App {
     /// own measurement, so it is its own task.
     fn restyle_and_repaint(&mut self) {
         self.restyle();
+        if let Some(mut reader) = self.reader.take() {
+            let started = Instant::now();
+            if let Some(dom) = &self.dom {
+                reader.styles = self.reader_style_snapshot(dom, &reader.view);
+                self.timings.style = Some(started.elapsed());
+                #[cfg(test)]
+                {
+                    self.reader_styles_run += 1;
+                    self.nodes_styled += reader.styles.nodes_styled();
+                }
+            }
+            self.reader = Some(reader);
+        }
         self.recolour_and_repaint();
     }
 
@@ -2137,7 +2375,12 @@ impl App {
     /// and a second increment on a counter that exists to catch exactly that.
     fn recolour_and_repaint(&mut self) {
         self.styles_view_built = false;
-        if let (Some(tree), Some(styles)) = (self.layout_tree.as_mut(), self.styles.as_ref()) {
+        let styles = self
+            .reader
+            .as_ref()
+            .map(|reader| &reader.styles)
+            .or(self.styles.as_ref());
+        if let (Some(tree), Some(styles)) = (self.layout_tree.as_mut(), styles) {
             recolour_tree(tree, styles);
             // Rebuild after recolour; need pixels map from cache.
         }
@@ -2194,8 +2437,15 @@ impl App {
         if self.styles_view_built {
             return;
         }
-        if let (Some(dom), Some(styles)) = (&self.dom, &self.styles) {
-            let text = inspector::style_lines(dom, styles).join("\n");
+        if let Some(dom) = &self.dom {
+            let (styles, projection) = match &self.reader {
+                Some(reader) => (&reader.styles, Some(reader.view.membership())),
+                None => match &self.styles {
+                    Some(styles) => (styles, None),
+                    None => return,
+                },
+            };
+            let text = inspector::style_lines_projected(dom, styles, projection).join("\n");
             self.styles_view
                 .set_content(&text, self.size.0, self.page());
             self.styles_view_built = true;
@@ -2490,6 +2740,15 @@ impl App {
         let Some(target) = fragment::resolve(dom, fragment) else {
             return;
         };
+        if let fragment::Target::Node(node) = target
+            && self
+                .reader
+                .as_ref()
+                .is_some_and(|reader| !reader.view.includes(node))
+        {
+            self.status_msg = Some("fragment outside reader content".into());
+            return;
+        }
         let y = match target {
             fragment::Target::Top => 0,
             fragment::Target::Node(node) => match layout::nearest_y(tree, dom, node) {
@@ -4505,6 +4764,11 @@ impl App {
             // Short, and only present when it happened: the page rendered
             // blank until its own `display:none` was ignored.
             format!("[unhidden] {base}")
+        } else {
+            base
+        };
+        let base = if self.reader.is_some() {
+            format!("[reader] {base}")
         } else {
             base
         };
@@ -9264,6 +9528,283 @@ mod tests {
         app.update(parsed(id, html));
         app.update(Msg::RunScripts { id });
         (app, id)
+    }
+
+    const READER_PAGE: &str = "<style>body{display:grid;color:red} article{display:none;position:fixed;width:9999px} p{border:8px solid}</style>\
+        <header id=page-head>PAGE CHROME</header><nav><a href='/menu'>MENU LINK</a></nav>\
+        <article id=story><header><h1>Article title</h1><p>By Writer</p></header>\
+        <p>First paragraph with <a href='/inside'>an included link</a> and enough useful prose.</p>\
+        <blockquote>A useful quotation.</blockquote><pre>let answer = 42;</pre>\
+        <ul><li>one</li><li>two</li></ul><aside>RELATED CHROME</aside>\
+        <footer>Article notes</footer></article><form><input value='FORM CHROME'></form>\
+        <footer>PAGE FOOTER</footer>";
+
+    #[test]
+    fn reader_toggle_is_ua_only_exact_once_and_restores_normal_page() {
+        let (mut app, _) = live_page(60, 12, READER_PAGE);
+        let url = app.current_url();
+        let normal_styles =
+            inspector::style_lines(app.dom.as_ref().unwrap(), app.styles.as_ref().unwrap());
+        let normal = screen(&mut app, 60, 12);
+        assert!(normal.contains("PAGE CHROME"), "{normal}");
+        let before = (
+            app.styles_run,
+            app.reader_styles_run,
+            app.layouts,
+            app.paints,
+        );
+
+        let entered = app.update(key(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert_eq!(entered.fetch, None);
+        assert!(
+            entered.sheets.is_empty() && entered.images.is_empty() && entered.scripts.is_empty()
+        );
+        assert_eq!(
+            (
+                app.styles_run,
+                app.reader_styles_run,
+                app.layouts,
+                app.paints
+            ),
+            (before.0, before.1 + 1, before.2 + 1, before.3 + 1)
+        );
+        let reader = screen(&mut app, 60, 12);
+        assert!(reader.contains("Article title"), "{reader}");
+        assert!(reader.contains("First paragraph"), "{reader}");
+        assert!(!reader.contains("PAGE CHROME"), "{reader}");
+        assert!(!reader.contains("RELATED CHROME"), "{reader}");
+        assert!(reader.contains("[reader]"), "{reader}");
+        assert_eq!(app.current_url(), url);
+        let story = app
+            .dom
+            .as_ref()
+            .and_then(|dom| {
+                (0..dom.node_count())
+                    .map(|n| NodeId(n as u32))
+                    .find(|&n| dom.attr(n, "id") == Some("story"))
+            })
+            .unwrap();
+        let active = app.reader.as_ref().unwrap();
+        assert_eq!(
+            active.styles.get(story).color,
+            crate::style::values::ColorValue::Default
+        );
+        assert_eq!(
+            active.styles.get(story).position,
+            crate::style::values::Position::Static
+        );
+
+        let exited = app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(exited.fetch, None);
+        assert_eq!(
+            (
+                app.styles_run,
+                app.reader_styles_run,
+                app.layouts,
+                app.paints
+            ),
+            (before.0, before.1 + 1, before.2 + 2, before.3 + 2)
+        );
+        assert!(app.reader.is_none());
+        assert_eq!(
+            inspector::style_lines(app.dom.as_ref().unwrap(), app.styles.as_ref().unwrap()),
+            normal_styles
+        );
+        assert!(!screen(&mut app, 60, 12).contains("[reader]"));
+    }
+
+    #[test]
+    fn refused_reader_toggle_changes_only_status_chrome() {
+        let links = "<p><a href=x>abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz</a></p>";
+        let (mut app, _) = live_page(50, 8, &format!("<div>{links}{links}</div>"));
+        let before = (
+            app.styles_run,
+            app.reader_styles_run,
+            app.layouts,
+            app.paints,
+        );
+        let offset = app.viewport.offset();
+        assert_eq!(
+            app.update(key(KeyCode::Char('R'), KeyModifiers::NONE)),
+            redraw()
+        );
+        assert_eq!(
+            (
+                app.styles_run,
+                app.reader_styles_run,
+                app.layouts,
+                app.paints
+            ),
+            before
+        );
+        assert_eq!(app.viewport.offset(), offset);
+        assert!(screen(&mut app, 50, 8).contains("reader mode unavailable"));
+    }
+
+    #[test]
+    fn reader_search_and_normal_scroll_survive_both_toggles() {
+        let paragraphs = (0..30)
+            .map(|n| format!("<p>paragraph {n} needle text that wraps across the reader width</p>"))
+            .collect::<String>();
+        let (mut app, _) = live_page(
+            32,
+            8,
+            &format!("<header>chrome</header><article>{paragraphs}</article>"),
+        );
+        let _ = app.viewport.scroll_to_offset(12);
+        app.commit_search("needle".into());
+        let normal_offset = app.viewport.offset();
+        let query = app.search.as_ref().unwrap().query.clone();
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(app.search.as_ref().unwrap().query, query);
+        let _ = app.viewport.scroll_to_bottom();
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert_eq!(app.search.as_ref().unwrap().query, query);
+        // Search keeps its current match on screen after geometry rebuild, so
+        // the saved anchor is the stronger invariant than an exact raw offset.
+        assert!(app.viewport.offset().abs_diff(normal_offset) < 8);
+    }
+
+    #[test]
+    fn reader_mutations_update_inside_once_skip_outside_and_end_on_root_removal() {
+        let (mut app, _) = live_page(
+            50,
+            10,
+            "<div id=chrome>outside text</div><article id=story><p id=inside>inside text</p></article>",
+        );
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        let find = |app: &App, value: &str| {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count())
+                .map(|n| NodeId(n as u32))
+                .find(|&n| dom.attr(n, "id") == Some(value))
+                .unwrap()
+        };
+
+        let chrome_text = app
+            .dom
+            .as_ref()
+            .unwrap()
+            .node(find(&app, "chrome"))
+            .first_child
+            .unwrap();
+        let before_versions = app.dom.as_ref().unwrap().change_versions();
+        app.dom
+            .as_mut()
+            .unwrap()
+            .set_text(chrome_text, "changed text");
+        let after_versions = app.dom.as_ref().unwrap().change_versions();
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        app.apply_dom_changes(before_versions, after_versions);
+        assert_eq!((app.reader_styles_run, app.layouts, app.paints), before);
+
+        let inside_text = app
+            .dom
+            .as_ref()
+            .unwrap()
+            .node(find(&app, "inside"))
+            .first_child
+            .unwrap();
+        let before_versions = app.dom.as_ref().unwrap().change_versions();
+        app.dom
+            .as_mut()
+            .unwrap()
+            .set_text(inside_text, "new projected prose");
+        let after_versions = app.dom.as_ref().unwrap().change_versions();
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        app.apply_dom_changes(before_versions, after_versions);
+        assert_eq!(
+            (app.reader_styles_run, app.layouts, app.paints),
+            (before.0 + 1, before.1 + 1, before.2 + 1)
+        );
+        assert!(screen(&mut app, 50, 10).contains("new projected prose"));
+
+        let story = find(&app, "story");
+        let before_versions = app.dom.as_ref().unwrap().change_versions();
+        app.dom.as_mut().unwrap().remove(story);
+        let after_versions = app.dom.as_ref().unwrap().change_versions();
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        app.apply_dom_changes(before_versions, after_versions);
+        assert!(app.reader.is_none());
+        assert_eq!(
+            (app.reader_styles_run, app.layouts, app.paints),
+            (before.0, before.1 + 1, before.2 + 1)
+        );
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("reader mode ended: content was removed")
+        );
+    }
+
+    #[test]
+    fn author_sheet_arrival_and_reader_resize_have_exact_stage_costs() {
+        let html = "<link rel=stylesheet href='/late.css'><header>chrome</header>\
+                    <article id=story><p>projected prose</p></article>";
+        let mut app = App::new(50, 10);
+        let (_, parsed_effect) = open_page(&mut app, html);
+        assert_eq!(parsed_effect.sheets.len(), 1);
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        let before = (
+            app.styles_run,
+            app.reader_styles_run,
+            app.layouts,
+            app.paints,
+        );
+        let effect = app.update(Msg::Stylesheet {
+            id: app.current_fetch.unwrap(),
+            slot: 0,
+            sheet: Some(crate::css::parse("article { color: red; width: 3px }")),
+        });
+        assert_eq!(effect, Effect::default());
+        assert_eq!(
+            (
+                app.styles_run,
+                app.reader_styles_run,
+                app.layouts,
+                app.paints
+            ),
+            (before.0 + 1, before.1, before.2, before.3)
+        );
+
+        let before = (
+            app.styles_run,
+            app.reader_styles_run,
+            app.layouts,
+            app.paints,
+        );
+        app.update(Msg::Resize(42, 9));
+        assert_eq!(
+            (
+                app.styles_run,
+                app.reader_styles_run,
+                app.layouts,
+                app.paints
+            ),
+            (before.0, before.1, before.2 + 1, before.3 + 1)
+        );
+    }
+
+    #[test]
+    fn reader_fragments_reject_excluded_targets_without_moving() {
+        let (mut app, _) = live_page(
+            36,
+            8,
+            "<nav><a id=outside>outside</a></nav><article><p>top</p><p id=inside>inside target</p></article>",
+        );
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        let _ = app.viewport.scroll_to_bottom();
+        let before = app.viewport.offset();
+        app.jump_to_fragment("http://x/#outside".into(), false);
+        assert_eq!(app.viewport.offset(), before);
+        assert_eq!(
+            app.status_msg.as_deref(),
+            Some("fragment outside reader content")
+        );
+        app.jump_to_fragment("http://x/#inside".into(), false);
+        assert_ne!(
+            app.status_msg.as_deref(),
+            Some("fragment outside reader content")
+        );
     }
 
     /// A page with one link whose listener cancels the click.

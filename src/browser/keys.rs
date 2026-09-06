@@ -52,6 +52,8 @@ pub enum Action {
     HistoryBack,
     HistoryForward,
     Reload,
+    /// Toggle the current page's semantic prose projection (M11.23).
+    ToggleReader,
     /// Yank the current page URL (`yy`).
     YankUrl,
     /// Open in-page search (`/`).
@@ -187,6 +189,7 @@ pub const BINDINGS: &[Binding] = &[
         Action::HistoryForward,
     ),
     browse(None, chord(KeyCode::Char('r'), NONE), Action::Reload),
+    browse(None, chord(KeyCode::Char('R'), NONE), Action::ToggleReader),
     // `yy`: yank page URL (same two-key shape as `gg`).
     browse(
         Some(chord(KeyCode::Char('y'), NONE)),
@@ -786,5 +789,34 @@ mod tests {
             resolve(Mode::SearchInput, None, &press(KeyCode::Esc, NONE)),
             Resolution::Action(Action::Cancel)
         );
+    }
+
+    #[test]
+    fn reader_binding_accepts_both_shift_reports_and_lowercase_stays_reload() {
+        assert_eq!(
+            browse_key(KeyCode::Char('R'), NONE),
+            Resolution::Action(Action::ToggleReader)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('R'), KeyModifiers::SHIFT),
+            Resolution::Action(Action::ToggleReader)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('r'), NONE),
+            Resolution::Action(Action::Reload)
+        );
+        for mode in [
+            Mode::UrlInput,
+            Mode::SearchInput,
+            Mode::Field,
+            Mode::Select,
+            Mode::Bookmarks,
+        ] {
+            assert_eq!(
+                resolve(mode, None, &press(KeyCode::Char('R'), KeyModifiers::SHIFT)),
+                Resolution::Unbound,
+                "reader leaked into {mode:?}"
+            );
+        }
     }
 }

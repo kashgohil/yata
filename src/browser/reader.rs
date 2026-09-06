@@ -26,6 +26,7 @@ pub struct ReaderView {
     pub root: NodeId,
     included: Vec<bool>,
     pub metrics: Metrics,
+    fingerprint: u64,
 }
 
 impl ReaderView {
@@ -35,6 +36,12 @@ impl ReaderView {
 
     pub fn membership(&self) -> &[bool] {
         &self.included
+    }
+
+    pub fn same_projected_content(&self, other: &ReaderView) -> bool {
+        self.root == other.root
+            && self.included == other.included
+            && self.fingerprint == other.fingerprint
     }
 }
 
@@ -105,10 +112,10 @@ pub fn analyze(dom: &Dom, styles: &Styles) -> Result<ReaderView, ReaderError> {
     // Pre-order once, then consume in reverse for a non-recursive post-order.
     // The DOM itself caps depth, but the analyzer does not need that promise.
     let mut order = Vec::with_capacity(dom.node_count());
-    let mut stack = vec![(dom.root, false, false)];
+    let mut stack = vec![(dom.root, false, false, false)];
     let mut under_link = vec![false; dom.node_count()];
     let mut candidate_blocked = vec![false; dom.node_count()];
-    while let Some((id, linked, blocked)) = stack.pop() {
+    while let Some((id, linked, blocked, article_context)) = stack.pop() {
         order.push(id);
         let linked = linked || tag(dom, id) == Some("a");
         under_link[id.0 as usize] = linked;
@@ -128,10 +135,12 @@ pub fn analyze(dom: &Dom, styles: &Styles) -> Result<ReaderView, ReaderError> {
                         | "option"
                 )
             )
+            || (matches!(tag(dom, id), Some("header" | "footer")) && !article_context)
             || dom.attr(id, "role").is_some_and(pruned_role);
+        let child_article_context = article_context || tag(dom, id) == Some("article");
         let children: Vec<_> = dom.children(id).collect();
         for child in children.into_iter().rev() {
-            stack.push((child, linked, blocks_descendants));
+            stack.push((child, linked, blocks_descendants, child_article_context));
         }
     }
 
@@ -181,11 +190,79 @@ pub fn analyze(dom: &Dom, styles: &Styles) -> Result<ReaderView, ReaderError> {
     }
 
     let best = best.ok_or(ReaderError::NoProseRoot)?;
+    let included = project(dom, styles, best.root);
     Ok(ReaderView {
         root: best.root,
-        included: project(dom, styles, best.root),
+        fingerprint: fingerprint(dom, &included),
+        included,
         metrics: best.metrics,
     })
+}
+
+/// Rebuild membership beneath the already-selected root without reranking the
+/// document.  Reader activation is stable across live mutations; only removal
+/// of that arena node ends it.
+pub fn refresh(
+    dom: &Dom,
+    styles: &Styles,
+    previous: &ReaderView,
+) -> Result<ReaderView, ReaderError> {
+    if styles.node_count() != dom.node_count() || !dom.is_connected(previous.root) {
+        return Err(ReaderError::NoProseRoot);
+    }
+    let included = project(dom, styles, previous.root);
+    Ok(ReaderView {
+        root: previous.root,
+        fingerprint: fingerprint(dom, &included),
+        included,
+        metrics: previous.metrics,
+    })
+}
+
+fn fingerprint(dom: &Dom, included: &[bool]) -> u64 {
+    fn byte(hash: &mut u64, value: u8) {
+        *hash ^= u64::from(value);
+        *hash = hash.wrapping_mul(1_099_511_628_211);
+    }
+    fn text(hash: &mut u64, value: &str) {
+        for b in value.bytes() {
+            byte(hash, b);
+        }
+        byte(hash, 0xff);
+    }
+
+    let mut hash = 14_695_981_039_346_656_037;
+    for index in 0..dom.node_count() {
+        if !included.get(index).copied().unwrap_or(false) {
+            continue;
+        }
+        for b in (index as u64).to_le_bytes() {
+            byte(&mut hash, b);
+        }
+        match &dom.node(NodeId(index as u32)).data {
+            NodeData::Element { tag, attrs } => {
+                byte(&mut hash, 1);
+                text(&mut hash, tag);
+                // Author selectors and inline style remain irrelevant.  Keep
+                // semantic/layout attributes so role, image dimensions and
+                // table spans invalidate the active projection correctly.
+                for (name, value) in attrs {
+                    if matches!(name.as_str(), "class" | "id" | "style") {
+                        continue;
+                    }
+                    text(&mut hash, name);
+                    text(&mut hash, value);
+                }
+            }
+            NodeData::Text(value) => {
+                byte(&mut hash, 2);
+                text(&mut hash, value);
+            }
+            NodeData::Document => byte(&mut hash, 3),
+            NodeData::Comment(_) | NodeData::Doctype(_) => byte(&mut hash, 4),
+        }
+    }
+    hash
 }
 
 fn summarize_node(

@@ -82,12 +82,29 @@ fn push_node(dom: &Dom, id: NodeId, depth: usize, out: &mut Vec<String>) {
 /// column of identical `color:default · normal` would hide the handful of lines
 /// worth reading.
 pub fn style_lines(dom: &Dom, styles: &Styles) -> Vec<String> {
+    style_lines_projected(dom, styles, None)
+}
+
+/// The active reader style surface: projected nodes only.  The optional mask
+/// includes the ancestor spine, so the indentation still explains how the
+/// selected root reaches the document entry point without showing siblings.
+pub fn style_lines_projected(dom: &Dom, styles: &Styles, included: Option<&[bool]>) -> Vec<String> {
     let mut out = Vec::new();
-    push_styled(dom, dom.root, 0, styles, &mut out);
+    push_styled(dom, dom.root, 0, styles, included, &mut out);
     out
 }
 
-fn push_styled(dom: &Dom, id: NodeId, depth: usize, styles: &Styles, out: &mut Vec<String>) {
+fn push_styled(
+    dom: &Dom,
+    id: NodeId,
+    depth: usize,
+    styles: &Styles,
+    included: Option<&[bool]>,
+    out: &mut Vec<String>,
+) {
+    if included.is_some_and(|mask| !mask.get(id.0 as usize).copied().unwrap_or(false)) {
+        return;
+    }
     let mut depth = depth;
     if let NodeData::Element { tag, attrs } = &dom.node(id).data {
         // Text nodes are skipped: they carry their parent's inherited values
@@ -101,7 +118,7 @@ fn push_styled(dom: &Dom, id: NodeId, depth: usize, styles: &Styles, out: &mut V
         depth += 1;
     }
     for child in dom.children(id) {
-        push_styled(dom, child, depth, styles, out);
+        push_styled(dom, child, depth, styles, included, out);
     }
 }
 

@@ -314,6 +314,25 @@ pub fn style_tree_with(dom: &Dom, sheets: &[&Stylesheet], ctx: &StyleContext<'_>
     styles
 }
 
+/// Resolve the live arena with UA rules and interaction state only, then make
+/// nodes outside a reader projection impossible for layout to reveal.
+///
+/// The projection is presentation metadata, not a DOM rewrite.  Marking its
+/// excluded roots with the same `hidden_by_ua` boundary used for inert markup
+/// means [`crate::layout::Hidden::Reveal`] can recover author-hidden prose
+/// without recovering page chrome or siblings of the projection spine.
+pub fn style_reader_tree_with(dom: &Dom, included: &[bool], ctx: &StyleContext<'_>) -> Styles {
+    debug_assert_eq!(included.len(), dom.node_count());
+    let mut styles = style_tree_with(dom, &[], ctx);
+    for (index, computed) in styles.computed.iter_mut().enumerate() {
+        if !included.get(index).copied().unwrap_or(false) {
+            computed.display = Display::None;
+            computed.hidden_by_ua = true;
+        }
+    }
+    styles
+}
+
 /// Recompute `roots` and everything under them, in place, leaving every other
 /// node's computed values exactly as they were (M11.3). The same pre-order
 /// walk [`style_tree_with`] runs, started somewhere other than the document
