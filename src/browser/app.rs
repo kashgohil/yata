@@ -10807,6 +10807,7 @@ mod tests {
         assert_eq!(dom.attr(selected[0], "value"), Some("rust"));
 
         browser.tabs[0].page.focus = Some(by_id(&browser.tabs[0].page, "send"));
+        let post_started = Instant::now();
         let submitted = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
         settle_m11_integration_documents(
             &mut browser,
@@ -10816,6 +10817,7 @@ mod tests {
             &bookmark_worker,
             &session_worker,
         );
+        let post_redirect_elapsed = post_started.elapsed();
         assert_eq!(
             browser.tabs[0].page.current_url().as_deref(),
             Some(article_url.as_str())
@@ -10993,6 +10995,9 @@ mod tests {
                 .count(),
             3,
             "bookmark open should cache-hit; fresh restore should fetch twice"
+        );
+        eprintln!(
+            "M11.25 loopback form POST + cookie-bearing 302 + article pipeline: {post_redirect_elapsed:?}"
         );
         std::fs::remove_dir_all(&temp).unwrap();
     }
