@@ -18,6 +18,14 @@ pub enum Action {
     CloseTab,
     NextTab,
     PreviousTab,
+    AddBookmark,
+    ToggleBookmarks,
+    BookmarkNext,
+    BookmarkPrevious,
+    BookmarkFirst,
+    BookmarkLast,
+    BookmarkOpen,
+    BookmarkDelete,
     ToggleDom,
     ToggleStyles,
     ToggleBoxes,
@@ -78,6 +86,7 @@ pub enum Mode {
     Field,
     /// Choosing an option without giving ordinary letters to the page.
     Select,
+    Bookmarks,
 }
 
 /// One key plus its modifiers. A binding is one chord, or a two-chord sequence
@@ -120,6 +129,10 @@ const fn input(mode: Mode, trigger: Chord, action: Action) -> Binding {
         trigger,
         action,
     }
+}
+
+const fn bookmarks(trigger: Chord, action: Action) -> Binding {
+    input(Mode::Bookmarks, trigger, action)
 }
 
 /// The single source of truth for key → action mappings (CLAUDE.md); the `?`
@@ -198,6 +211,12 @@ pub const BINDINGS: &[Binding] = &[
         Action::PreviousTab,
     ),
     browse(None, chord(KeyCode::Esc, NONE), Action::Cancel),
+    browse(None, chord(KeyCode::Char('a'), NONE), Action::AddBookmark),
+    browse(
+        None,
+        chord(KeyCode::Char('b'), NONE),
+        Action::ToggleBookmarks,
+    ),
     browse(None, chord(KeyCode::Char('q'), NONE), Action::Quit),
     browse(None, chord(KeyCode::Char('c'), CTRL), Action::Quit),
     // UrlInput / SearchInput. `q` is absent on purpose: it is a letter here.
@@ -312,6 +331,21 @@ pub const BINDINGS: &[Binding] = &[
         Action::FocusPrev,
     ),
     input(Mode::Select, chord(KeyCode::Char('c'), CTRL), Action::Quit),
+    // Browser-global bookmark library.
+    bookmarks(chord(KeyCode::Char('j'), NONE), Action::BookmarkNext),
+    bookmarks(chord(KeyCode::Down, NONE), Action::BookmarkNext),
+    bookmarks(chord(KeyCode::Char('k'), NONE), Action::BookmarkPrevious),
+    bookmarks(chord(KeyCode::Up, NONE), Action::BookmarkPrevious),
+    bookmarks(chord(KeyCode::Char('g'), NONE), Action::BookmarkFirst),
+    bookmarks(chord(KeyCode::Home, NONE), Action::BookmarkFirst),
+    bookmarks(chord(KeyCode::Char('G'), NONE), Action::BookmarkLast),
+    bookmarks(chord(KeyCode::End, NONE), Action::BookmarkLast),
+    bookmarks(chord(KeyCode::Enter, NONE), Action::BookmarkOpen),
+    bookmarks(chord(KeyCode::Char('d'), NONE), Action::BookmarkDelete),
+    bookmarks(chord(KeyCode::Char('b'), NONE), Action::ToggleBookmarks),
+    bookmarks(chord(KeyCode::Esc, NONE), Action::Cancel),
+    bookmarks(chord(KeyCode::Char('q'), NONE), Action::Quit),
+    bookmarks(chord(KeyCode::Char('c'), CTRL), Action::Quit),
 ];
 
 /// The outcome of resolving one key press against the table, given the current
@@ -421,6 +455,44 @@ mod tests {
             browse_key(KeyCode::End, NONE),
             Resolution::Action(Action::Bottom)
         );
+    }
+
+    #[test]
+    fn bookmark_bindings_are_scoped_to_their_table_modes() {
+        for (code, action) in [
+            (KeyCode::Char('j'), Action::BookmarkNext),
+            (KeyCode::Char('k'), Action::BookmarkPrevious),
+            (KeyCode::Char('g'), Action::BookmarkFirst),
+            (KeyCode::Char('G'), Action::BookmarkLast),
+            (KeyCode::Enter, Action::BookmarkOpen),
+            (KeyCode::Char('d'), Action::BookmarkDelete),
+            (KeyCode::Char('b'), Action::ToggleBookmarks),
+            (KeyCode::Esc, Action::Cancel),
+            (KeyCode::Char('q'), Action::Quit),
+        ] {
+            assert_eq!(
+                resolve(Mode::Bookmarks, None, &press(code, NONE)),
+                Resolution::Action(action)
+            );
+        }
+        assert_eq!(
+            browse_key(KeyCode::Char('a'), NONE),
+            Resolution::Action(Action::AddBookmark)
+        );
+        assert_eq!(
+            browse_key(KeyCode::Char('b'), NONE),
+            Resolution::Action(Action::ToggleBookmarks)
+        );
+        for mode in [Mode::UrlInput, Mode::SearchInput, Mode::Field, Mode::Select] {
+            assert_ne!(
+                resolve(mode, None, &press(KeyCode::Char('a'), NONE)),
+                Resolution::Action(Action::AddBookmark)
+            );
+            assert_ne!(
+                resolve(mode, None, &press(KeyCode::Char('b'), NONE)),
+                Resolution::Action(Action::ToggleBookmarks)
+            );
+        }
     }
 
     #[test]

@@ -1,9 +1,12 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::browser::bookmarks::sanitize_title;
+use crate::browser::bookmarks::{
+    AddResult, Bookmarks, MAX_BOOKMARKS, MAX_URL_BYTES, sanitize_title, valid_url,
+};
 use crate::browser::error_page;
 use crate::browser::form;
 use crate::browser::fragment;
@@ -90,6 +93,9 @@ pub struct Effect {
     /// Tab-set operation resolved by the page's table-driven key handling.
     /// The outer browser owns the collection and applies it after this update.
     pub tab: Option<TabAction>,
+    /// An immutable bookmark snapshot for the event loop to submit through
+    /// the worker's short-lock handle.
+    pub bookmark_save: Option<(u64, Arc<[crate::browser::bookmarks::Bookmark]>)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -1360,6 +1366,14 @@ impl App {
             Action::CloseTab => tab_action(TabAction::Close),
             Action::NextTab => tab_action(TabAction::Next),
             Action::PreviousTab => tab_action(TabAction::Previous),
+            Action::AddBookmark
+            | Action::ToggleBookmarks
+            | Action::BookmarkNext
+            | Action::BookmarkPrevious
+            | Action::BookmarkFirst
+            | Action::BookmarkLast
+            | Action::BookmarkOpen
+            | Action::BookmarkDelete => Effect::default(),
             Action::ToggleDom => self.toggle_surface(Surface::Dom),
             Action::ToggleStyles => self.toggle_surface(Surface::Styles),
             Action::ToggleBoxes => self.toggle_surface(Surface::Boxes),
@@ -4702,6 +4716,20 @@ struct Tab {
     stale_size: bool,
 }
 
+#[derive(Debug)]
+enum BookmarkPersistence {
+    Loading {
+        available: bool,
+    },
+    Ready {
+        available: bool,
+        submitted: u64,
+        acknowledged: u64,
+        error: Option<String>,
+    },
+    ReadOnly(String),
+}
+
 /// One terminal browser session: ordered live pages, one active selection and
 /// one chrome surface. `App` remains the page state machine; this is the sole
 /// owner and router for the bounded tab set.
@@ -4715,6 +4743,13 @@ pub struct Browser {
     /// Tab whose Kitty placement bookkeeping matches the terminal-global
     /// image state.
     kitty_tab: Option<TabId>,
+    bookmarks: Bookmarks,
+    bookmark_library: bool,
+    bookmark_selected: Option<usize>,
+    bookmark_first_visible: usize,
+    bookmark_revision: u64,
+    bookmark_notice: Option<String>,
+    bookmark_persistence: BookmarkPersistence,
 }
 
 impl Browser {
@@ -4723,6 +4758,22 @@ impl Browser {
     }
 
     pub fn with_caps(w: u16, h: u16, kitty_graphics: bool) -> Browser {
+        Self::build(w, h, kitty_graphics, false, false)
+    }
+
+    /// Interactive construction begins visibly loading until its worker sends
+    /// the session-global load result. Tests and headless callers use
+    /// `with_caps`, which performs no persistence setup.
+    pub fn with_bookmark_persistence(
+        w: u16,
+        h: u16,
+        kitty_graphics: bool,
+        available: bool,
+    ) -> Browser {
+        Self::build(w, h, kitty_graphics, true, available)
+    }
+
+    fn build(w: u16, h: u16, kitty_graphics: bool, loading: bool, available: bool) -> Browser {
         let id = TabId(1);
         let session = BrowserSession::new();
         Browser {
@@ -4737,6 +4788,22 @@ impl Browser {
             active: 0,
             next_tab: 2,
             kitty_tab: Some(id),
+            bookmarks: Bookmarks::new(),
+            bookmark_library: false,
+            bookmark_selected: None,
+            bookmark_first_visible: 0,
+            bookmark_revision: 0,
+            bookmark_notice: None,
+            bookmark_persistence: if loading {
+                BookmarkPersistence::Loading { available }
+            } else {
+                BookmarkPersistence::Ready {
+                    available: false,
+                    submitted: 0,
+                    acknowledged: 0,
+                    error: None,
+                }
+            },
         }
     }
 
@@ -4749,13 +4816,20 @@ impl Browser {
     }
 
     pub fn update(&mut self, mut msg: Msg) -> Effect {
+        msg = match msg {
+            Msg::BookmarksLoaded(result) => return self.bookmarks_loaded(result),
+            Msg::BookmarksSaved { revision, result } => {
+                return self.bookmarks_saved(revision, result);
+            }
+            other => other,
+        };
         if let Some(page) = msg.page() {
             let Some(index) = self.tabs.iter().position(|tab| tab.id == page.tab) else {
                 return Effect::default();
             };
             let old_label = self.tabs[index].page.tab_label();
             let mut effect = self.tabs[index].page.update(msg);
-            if index != self.active {
+            if index != self.active || self.bookmark_library {
                 let page = &self.tabs[index].page;
                 self.tabs[index].stale_size =
                     page.layout_tree.is_some() && page.laid_out_size != Some(page.size);
@@ -4766,9 +4840,31 @@ impl Browser {
             return effect;
         }
 
+        if let Msg::Key(event) = &msg {
+            if self.bookmark_library {
+                return self.on_bookmark_key(event);
+            }
+            if self.tabs[self.active].page.accepts_browser_chrome_keys()
+                && let Resolution::Action(action) = keys::resolve(
+                    keys::Mode::Browse,
+                    self.tabs[self.active].page.pending,
+                    event,
+                )
+                && matches!(action, Action::AddBookmark | Action::ToggleBookmarks)
+            {
+                self.tabs[self.active].page.pending = None;
+                return match action {
+                    Action::AddBookmark => self.add_active_bookmark(),
+                    Action::ToggleBookmarks => self.open_bookmark_library(),
+                    _ => unreachable!(),
+                };
+            }
+        }
+
         match &mut msg {
             Msg::Resize(w, h) => {
                 self.size = (*w, *h);
+                self.keep_bookmark_visible();
                 let page_h = h.saturating_sub(1);
                 for (index, tab) in self.tabs.iter_mut().enumerate() {
                     if index != self.active {
@@ -4786,6 +4882,227 @@ impl Browser {
                 self.update_active(msg)
             }
             _ => self.update_active(msg),
+        }
+    }
+
+    fn bookmarks_loaded(&mut self, result: Result<Bookmarks, String>) -> Effect {
+        let available = match self.bookmark_persistence {
+            BookmarkPersistence::Loading { available } => available,
+            _ => return Effect::default(),
+        };
+        match result {
+            Ok(bookmarks) => {
+                self.bookmarks = bookmarks;
+                self.bookmark_selected = (!self.bookmarks.is_empty()).then_some(0);
+                self.bookmark_persistence = BookmarkPersistence::Ready {
+                    available,
+                    submitted: 0,
+                    acknowledged: 0,
+                    error: None,
+                };
+            }
+            Err(error) => {
+                self.bookmarks = Bookmarks::new();
+                self.bookmark_selected = None;
+                self.bookmark_persistence = BookmarkPersistence::ReadOnly(bounded(error));
+            }
+        }
+        redraw()
+    }
+
+    fn bookmarks_saved(&mut self, revision: u64, result: Result<(), String>) -> Effect {
+        let BookmarkPersistence::Ready {
+            submitted,
+            acknowledged,
+            error,
+            ..
+        } = &mut self.bookmark_persistence
+        else {
+            return Effect::default();
+        };
+        if revision < *acknowledged {
+            return Effect::default();
+        }
+        *acknowledged = revision;
+        if revision == *submitted {
+            *error = result.err().map(bounded);
+            return redraw();
+        }
+        Effect::default()
+    }
+
+    fn open_bookmark_library(&mut self) -> Effect {
+        self.bookmark_library = true;
+        self.bookmark_notice = None;
+        self.bookmark_selected = (!self.bookmarks.is_empty()).then_some(0);
+        self.bookmark_first_visible = 0;
+        redraw()
+    }
+
+    fn on_bookmark_key(&mut self, event: &KeyEvent) -> Effect {
+        let Resolution::Action(action) = keys::resolve(keys::Mode::Bookmarks, None, event) else {
+            return Effect::default();
+        };
+        self.bookmark_notice = None;
+        match action {
+            Action::Quit => Effect {
+                quit: true,
+                ..Effect::default()
+            },
+            Action::ToggleBookmarks | Action::Cancel => {
+                self.bookmark_library = false;
+                redraw()
+            }
+            Action::BookmarkNext => self.move_bookmark_selection(1),
+            Action::BookmarkPrevious => self.move_bookmark_selection(-1),
+            Action::BookmarkFirst => self.set_bookmark_selection(0),
+            Action::BookmarkLast => {
+                self.set_bookmark_selection(self.bookmarks.len().saturating_sub(1))
+            }
+            Action::BookmarkOpen => {
+                let Some(index) = self.bookmark_selected else {
+                    return Effect::default();
+                };
+                let Some(record) = self.bookmarks.records().get(index) else {
+                    return Effect::default();
+                };
+                let url = record.url.to_string();
+                self.bookmark_library = false;
+                self.tabs[self.active].page.navigate(url, true)
+            }
+            Action::BookmarkDelete => self.delete_selected_bookmark(),
+            _ => Effect::default(),
+        }
+    }
+
+    fn move_bookmark_selection(&mut self, delta: isize) -> Effect {
+        let Some(selected) = self.bookmark_selected else {
+            return Effect::default();
+        };
+        let last = self.bookmarks.len().saturating_sub(1);
+        let next = if delta < 0 {
+            selected.saturating_sub(delta.unsigned_abs())
+        } else {
+            selected.saturating_add(delta as usize).min(last)
+        };
+        self.set_bookmark_selection(next)
+    }
+
+    fn set_bookmark_selection(&mut self, selected: usize) -> Effect {
+        if self.bookmarks.is_empty() {
+            return Effect::default();
+        }
+        let selected = selected.min(self.bookmarks.len() - 1);
+        if self.bookmark_selected == Some(selected) {
+            return Effect::default();
+        }
+        self.bookmark_selected = Some(selected);
+        self.keep_bookmark_visible();
+        redraw()
+    }
+
+    fn keep_bookmark_visible(&mut self) {
+        let Some(selected) = self.bookmark_selected else {
+            self.bookmark_first_visible = 0;
+            return;
+        };
+        let rows = self.size.1.saturating_sub(3) as usize;
+        if rows == 0 {
+            self.bookmark_first_visible = selected;
+        } else if selected < self.bookmark_first_visible {
+            self.bookmark_first_visible = selected;
+        } else if selected >= self.bookmark_first_visible.saturating_add(rows) {
+            self.bookmark_first_visible = selected + 1 - rows;
+        }
+    }
+
+    fn add_active_bookmark(&mut self) -> Effect {
+        if matches!(
+            self.bookmark_persistence,
+            BookmarkPersistence::Loading { .. }
+        ) {
+            self.tabs[self.active].page.status_msg = Some("bookmarks are still loading".into());
+            return redraw();
+        }
+        let Some(url) = self.tabs[self.active].page.current_url() else {
+            self.tabs[self.active].page.status_msg = Some("blank page cannot be bookmarked".into());
+            return redraw();
+        };
+        if url.len() > MAX_URL_BYTES {
+            self.tabs[self.active].page.status_msg = Some("bookmark URL is too long".into());
+            return redraw();
+        }
+        if !valid_url(&url) {
+            self.tabs[self.active].page.status_msg =
+                Some("only HTTP(S) pages can be bookmarked".into());
+            return redraw();
+        }
+        let title = self.tabs[self.active].page.tab_label();
+        match self.bookmarks.add(Arc::from(url), Arc::from(title)) {
+            AddResult::Duplicate => {
+                self.tabs[self.active].page.status_msg = Some("already bookmarked".into());
+                redraw()
+            }
+            AddResult::Full => {
+                self.tabs[self.active].page.status_msg =
+                    Some(format!("bookmark limit ({MAX_BOOKMARKS})"));
+                redraw()
+            }
+            AddResult::Added => {
+                self.tabs[self.active].page.status_msg = Some("bookmarked".into());
+                self.bookmark_selected = Some(0);
+                self.bookmark_first_visible = 0;
+                self.bookmark_mutated()
+            }
+        }
+    }
+
+    fn delete_selected_bookmark(&mut self) -> Effect {
+        if matches!(
+            self.bookmark_persistence,
+            BookmarkPersistence::Loading { .. }
+        ) {
+            self.bookmark_notice = Some("bookmarks are still loading".into());
+            return redraw();
+        }
+        let Some(selected) = self.bookmark_selected else {
+            return Effect::default();
+        };
+        if self.bookmarks.remove(selected).is_none() {
+            return Effect::default();
+        }
+        self.bookmark_selected = if self.bookmarks.is_empty() {
+            None
+        } else {
+            Some(selected.min(self.bookmarks.len() - 1))
+        };
+        self.keep_bookmark_visible();
+        self.bookmark_notice = Some("bookmark deleted".into());
+        self.bookmark_mutated()
+    }
+
+    fn bookmark_mutated(&mut self) -> Effect {
+        let Some(revision) = self.bookmark_revision.checked_add(1) else {
+            self.bookmark_notice = Some("bookmark revision space exhausted".into());
+            return redraw();
+        };
+        self.bookmark_revision = revision;
+        let mut save = None;
+        if let BookmarkPersistence::Ready {
+            available: true,
+            submitted,
+            error,
+            ..
+        } = &mut self.bookmark_persistence
+        {
+            *submitted = revision;
+            *error = None;
+            save = Some((revision, self.bookmarks.snapshot()));
+        }
+        Effect {
+            dirty: true,
+            bookmark_save: save,
+            ..Effect::default()
         }
     }
 
@@ -4875,9 +5192,104 @@ impl Browser {
     pub fn draw(&self, frame: &mut Frame) {
         frame.clear();
         self.draw_tab_strip(frame);
+        if self.bookmark_library {
+            self.draw_bookmark_library(frame);
+            return;
+        }
         let mut page = Frame::new(frame.width(), frame.height().saturating_sub(1));
         self.tabs[self.active].page.draw(&mut page);
         frame.blit_rows(&page, 1);
+    }
+
+    fn draw_bookmark_library(&self, frame: &mut Frame) {
+        if frame.height() <= 1 || frame.width() == 0 {
+            return;
+        }
+        frame.put_str(0, 1, "yata — bookmarks", Style::default());
+        let hint = help::compact_hint(keys::Mode::Bookmarks);
+        let title_width = "yata — bookmarks".width() as u16;
+        if title_width.saturating_add(3) < frame.width() {
+            frame.put_str(title_width + 3, 1, &hint, Style::default());
+        }
+        let status_row = frame.height().saturating_sub(1);
+        let record_rows = frame.height().saturating_sub(3) as usize;
+        if self.bookmarks.is_empty() && record_rows > 0 {
+            let empty = if matches!(
+                self.bookmark_persistence,
+                BookmarkPersistence::Loading { .. }
+            ) {
+                "loading bookmarks…"
+            } else {
+                "no bookmarks yet"
+            };
+            frame.put_str(0, 2, empty, Style::default());
+        } else {
+            for (row, (index, record)) in self
+                .bookmarks
+                .records()
+                .iter()
+                .enumerate()
+                .skip(self.bookmark_first_visible)
+                .enumerate()
+                .take(record_rows)
+            {
+                let y = 2 + row as u16;
+                let style = if self.bookmark_selected == Some(index) {
+                    reversed()
+                } else {
+                    Style::default()
+                };
+                if self.bookmark_selected == Some(index) {
+                    for x in 0..frame.width() {
+                        frame.set(x, y, Cell::new(' ', style));
+                    }
+                }
+                let mut line = String::with_capacity(
+                    record
+                        .title
+                        .len()
+                        .saturating_add(record.url.len())
+                        .saturating_add(3),
+                );
+                line.push_str(&record.title);
+                line.push_str(" — ");
+                line.push_str(&record.url);
+                frame.put_str(0, y, &line, style);
+            }
+        }
+        if status_row > 1 {
+            let left = format!(
+                "{} bookmark{}",
+                self.bookmarks.len(),
+                if self.bookmarks.len() == 1 { "" } else { "s" }
+            );
+            let middle = self.bookmark_status();
+            let row = statusline::compose(frame.width() as usize, &left, &middle, "");
+            frame.put_str(0, status_row, &row, reversed());
+        }
+    }
+
+    fn bookmark_status(&self) -> String {
+        if let Some(notice) = &self.bookmark_notice {
+            return notice.clone();
+        }
+        match &self.bookmark_persistence {
+            BookmarkPersistence::Loading { .. } => "loading bookmarks".into(),
+            BookmarkPersistence::ReadOnly(error) => format!("read-only · {error}"),
+            BookmarkPersistence::Ready {
+                available: false, ..
+            } => "persistence unavailable".into(),
+            BookmarkPersistence::Ready {
+                error: Some(error), ..
+            } => format!("unsaved · {error}"),
+            BookmarkPersistence::Ready {
+                submitted,
+                acknowledged,
+                error: None,
+                ..
+            } if submitted > acknowledged => "saving bookmarks".into(),
+            BookmarkPersistence::Ready { .. } => "saved".into(),
+        }
     }
 
     fn draw_tab_strip(&self, frame: &mut Frame) {
@@ -4961,6 +5373,10 @@ impl Browser {
 }
 
 impl App {
+    fn accepts_browser_chrome_keys(&self) -> bool {
+        matches!(self.mode, Mode::Browse) && self.hint.is_none()
+    }
+
     fn tab_label(&self) -> String {
         if let Some(dom) = &self.dom {
             for raw in 0..dom.node_count() {
@@ -4983,6 +5399,19 @@ impl App {
             .and_then(|url| url.host_str().map(str::to_string))
             .unwrap_or_else(|| sanitize_title(&url))
     }
+}
+
+fn bounded(mut message: String) -> String {
+    let at = message
+        .char_indices()
+        .map(|(at, _)| at)
+        .take_while(|at| *at <= 1_024)
+        .last()
+        .unwrap_or(0);
+    if message.len() > 1_024 {
+        message.truncate(at);
+    }
+    message
 }
 
 fn collect_text(dom: &Dom, node: NodeId, out: &mut String) {
@@ -5533,6 +5962,102 @@ mod tests {
 
     fn ch(c: char) -> Msg {
         key(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    fn set_browser_page(browser: &mut Browser, index: usize, url: &str, title: &str) {
+        browser.tabs[index].page.fetch = Fetch::Loaded {
+            url: url.into(),
+            status: 200,
+            body: Vec::new(),
+        };
+        browser.tabs[index].page.dom = Some(crate::html::parse(&format!(
+            "<title>{title}</title><p>page</p>"
+        )));
+    }
+
+    #[test]
+    fn bookmarks_load_mutate_globally_and_open_through_active_history() {
+        let mut browser = Browser::with_bookmark_persistence(60, 8, false, true);
+        set_browser_page(&mut browser, 0, "https://a.test/#citation", "  A\n title  ");
+        let generation_a = browser.tabs[0].page.fetch_gen;
+        let refused = browser.update(ch('a'));
+        assert!(refused.bookmark_save.is_none());
+        assert_eq!(browser.bookmarks.len(), 0);
+        assert_eq!(
+            browser.tabs[0].page.status_msg.as_deref(),
+            Some("bookmarks are still loading")
+        );
+
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        let save = browser.update(ch('a')).bookmark_save.unwrap();
+        assert_eq!(save.0, 1);
+        assert_eq!(save.1[0].url.as_ref(), "https://a.test/#citation");
+        assert_eq!(save.1[0].title.as_ref(), "A title");
+        browser.update(ch('b'));
+        assert!(browser.bookmark_library);
+        assert_eq!(
+            browser.update(ch('t')),
+            Effect::default(),
+            "tab key leaked through modal chrome"
+        );
+        browser.update(ch('b'));
+
+        browser.update(ch('t'));
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        set_browser_page(&mut browser, 1, "https://b.test/", "B");
+        browser.update(ch('b'));
+        let effect = browser.update(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!browser.bookmark_library);
+        let opened = effect.fetch.unwrap();
+        assert_eq!(opened.1.url, "https://a.test/#citation");
+        assert!(browser.tabs[1].page.history.can_back());
+        assert_eq!(browser.tabs[0].page.fetch_gen, generation_a);
+        assert_eq!(browser.bookmarks.len(), 1);
+    }
+
+    #[test]
+    fn bookmark_selection_scroll_delete_and_stale_save_status_are_bounded() {
+        let mut browser = Browser::with_bookmark_persistence(24, 5, false, true);
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        for n in 0..5 {
+            set_browser_page(
+                &mut browser,
+                0,
+                &format!("https://example.test/{n}"),
+                &format!("猫 {n}"),
+            );
+            assert!(browser.update(ch('a')).bookmark_save.is_some());
+        }
+        browser.update(ch('b'));
+        browser.update(ch('G'));
+        assert_eq!(browser.bookmark_selected, Some(4));
+        assert_eq!(browser.bookmark_first_visible, 3);
+        browser.update(ch('d'));
+        assert_eq!(browser.bookmark_selected, Some(3));
+        assert_eq!(browser.bookmarks.len(), 4);
+
+        let newest = browser.bookmark_revision;
+        browser.update(Msg::BookmarksSaved {
+            revision: newest - 1,
+            result: Ok(()),
+        });
+        assert_eq!(browser.bookmark_status(), "bookmark deleted");
+        browser.bookmark_notice = None;
+        assert_eq!(browser.bookmark_status(), "saving bookmarks");
+        browser.update(Msg::BookmarksSaved {
+            revision: newest,
+            result: Err("disk failed".into()),
+        });
+        assert!(browser.bookmark_status().contains("unsaved"));
+
+        for (w, h) in [(0, 0), (1, 1), (2, 2), (24, 5)] {
+            browser.update(Msg::Resize(w, h));
+            let mut frame = Frame::new(w, h);
+            browser.draw(&mut frame);
+            if h > 1 && w > 0 {
+                assert!(row_text(&frame, 1).starts_with('y'));
+            }
+        }
     }
 
     #[test]

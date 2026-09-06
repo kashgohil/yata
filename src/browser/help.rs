@@ -25,6 +25,14 @@ pub fn action_help(action: Action) -> &'static str {
         Action::CloseTab => "close tab",
         Action::NextTab => "next tab",
         Action::PreviousTab => "previous tab",
+        Action::AddBookmark => "add bookmark",
+        Action::ToggleBookmarks => "bookmark library",
+        Action::BookmarkNext => "next bookmark",
+        Action::BookmarkPrevious => "previous bookmark",
+        Action::BookmarkFirst => "first bookmark",
+        Action::BookmarkLast => "last bookmark",
+        Action::BookmarkOpen => "open bookmark",
+        Action::BookmarkDelete => "delete bookmark",
         Action::ToggleDom => "DOM inspector",
         Action::ToggleStyles => "styles inspector",
         Action::ToggleBoxes => "box inspector",
@@ -89,6 +97,9 @@ pub fn help_text() -> String {
     lines.extend(heading("Select — Enter chooses, Esc stops"));
     lines.extend(section_lines(Mode::Select));
     lines.push(String::new());
+    lines.extend(heading("Bookmarks"));
+    lines.extend(section_lines(Mode::Bookmarks));
+    lines.push(String::new());
     lines.push("Press ? or Esc to close.".into());
     lines.join("\n")
 }
@@ -125,6 +136,27 @@ fn section_lines(mode: Mode) -> Vec<String> {
         out.push(format!("  {:<22} {}", keys, action_help(*action)));
     }
     out
+}
+
+/// A chrome surface can stay terse while deriving its chords and wording from
+/// the same table as the full help overlay.
+pub fn compact_hint(mode: Mode) -> String {
+    let mut groups: Vec<(Action, Vec<String>)> = Vec::new();
+    for binding in keys::BINDINGS.iter().filter(|binding| binding.mode == mode) {
+        if let Some((_, chords)) = groups
+            .iter_mut()
+            .find(|(action, _)| *action == binding.action)
+        {
+            chords.push(format_binding(binding));
+        } else {
+            groups.push((binding.action, vec![format_binding(binding)]));
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(action, chords)| format!("{} {}", chords.join("/"), action_help(action)))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn format_binding(b: &Binding) -> String {
@@ -241,5 +273,21 @@ mod tests {
             assert!(text.contains(&format_binding(b)), "{:?}\n{text}", b.action);
             assert!(text.contains(action_help(b.action)), "{text}");
         }
+    }
+
+    #[test]
+    fn help_and_compact_hint_include_bookmarks_from_the_table() {
+        let text = help_text();
+        assert!(text.contains("Bookmarks"));
+        for binding in keys::BINDINGS
+            .iter()
+            .filter(|binding| binding.mode == Mode::Bookmarks)
+        {
+            assert!(text.contains(&format_binding(binding)));
+            assert!(text.contains(action_help(binding.action)));
+        }
+        let hint = compact_hint(Mode::Bookmarks);
+        assert!(hint.contains("open bookmark"));
+        assert!(hint.contains("delete bookmark"));
     }
 }

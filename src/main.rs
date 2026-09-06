@@ -7,6 +7,8 @@ use crossterm::event::{self, Event};
 use crossterm::terminal;
 
 use yata::browser::app::{self, App, Browser, DocumentWork, Effect};
+use yata::browser::bookmark_worker::BookmarkWorker;
+use yata::browser::bookmarks;
 use yata::browser::{error_page, yank};
 use yata::js::console::Console;
 use yata::msg::Msg;
@@ -67,7 +69,7 @@ fn main() -> io::Result<()> {
         default_hook(info);
     }));
 
-    let _screen = term::Screen::new()?;
+    let screen = term::Screen::new()?;
 
     if panic_requested {
         panic!("deliberate panic via --panic; the terminal should be restored");
@@ -75,10 +77,15 @@ fn main() -> io::Result<()> {
 
     let (w, h) = terminal::size()?;
     let caps = term::detect_caps_from_env();
-    let mut renderer = Renderer::new(w, h, caps);
-    let mut app = Browser::with_caps(w, h, caps.kitty);
-
     let (tx, rx) = mpsc::channel();
+    let bookmark_path = bookmarks::resolve_path(
+        env::var("YATA_BOOKMARKS_PATH").ok().as_deref(),
+        env::var("XDG_DATA_HOME").ok().as_deref(),
+        env::var("HOME").ok().as_deref(),
+    );
+    let bookmark_worker = BookmarkWorker::spawn(bookmark_path.clone(), tx.clone());
+    let mut renderer = Renderer::new(w, h, caps);
+    let mut app = Browser::with_bookmark_persistence(w, h, caps.kitty, bookmark_path.is_some());
     if let Some(url) = url {
         // Scheme defaulting for the CLI argument goes through the same helper
         // the URL bar uses. The id makes any previous generation stale; each
@@ -110,6 +117,9 @@ fn main() -> io::Result<()> {
     while let Ok(first) = rx.recv() {
         let batch = iter::once(first).chain(iter::from_fn(|| rx.try_recv().ok()));
         let effect = apply_batch(&mut app, batch);
+        if let Some((revision, records)) = effect.bookmark_save.clone() {
+            bookmark_worker.submit(revision, records);
+        }
         if effect.quit {
             break;
         }
@@ -187,6 +197,8 @@ fn main() -> io::Result<()> {
             render(&mut app, &mut renderer, &mut out)?;
         }
     }
+    drop(screen);
+    bookmark_worker.shutdown();
     Ok(())
 }
 
@@ -710,6 +722,9 @@ fn apply_batch(app: &mut impl UiApp, msgs: impl Iterator<Item = Msg>) -> Effect 
         }
         if e.tab.is_some() {
             effect.tab = e.tab;
+        }
+        if e.bookmark_save.is_some() {
+            effect.bookmark_save = e.bookmark_save;
         }
         if e.quit {
             effect.quit = true;
