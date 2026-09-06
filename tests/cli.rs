@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use unicode_width::UnicodeWidthStr;
 
@@ -72,6 +73,44 @@ fn yata(args: &[&str]) -> Output {
         .args(args)
         .output()
         .expect("failed to run the yata binary")
+}
+
+#[test]
+fn every_headless_mode_ignores_the_bookmark_path() {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    for mode in [
+        "--dump",
+        "--dump-dom",
+        "--dump-text",
+        "--dump-boxes",
+        "--dump-js",
+        "--timing",
+    ] {
+        let addr = serve_once(response_with_body("200 OK", b"<p>headless</p>"));
+        let path = std::env::temp_dir()
+            .join(format!(
+                "yata-headless-bookmarks-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ))
+            .join("never/bookmarks");
+        let output = Command::new(env!("CARGO_BIN_EXE_yata"))
+            .env("YATA_BOOKMARKS_PATH", &path)
+            .args([mode, &format!("http://{addr}/")])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!path.exists(), "{mode} created the bookmark file");
+        assert!(
+            !path.parent().unwrap().exists(),
+            "{mode} created bookmark directories"
+        );
+    }
 }
 
 #[test]

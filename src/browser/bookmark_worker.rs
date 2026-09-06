@@ -29,11 +29,35 @@ pub struct BookmarkWorker {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(test)]
+struct SaveGate {
+    released: Mutex<bool>,
+    wake: Condvar,
+    entered: Sender<()>,
+}
+
 impl BookmarkWorker {
     pub fn spawn(path: Option<PathBuf>, events: Sender<Msg>) -> Self {
+        Self::spawn_inner(path, events, None)
+    }
+
+    fn spawn_inner(
+        path: Option<PathBuf>,
+        events: Sender<Msg>,
+        #[cfg(test)] gate: Option<Arc<SaveGate>>,
+        #[cfg(not(test))] _gate: Option<()>,
+    ) -> Self {
         let shared = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let worker_shared = Arc::clone(&shared);
-        let thread = thread::spawn(move || run(path, events, worker_shared));
+        let thread = thread::spawn(move || {
+            run(
+                path,
+                events,
+                worker_shared,
+                #[cfg(test)]
+                gate,
+            )
+        });
         Self {
             shared,
             thread: Some(thread),
@@ -64,7 +88,12 @@ impl BookmarkWorker {
     }
 }
 
-fn run(path: Option<PathBuf>, events: Sender<Msg>, shared: Arc<(Mutex<State>, Condvar)>) {
+fn run(
+    path: Option<PathBuf>,
+    events: Sender<Msg>,
+    shared: Arc<(Mutex<State>, Condvar)>,
+    #[cfg(test)] gate: Option<Arc<SaveGate>>,
+) {
     let loaded = match &path {
         Some(path) => load(path),
         None => Ok(Bookmarks::new()),
@@ -88,6 +117,14 @@ fn run(path: Option<PathBuf>, events: Sender<Msg>, shared: Arc<(Mutex<State>, Co
             }
         };
         let Some(save) = save else { break };
+        #[cfg(test)]
+        if let Some(gate) = &gate {
+            let _ = gate.entered.send(());
+            let mut released = gate.released.lock().unwrap();
+            while !*released {
+                released = gate.wake.wait(released).unwrap();
+            }
+        }
         let result = if writable {
             save_atomic(
                 path.as_ref().expect("writable worker has a path"),
@@ -293,6 +330,79 @@ mod tests {
             load(&path).unwrap().records(),
             &[record("https://three.test/", "Three")]
         );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn blocked_first_write_coalesces_pending_revisions_to_the_latest() {
+        let path = temp_path("bookmarks");
+        let (tx, rx) = mpsc::channel();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let gate = Arc::new(SaveGate {
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+            entered: entered_tx,
+        });
+        let worker = BookmarkWorker::spawn_inner(Some(path.clone()), tx, Some(Arc::clone(&gate)));
+        let _ = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.submit(1, Arc::from([record("https://one.test/", "One")]));
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.submit(2, Arc::from([record("https://two.test/", "Two")]));
+        worker.submit(3, Arc::from([record("https://three.test/", "Three")]));
+        *gate.released.lock().unwrap() = true;
+        gate.wake.notify_one();
+
+        let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(
+            first,
+            Msg::BookmarksSaved {
+                revision: 1,
+                result: Ok(())
+            }
+        ));
+        assert!(matches!(
+            second,
+            Msg::BookmarksSaved {
+                revision: 3,
+                result: Ok(())
+            }
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "revision 2 was written instead of coalesced"
+        );
+        worker.shutdown();
+        assert_eq!(
+            load(&path).unwrap().records(),
+            &[record("https://three.test/", "Three")]
+        );
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn temporary_open_failure_preserves_the_last_good_named_file() {
+        let path = temp_path("bookmarks");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = bookmarks::encode(&[record("https://old.test/", "Old")]).unwrap();
+        fs::write(&path, &old).unwrap();
+        fs::create_dir(temporary_path(&path)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let worker = BookmarkWorker::spawn(Some(path.clone()), tx);
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Msg::BookmarksLoaded(Ok(_))
+        ));
+        worker.submit(1, Arc::from([record("https://new.test/", "New")]));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Msg::BookmarksSaved {
+                revision: 1,
+                result: Err(_)
+            }
+        ));
+        worker.shutdown();
+        assert_eq!(fs::read(&path).unwrap(), old);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }
