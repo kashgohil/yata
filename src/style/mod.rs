@@ -324,7 +324,6 @@ pub fn style_tree_with(dom: &Dom, sheets: &[&Stylesheet], ctx: &StyleContext<'_>
 pub fn style_reader_tree_with(dom: &Dom, included: &[bool], ctx: &StyleContext<'_>) -> Styles {
     debug_assert_eq!(included.len(), dom.node_count());
     let ua = RuleIndex::build(&[ua_stylesheet()]);
-    let author = RuleIndex::build(&[]);
     let excluded = ComputedStyle {
         display: Display::None,
         hidden_by_ua: true,
@@ -336,16 +335,7 @@ pub fn style_reader_tree_with(dom: &Dom, included: &[bool], ctx: &StyleContext<'
         nodes_styled: 0,
     };
     if included.get(dom.root.0 as usize).copied().unwrap_or(false) {
-        resolve_projected(
-            dom,
-            dom.root,
-            &ComputedStyle::default(),
-            &ua,
-            &author,
-            ctx,
-            included,
-            &mut styles,
-        );
+        resolve_projected(dom, dom.root, &ua, ctx, included, &mut styles);
     }
     styles
 }
@@ -354,12 +344,37 @@ pub fn style_reader_tree_with(dom: &Dom, included: &[bool], ctx: &StyleContext<'
 fn resolve_projected(
     dom: &Dom,
     node: NodeId,
-    parent: &ComputedStyle,
     ua: &RuleIndex<'_>,
-    author: &RuleIndex<'_>,
     ctx: &StyleContext<'_>,
     included: &[bool],
     out: &mut Styles,
+) {
+    let mut entries = Vec::new();
+    let mut slots = Vec::new();
+    resolve_projected_from(
+        dom,
+        node,
+        &ComputedStyle::default(),
+        ua,
+        ctx,
+        included,
+        out,
+        &mut entries,
+        &mut slots,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_projected_from<'a>(
+    dom: &Dom,
+    node: NodeId,
+    parent: &ComputedStyle,
+    ua: &RuleIndex<'a>,
+    ctx: &StyleContext<'_>,
+    included: &[bool],
+    out: &mut Styles,
+    entries: &mut Vec<Entry<'a>>,
+    slots: &mut Vec<usize>,
 ) {
     if !included.get(node.0 as usize).copied().unwrap_or(false) {
         return;
@@ -369,13 +384,55 @@ fn resolve_projected(
         out.nodes_styled += 1;
     }
     let computed = match &dom.node(node).data {
-        NodeData::Element { .. } => cascade(dom, node, parent, ua, author, ctx),
+        NodeData::Element { .. } => cascade_ua(dom, node, parent, ua, ctx, entries, slots),
         _ => parent.inherit(),
     };
     out.computed[node.0 as usize] = computed.clone();
     for child in dom.children(node) {
-        resolve_projected(dom, child, &computed, ua, author, ctx, included, out);
+        resolve_projected_from(
+            dom, child, &computed, ua, ctx, included, out, entries, slots,
+        );
     }
+}
+
+/// Reader presentation has one origin: the UA sheet. Keeping its scratch
+/// vector across the projected walk avoids one allocation per element and,
+/// importantly, never admits inline author declarations into reader mode.
+fn cascade_ua<'a>(
+    dom: &Dom,
+    node: NodeId,
+    parent: &ComputedStyle,
+    ua: &RuleIndex<'a>,
+    ctx: &StyleContext<'_>,
+    entries: &mut Vec<Entry<'a>>,
+    slots: &mut Vec<usize>,
+) -> ComputedStyle {
+    entries.clear();
+    ua.for_each_match(dom, node, ctx, slots, |candidate| {
+        let specificity = candidate.selector.specificity();
+        for declaration in candidate.declarations {
+            entries.push(Entry {
+                rank: if declaration.important {
+                    Rank::UaImportant
+                } else {
+                    Rank::UaNormal
+                },
+                specificity,
+                order: candidate.order,
+                declaration,
+            });
+        }
+    });
+    entries.sort_by_key(|entry| (entry.rank, entry.specificity, entry.order));
+
+    let mut computed = parent.inherit();
+    for entry in entries.iter() {
+        let applied = apply(&mut computed, entry.declaration);
+        if applied && entry.declaration.name == "display" {
+            computed.hidden_by_ua = entry.rank == Rank::UaImportant;
+        }
+    }
+    computed
 }
 
 /// Recompute `roots` and everything under them, in place, leaving every other

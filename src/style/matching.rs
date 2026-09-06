@@ -87,14 +87,34 @@ impl<'a> RuleIndex<'a> {
     /// Candidates that match `node`, in sheet order. Only the buckets this
     /// element can fall into are tested.
     pub fn matches(&self, dom: &Dom, node: NodeId, ctx: &StyleContext<'_>) -> Vec<&Candidate<'a>> {
-        let mut slots = self.universal.clone();
+        let mut slots = Vec::new();
+        let mut matches = Vec::new();
+        self.for_each_match(dom, node, ctx, &mut slots, |candidate| {
+            matches.push(candidate)
+        });
+        matches
+    }
+
+    /// Visit matching candidates while reusing the caller's slot buffer.
+    /// Reader mode resolves thousands of elements against one tiny UA index;
+    /// allocating two vectors for each of them costs more than matching does.
+    pub(crate) fn for_each_match<'s>(
+        &'s self,
+        dom: &Dom,
+        node: NodeId,
+        ctx: &StyleContext<'_>,
+        slots: &mut Vec<usize>,
+        mut visit: impl FnMut(&'s Candidate<'a>),
+    ) {
+        slots.clear();
+        slots.extend_from_slice(&self.universal);
         if let NodeData::Element { tag, .. } = &dom.node(node).data {
             if let Some(bucket) = self.by_tag.get(tag.as_str()) {
                 slots.extend_from_slice(bucket);
             }
         } else {
             // Only elements match selectors; text nodes inherit instead.
-            return Vec::new();
+            return;
         }
         if let Some(id) = dom.attr(node, "id")
             && let Some(bucket) = self.by_id.get(id)
@@ -110,11 +130,12 @@ impl<'a> RuleIndex<'a> {
         // duplicate declaration is a duplicate cascade entry.
         slots.sort_unstable();
         slots.dedup();
-        slots
-            .into_iter()
-            .map(|slot| &self.candidates[slot])
-            .filter(|c| matches(dom, node, c.selector, ctx))
-            .collect()
+        for &slot in slots.iter() {
+            let candidate = &self.candidates[slot];
+            if matches(dom, node, candidate.selector, ctx) {
+                visit(candidate);
+            }
+        }
     }
 
     /// The same answer, computed by testing every rule: the oracle for the

@@ -376,10 +376,16 @@ fn pruned(dom: &Dom, styles: &Styles, id: NodeId, article_context: bool) -> bool
 }
 
 fn pruned_role(role: &str) -> bool {
-    matches!(
-        role.trim().to_ascii_lowercase().as_str(),
-        "navigation" | "complementary" | "banner" | "contentinfo" | "dialog"
-    )
+    let role = role.trim();
+    [
+        "navigation",
+        "complementary",
+        "banner",
+        "contentinfo",
+        "dialog",
+    ]
+    .iter()
+    .any(|candidate| role.eq_ignore_ascii_case(candidate))
 }
 
 fn tag(dom: &Dom, id: NodeId) -> Option<&str> {
