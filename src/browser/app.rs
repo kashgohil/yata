@@ -6072,6 +6072,13 @@ mod tests {
         );
 
         browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        js::cookies::apply_set_cookie(
+            &browser.session.cookies,
+            "https://a.test/",
+            &["sid=shared; Path=/".into()],
+            js::cookies::now(),
+            &browser.tabs[0].page.console,
+        );
         let save = browser.update(ch('a')).bookmark_save.unwrap();
         assert_eq!(save.0, 1);
         assert_eq!(save.1[0].url.as_ref(), "https://a.test/#citation");
@@ -6093,9 +6100,26 @@ mod tests {
         assert!(!browser.bookmark_library);
         let opened = effect.fetch.unwrap();
         assert_eq!(opened.1.url, "https://a.test/#citation");
+        assert_eq!(opened.1.cookie.as_deref(), Some("sid=shared"));
         assert!(browser.tabs[1].page.history.can_back());
         assert_eq!(browser.tabs[0].page.fetch_gen, generation_a);
         assert_eq!(browser.bookmarks.len(), 1);
+
+        browser.update(ch('g'));
+        browser.update(ch('T'));
+        browser.update(ch('x'));
+        assert_eq!(browser.tabs.len(), 1);
+        assert_eq!(
+            browser.bookmarks.len(),
+            1,
+            "closing the source tab lost the bookmark"
+        );
+        browser.update(ch('b'));
+        browser.update(ch('d'));
+        assert!(
+            browser.bookmarks.is_empty(),
+            "deletion in the remaining tab was not global"
+        );
     }
 
     #[test]
@@ -6280,6 +6304,36 @@ mod tests {
         for y in 0..frame.height() {
             assert_ne!(frame.get(frame.width() - 1, y).ch, '\0');
         }
+    }
+
+    #[test]
+    fn library_frame_exposes_empty_loading_saving_and_error_states() {
+        let mut browser = Browser::with_bookmark_persistence(60, 6, false, true);
+        browser.update(ch('b'));
+        let mut frame = Frame::new(60, 6);
+        browser.draw(&mut frame);
+        assert!(row_text(&frame, 2).contains("loading bookmarks"));
+        assert!(row_text(&frame, 5).contains("loading bookmarks"));
+
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        browser.draw(&mut frame);
+        assert!(row_text(&frame, 2).contains("no bookmarks"));
+        assert!(row_text(&frame, 5).contains("0 bookmarks"));
+        browser.update(ch('b'));
+        set_browser_page(&mut browser, 0, "https://one.test/", "One");
+        let revision = browser.update(ch('a')).bookmark_save.unwrap().0;
+        browser.update(ch('b'));
+        browser.draw(&mut frame);
+        assert!(row_text(&frame, 5).contains("saving bookmarks"));
+        assert!(frame.get(0, 2).attrs.contains(Attrs::REVERSE));
+
+        browser.update(Msg::BookmarksSaved {
+            revision,
+            result: Err("permission denied".into()),
+        });
+        browser.draw(&mut frame);
+        assert!(row_text(&frame, 5).contains("unsaved"));
+        assert!(row_text(&frame, 5).contains("permission denied"));
     }
 
     #[test]
