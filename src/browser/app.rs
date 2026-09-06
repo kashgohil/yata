@@ -2713,10 +2713,14 @@ impl App {
 
     /// Current page URL if one is known (loaded, loading, or failed).
     fn current_url(&self) -> Option<String> {
+        self.current_url_ref().map(str::to_string)
+    }
+
+    fn current_url_ref(&self) -> Option<&str> {
         match &self.fetch {
             Fetch::Idle => None,
             Fetch::Loading { url, .. } | Fetch::Loaded { url, .. } | Fetch::Failed { url, .. } => {
-                Some(url.clone())
+                Some(url)
             }
         }
     }
@@ -5089,6 +5093,8 @@ struct Tab {
     id: TabId,
     page: App,
     stale_size: bool,
+    checkpoint_url: Option<Arc<str>>,
+    checkpoint_scroll: u32,
 }
 
 #[derive(Debug)]
@@ -5124,7 +5130,7 @@ enum SessionPersistence {
 struct SessionFingerprint {
     active: usize,
     tabs: usize,
-    url: Option<String>,
+    url: Option<Arc<str>>,
     scroll: u32,
     generation: u64,
 }
@@ -5212,6 +5218,8 @@ impl Browser {
                 id,
                 page: App::with_session(w, h.saturating_sub(1), kitty_graphics, id, &session),
                 stale_size: false,
+                checkpoint_url: None,
+                checkpoint_scroll: 0,
             }],
             session,
             active: 0,
@@ -5260,6 +5268,7 @@ impl Browser {
 
     pub fn start_navigation(&mut self, url: String) -> Effect {
         let effect = self.tabs[self.active].page.start_navigation(url);
+        self.sync_tab_projection(self.active);
         self.session_untouched = false;
         self.session_mutated(effect)
     }
@@ -5302,7 +5311,8 @@ impl Browser {
                     old_label != self.tabs[index].page.tab_label() && self.tab_is_visible(index);
             }
             effect.tab = None;
-            if before.is_some_and(|before| before != self.page_fingerprint(index)) {
+            if before.is_some_and(|before| self.page_projection_changed(index, &before)) {
+                self.sync_tab_projection(index);
                 self.session_untouched = false;
                 return self.session_mutated(effect);
             }
@@ -5367,19 +5377,44 @@ impl Browser {
         SessionFingerprint {
             active: self.active,
             tabs: self.tabs.len(),
-            url: page.current_url(),
-            scroll: page.session_scroll(),
+            url: self.tabs[self.active].checkpoint_url.clone(),
+            scroll: self.tabs[self.active].checkpoint_scroll,
             generation: page.fetch_gen,
         }
     }
 
-    fn page_fingerprint(&self, index: usize) -> (Option<String>, u32, u64) {
+    fn page_fingerprint(&self, index: usize) -> (Option<Arc<str>>, u32, u64) {
+        let tab = &self.tabs[index];
+        (
+            tab.checkpoint_url.clone(),
+            tab.checkpoint_scroll,
+            tab.page.fetch_gen,
+        )
+    }
+
+    fn page_projection_changed(&self, index: usize, before: &(Option<Arc<str>>, u32, u64)) -> bool {
         let page = &self.tabs[index].page;
-        (page.current_url(), page.session_scroll(), page.fetch_gen)
+        before.0.as_deref() != page.current_url_ref()
+            || before.1 != page.session_scroll()
+            || before.2 != page.fetch_gen
+    }
+
+    fn sync_tab_projection(&mut self, index: usize) {
+        let tab = &mut self.tabs[index];
+        tab.checkpoint_url = tab.page.current_url_ref().map(Arc::from);
+        tab.checkpoint_scroll = tab.page.session_scroll();
     }
 
     fn finish_session_input(&mut self, before: SessionFingerprint, effect: Effect) -> Effect {
-        if effect.quit || before != self.session_fingerprint() {
+        let active_page = &self.tabs[self.active].page;
+        let changed = effect.quit
+            || before.active != self.active
+            || before.tabs != self.tabs.len()
+            || before.url.as_deref() != active_page.current_url_ref()
+            || before.scroll != active_page.session_scroll()
+            || before.generation != active_page.fetch_gen;
+        if changed {
+            self.sync_tab_projection(self.active);
             self.session_untouched = false;
             self.session_mutated(effect)
         } else {
@@ -5392,8 +5427,8 @@ impl Browser {
             .tabs
             .iter()
             .map(|tab| SessionTab {
-                url: tab.page.current_url().map(Arc::from),
-                scroll: tab.page.session_scroll(),
+                url: tab.checkpoint_url.clone(),
+                scroll: tab.checkpoint_scroll,
             })
             .collect();
         SessionSnapshot::new(self.active, Arc::from(tabs))
@@ -5513,6 +5548,8 @@ impl Browser {
                 id,
                 page,
                 stale_size: false,
+                checkpoint_url: record.url.clone(),
+                checkpoint_scroll: record.scroll,
             });
         }
         self.tabs = tabs;
@@ -5827,6 +5864,8 @@ impl Browser {
                 id,
                 page,
                 stale_size: false,
+                checkpoint_url: None,
+                checkpoint_scroll: 0,
             },
         );
         true
@@ -6843,6 +6882,16 @@ mod tests {
             chrome.tabs[0].page.current_url().as_deref(),
             Some("https://disk.test/")
         );
+
+        let mut bookmarks = Browser::with_persistence(40, 8, false, true, true);
+        assert!(bookmarks.update(ch('b')).session_save.is_none());
+        bookmarks.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        let restored = bookmarks.update(Msg::SessionLoaded(Ok(Some(checkpoint(
+            0,
+            &[(Some("https://independent.test/"), 0)],
+        )))));
+        assert_eq!(restored.documents.len(), 1);
+        assert_eq!(bookmarks.tabs.len(), 1);
     }
 
     #[test]
@@ -6876,6 +6925,141 @@ mod tests {
 
         let quit = browser.update(ch('q'));
         assert_eq!(quit.session_save.as_ref().map(|save| save.0), Some(2));
+    }
+
+    #[test]
+    fn scroll_reload_tab_selection_and_close_each_checkpoint_once() {
+        let mut browser = Browser::with_persistence(40, 8, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(None)));
+        let navigation = browser.start_navigation("https://page.test/".into());
+        let id = navigation.fetch.unwrap().0;
+        browser.update(Msg::Loaded {
+            id,
+            url: "https://page.test/".into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        let html = (0..50)
+            .map(|n| format!("<p>row {n}</p>"))
+            .collect::<String>();
+        browser.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(&html),
+            elapsed: Duration::ZERO,
+        });
+
+        assert_eq!(browser.update(ch('j')).session_save.unwrap().0, 2);
+        assert_eq!(browser.update(ch('r')).session_save.unwrap().0, 3);
+        assert_eq!(browser.update(ch('t')).session_save.unwrap().0, 4);
+        assert!(
+            browser
+                .update(key(KeyCode::Esc, KeyModifiers::NONE))
+                .session_save
+                .is_none()
+        );
+        assert!(browser.update(ch('g')).session_save.is_none());
+        assert_eq!(browser.update(ch('T')).session_save.unwrap().0, 5);
+        assert_eq!(browser.update(ch('x')).session_save.unwrap().0, 6);
+        assert_eq!(browser.tabs.len(), 1);
+    }
+
+    #[test]
+    fn reader_scrolling_checkpoints_the_retained_normal_row_and_restores_normal_mode() {
+        let mut browser = Browser::with_persistence(50, 10, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(None)));
+        let navigation = browser.start_navigation("https://reader.test/".into());
+        let id = navigation.fetch.unwrap().0;
+        browser.update(Msg::Loaded {
+            id,
+            url: "https://reader.test/".into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        let prose = (0..100)
+            .map(|n| format!("<p>This is a sufficiently long paragraph number {n} for prose.</p>"))
+            .collect::<String>();
+        browser.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(&format!("<main><h1>Title</h1>{prose}</main>")),
+            elapsed: Duration::ZERO,
+        });
+        for _ in 0..12 {
+            browser.update(ch('j'));
+        }
+        let normal = browser.tabs[0].page.viewport.offset() as u32;
+        assert!(normal > 0);
+        assert!(browser.update(ch('R')).session_save.is_none());
+        for _ in 0..8 {
+            assert!(browser.update(ch('j')).session_save.is_none());
+        }
+        assert_eq!(browser.session_snapshot().tabs[0].scroll, normal);
+
+        let saved = browser.session_snapshot();
+        let mut restored = Browser::with_persistence(50, 10, false, false, true);
+        restored.update(Msg::SessionLoaded(Ok(Some(saved))));
+        assert!(restored.tabs[0].page.reader.is_none());
+        assert_eq!(restored.tabs[0].page.session_scroll(), normal);
+    }
+
+    #[test]
+    #[ignore = "release session restore/input measurement"]
+    fn measure_session_restore_and_rapid_cjk_scroll_submission() {
+        let url = "https://example.test/";
+        let saved = checkpoint(
+            MAX_TABS - 1,
+            &(0..MAX_TABS)
+                .map(|n| (Some(url), n as u32))
+                .collect::<Vec<_>>(),
+        );
+        const RESTORES: u32 = 500;
+        let started = Instant::now();
+        for _ in 0..RESTORES {
+            let mut browser = Browser::with_persistence(80, 24, false, false, true);
+            let effect = browser.update(Msg::SessionLoaded(Ok(Some(saved.clone()))));
+            assert_eq!(effect.documents.len(), MAX_TABS);
+        }
+        let restore_mean = started.elapsed() / RESTORES;
+
+        let mut browser = Browser::with_persistence(80, 24, false, false, true);
+        browser.update(Msg::SessionLoaded(Ok(Some(saved))));
+        let id = browser.tabs[browser.active].page.current_fetch.unwrap();
+        browser.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: Vec::new(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        let html = (0..4_000)
+            .map(|n| format!("<p>猫の行 {n}</p>"))
+            .collect::<String>();
+        browser.update(Msg::Parsed {
+            id,
+            dom: crate::html::parse(&html),
+            elapsed: Duration::ZERO,
+        });
+        const SCROLLS: u32 = 1_000;
+        let started = Instant::now();
+        for _ in 0..SCROLLS {
+            assert!(browser.update(ch('j')).session_save.is_some());
+        }
+        let scroll_mean = started.elapsed() / SCROLLS;
+        assert!(restore_mean < Duration::from_millis(10));
+        assert!(scroll_mean < Duration::from_millis(10));
+        eprintln!(
+            "M11.24 session application mean: {restore_mean:?}; CJK scroll + shallow submission mean: {scroll_mean:?}"
+        );
     }
 
     #[test]

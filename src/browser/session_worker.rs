@@ -450,4 +450,23 @@ mod tests {
         }
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
+
+    #[test]
+    #[ignore = "release graceful checkpoint flush measurement"]
+    fn measure_graceful_session_flush() {
+        use std::time::Instant;
+
+        let path = temp_path("session");
+        let (tx, rx) = mpsc::channel();
+        let worker =
+            SessionWorker::spawn_with_quiet_period(Some(path.clone()), tx, Duration::from_secs(60));
+        let _ = rx.recv().unwrap();
+        worker.submit(1, snapshot("https://example.test/", 37));
+        let started = Instant::now();
+        worker.shutdown();
+        let elapsed = started.elapsed();
+        assert!(load(&path).unwrap().is_some());
+        eprintln!("M11.24 graceful atomic session flush + join: {elapsed:?}");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 }

@@ -1025,3 +1025,34 @@ projection itself is an arena-indexed `Vec<bool>` bitset (25,596 logical slots
 here); analyzer summaries are temporary and dropped after activation. Both
 toggle effects carry zero document, stylesheet, image, script, or fetch work,
 independently pinned by the unit suite.
+
+---
+
+## M11.24 — session restore (2026-09-06)
+
+Machine A, release build. The codec case is the maximum 16-tab checkpoint with
+an 8,192-byte normalized URL in every record (131,216 encoded bytes). Restore
+application recreates all 16 fresh `App` values and ordinary request plans; the
+scroll case uses a 4,000-paragraph CJK document and builds/submits the full
+16-record shallow `Arc<str>` projection on every moved row:
+
+    cargo test --release --lib measure_maximum_session_checkpoint_codec \
+      -- --ignored --nocapture --test-threads=1
+    cargo test --release --lib measure_session_restore_and_rapid_cjk_scroll_submission \
+      -- --ignored --nocapture --test-threads=1
+    cargo test --release --lib measure_graceful_session_flush \
+      -- --ignored --nocapture --test-threads=1
+
+| operation | mean / observed time |
+| --- | ---: |
+| strict decode, maximum checkpoint | 500.444 µs |
+| apply 16-tab snapshot and plan fresh loads | 29.645 µs |
+| CJK scroll + 16-tab shallow submission | 2.018 µs |
+| final atomic write, sync, and worker join | 11.607 ms |
+
+All UI-thread work is far below the 10 ms input budget. The 250 ms quiet
+period and final flush are worker-owned; after the last acknowledgement both
+the worker and event loop block on condition variables/channel receive, with
+no polling or periodic wake. Functional counters separately pin zero pipeline
+stages for checkpoint load/save/ack and exactly one ordinary fresh pipeline per
+restored nonblank URL.

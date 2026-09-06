@@ -350,4 +350,33 @@ mod tests {
         );
         assert_eq!(resolve_path(None, Some(""), Some("relative")), None);
     }
+
+    #[test]
+    #[ignore = "release checkpoint codec measurement"]
+    fn measure_maximum_session_checkpoint_codec() {
+        use std::time::Instant;
+
+        let prefix = "https://example.test/";
+        let url = format!("{prefix}{}", "x".repeat(MAX_URL_BYTES - prefix.len()));
+        let snapshot = SessionSnapshot::new(
+            MAX_TABS - 1,
+            Arc::from(
+                (0..MAX_TABS)
+                    .map(|n| tab(Some(&url), n as u32))
+                    .collect::<Vec<_>>(),
+            ),
+        )
+        .unwrap();
+        let bytes = encode(&snapshot).unwrap();
+        const ROUNDS: u32 = 1_000;
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            assert_eq!(decode(&bytes).unwrap(), snapshot);
+        }
+        eprintln!(
+            "M11.24 maximum 16-tab / 8,192-byte URL decode: {:?} mean ({} bytes)",
+            started.elapsed() / ROUNDS,
+            bytes.len()
+        );
+    }
 }
