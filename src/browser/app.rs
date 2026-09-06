@@ -5668,6 +5668,82 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_document_chains_settle_in_their_addressed_tabs() {
+        let mut browser = Browser::new(30, 6);
+        let a = browser
+            .start_navigation("https://a.test/start".into())
+            .fetch
+            .unwrap()
+            .0;
+        browser.update(ch('t'));
+        let b = browser
+            .start_navigation("https://b.test/final".into())
+            .fetch
+            .unwrap()
+            .0;
+        assert_eq!(a.generation, b.generation);
+
+        // B finishes first while selected. A then redirects and finishes in
+        // the background; neither chain borrows the active index as identity.
+        browser.update(Msg::Loaded {
+            id: b,
+            url: "https://b.test/final".into(),
+            status: 200,
+            body: b"<p>body b</p>".to_vec(),
+            elapsed: Duration::from_millis(2),
+            content_type: Some("text/html".into()),
+            set_cookie: vec![],
+            metadata: Metadata::default(),
+        });
+        browser.update(Msg::Parsed {
+            id: b,
+            dom: crate::html::parse("<p>body b</p>"),
+            elapsed: Duration::ZERO,
+        });
+        let hop = browser.update(Msg::Redirect {
+            id: a,
+            url: "https://a.test/start".into(),
+            to: "https://a.test/final".into(),
+            status: 302,
+            elapsed: Duration::from_millis(3),
+            set_cookie: vec![],
+        });
+        let (hop_id, request) = hop.fetch.expect("A redirect lost its next request");
+        assert_eq!(hop_id, a);
+        assert_eq!(request.url, "https://a.test/final");
+        assert_eq!(request.method, net::Method::Get);
+        assert!(!hop.dirty, "a background redirect repainted B");
+        browser.update(Msg::Loaded {
+            id: a,
+            url: "https://a.test/final".into(),
+            status: 200,
+            body: b"<p>body a</p>".to_vec(),
+            elapsed: Duration::from_millis(5),
+            content_type: Some("text/html".into()),
+            set_cookie: vec![],
+            metadata: Metadata::default(),
+        });
+        browser.update(Msg::Parsed {
+            id: a,
+            dom: crate::html::parse("<p>body a</p>"),
+            elapsed: Duration::ZERO,
+        });
+
+        assert!(matches!(
+            &browser.tabs[0].page.fetch,
+            Fetch::Loaded { url, body, .. }
+                if url == "https://a.test/final" && body == b"<p>body a</p>"
+        ));
+        assert!(matches!(
+            &browser.tabs[1].page.fetch,
+            Fetch::Loaded { url, body, .. }
+                if url == "https://b.test/final" && body == b"<p>body b</p>"
+        ));
+        assert_eq!(browser.tabs[0].page.hops.count, 1);
+        assert_eq!(browser.tabs[1].page.hops.count, 0);
+    }
+
+    #[test]
     fn the_strip_is_cell_safe_at_tiny_sizes_and_sanitizes_titles() {
         assert_eq!(
             sanitize_title("  one\n\t two\u{1b}three  "),
@@ -5810,6 +5886,32 @@ mod tests {
                 .images
                 .cache_contains("https://same.test/p.png")
         );
+        let image_page = browser
+            .start_navigation("https://same.test/image-page".into())
+            .fetch
+            .unwrap()
+            .0;
+        browser.update(Msg::Loaded {
+            id: image_page,
+            url: "https://same.test/image-page".into(),
+            status: 200,
+            body: b"<img src=/p.png>".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: vec![],
+            metadata: Metadata::default(),
+        });
+        let image_hit = browser.update(Msg::Parsed {
+            id: image_page,
+            dom: crate::html::parse("<img src=/p.png>"),
+            elapsed: Duration::ZERO,
+        });
+        assert!(
+            image_hit.images.is_empty(),
+            "a decoded hit scheduled a second network/decode worker"
+        );
+        assert!(browser.tabs[0].page.images.page_imgs().is_empty());
+        assert_eq!(browser.tabs[1].page.images.page_imgs().len(), 1);
 
         browser.tabs[1]
             .page
