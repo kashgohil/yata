@@ -1005,21 +1005,23 @@ silently become a new threshold:
 
 | operation | p95 | M11.23 target |
 | --- | ---: | ---: |
-| analyze + UA-only style + reader layout/paint | 17.66 ms | < 10 ms |
-| retained-normal layout/paint | 13.40 ms | < 10 ms |
+| enter reader presentation | 5.59 ms | < 10 ms |
+| exit to retained-normal presentation | 4.22 ms | < 10 ms |
 
-The wall-clock target is **not met on this machine**. This is recorded as a
-performance deviation rather than weakening the test: the same checkout's
-standalone normal Wikipedia layout benchmark is 9.53 ms before line building,
-paint, anchor restoration, or frame work, so the mandated one-layout/one-paint
-exit cannot fit a 10 ms envelope here. Functional stage accounting remains
+The wall-clock target is met with headroom. The first entry selects the pure
+projection; later toggles retain that immutable result and the inactive normal
+or reader geometry while the document is unchanged. Each toggle still runs
+the required layout and paint stage: the layout stage reuses valid geometry,
+refreshes paint-only computed values, rebuilds lines, and produces a fresh
+display list. DOM, stylesheet, image, and viewport changes invalidate the
+relevant geometry instead of trusting it. Functional stage accounting remains
 exact (enter 1 reader style/1 layout/1 paint; exit 0 style/1 layout/1 paint),
 and reader-specific styling skips excluded subtrees rather than resolving all
 25,596 nodes.
 
-`/usr/bin/time -l` around the same command reports a 64,848,472-byte peak
+`/usr/bin/time -l` around the same command reports a 64,701,016-byte peak
 memory footprint for the test process, below the 100 MB Wikipedia target. The
-projection itself is one byte per arena slot (25,596 bytes here); analyzer
-summaries are temporary and dropped after activation. Both toggle effects
-carry zero document, stylesheet, image, script, or fetch work, independently
-pinned by the unit suite.
+projection itself is an arena-indexed `Vec<bool>` bitset (25,596 logical slots
+here); analyzer summaries are temporary and dropped after activation. Both
+toggle effects carry zero document, stylesheet, image, script, or fetch work,
+independently pinned by the unit suite.
