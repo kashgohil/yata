@@ -1073,3 +1073,100 @@ tab's row 20 after layout. A settled sample from `top -l 3 -s 2 -pid <pid>`
 reported the process as `sleeping` at **0.0% CPU**. A second normal quit left
 the same decodable 0600 checkpoint and the process exited after its worker
 joins.
+
+---
+
+## M11 — daily-driver integration (2026-09-06)
+
+Final closeout measurements were taken on Machine A (Apple M4 Pro, macOS
+26/Darwin 25.5, rustc 1.96.1), release builds, at 80×24 unless noted. The
+offline fixtures were served by one `python3 -m http.server 18765 --bind
+127.0.0.1` process. Parent `2488c83` and the candidate alternated first place
+for seven rounds; round zero warmed code/filesystem paths and the six retained
+samples below report mean and full range. “Engine” is the sum printed by
+`--timing` for parse + style + layout + script + frame; fetch is kept separate
+so loopback scheduling does not hide engine movement.
+
+| page | parent fetch / engine | candidate fetch / engine | result |
+| --- | ---: | ---: | --- |
+| danluu.com | 3.10 ms (3.0–3.2) / 1.25 ms (1.2–1.3) | 3.08 ms (2.9–3.3) / 1.45 ms (1.4–1.5) | 4.53 ms combined; < 50 ms |
+| Hacker News | 2.98 ms (2.6–3.4) / 1.15 ms (1.0–1.3) | 2.90 ms (2.6–3.2) / 1.42 ms (1.3–1.6) | M11 table work is present; 4.32 ms combined |
+| Wikipedia | 3.27 ms (3.1–3.6) / 66.83 ms (65.4–69.3) | 3.40 ms (3.2–4.2) / 71.32 ms (69.6–73.9) | controls/table/position work is present; 74.72 ms combined, < 250 ms |
+
+The candidate adds real M11 layout work on HN and Wikipedia; this is not a
+byte-identical workload disguised as an A/B win. All samples include scripts.
+The closeout loop invokes each release binary's `--timing` against the three
+loopback URLs, alternates `parent candidate` / `candidate parent`, and discards
+its first row.
+
+### Settled input and scroll
+
+| operation | samples / spread | stages or reuse proof | budget |
+| --- | ---: | --- | ---: |
+| Wikipedia field keypress → presented frame | 3.11 ms mean (2.49–4.31), 5 interleaved | style/layout/paint `(0,0,1)` | < 10 ms |
+| Wikipedia checkbox activation → frame | 2.75 ms mean (2.49–3.04), 5 interleaved | `(0,0,1)`; retained full-layout baseline 10.73 ms (10.00–12.33) | < 10 ms |
+| settled single-select commit → frame | 23.00 µs mean (21.04–31.79), n=20 | `(0,0,1)` | < 10 ms |
+| HN/Wikipedia tab switch + cached-frame draw | 24.776 µs mean, n=200 | both tabs' style/layout/paint counters stay flat | < 10 ms |
+| full-library bookmark selection → navigation plan/loading frame | 64.333 µs | network/pipeline settlement is outside the input turn | < 10 ms |
+| Wikipedia reader enter / exit | p95 5.276 / 3.962 ms, n=200 | enter `(reader-style,layout,paint)=(1,1,1)`; exit `(0,1,1)` | < 10 ms |
+| ordinary / fixed+sticky scroll key → frame | 6.006 / 6.806 µs mean, 2,000 alternating steps each | `styles_run` and `layouts` flat | < 5 ms |
+
+The field and checkbox measurements retain the rejected full-layout path as a
+same-process comparison switch. Fresh closeout measurements found that path at
+11.30 ms and 10.73 ms respectively, so M11.25 shipped the already-equivalent
+fixed-geometry control patch; `a_patched_tree_is_the_tree_a_fresh_layout_would_have_built`
+checks text, checkbox and select results against a fresh layout.
+
+Reproduce the absolute/input cases with:
+
+```text
+cargo test --release --lib measure_a_keystroke -- --ignored --nocapture --test-threads=1
+cargo test --release --lib measure_choice_activation -- --ignored --nocapture --test-threads=1
+cargo test --release --lib measure_ordinary_and_fixed_sticky_scroll_steps -- --ignored --nocapture --test-threads=1
+cargo test --release --lib measure_settled_tab_switches -- --ignored --nocapture --test-threads=1
+cargo test --release --lib measure_full_bookmark_library_inputs -- --ignored --nocapture --test-threads=1
+cargo test --release --lib measure_reader_toggle_on_wikipedia -- --ignored --nocapture --test-threads=1
+```
+
+### Loopback network and persistence observations
+
+| operation | observed wall time | boundary proved |
+| --- | ---: | --- |
+| fresh history/cache representation → pipeline | 41.750 µs | no network effect; one downstream pipeline |
+| validator reload: 304 round trip → stored bytes → pipeline | 433.125 µs | one conditional GET and one downstream pipeline |
+| URL-encoded form POST → cookie-bearing 302 → article pipeline | 1.646 ms | listener saw live text/checkbox/select; hop and next GET carried the right cookies |
+| maximum bookmark file decode (1,024 near-max URL/title records, 8,912,914 bytes) | 25.616 ms mean, n=100 | worker-side startup decode, never UI-thread input work |
+| apply 1,024-record bookmark library | 3.939 µs mean, n=200 | UI-side bounded projection |
+| maximum session decode (16 × 8,192-byte URLs, 131,216 bytes) | 485.935 µs mean, n=1,000 | worker-side startup decode |
+| apply restored 16-tab recipe / rapid CJK scroll submission | 16.476 / 1.920 µs mean | ordinary fresh requests; shallow UI projection |
+| final atomic session write + sync + worker join | 10.580 ms | shutdown-only disk latency |
+
+Commands are the named `measure_*` tests above plus
+`measure_maximum_bookmark_file_decode`, `measure_maximum_session_checkpoint_codec`,
+`measure_session_restore_and_rapid_cjk_scroll_submission`,
+`measure_graceful_session_flush`, the `loopback_a_b_back` test, and the
+`m11_daily_driver_boundaries_hold_in_one_loopback_session_and_restart` test.
+POST and redirect have no meaningful parent equivalent, so their absolute
+latency is reported without manufacturing an A/B baseline.
+
+### Memory and idle work
+
+`/usr/bin/time -l` around the two isolated ignored shapes reports:
+
+| retained shape | maximum RSS | peak footprint |
+| --- | ---: | ---: |
+| one normal Wikipedia tab | 90,210,304 bytes | 65,438,320 bytes |
+| integrated: Wikipedia document cache + reader projection + 15 additional blank tabs + full bookmark library + 16-tab session projection | 90,472,448 bytes | 65,700,464 bytes |
+| measured increment | 262,144 bytes | 262,144 bytes |
+
+The one-page process remains below 100 MB; the integrated total is deliberately
+reported separately. Reproduce with `/usr/bin/time -l cargo test --release
+--lib measure_m11_{one_normal_tab,integrated}_memory_shape -- --ignored
+--nocapture --test-threads=1` (run each filter separately).
+
+After the interactive integration flow, all page work, cache activity and both
+persistence workers settled. `top -l 3 -s 1 -pid <pid>` reported `sleeping` and
+**0.0% CPU** at 5,184 KiB resident. The main loop was blocked in `recv`; worker
+quiet periods use condition variables. The pending-timer case remains pinned by
+`a_pending_timer_leaves_the_thread_parked`, so a future timer also sleeps until
+its deadline rather than polling.
