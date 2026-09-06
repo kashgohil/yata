@@ -141,17 +141,22 @@ pub struct NavQueue {
     request: Rc<RefCell<Option<NavRequest>>>,
 }
 
-/// Where a script asked to go, and whether it should replace the current
-/// history entry rather than push one.
+/// Where a script asked to go, whether it should replace the current history
+/// entry rather than push one, and whether it explicitly asked to reload.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NavRequest {
     pub url: String,
     pub replace: bool,
+    pub reload: bool,
 }
 
 impl NavQueue {
-    fn set(&self, url: String, replace: bool) {
-        *self.request.borrow_mut() = Some(NavRequest { url, replace });
+    fn set(&self, url: String, replace: bool, reload: bool) {
+        *self.request.borrow_mut() = Some(NavRequest {
+            url,
+            replace,
+            reload,
+        });
     }
 
     /// Take the navigation this tick asked for, if any.
@@ -1125,9 +1130,12 @@ pub fn install<'js>(
     let nav = navigation.clone();
     api.set(
         "navigate",
-        Function::new(ctx.clone(), move |url: String, replace: bool| {
-            nav.set(url, replace);
-        })?,
+        Function::new(
+            ctx.clone(),
+            move |url: String, replace: bool, reload: bool| {
+                nav.set(url, replace, reload);
+            },
+        )?,
     )?;
 
     // Storage, per origin. The origin is derived here rather than in JS so a
@@ -2284,7 +2292,7 @@ const PRELUDE: &str = r#"
 
   const location = {
     get href() { return parts().href; },
-    set href(value) { raw.navigate(String(value), false); },
+    set href(value) { raw.navigate(String(value), false, false); },
     get protocol() { return parts().protocol; },
     get host() { return parts().host; },
     get hostname() { return parts().hostname; },
@@ -2296,14 +2304,14 @@ const PRELUDE: &str = r#"
       // An assignment, not a replacement: a browser pushes a history entry
       // for a fragment change, so `H` goes back to where the reader was.
       const to = String(value);
-      raw.navigate(to.charAt(0) === '#' ? to : '#' + to, false);
+      raw.navigate(to.charAt(0) === '#' ? to : '#' + to, false, false);
     },
     get origin() { return parts().origin; },
-    assign: function (url) { raw.navigate(String(url), false); },
+    assign: function (url) { raw.navigate(String(url), false, false); },
     // `replace` does not push history — the distinction M6's `History`
     // already models, so it is carried through rather than invented here.
-    replace: function (url) { raw.navigate(String(url), true); },
-    reload: function () { raw.navigate(parts().href, true); },
+    replace: function (url) { raw.navigate(String(url), true, false); },
+    reload: function () { raw.navigate(parts().href, true, true); },
     toString: function () { return parts().href; },
   };
 

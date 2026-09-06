@@ -3647,6 +3647,13 @@ impl App {
         let Some(request) = self.js_host.as_ref().and_then(js::Host::take_navigation) else {
             return;
         };
+        if request.reload {
+            let navigation = self.reload();
+            effect.fetch = navigation.fetch;
+            effect.cached = navigation.cached;
+            effect.dirty |= navigation.dirty;
+            return;
+        }
         let Some(url) = self.resolve_href(&request.url) else {
             self.console.push(
                 crate::js::console::Level::Warn,
@@ -3657,10 +3664,12 @@ impl App {
             return;
         };
         // `assign` pushes history, `replace` does not — M6's distinction,
-        // carried through rather than reinvented. A pure fragment change is a
-        // same-document move, and `navigate` is where that is decided for both
-        // callers: `location.hash = 'x'` scrolls exactly where a click on
-        // `<a href="#x">` scrolls, because it is the same function (M11.4).
+        // carried through rather than reinvented. `reload` was handled above
+        // because M11.20 gives it forced-validation cache policy. A pure
+        // fragment change is a same-document move, and `navigate` is where
+        // that is decided for both remaining callers: `location.hash = 'x'`
+        // scrolls exactly where a click on `<a href="#x">` scrolls, because
+        // it is the same function (M11.4).
         let navigation = self.navigate(url, !request.replace);
         if let Some(fetch) = navigation.fetch {
             effect.fetch = Some(fetch);
@@ -12020,15 +12029,30 @@ mod tests {
 
     #[test]
     fn location_reload_refetches_the_page() {
-        // The other caller of the same rule: `location.reload()` is
-        // `navigate(href, replace)` in the binding, so a fragmentless
-        // same-document navigation has to reach the network or the page's own
-        // reload button does nothing (M10.11) — or, worse, silently scrolls
-        // the reader to the top.
-        let (mut app, id) = scripted_app("<p>page</p><script>location.reload();</script>");
+        // A script reload reaches the explicit reload policy, not ordinary
+        // replace navigation: even this fresh representation must validate.
+        let html = "<p>page</p><script>location.reload();</script>";
+        let mut app = App::new(40, 10);
+        let first = app.start_navigation("http://final/".into());
+        let id = first.fetch.unwrap().0;
+        load_cacheable(
+            &mut app,
+            id,
+            "http://final/",
+            html.as_bytes(),
+            cache_metadata(&["max-age=60"], Some("\"one\"")),
+        );
+        app.update(parsed(id, html));
         let effect = app.update(Msg::RunScripts { id });
         let (again, url) = effect.fetch.expect("location.reload() did not fetch");
         assert_eq!(url.url, "http://final/");
+        assert_eq!(
+            url.method,
+            net::Method::Conditional {
+                no_cache: true,
+                if_none_match: Some("\"one\"".into()),
+            }
+        );
         assert_ne!(again, id, "a reload is a new generation");
         assert!(!app.history.can_back(), "a reload is not a history entry");
     }

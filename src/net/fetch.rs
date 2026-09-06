@@ -526,21 +526,22 @@ fn selected_metadata(headers: &reqwest::header::HeaderMap) -> Metadata {
     fn lines(
         headers: &reqwest::header::HeaderMap,
         name: reqwest::header::HeaderName,
-    ) -> (Vec<String>, bool) {
+    ) -> (Vec<String>, bool, bool) {
         let mut out = Vec::new();
-        let mut unusable = false;
+        let mut over_limit = false;
+        let mut non_utf8 = false;
         for value in headers.get_all(name).iter() {
             if out.len() == MAX_LINES {
-                unusable = true;
+                over_limit = true;
                 break;
             }
             match value.to_str() {
                 Ok(value) if value.len() <= MAX_FIELD_BYTES => out.push(value.to_string()),
-                Ok(_) => unusable = true,
-                Err(_) => unusable = true,
+                Ok(_) => over_limit = true,
+                Err(_) => non_utf8 = true,
             }
         }
-        (out, unusable)
+        (out, over_limit, non_utf8)
     }
     fn one(
         headers: &reqwest::header::HeaderMap,
@@ -555,12 +556,18 @@ fn selected_metadata(headers: &reqwest::header::HeaderMap) -> Metadata {
             Err(_) => (None, false),
         }
     }
-    let (cache_control, control_bad) = lines(headers, reqwest::header::CACHE_CONTROL);
-    let (vary, vary_unusable) = lines(headers, reqwest::header::VARY);
+    let (cache_control, control_over_limit, _) = lines(headers, reqwest::header::CACHE_CONTROL);
+    let (vary, vary_over_limit, vary_non_utf8) = lines(headers, reqwest::header::VARY);
     let (etag, etag_bad) = one(headers, reqwest::header::ETAG);
     let (age, age_bad) = one(headers, reqwest::header::AGE);
-    let mut metadata = Metadata::bounded(cache_control, etag, age, vary, vary_unusable);
-    metadata.over_limit |= control_bad || etag_bad || age_bad;
+    let mut metadata = Metadata::bounded(
+        cache_control,
+        etag,
+        age,
+        vary,
+        vary_over_limit || vary_non_utf8,
+    );
+    metadata.over_limit |= control_over_limit || vary_over_limit || etag_bad || age_bad;
     metadata
 }
 
@@ -977,6 +984,31 @@ mod tests {
         assert!(
             request.contains("if-none-match: W/\"one\"\r\n"),
             "{request}"
+        );
+    }
+
+    #[test]
+    fn non_utf8_cache_metadata_is_ignored_except_for_vary() {
+        use reqwest::header::{CACHE_CONTROL, ETAG, HeaderMap, HeaderValue, VARY};
+
+        let invalid =
+            HeaderValue::from_bytes(b"\xff").expect("opaque header byte is valid on wire");
+        let mut headers = HeaderMap::new();
+        headers.append(CACHE_CONTROL, invalid.clone());
+        headers.insert(ETAG, HeaderValue::from_static("\"one\""));
+        let metadata = selected_metadata(&headers);
+        assert!(metadata.cache_control.is_empty());
+        assert_eq!(metadata.etag.as_deref(), Some("\"one\""));
+        assert!(!metadata.over_limit, "ignored bytes are not a size attack");
+        assert!(!metadata.vary_unusable);
+
+        headers.append(VARY, invalid);
+        let metadata = selected_metadata(&headers);
+        assert!(metadata.vary.is_empty());
+        assert!(metadata.vary_unusable, "an unreadable Vary forbids reuse");
+        assert!(
+            !metadata.over_limit,
+            "unreadable Vary is not an over-limit field"
         );
     }
 
