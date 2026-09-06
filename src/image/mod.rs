@@ -15,7 +15,7 @@ pub use kitty::{
     KittyPlacement, delete_all_images, delete_all_placements, place_sequence, placement_sequence,
     transmit_sequence,
 };
-pub use session::ImageSession;
+pub use session::{ImageSession, SharedImageCache};
 
 use std::sync::Arc;
 

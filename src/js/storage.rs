@@ -46,30 +46,45 @@ pub enum Area {
 /// two pages on one origin must see the same data.
 #[derive(Clone, Default)]
 pub struct Storage {
-    areas: Rc<RefCell<Areas>>,
+    local: Rc<RefCell<Stores>>,
+    session: Rc<RefCell<Stores>>,
 }
 
-/// Every origin's stores, keyed by (origin, area). A `BTreeMap` inside so
-/// `key(i)` is stable across calls.
-type Areas = HashMap<(String, Area), BTreeMap<String, String>>;
+type Stores = HashMap<String, BTreeMap<String, String>>;
 
 impl Storage {
     pub fn new() -> Storage {
         Storage::default()
     }
 
+    /// Share local storage with a new tab while giving it a fresh session
+    /// namespace. Cloning `Storage` still shares both areas within one tab.
+    pub fn fork_tab(&self) -> Storage {
+        Storage {
+            local: self.local.clone(),
+            session: Rc::new(RefCell::new(HashMap::new())),
+        }
+    }
+
+    fn stores(&self, area: Area) -> &Rc<RefCell<Stores>> {
+        match area {
+            Area::Local => &self.local,
+            Area::Session => &self.session,
+        }
+    }
+
     pub fn get(&self, origin: &str, area: Area, key: &str) -> Option<String> {
-        self.areas
+        self.stores(area)
             .borrow()
-            .get(&(origin.to_string(), area))
+            .get(origin)
             .and_then(|store| store.get(key).cloned())
     }
 
     /// Write, or report that the origin's quota is full. The caller turns
     /// `false` into the `QuotaExceededError` a browser throws.
     pub fn set(&self, origin: &str, area: Area, key: &str, value: &str) -> bool {
-        let mut areas = self.areas.borrow_mut();
-        let store = areas.entry((origin.to_string(), area)).or_default();
+        let mut stores = self.stores(area).borrow_mut();
+        let store = stores.entry(origin.to_string()).or_default();
 
         // Measure what the store *would* weigh, so replacing a large value
         // with a small one is never refused.
@@ -87,19 +102,19 @@ impl Storage {
     }
 
     pub fn remove(&self, origin: &str, area: Area, key: &str) {
-        if let Some(store) = self.areas.borrow_mut().get_mut(&(origin.to_string(), area)) {
+        if let Some(store) = self.stores(area).borrow_mut().get_mut(origin) {
             store.remove(key);
         }
     }
 
     pub fn clear(&self, origin: &str, area: Area) {
-        self.areas.borrow_mut().remove(&(origin.to_string(), area));
+        self.stores(area).borrow_mut().remove(origin);
     }
 
     pub fn len(&self, origin: &str, area: Area) -> usize {
-        self.areas
+        self.stores(area)
             .borrow()
-            .get(&(origin.to_string(), area))
+            .get(origin)
             .map_or(0, BTreeMap::len)
     }
 
@@ -107,9 +122,9 @@ impl Storage {
     /// with the same `i` agree — a browser's order is unspecified but stable,
     /// and a `BTreeMap` gives us stable for free.
     pub fn key_at(&self, origin: &str, area: Area, index: usize) -> Option<String> {
-        self.areas
+        self.stores(area)
             .borrow()
-            .get(&(origin.to_string(), area))
+            .get(origin)
             .and_then(|store| store.keys().nth(index).cloned())
     }
 }
@@ -191,6 +206,36 @@ mod tests {
         assert_eq!(
             storage.get("https://a.test", Area::Session, "k").as_deref(),
             Some("session")
+        );
+    }
+
+    #[test]
+    fn a_forked_tab_shares_local_and_isolates_session_storage() {
+        let first = Storage::new();
+        first.set("https://a.test", Area::Local, "shared", "one");
+        first.set("https://a.test", Area::Session, "private", "first");
+        let second = first.fork_tab();
+
+        assert_eq!(
+            second
+                .get("https://a.test", Area::Local, "shared")
+                .as_deref(),
+            Some("one")
+        );
+        assert_eq!(second.get("https://a.test", Area::Session, "private"), None);
+        second.set("https://a.test", Area::Local, "shared", "two");
+        second.set("https://a.test", Area::Session, "private", "second");
+        assert_eq!(
+            first
+                .get("https://a.test", Area::Local, "shared")
+                .as_deref(),
+            Some("two")
+        );
+        assert_eq!(
+            first
+                .get("https://a.test", Area::Session, "private")
+                .as_deref(),
+            Some("first")
         );
     }
 

@@ -326,6 +326,30 @@ mod tests {
     }
 
     #[test]
+    fn navigation_and_close_are_scoped_to_one_tab() {
+        let (tx, rx) = mpsc::channel();
+        let timers = Timers::spawn(tx);
+        let old_a = PageId::new(TabId(1), 1);
+        let new_a = PageId::new(TabId(1), 2);
+        let b = PageId::new(TabId(2), 1);
+        for page in [old_a, new_a, b] {
+            timers.apply(TimerRequest::Schedule {
+                page,
+                id: TimerId(1),
+                delay: Duration::from_millis(20),
+            });
+        }
+        timers.apply(TimerRequest::CancelOthers { keep: new_a });
+        assert_eq!(timers.pending(), 2, "navigation cancelled another tab");
+        timers.apply(TimerRequest::CancelTab { tab: TabId(1) });
+        assert_eq!(timers.pending(), 1);
+        let Msg::Timer { page, .. } = rx.recv_timeout(Duration::from_secs(2)).unwrap() else {
+            panic!("tab B's timer did not survive")
+        };
+        assert_eq!(page, b);
+    }
+
+    #[test]
     fn a_zero_delay_is_clamped_rather_than_immediate() {
         // The clamp is what stops `setTimeout(f, 0)` re-arming itself into a
         // spin: at the floor a page gets 250 ticks a second, not as many as

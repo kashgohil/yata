@@ -1,4 +1,6 @@
+use std::cell::RefCell;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crate::browser::error_page;
@@ -16,7 +18,7 @@ use crate::browser::timing::{self, Timings};
 use crate::browser::viewport::Viewport;
 use crate::css::Stylesheet;
 use crate::dom::{AttrChanges, Dom, NodeData, NodeId};
-use crate::image::ImageSession;
+use crate::image::{ImageCache, ImageSession, SharedImageCache};
 use crate::js::cookies::Jar;
 use crate::js::queue::ScriptQueue;
 use crate::js::storage::Storage;
@@ -151,6 +153,58 @@ enum PendingScroll {
 /// bound: `--dump` of a redirecting URL has to reach the same page the TUI
 /// reaches, and two numbers would be two browsers.
 pub const MAX_REDIRECTS: u32 = 20;
+
+#[derive(Clone)]
+struct SharedCache(Rc<RefCell<Cache>>);
+
+impl SharedCache {
+    fn new() -> SharedCache {
+        SharedCache(Rc::new(RefCell::new(Cache::default())))
+    }
+
+    fn plan(&self, key: &CacheKey, mode: RequestMode, now: Duration) -> Plan {
+        self.0.borrow_mut().plan(key, mode, now)
+    }
+
+    fn insert(&self, key: CacheKey, response: Representation, now: Duration) -> bool {
+        self.0.borrow_mut().insert(key, response, now)
+    }
+
+    fn revalidate(
+        &self,
+        key: &CacheKey,
+        metadata: &crate::browser::http_cache::Metadata,
+        now: Duration,
+    ) -> Option<Representation> {
+        self.0.borrow_mut().revalidate(key, metadata, now)
+    }
+
+    fn remove(&self, key: &CacheKey) {
+        self.0.borrow_mut().remove(key);
+    }
+}
+
+/// Resources whose lifetime is the browser process rather than a live page.
+#[derive(Clone)]
+struct BrowserSession {
+    cookies: Jar,
+    cache: SharedCache,
+    cache_epoch: Instant,
+    storage: Storage,
+    images: SharedImageCache,
+}
+
+impl BrowserSession {
+    fn new() -> BrowserSession {
+        BrowserSession {
+            cookies: Jar::new(),
+            cache: SharedCache::new(),
+            cache_epoch: Instant::now(),
+            storage: Storage::new(),
+            images: Rc::new(RefCell::new(ImageCache::default())),
+        }
+    }
+}
 
 /// The redirect chain this fetch generation has taken so far (M11.7a).
 ///
@@ -326,7 +380,7 @@ pub struct App {
     /// every request this app makes — see `App::request` and `js::cookies`.
     cookies: Jar,
     /// Session document cache. Page teardown deliberately never clears it.
-    cache: Cache,
+    cache: SharedCache,
     cache_epoch: Instant,
     cache_key: Option<CacheKey>,
     cache_candidate: Option<CacheKey>,
@@ -480,6 +534,16 @@ impl App {
     }
 
     pub(crate) fn with_tab(w: u16, h: u16, kitty_graphics: bool, tab: TabId) -> Self {
+        Self::with_session(w, h, kitty_graphics, tab, &BrowserSession::new())
+    }
+
+    fn with_session(
+        w: u16,
+        h: u16,
+        kitty_graphics: bool,
+        tab: TabId,
+        session: &BrowserSession,
+    ) -> Self {
         App {
             size: (w, h),
             tab,
@@ -499,10 +563,10 @@ impl App {
             owed_script_errors: Vec::new(),
             script_queue: ScriptQueue::default(),
             script_queue_page: None,
-            storage: Storage::new(),
-            cookies: Jar::new(),
-            cache: Cache::default(),
-            cache_epoch: Instant::now(),
+            storage: session.storage.fork_tab(),
+            cookies: session.cookies.clone(),
+            cache: session.cache.clone(),
+            cache_epoch: session.cache_epoch,
             cache_key: None,
             cache_candidate: None,
             document_source: net::DocumentSource::Network,
@@ -549,7 +613,7 @@ impl App {
             no_insert_detection: false,
             #[cfg(test)]
             narrow_keystroke: false,
-            images: ImageSession::new(kitty_graphics),
+            images: ImageSession::with_cache(kitty_graphics, session.images.clone()),
         }
     }
 
@@ -4610,6 +4674,7 @@ struct Tab {
 pub struct Browser {
     size: (u16, u16),
     kitty_graphics: bool,
+    session: BrowserSession,
     tabs: Vec<Tab>,
     active: usize,
     next_tab: u64,
@@ -4622,14 +4687,16 @@ impl Browser {
 
     pub fn with_caps(w: u16, h: u16, kitty_graphics: bool) -> Browser {
         let id = TabId(1);
+        let session = BrowserSession::new();
         Browser {
             size: (w, h),
             kitty_graphics,
             tabs: vec![Tab {
                 id,
-                page: App::with_tab(w, h.saturating_sub(1), kitty_graphics, id),
+                page: App::with_session(w, h.saturating_sub(1), kitty_graphics, id, &session),
                 stale_size: false,
             }],
+            session,
             active: 0,
             next_tab: 2,
         }
@@ -4730,11 +4797,12 @@ impl Browser {
         };
         let id = TabId(self.next_tab);
         self.next_tab = next;
-        let mut page = App::with_tab(
+        let mut page = App::with_session(
             self.size.0,
             self.size.1.saturating_sub(1),
             self.kitty_graphics,
             id,
+            &self.session,
         );
         page.mode = Mode::UrlInput {
             buffer: String::new(),
@@ -5558,6 +5626,121 @@ mod tests {
             let mut frame = Frame::new(w, h);
             browser.draw(&mut frame);
         }
+    }
+
+    #[test]
+    fn cookies_and_document_cache_are_shared_without_sharing_page_state() {
+        let mut cookies = Browser::new(40, 8);
+        let a = cookies
+            .start_navigation("https://same.test/a".into())
+            .fetch
+            .unwrap()
+            .0;
+        cookies.update(Msg::Loaded {
+            id: a,
+            url: "https://same.test/a".into(),
+            status: 200,
+            body: b"a".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: vec!["sid=shared; Path=/".into()],
+            metadata: Metadata::default(),
+        });
+        cookies.update(ch('t'));
+        let request = cookies
+            .start_navigation("https://same.test/b".into())
+            .fetch
+            .unwrap()
+            .1;
+        assert_eq!(request.cookie.as_deref(), Some("sid=shared"));
+
+        let mut cached = Browser::new(40, 8);
+        let first = cached
+            .start_navigation("https://cache.test/page".into())
+            .fetch
+            .unwrap()
+            .0;
+        cached.update(Msg::Loaded {
+            id: first,
+            url: "https://cache.test/page".into(),
+            status: 200,
+            body: b"cached body".to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: vec![],
+            metadata: Metadata::bounded(vec!["max-age=600".into()], None, None, vec![], false),
+        });
+        cached.update(ch('t'));
+        let hit = cached.start_navigation("https://cache.test/page".into());
+        assert!(hit.fetch.is_none());
+        let (second, _, representation, _) = hit.cached.expect("cache was private to tab A");
+        assert_ne!(first.tab, second.tab);
+        assert_eq!(representation.body, b"cached body");
+        assert!(
+            cached.tabs[1].page.dom.is_none(),
+            "a cache hit shared a DOM"
+        );
+    }
+
+    #[test]
+    fn local_and_decoded_images_are_shared_while_session_storage_is_tab_local() {
+        use crate::js::storage::Area;
+        let mut browser = Browser::new(30, 6);
+        let origin = "https://same.test";
+        browser.tabs[0]
+            .page
+            .storage
+            .set(origin, Area::Local, "theme", "dark");
+        browser.tabs[0]
+            .page
+            .storage
+            .set(origin, Area::Session, "draft", "a");
+        browser.tabs[0].page.images.insert(
+            "https://same.test/p.png".into(),
+            crate::image::DecodedImage {
+                width: 1,
+                height: 1,
+                rgba: std::sync::Arc::from([0, 0, 0, 255]),
+            },
+        );
+        browser.update(ch('t'));
+        assert_eq!(
+            browser.tabs[1]
+                .page
+                .storage
+                .get(origin, Area::Local, "theme")
+                .as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            browser.tabs[1]
+                .page
+                .storage
+                .get(origin, Area::Session, "draft"),
+            None
+        );
+        assert!(
+            browser.tabs[1]
+                .page
+                .images
+                .cache_contains("https://same.test/p.png")
+        );
+
+        browser.tabs[1]
+            .page
+            .storage
+            .set(origin, Area::Session, "draft", "b");
+        let _ = browser.tabs[1]
+            .page
+            .start_navigation("https://same.test/next".into());
+        assert_eq!(
+            browser.tabs[1]
+                .page
+                .storage
+                .get(origin, Area::Session, "draft")
+                .as_deref(),
+            Some("b")
+        );
     }
 
     #[test]

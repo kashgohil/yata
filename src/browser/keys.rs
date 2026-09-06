@@ -147,18 +147,6 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::End, NONE), Action::Bottom),
     browse(None, chord(KeyCode::Char('o'), NONE), Action::OpenUrl),
     browse(None, chord(KeyCode::Char('O'), NONE), Action::EditUrl),
-    browse(None, chord(KeyCode::Char('t'), NONE), Action::NewTab),
-    browse(None, chord(KeyCode::Char('x'), NONE), Action::CloseTab),
-    browse(
-        Some(chord(KeyCode::Char('g'), NONE)),
-        chord(KeyCode::Char('t'), NONE),
-        Action::NextTab,
-    ),
-    browse(
-        Some(chord(KeyCode::Char('g'), NONE)),
-        chord(KeyCode::Char('T'), NONE),
-        Action::PreviousTab,
-    ),
     // `F1`–`F4` are the DOM, styles, boxes and timing inspectors
     // (PLAN.md §3 `F1`–`F4`); Browse only — in the URL bar they are unbound.
     browse(None, chord(KeyCode::F(1), NONE), Action::ToggleDom),
@@ -197,6 +185,18 @@ pub const BINDINGS: &[Binding] = &[
     browse(None, chord(KeyCode::Char('n'), NONE), Action::SearchNext),
     browse(None, chord(KeyCode::Char('N'), NONE), Action::SearchPrev),
     browse(None, chord(KeyCode::Char('?'), NONE), Action::ToggleHelp),
+    browse(None, chord(KeyCode::Char('t'), NONE), Action::NewTab),
+    browse(None, chord(KeyCode::Char('x'), NONE), Action::CloseTab),
+    browse(
+        Some(chord(KeyCode::Char('g'), NONE)),
+        chord(KeyCode::Char('t'), NONE),
+        Action::NextTab,
+    ),
+    browse(
+        Some(chord(KeyCode::Char('g'), NONE)),
+        chord(KeyCode::Char('T'), NONE),
+        Action::PreviousTab,
+    ),
     browse(None, chord(KeyCode::Esc, NONE), Action::Cancel),
     browse(None, chord(KeyCode::Char('q'), NONE), Action::Quit),
     browse(None, chord(KeyCode::Char('c'), CTRL), Action::Quit),

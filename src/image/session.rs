@@ -4,7 +4,9 @@
 //! of `App` so navigation/layout/paint stay thin. Layout still receives a pure
 //! [`ImageContext`]; Kitty is a post-present side channel.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use super::cache::ImageCache;
@@ -20,7 +22,7 @@ use crate::paint::{DisplayList, ImagePixels, kitty_placements};
 /// One browsing session's images: global LRU + current page + Kitty uploads.
 #[derive(Debug)]
 pub struct ImageSession {
-    cache: ImageCache,
+    cache: SharedImageCache,
     page_imgs: Vec<ImgRef>,
     kitty_enabled: bool,
     /// We currently have at least one Kitty placement on screen.
@@ -31,6 +33,8 @@ pub struct ImageSession {
     /// Last emitted placement geometry; identical → emit nothing.
     last_sig: Vec<PlaceSig>,
 }
+
+pub type SharedImageCache = Rc<RefCell<ImageCache>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PlaceSig {
@@ -43,8 +47,12 @@ struct PlaceSig {
 
 impl ImageSession {
     pub fn new(kitty_enabled: bool) -> Self {
+        Self::with_cache(kitty_enabled, Rc::new(RefCell::new(ImageCache::default())))
+    }
+
+    pub fn with_cache(kitty_enabled: bool, cache: SharedImageCache) -> Self {
         ImageSession {
-            cache: ImageCache::default(),
+            cache,
             page_imgs: Vec::new(),
             kitty_enabled,
             kitty_active: false,
@@ -66,7 +74,7 @@ impl ImageSession {
     }
 
     pub fn cache_contains(&self, url: &str) -> bool {
-        self.cache.contains(url)
+        self.cache.borrow().contains(url)
     }
 
     /// Discover imgs and return absolute URLs that still need a network fetch.
@@ -78,9 +86,9 @@ impl ImageSession {
             if !seen.insert(img.url.clone()) {
                 continue;
             }
-            if self.cache.contains(&img.url) {
+            if self.cache.borrow().contains(&img.url) {
                 // Protect current-page URLs under LRU pressure.
-                let _ = self.cache.get(&img.url);
+                let _ = self.cache.borrow_mut().get(&img.url);
                 continue;
             }
             pending.push((id, img.url.clone()));
@@ -91,18 +99,18 @@ impl ImageSession {
     pub fn insert(&mut self, url: String, image: DecodedImage) {
         // New pixels invalidate any prior Kitty upload for this URL.
         self.uploaded.remove(&url);
-        self.cache.insert(url, image);
+        self.cache.borrow_mut().insert(url, image);
         self.last_sig.clear();
     }
 
     pub fn context(&mut self) -> ImageContext {
-        ImageContext::from_discovery(&self.page_imgs, &mut self.cache)
+        ImageContext::from_discovery(&self.page_imgs, &mut self.cache.borrow_mut())
     }
 
     pub fn pixels(&mut self) -> ImagePixels {
         let mut map = ImagePixels::new();
         for img in &self.page_imgs {
-            if let Some(d) = self.cache.get(&img.url) {
+            if let Some(d) = self.cache.borrow_mut().get(&img.url) {
                 map.insert(img.url.clone(), d);
             }
         }
