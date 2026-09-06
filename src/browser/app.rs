@@ -35,7 +35,7 @@ use crate::style::sources::{self, Source};
 use crate::style::{self, StyleContext, Styles};
 use crate::timers::{TimerId, TimerRequest};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::term::{Attrs, Cell, Frame, Style};
 
@@ -4743,6 +4743,7 @@ pub struct Browser {
     /// Tab whose Kitty placement bookkeeping matches the terminal-global
     /// image state.
     kitty_tab: Option<TabId>,
+    kitty_hidden_by_bookmarks: bool,
     bookmarks: Bookmarks,
     bookmark_library: bool,
     bookmark_selected: Option<usize>,
@@ -4788,6 +4789,7 @@ impl Browser {
             active: 0,
             next_tab: 2,
             kitty_tab: Some(id),
+            kitty_hidden_by_bookmarks: false,
             bookmarks: Bookmarks::new(),
             bookmark_library: false,
             bookmark_selected: None,
@@ -4859,6 +4861,9 @@ impl Browser {
                     _ => unreachable!(),
                 };
             }
+        }
+        if self.bookmark_library && matches!(msg, Msg::Mouse(_)) {
+            return Effect::default();
         }
 
         match &mut msg {
@@ -5048,6 +5053,11 @@ impl Browser {
                     Some(format!("bookmark limit ({MAX_BOOKMARKS})"));
                 redraw()
             }
+            AddResult::Invalid => {
+                self.tabs[self.active].page.status_msg =
+                    Some("page cannot be represented as a bookmark".into());
+                redraw()
+            }
             AddResult::Added => {
                 self.tabs[self.active].page.status_msg = Some("bookmarked".into());
                 self.bookmark_selected = Some(0);
@@ -5199,6 +5209,33 @@ impl Browser {
         let mut page = Frame::new(frame.width(), frame.height().saturating_sub(1));
         self.tabs[self.active].page.draw(&mut page);
         frame.blit_rows(&page, 1);
+        self.draw_browser_status(frame);
+    }
+
+    fn draw_browser_status(&self, frame: &mut Frame) {
+        let Some(y) = frame.height().checked_sub(1) else {
+            return;
+        };
+        let page = &self.tabs[self.active].page;
+        let page_middle = page.status_middle();
+        let bookmark_middle = format!(
+            "{} bookmark{} · {}",
+            self.bookmarks.len(),
+            if self.bookmarks.len() == 1 { "" } else { "s" },
+            self.bookmark_status()
+        );
+        let middle = if page_middle.is_empty() {
+            bookmark_middle
+        } else {
+            format!("{page_middle} · {bookmark_middle}")
+        };
+        let row = statusline::compose(
+            frame.width() as usize,
+            &page.status_left(),
+            &middle,
+            &page.status_right(),
+        );
+        frame.put_str(0, y, &row, reversed());
     }
 
     fn draw_bookmark_library(&self, frame: &mut Frame) {
@@ -5244,16 +5281,18 @@ impl Browser {
                         frame.set(x, y, Cell::new(' ', style));
                     }
                 }
-                let mut line = String::with_capacity(
-                    record
-                        .title
-                        .len()
-                        .saturating_add(record.url.len())
-                        .saturating_add(3),
-                );
-                line.push_str(&record.title);
-                line.push_str(" — ");
-                line.push_str(&record.url);
+                let width = frame.width() as usize;
+                let line = if width > 3 {
+                    let content = width - 3;
+                    let title_width = content / 2;
+                    let url_width = content - title_width;
+                    let mut line = clip_cells(&record.title, title_width);
+                    line.push_str(" — ");
+                    line.push_str(&clip_cells(&record.url, url_width));
+                    line
+                } else {
+                    clip_cells(&record.title, width)
+                };
                 frame.put_str(0, y, &line, style);
             }
         }
@@ -5348,6 +5387,20 @@ impl Browser {
     }
 
     pub fn kitty_frame(&mut self) -> Option<Vec<u8>> {
+        if self.bookmark_library {
+            if self.kitty_graphics && !self.kitty_hidden_by_bookmarks {
+                self.kitty_hidden_by_bookmarks = true;
+                for tab in &mut self.tabs {
+                    tab.page.images.terminal_reset();
+                }
+                return Some(crate::image::delete_all_images().to_vec());
+            }
+            return None;
+        }
+        if self.kitty_hidden_by_bookmarks {
+            self.kitty_hidden_by_bookmarks = false;
+            return self.tabs[self.active].page.kitty_frame_with_offset(1);
+        }
         let active = self.tabs[self.active].id;
         if self.kitty_graphics && self.kitty_tab != Some(active) {
             self.kitty_tab = Some(active);
@@ -5412,6 +5465,29 @@ fn bounded(mut message: String) -> String {
         message.truncate(at);
     }
     message
+}
+
+fn clip_cells(value: &str, limit: usize) -> String {
+    let mut out = String::new();
+    let mut used: usize = 0;
+    let mut clipped = false;
+    for ch in value.chars() {
+        let width = ch.width().unwrap_or(0);
+        if used.saturating_add(width) > limit {
+            clipped = true;
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    if clipped && limit > 0 {
+        while used >= limit {
+            let Some(ch) = out.pop() else { break };
+            used = used.saturating_sub(ch.width().unwrap_or(0));
+        }
+        out.push('…');
+    }
+    out
 }
 
 fn collect_text(dom: &Dom, node: NodeId, out: &mut String) {

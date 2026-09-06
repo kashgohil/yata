@@ -27,6 +27,7 @@ pub enum AddResult {
     Added,
     Duplicate,
     Full,
+    Invalid,
 }
 
 impl Bookmarks {
@@ -44,15 +45,15 @@ impl Bookmarks {
     }
 
     pub fn add(&mut self, url: Arc<str>, title: Arc<str>) -> AddResult {
+        if validate_record(&url, &title).is_err() {
+            return AddResult::Invalid;
+        }
         if self.records.iter().any(|record| record.url == url) {
             return AddResult::Duplicate;
         }
         if self.records.len() == MAX_BOOKMARKS {
             return AddResult::Full;
         }
-        debug_assert!(valid_url(&url));
-        debug_assert!(url.len() <= MAX_URL_BYTES);
-        debug_assert!(!title.is_empty() && title.len() <= MAX_TITLE_BYTES);
         self.records.insert(0, Bookmark { url, title });
         AddResult::Added
     }
@@ -147,6 +148,9 @@ pub fn decode(bytes: &[u8]) -> Result<Bookmarks, FormatError> {
         }));
     }
     let body = &bytes[HEADER.len()..];
+    if body.is_empty() {
+        return Ok(Bookmarks::new());
+    }
     if !body.is_empty() && !body.ends_with(b"\n") {
         return Err(FormatError::new(
             "bookmark record is not newline terminated",
@@ -154,10 +158,14 @@ pub fn decode(bytes: &[u8]) -> Result<Bookmarks, FormatError> {
     }
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    for line in body
-        .split(|&byte| byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
+    let records_bytes = body.strip_suffix(b"\n").unwrap_or(body);
+    if records_bytes.is_empty() {
+        return Err(FormatError::new("bookmark record is empty"));
+    }
+    for line in records_bytes.split(|&byte| byte == b'\n') {
+        if line.is_empty() {
+            return Err(FormatError::new("bookmark record is empty"));
+        }
         if records.len() == MAX_BOOKMARKS {
             return Err(FormatError::new("too many bookmarks"));
         }
@@ -240,6 +248,10 @@ fn unescape(input: &[u8], limit: usize, field: &str) -> Result<String, FormatErr
                     )));
                 }
             });
+        } else if byte == b'\r' {
+            return Err(FormatError::new(format!(
+                "unescaped carriage return in bookmark {field}"
+            )));
         } else {
             out.push(byte);
         }
@@ -336,6 +348,8 @@ mod tests {
             b"yata-bookmarks-v1\nftp://a.test/\ttitle\n",
             b"yata-bookmarks-v1\nhttps://A.test\ttitle\n",
             b"yata-bookmarks-v1\nhttps://a.test/\tone\nhttps://a.test/\ttwo\n",
+            b"yata-bookmarks-v1\n\n",
+            b"yata-bookmarks-v1\nhttps://a.test/\traw\rtitle\n",
         ] {
             assert!(
                 decode(bad).is_err(),
@@ -371,6 +385,10 @@ mod tests {
         assert_eq!(
             bookmarks.add(Arc::from("https://example.test/full"), Arc::from("title")),
             AddResult::Full
+        );
+        assert_eq!(
+            Bookmarks::new().add(Arc::from("ftp://example.test/"), Arc::from("title")),
+            AddResult::Invalid
         );
     }
 
