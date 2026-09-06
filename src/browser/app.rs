@@ -1235,6 +1235,9 @@ impl App {
                 self.apply_error_page(url, reason);
                 redraw()
             }
+            // These are owned by the outer browser session. Keeping harmless
+            // arms here makes accidental page routing unable to mutate a page.
+            Msg::BookmarksLoaded(_) | Msg::BookmarksSaved { .. } => Effect::default(),
         }
     }
 

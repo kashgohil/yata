@@ -13,6 +13,12 @@ use crate::timers::TimerId;
 /// loop is the sole receiver.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Msg {
+    /// Session-global bookmark persistence results have no page generation.
+    BookmarksLoaded(Result<crate::browser::bookmarks::Bookmarks, String>),
+    BookmarksSaved {
+        revision: u64,
+        result: Result<(), String>,
+    },
     Key(KeyEvent),
     /// SGR mouse (mode 1006). Click → hit-test; move → `:hover` (M6).
     Mouse(MouseEvent),
@@ -188,7 +194,12 @@ impl Msg {
             | Msg::Script { id, .. }
             | Msg::RunScripts { id } => Some(*id),
             Msg::JsFetch { page, .. } | Msg::Timer { page, .. } => Some(*page),
-            Msg::Key(_) | Msg::Mouse(_) | Msg::Resize(_, _) | Msg::InputClosed => None,
+            Msg::Key(_)
+            | Msg::Mouse(_)
+            | Msg::Resize(_, _)
+            | Msg::InputClosed
+            | Msg::BookmarksLoaded(_)
+            | Msg::BookmarksSaved { .. } => None,
         }
     }
 }

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod bookmark_worker;
 pub mod bookmarks;
 pub mod error_page;
 pub mod form;
