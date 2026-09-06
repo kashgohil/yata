@@ -192,3 +192,74 @@ impl Msg {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{PageId, TabId};
+
+    #[test]
+    fn every_page_originated_message_exposes_its_complete_address() {
+        let page = PageId::new(TabId(7), 3);
+        let messages = vec![
+            Msg::Loading {
+                id: page,
+                bytes_so_far: 1,
+            },
+            Msg::Loaded {
+                id: page,
+                url: "https://x.test/".into(),
+                status: 200,
+                body: vec![],
+                elapsed: Duration::ZERO,
+                content_type: None,
+                set_cookie: vec![],
+                metadata: Default::default(),
+            },
+            Msg::Redirect {
+                id: page,
+                url: "https://x.test/".into(),
+                to: "https://x.test/y".into(),
+                status: 302,
+                elapsed: Duration::ZERO,
+                set_cookie: vec![],
+            },
+            Msg::Parsed {
+                id: page,
+                dom: Dom::new_document(),
+                elapsed: Duration::ZERO,
+            },
+            Msg::Stylesheet {
+                id: page,
+                slot: 0,
+                sheet: None,
+            },
+            Msg::NetError {
+                id: page,
+                url: "https://x.test/".into(),
+                reason: "failed".into(),
+            },
+            Msg::Image {
+                id: page,
+                url: "https://x.test/i.png".into(),
+                result: Err("failed".into()),
+            },
+            Msg::Script {
+                id: page,
+                slot: 0,
+                source: None,
+            },
+            Msg::JsFetch {
+                page,
+                request: 1,
+                result: Err("failed".into()),
+            },
+            Msg::Timer {
+                page,
+                id: TimerId(1),
+            },
+            Msg::RunScripts { id: page },
+        ];
+        assert!(messages.iter().all(|message| message.page() == Some(page)));
+    }
+}
