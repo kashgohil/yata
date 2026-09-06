@@ -1310,7 +1310,10 @@ impl App {
             }
             // These are owned by the outer browser session. Keeping harmless
             // arms here makes accidental page routing unable to mutate a page.
-            Msg::BookmarksLoaded(_) | Msg::BookmarksSaved { .. } => Effect::default(),
+            Msg::BookmarksLoaded(_)
+            | Msg::BookmarksSaved { .. }
+            | Msg::SessionLoaded(_)
+            | Msg::SessionSaved { .. } => Effect::default(),
         }
     }
 

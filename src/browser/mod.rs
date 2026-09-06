@@ -13,6 +13,7 @@ pub mod keys;
 pub mod reader;
 pub mod search;
 pub mod session;
+pub mod session_worker;
 pub mod statusline;
 pub mod timing;
 pub mod viewport;
