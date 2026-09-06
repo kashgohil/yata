@@ -10794,6 +10794,12 @@ mod tests {
                 .any(|box_| box_.node == Some(table) && box_.kind == layout::BoxKind::Table)
         );
         assert_eq!(dom.attr(table, "id"), Some("article-table"));
+        assert_eq!(page.console.entries().len(), 1);
+        assert_eq!(
+            page.console.entries()[0].text,
+            "deliberate integration fixture probe"
+        );
+        assert_eq!(page.console.error_count(), 1);
         let query = by_id(&browser.tabs[0].page, "query");
         browser.tabs[0].page.focus = Some(query);
         browser.update(key(KeyCode::Enter, KeyModifiers::NONE));

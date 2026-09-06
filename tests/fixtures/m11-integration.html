@@ -36,6 +36,7 @@
     </form>
   </main>
   <script>
+    console.error('deliberate integration fixture probe');
     document.getElementById('briefing').addEventListener('submit', function () {
       document.cookie = 'observed=' + document.getElementById('query').value + '-' +
                         document.getElementById('topic').value + '-' +
