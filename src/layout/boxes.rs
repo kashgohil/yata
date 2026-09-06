@@ -142,7 +142,7 @@ impl LayoutTree {
     }
 
     /// Depth-first walk in paint order.
-    pub fn walk(&self, id: BoxId, f: &mut dyn FnMut(BoxId, &LayoutBox)) {
+    pub fn walk(&self, id: BoxId, f: &mut impl FnMut(BoxId, &LayoutBox)) {
         let b = self.get(id);
         f(id, b);
         for &child in &b.children {
@@ -156,11 +156,16 @@ impl LayoutTree {
     ///
     /// Subtrees under a collapsed clip are skipped entirely: a clip only ever
     /// narrows, so nothing inside one could reach the screen.
-    pub fn walk_clipped(&self, f: &mut dyn FnMut(BoxId, &LayoutBox, Clip)) {
+    pub fn walk_clipped(&self, f: &mut impl FnMut(BoxId, &LayoutBox, Clip)) {
         self.walk_clipped_from(self.root, Clip::NONE, f);
     }
 
-    fn walk_clipped_from(&self, id: BoxId, clip: Clip, f: &mut dyn FnMut(BoxId, &LayoutBox, Clip)) {
+    fn walk_clipped_from(
+        &self,
+        id: BoxId,
+        clip: Clip,
+        f: &mut impl FnMut(BoxId, &LayoutBox, Clip),
+    ) {
         let b = self.get(id);
         f(id, b, clip);
         let inside = clip.inside(b);

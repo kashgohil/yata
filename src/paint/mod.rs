@@ -34,7 +34,9 @@ pub enum DisplayCommand {
     Text {
         x: i32,
         y: i32,
-        text: String,
+        /// Shared because the authoritative ordered list and compatibility
+        /// views retain the same immutable glyph run.
+        text: Arc<str>,
         style: Style,
     },
     /// Replaced image: half-block grid baked in for the scroll path; optional
@@ -218,7 +220,7 @@ fn paint_box(
                     list.push(DisplayCommand::Text {
                         x,
                         y: run.y,
-                        text,
+                        text: text.into(),
                         style: run.style,
                     });
                 }
@@ -233,7 +235,7 @@ fn paint_box(
                 list.push(DisplayCommand::Text {
                     x,
                     y: b.dimensions.content.y,
-                    text,
+                    text: text.into(),
                     style: b.term_style,
                 });
             }
@@ -287,7 +289,7 @@ fn paint_box(
                     list.push(DisplayCommand::Text {
                         x,
                         y: rect.y,
-                        text,
+                        text: text.into(),
                         style: Style {
                             fg: Color::Rgb(0xc0, 0xc0, 0xc0),
                             bg: Color::Rgb(0x40, 0x40, 0x40),
@@ -431,7 +433,7 @@ pub fn paint_to_frame(
                     continue;
                 }
                 let screen_x = origin_x as i32 + *x;
-                let text_cells = unicode_width::UnicodeWidthStr::width(text.as_str()) as i32;
+                let text_cells = unicode_width::UnicodeWidthStr::width(text.as_ref()) as i32;
                 if screen_x >= frame.width() as i32 || screen_x + text_cells <= 0 {
                     continue;
                 }
@@ -709,7 +711,7 @@ mod tests {
         list.commands
             .iter()
             .filter_map(|c| match c {
-                DisplayCommand::Text { x, y, text, .. } => Some((*x, *y, text.clone())),
+                DisplayCommand::Text { x, y, text, .. } => Some((*x, *y, text.to_string())),
                 _ => None,
             })
             .collect()
@@ -728,7 +730,7 @@ mod tests {
             .commands
             .iter()
             .filter_map(|c| match c {
-                DisplayCommand::Text { text, .. } => Some(text.as_str()),
+                DisplayCommand::Text { text, .. } => Some(text.as_ref()),
                 _ => None,
             })
             .collect();
@@ -829,7 +831,7 @@ mod tests {
             .fixed_commands
             .iter()
             .find_map(|command| match command {
-                DisplayCommand::Text { text, y, .. } if text == "fixed" => Some(*y),
+                DisplayCommand::Text { text, y, .. } if text.as_ref() == "fixed" => Some(*y),
                 _ => None,
             });
         assert_eq!(y, Some(1));
@@ -853,7 +855,7 @@ mod tests {
             .fixed_commands
             .iter()
             .find_map(|command| match command {
-                DisplayCommand::Text { text, y, .. } if text == "fixed" => Some(*y),
+                DisplayCommand::Text { text, y, .. } if text.as_ref() == "fixed" => Some(*y),
                 _ => None,
             });
         assert_eq!(y, Some(2));
