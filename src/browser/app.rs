@@ -9530,6 +9530,23 @@ mod tests {
         (app, id)
     }
 
+    fn load_active_browser_page(browser: &mut Browser, url: &str, html: &str) -> PageId {
+        let id = browser.start_navigation(url.into()).fetch.unwrap().0;
+        browser.update(Msg::Loaded {
+            id,
+            url: url.into(),
+            status: 200,
+            body: html.as_bytes().to_vec(),
+            elapsed: Duration::ZERO,
+            content_type: Some("text/html".into()),
+            set_cookie: Vec::new(),
+            metadata: Default::default(),
+        });
+        browser.update(parsed(id, html));
+        browser.update(Msg::RunScripts { id });
+        id
+    }
+
     const READER_PAGE: &str = "<style>body{display:grid;color:red} article{display:none;position:fixed;width:9999px} p{border:8px solid}</style>\
         <header id=page-head>PAGE CHROME</header><nav><a href='/menu'>MENU LINK</a></nav>\
         <article id=story><header><h1>Article title</h1><p>By Writer</p></header>\
@@ -9805,6 +9822,250 @@ mod tests {
             app.status_msg.as_deref(),
             Some("fragment outside reader content")
         );
+    }
+
+    #[test]
+    fn reader_interaction_queries_only_original_projected_nodes() {
+        let (mut app, _) = live_page(
+            60,
+            10,
+            "<nav><a id=menu href='/menu'>menu</a></nav><article><p>prose <a id=inside href='/inside'>inside</a></p></article><form><input></form>",
+        );
+        let node = |app: &App, value: &str| {
+            let dom = app.dom.as_ref().unwrap();
+            (0..dom.node_count())
+                .map(|n| NodeId(n as u32))
+                .find(|&n| dom.attr(n, "id") == Some(value))
+                .unwrap()
+        };
+        let inside = node(&app, "inside");
+        let menu = node(&app, "menu");
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        let dom = app.dom.as_ref().unwrap();
+        let tree = app.layout_tree.as_ref().unwrap();
+        assert_eq!(layout::focusables(tree, dom), vec![inside]);
+        assert!(
+            !layout::collect_links(tree, dom)
+                .iter()
+                .any(|link| link.node == menu)
+        );
+
+        app.update(key(KeyCode::Char('f'), KeyModifiers::NONE));
+        let labels = &app.hint.as_ref().unwrap().labels;
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].1.node, inside);
+        app.update(key(KeyCode::Esc, KeyModifiers::NONE));
+
+        let link =
+            layout::collect_links(app.layout_tree.as_ref().unwrap(), app.dom.as_ref().unwrap())[0]
+                .clone();
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        app.update(mouse_move(
+            (column(app.size.0).left as i32 + link.x) as u16,
+            (link.y - app.viewport.offset() as i32) as u16,
+        ));
+        assert_eq!(app.hover, Some(inside));
+        assert_eq!(
+            (app.reader_styles_run, app.layouts, app.paints),
+            (before.0 + 1, before.1, before.2 + 1)
+        );
+
+        let effect = app.update(click_first_link(&app));
+        assert_eq!(effect.fetch.unwrap().1.url, "http://final/inside");
+        assert!(
+            app.reader.is_none(),
+            "cross-document navigation kept reader mode"
+        );
+    }
+
+    #[test]
+    fn reader_state_is_per_tab_and_bookmark_modal_preserves_it_without_work() {
+        let mut browser = Browser::new(60, 12);
+        load_active_browser_page(
+            &mut browser,
+            "https://one.test/article",
+            "<title>One article</title><header>chrome</header><article><p>one prose</p></article>",
+        );
+        browser.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        assert!(browser.tabs[0].page.reader.is_some());
+        let first_counts = (
+            browser.tabs[0].page.styles_run,
+            browser.tabs[0].page.reader_styles_run,
+            browser.tabs[0].page.layouts,
+            browser.tabs[0].page.paints,
+        );
+
+        browser.update(ch('t'));
+        browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+        load_active_browser_page(
+            &mut browser,
+            "https://two.test/",
+            "<title>Two</title><main><p>two prose</p></main>",
+        );
+        assert!(browser.tabs[1].page.reader.is_none());
+        let second_counts = (
+            browser.tabs[1].page.styles_run,
+            browser.tabs[1].page.reader_styles_run,
+            browser.tabs[1].page.layouts,
+            browser.tabs[1].page.paints,
+        );
+        browser.update(ch('g'));
+        browser.update(ch('T'));
+        assert_eq!(browser.active, 0);
+        assert!(browser.tabs[0].page.reader.is_some());
+        assert_eq!(
+            (
+                browser.tabs[0].page.styles_run,
+                browser.tabs[0].page.reader_styles_run,
+                browser.tabs[0].page.layouts,
+                browser.tabs[0].page.paints,
+            ),
+            first_counts
+        );
+        browser.update(ch('g'));
+        browser.update(ch('t'));
+        assert_eq!(
+            (
+                browser.tabs[1].page.styles_run,
+                browser.tabs[1].page.reader_styles_run,
+                browser.tabs[1].page.layouts,
+                browser.tabs[1].page.paints,
+            ),
+            second_counts
+        );
+
+        browser.update(ch('g'));
+        browser.update(ch('T'));
+        let before_modal = first_counts;
+        browser.update(ch('b'));
+        assert!(browser.bookmark_library);
+        browser.update(ch('b'));
+        assert!(!browser.bookmark_library);
+        assert!(browser.tabs[0].page.reader.is_some());
+        assert_eq!(
+            (
+                browser.tabs[0].page.styles_run,
+                browser.tabs[0].page.reader_styles_run,
+                browser.tabs[0].page.layouts,
+                browser.tabs[0].page.paints,
+            ),
+            before_modal
+        );
+        browser.update(ch('a'));
+        assert_eq!(
+            browser.bookmarks.records()[0].url.as_ref(),
+            "https://one.test/article"
+        );
+        assert_eq!(browser.bookmarks.records()[0].title.as_ref(), "One article");
+    }
+
+    #[test]
+    fn excluded_image_decode_and_reader_inspectors_obey_the_projection() {
+        let (mut app, id) = live_page(
+            60,
+            12,
+            "<nav id=chrome><img src='excluded.png' alt='EXCLUDED IMAGE'><a href=x>menu</a></nav>\
+             <article id=story><h1>Title</h1><p>projected prose</p></article>",
+        );
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        let effect = app.update(Msg::Image {
+            id,
+            url: "http://final/excluded.png".into(),
+            result: Ok(crate::image::DecodedImage::new(2, 2, vec![255; 16])),
+        });
+        assert_eq!(effect, Effect::default());
+        assert_eq!((app.reader_styles_run, app.layouts, app.paints), before);
+
+        app.update(f1());
+        let f1_view = screen(&mut app, 60, 12);
+        assert!(
+            f1_view.contains("nav#chrome"),
+            "F1 hid the live DOM:\n{f1_view}"
+        );
+        app.update(f1());
+        app.update(f2());
+        let f2_view = screen(&mut app, 60, 12);
+        assert!(f2_view.contains("article#story"), "{f2_view}");
+        assert!(
+            !f2_view.contains("nav#chrome"),
+            "F2 leaked chrome:\n{f2_view}"
+        );
+        app.update(f2());
+        app.update(f3());
+        let f3_view = screen(&mut app, 60, 12);
+        assert!(
+            !f3_view.contains("nav#chrome"),
+            "F3 leaked chrome:\n{f3_view}"
+        );
+        assert!(f3_view.contains("article#story"), "{f3_view}");
+    }
+
+    #[test]
+    fn reader_timers_update_projected_prose_once_and_skip_outside_chrome() {
+        let (mut app, id) = scripted_app(
+            "<article id=story><p>initial prose</p></article><script>\
+             setTimeout(function () { var p=document.createElement('p'); p.textContent='timer prose'; document.getElementById('story').appendChild(p); }, 10);\
+             setTimeout(function () { var n=document.createElement('nav'); n.textContent='timer chrome'; document.body.appendChild(n); }, 20);\
+             </script>",
+        );
+        app.update(Msg::RunScripts { id });
+        app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(1),
+        });
+        assert_eq!(
+            (app.reader_styles_run, app.layouts, app.paints),
+            (before.0 + 1, before.1 + 1, before.2 + 1)
+        );
+        assert!(screen(&mut app, 50, 10).contains("timer prose"));
+
+        let before = (app.reader_styles_run, app.layouts, app.paints);
+        app.update(Msg::Timer {
+            page: id,
+            id: TimerId(2),
+        });
+        assert_eq!((app.reader_styles_run, app.layouts, app.paints), before);
+        let frame = screen(&mut app, 50, 10);
+        assert!(!frame.contains("timer chrome"), "{frame}");
+    }
+
+    #[test]
+    #[ignore = "release reader toggle performance measurement"]
+    fn measure_reader_toggle_on_wikipedia() {
+        let html = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        let (mut app, _) = live_page(80, 24, html);
+        let mut enter = Vec::with_capacity(200);
+        let mut exit = Vec::with_capacity(200);
+        for _ in 0..200 {
+            let started = Instant::now();
+            app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+            enter.push(started.elapsed());
+            assert!(app.reader.is_some(), "Wikipedia had no prose root");
+            let started = Instant::now();
+            app.update(key(KeyCode::Char('R'), KeyModifiers::NONE));
+            exit.push(started.elapsed());
+        }
+        enter.sort_unstable();
+        exit.sort_unstable();
+        let p95 = |samples: &[Duration]| samples[samples.len() * 95 / 100];
+        eprintln!(
+            "M11.23 Wikipedia reader toggle (80x24, n=200): enter p95 {:?}; exit p95 {:?}; nodes {}; arena membership {} bytes",
+            p95(&enter),
+            p95(&exit),
+            app.dom.as_ref().unwrap().node_count(),
+            app.dom.as_ref().unwrap().node_count() * std::mem::size_of::<bool>(),
+        );
+        if !cfg!(debug_assertions) {
+            assert!(p95(&enter) < Duration::from_millis(10));
+            assert!(p95(&exit) < Duration::from_millis(10));
+        }
     }
 
     /// A page with one link whose listener cancels the click.

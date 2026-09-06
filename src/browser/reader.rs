@@ -40,7 +40,10 @@ impl ReaderView {
 
     pub fn same_projected_content(&self, other: &ReaderView) -> bool {
         self.root == other.root
-            && self.included == other.included
+            && (0..self.included.len().max(other.included.len())).all(|index| {
+                self.included.get(index).copied().unwrap_or(false)
+                    == other.included.get(index).copied().unwrap_or(false)
+            })
             && self.fingerprint == other.fingerprint
     }
 }

@@ -291,4 +291,14 @@ mod tests {
         assert!(hint.contains("open bookmark"));
         assert!(hint.contains("delete bookmark"));
     }
+
+    #[test]
+    fn help_lists_reader_mode_once_from_the_binding_table() {
+        let text = help_text();
+        assert_eq!(text.matches("reader mode").count(), 1, "{text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains('R') && line.contains("reader mode"))
+        );
+    }
 }

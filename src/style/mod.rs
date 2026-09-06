@@ -323,14 +323,57 @@ pub fn style_tree_with(dom: &Dom, sheets: &[&Stylesheet], ctx: &StyleContext<'_>
 /// without recovering page chrome or siblings of the projection spine.
 pub fn style_reader_tree_with(dom: &Dom, included: &[bool], ctx: &StyleContext<'_>) -> Styles {
     debug_assert_eq!(included.len(), dom.node_count());
-    let mut styles = style_tree_with(dom, &[], ctx);
-    for (index, computed) in styles.computed.iter_mut().enumerate() {
-        if !included.get(index).copied().unwrap_or(false) {
-            computed.display = Display::None;
-            computed.hidden_by_ua = true;
-        }
+    let ua = RuleIndex::build(&[ua_stylesheet()]);
+    let author = RuleIndex::build(&[]);
+    let mut excluded = ComputedStyle::default();
+    excluded.display = Display::None;
+    excluded.hidden_by_ua = true;
+    let mut styles = Styles {
+        computed: vec![excluded; dom.node_count()],
+        #[cfg(test)]
+        nodes_styled: 0,
+    };
+    if included.get(dom.root.0 as usize).copied().unwrap_or(false) {
+        resolve_projected(
+            dom,
+            dom.root,
+            &ComputedStyle::default(),
+            &ua,
+            &author,
+            ctx,
+            included,
+            &mut styles,
+        );
     }
     styles
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_projected(
+    dom: &Dom,
+    node: NodeId,
+    parent: &ComputedStyle,
+    ua: &RuleIndex<'_>,
+    author: &RuleIndex<'_>,
+    ctx: &StyleContext<'_>,
+    included: &[bool],
+    out: &mut Styles,
+) {
+    if !included.get(node.0 as usize).copied().unwrap_or(false) {
+        return;
+    }
+    #[cfg(test)]
+    {
+        out.nodes_styled += 1;
+    }
+    let computed = match &dom.node(node).data {
+        NodeData::Element { .. } => cascade(dom, node, parent, ua, author, ctx),
+        _ => parent.inherit(),
+    };
+    out.computed[node.0 as usize] = computed.clone();
+    for child in dom.children(node) {
+        resolve_projected(dom, child, &computed, ua, author, ctx, included, out);
+    }
 }
 
 /// Recompute `roots` and everything under them, in place, leaving every other
