@@ -1,0 +1,29 @@
+<!doctype html>
+<title>fixed and sticky</title>
+<style>
+  body { margin: 0 }
+  .tools {
+    position: fixed;
+    top: 0;
+    right: 0;
+    padding: 8px;
+    background: #eeeeee;
+  }
+  .chapter {
+    position: sticky;
+    top: 0;
+    margin: 0;
+    padding: 8px;
+    background: #ddeeff;
+  }
+  p { margin: 0 }
+</style>
+<header class="tools"><a href="#search">Search</a></header>
+<main>
+  <section>
+    <h2 class="chapter">Results</h2>
+    <p>one</p><p>two</p><p>three</p><p>four</p><p>five</p>
+    <p>six</p><p>seven</p><p>eight</p><p>nine</p><p>ten</p>
+  </section>
+  <p id="search">Search target</p>
+</main>

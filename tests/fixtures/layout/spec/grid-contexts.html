@@ -1,0 +1,15 @@
+<!-- width: 24 -->
+<!-- viewport-height: 4 -->
+<style>
+body, div, p, table, td { margin:0 }
+.flex { display:flex }
+.grid { display:grid; grid-template-columns:8px 1fr }
+.flexgrid { flex:1 }
+.positioned { position:relative }
+.absolute { position:absolute; top:0; left:0 }
+.clip { height:1em; overflow:hidden }
+</style>
+<div class=flex><div class="grid flexgrid"><p>f</p><p>flex</p></div></div>
+<table><tr><td><div class=grid><p>t</p><p>table</p></div></td></tr></table>
+<div class="grid positioned"><p>p</p><p>positioned</p><p class=absolute>absolute</p></div>
+<div class="grid clip"><p>c</p><p>shown</p><p>next</p></div>

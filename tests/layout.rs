@@ -79,12 +79,252 @@ fn fixture_width(html: &str) -> u16 {
     value.trim().parse().unwrap_or(DEFAULT_WIDTH)
 }
 
+fn fixture_viewport_height(html: &str) -> u16 {
+    html.lines()
+        .take(2)
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("<!-- viewport-height:")?
+                .strip_suffix("-->")
+        })
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(1)
+}
+
+#[test]
+fn grid_text_is_an_anonymous_item_and_absolute_children_do_not_reserve_a_cell() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:1fr 1fr}.abs{position:absolute}</style><div class=g>text<span>next</span><i class=abs>floating</i></div>"#,
+        20,
+    );
+    assert!(dump.contains("grid cols=[10, 10] rows=[1]"), "{dump}");
+    assert!(dump.contains("#text \"text\"  x=0 y=0"), "{dump}");
+    assert!(dump.contains("#text \"next\"  x=10 y=0"), "{dump}");
+}
+
+#[test]
+fn inline_grid_keeps_its_own_formatting_root_when_it_is_a_grid_item() {
+    let dump = box_dump(
+        r#"<style>.outer{display:grid;grid-template-columns:1fr}.inner{display:inline-grid;grid-template-columns:1fr 1fr}</style><div class=outer><span class=inner><b>left</b><b>right</b></span></div>"#,
+        20,
+    );
+    assert_eq!(dump.matches(" grid cols=").count(), 2, "{dump}");
+    assert!(dump.contains("#text \"left\"  x=0 y=0"), "{dump}");
+    assert!(dump.contains("#text \"right\"  x=10 y=0"), "{dump}");
+}
+
+#[test]
+fn sticky_grid_item_keeps_its_static_row_space() {
+    let dump = box_dump(
+        "<!-- viewport-height: 4 -->\n<style>.g{display:grid}.sticky{position:sticky;top:0}p{margin:0}</style><div class=g><p class=sticky>head</p><p>after</p></div>",
+        20,
+    );
+    assert!(dump.contains("#text \"head\"  x=0 y=0"), "{dump}");
+    assert!(dump.contains("#text \"after\"  x=0 y=1"), "{dump}");
+    assert!(dump.contains("sticky top 0"), "{dump}");
+}
+
+#[test]
+fn fixed_grid_child_does_not_reserve_a_cell() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:1fr 1fr}.fixed{position:fixed;top:0}p{margin:0}</style><div class=g><p class=fixed>fixed</p><p>flow</p></div>"#,
+        20,
+    );
+    assert!(dump.contains("grid cols=[10, 10] rows=[1]"), "{dump}");
+    assert!(dump.contains("#text \"flow\"  x=0 y=0"), "{dump}");
+    assert!(dump.contains("fixed viewport"), "{dump}");
+}
+
+#[test]
+fn one_cell_grid_tracks_handle_cjk_and_long_words_without_bad_geometry() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:1px}p{margin:0}</style><div class=g><p>界界</p><p>unbroken</p></div>"#,
+        20,
+    );
+    // The first auto row contains two width-two CJK glyphs; the second wraps
+    // an eight-character word. Both boxes remain finite one-cell tracks.
+    assert!(dump.contains("grid cols=[1] rows=[2, 8]"), "{dump}");
+    assert!(dump.contains("#text \"界\"  x=0 y=0 w=2 h=1"), "{dump}");
+    assert!(dump.contains("#text \"u\"  x=0 y=2 w=1 h=1"), "{dump}");
+}
+
+#[test]
+fn hostile_grid_sums_stay_bounded_and_never_make_negative_rectangles() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:repeat(256,99999999999em);column-gap:99999999999em}p{margin:0}</style><div class=g><p>a</p><p>b</p></div>"#,
+        1,
+    );
+    let root = dump
+        .lines()
+        .find(|line| line.contains(" grid cols="))
+        .unwrap();
+    assert_eq!(
+        root.matches(", ").count(),
+        255,
+        "track list was not bounded: {root}"
+    );
+    assert!(!dump.contains(" w=-"), "{dump}");
+    assert!(!dump.contains(" h=-"), "{dump}");
+    assert!(!dump.contains(" x=-"), "{dump}");
+    assert!(!dump.contains(" y=-"), "{dump}");
+}
+
+#[test]
+fn percentage_and_repeat_fr_tracks_resolve_against_the_grid_width() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:25% repeat(2, 1fr)}p{margin:0}</style><div class=g><p>a</p><p>b</p><p>c</p></div>"#,
+        20,
+    );
+    // 25% of 20 is five. The remaining fifteen cells divide deterministically
+    // between the two `fr` tracks, with the rounding cell going first.
+    assert!(dump.contains("grid cols=[5, 8, 7] rows=[1]"), "{dump}");
+    assert!(dump.contains("#text \"b\"  x=5 y=0"), "{dump}");
+    assert!(dump.contains("#text \"c\"  x=13 y=0"), "{dump}");
+}
+
+#[test]
+fn minmax_caps_an_auto_track_without_second_pass_layout() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:minmax(auto, 2em)}p{margin:0}</style><div class=g><p>longword</p></div>"#,
+        20,
+    );
+    // The item's min-content contribution is eight, but `2em` is four cells.
+    // It wraps in that final width rather than triggering a track-sizing retry.
+    assert!(dump.contains("grid cols=[4] rows=[2]"), "{dump}");
+    assert!(dump.contains("#text \"long\"  x=0 y=0 w=4 h=1"), "{dump}");
+}
+
+#[test]
+fn auto_placement_skips_cells_reserved_by_a_span() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:repeat(3, 1fr)}.span{grid-column:1 / span 2}p{margin:0}</style><div class=g><p class=span>wide</p><p>auto</p></div>"#,
+        20,
+    );
+    // Twenty cells divide 7/7/6. The explicit item reserves columns one and
+    // two, so the auto item starts at the third track's x=14.
+    assert!(dump.contains("grid cols=[7, 7, 6] rows=[1]"), "{dump}");
+    assert!(dump.contains("#text \"auto\"  x=14 y=0"), "{dump}");
+}
+
+#[test]
+fn row_spans_reserve_every_covered_cell_for_auto_placement() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:1fr 1fr}.tall{grid-row:1 / span 2}p{margin:0}</style><div class=g><p class=tall>tall</p><p>top</p><p>bottom</p></div>"#,
+        20,
+    );
+    assert!(dump.contains("grid cols=[10, 10] rows=[1, 1]"), "{dump}");
+    assert!(dump.contains("#text \"top\"  x=10 y=0"), "{dump}");
+    assert!(dump.contains("#text \"bottom\"  x=10 y=1"), "{dump}");
+}
+
+#[test]
+fn row_tracks_use_vertical_units_and_definite_height_for_percent_and_fr() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;height:8em;grid-template-columns:1fr;grid-template-rows:32px 25% 1fr}p{margin:0}</style><div class=g><p>a</p><p>b</p><p>c</p></div>"#,
+        20,
+    );
+    // 32px is two terminal lines, 25% of the definite eight-line content
+    // height is two, and the fractional row receives the remaining four.
+    assert!(dump.contains("grid cols=[20] rows=[2, 2, 4]"), "{dump}");
+    assert!(dump.contains("#text \"b\"  x=0 y=2"), "{dump}");
+    assert!(dump.contains("#text \"c\"  x=0 y=4"), "{dump}");
+}
+
+#[test]
+fn indefinite_fractional_and_percentage_rows_keep_content_visible() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-rows:1fr 50%}p{margin:0}</style><div class=g><p>first</p><p>second</p></div>"#,
+        20,
+    );
+    assert!(dump.contains("grid cols=[6] rows=[1, 1]"), "{dump}");
+    assert!(dump.contains("#text \"second\"  x=0 y=1"), "{dump}");
+}
+
+#[test]
+fn end_lines_and_end_anchored_spans_reserve_the_expected_columns() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:repeat(3,1fr)}p{margin:0}.end{grid-column-end:4}.span{grid-column:span 2 / 4}</style><div class=g><p class=end>end</p><p class=span>span</p><p>auto</p></div>"#,
+        12,
+    );
+    assert!(dump.contains("grid cols=[4, 4, 4] rows=[1, 1]"), "{dump}");
+    assert!(dump.contains("#text \"end\"  x=8 y=0"), "{dump}");
+    assert!(dump.contains("#text \"span\"  x=4 y=1"), "{dump}");
+    assert!(dump.contains("#text \"auto\"  x=0 y=0"), "{dump}");
+}
+
+#[test]
+fn inline_grid_is_atomic_inside_an_inline_formatting_context() {
+    let dump = box_dump(
+        r#"<style>p{margin:0}.i{display:inline-grid;grid-template-columns:1fr 1fr}</style><p>before <span class=i><b>a</b><b>b</b></span> after</p>"#,
+        20,
+    );
+    assert!(dump.contains("<span.i> grid cols=[1, 1]"), "{dump}");
+    // The inline grid is an ordinary child of the line, not a block that
+    // forces `after` onto a new row.
+    assert!(dump.contains("#text \"after\"  x=9 y=0"), "{dump}");
+}
+
+#[test]
+fn inline_grid_shrink_to_fit_sums_its_explicit_column_contributions() {
+    let dump = box_dump(
+        r#"<style>p{margin:0}.i{display:inline-grid;grid-template-columns:auto auto}.item{display:block;margin:0}</style><p>x<span class=i><span class=item>left</span><span class=item>right</span></span>y</p>"#,
+        20,
+    );
+    assert!(dump.contains("<span.i> grid cols=[4, 5]"), "{dump}");
+    assert!(dump.contains("#text \"right\"  x=5 y=0"), "{dump}");
+    assert!(dump.contains("#text \"y\"  x=10 y=0"), "{dump}");
+}
+
+#[test]
+fn inline_flex_keeps_its_flex_root_when_it_is_a_grid_item() {
+    let dump = box_dump(
+        r#"<style>.outer{display:grid;grid-template-columns:1fr}.inner{display:inline-flex}.inner b{flex:1}</style><div class=outer><span class=inner><b>left</b><b>right</b></span></div>"#,
+        20,
+    );
+    assert!(dump.contains("<span.inner> flex row"), "{dump}");
+    assert!(dump.contains("#text \"left\"  x=0 y=0"), "{dump}");
+    assert!(dump.contains("#text \"right\"  x=10 y=0"), "{dump}");
+}
+
+#[test]
+fn table_grid_item_uses_the_grid_resolved_cell_width() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:1fr}table{margin:0}</style><div class=g><table><tr><td>left</td><td>right</td></tr></table></div>"#,
+        20,
+    );
+    assert!(dump.contains("<div.g> grid cols=[20]"), "{dump}");
+    assert!(dump.contains("table <table>  x=0 y=0 w=20"), "{dump}");
+    assert!(dump.contains("#text \"left\"  x=0 y=0"), "{dump}");
+}
+
+#[test]
+fn form_controls_and_replaced_images_are_ordinary_grid_items() {
+    let dump = box_dump(
+        r#"<style>.g{display:grid;grid-template-columns:1fr 1fr}</style><div class=g><input value=field><img src=pic.png width=16 height=32 alt=pic></div>"#,
+        20,
+    );
+    assert!(dump.contains("grid cols=[10, 10] rows=[2]"), "{dump}");
+    assert!(
+        dump.contains("<input …> field value \"field\"  x=1 y=0 w=8 h=1"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("img \"pic\" https://fixture.test/pic.png  x=10 y=0 w=2 h=2"),
+        "{dump}"
+    );
+}
+
 /// The stage under test — the same function `--dump-boxes` prints through, so
 /// a golden always pins boxes a reviewer can put on screen with the flag or
 /// `F3`. The base URL is a fixed fake: fixtures are offline, and image `src`
 /// only has to resolve, not fetch.
 fn box_dump(html: &str, width: u16) -> String {
-    headless::box_dump(&mut html::parse(html), Some(FIXTURE_BASE), width)
+    headless::box_dump_with_viewport(
+        &mut html::parse(html),
+        Some(FIXTURE_BASE),
+        width,
+        fixture_viewport_height(html),
+    )
 }
 
 /// Strip a spec golden's `# ` header: the derivation is for the reader, the

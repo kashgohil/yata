@@ -149,6 +149,29 @@ fn simple_box_model_snapshot() {
     assert_snapshot("simple-box-model", &grid);
 }
 
+#[test]
+fn overlapping_grid_items_paint_in_dom_order() {
+    let html = r#"<style>
+      .g { display:grid; grid-template-columns:1fr }
+      .g > div { grid-column:1; grid-row:1; margin:0 }
+      .first { background:#f00 }.last { background:#00f }
+    </style><div class=g><div class=first>first</div><div class=last>last</div></div>"#;
+    let frame = render_frame(html, 20, 2);
+    assert_eq!(render_grid(html, 20, 2).lines().next(), Some("last"));
+    assert_eq!(frame.get(10, 0).bg, Color::Rgb(0, 0, 255));
+}
+
+#[test]
+fn overflow_clip_applies_to_laid_out_grid_children() {
+    let html = r#"<style>
+      .g { display:grid; grid-template-columns:1fr; height:1em; overflow:hidden }
+      p { margin:0 }
+    </style><div class=g><p>visible</p><p>clipped</p></div>"#;
+    let grid = render_grid(html, 20, 3);
+    assert!(grid.contains("visible"), "{grid}");
+    assert!(!grid.contains("clipped"), "{grid}");
+}
+
 /// M9.3: the paint half of `layout/spec/overflow-clip`. That golden pins where
 /// the boxes are (clipping moves nothing); this one pins which cells survive,
 /// which is the only place the property is visible.

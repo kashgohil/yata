@@ -322,6 +322,29 @@ fn dump_boxes_reports_positioned_final_geometry() {
 }
 
 #[test]
+fn dump_boxes_exposes_resolved_grid_tracks_and_item_rectangles() {
+    let body = br#"<style>*{margin:0}.g{display:grid;grid-template-columns:8px 1fr;gap:1em}.wide{grid-column:1 / span 2}</style><div class=g><p>rail</p><p>article</p><p class=wide>footer</p></div>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let boxes = String::from_utf8(out.stdout).unwrap();
+    assert!(boxes.contains("<div.g> grid cols=[1,"), "{boxes}");
+    // The one-cell rail wraps its four characters, making the auto row four
+    // lines high; the row gap then puts the spanning footer at line five.
+    assert!(boxes.contains("rows=[4, 1]"), "{boxes}");
+    assert!(boxes.contains("#text \"article\"  x=3 y=0"), "{boxes}");
+    assert!(boxes.contains("#text \"footer\"  x=0 y=5"), "{boxes}");
+
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+    assert_eq!(lines.first().copied(), Some("r  article"), "{text}");
+    assert_eq!(lines.get(5).copied(), Some("footer"), "{text}");
+}
+
+#[test]
 fn dump_text_and_boxes_expose_choice_controls_without_option_prose() {
     let body = br#"<body style="margin:0"><p style="margin:0">Choice <input type=checkbox checked> <select><option>One</option><option selected>Two</option></select></p></body>"#;
     let addr = serve_once(response_with_body("200 OK", body));
@@ -448,6 +471,36 @@ fn dump_boxes_prints_the_box_tree_to_stdout() {
         "stderr: {:?}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+#[test]
+fn dump_boxes_exposes_fixed_and_sticky_annotations() {
+    let body = br#"<style>
+        .fixed { position: fixed; top: 0 }
+        .sticky { position: sticky; top: 0 }
+    </style><div class=fixed>fixed</div><div class=sticky>sticky</div>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-boxes", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let boxes = String::from_utf8(out.stdout).unwrap();
+    assert!(boxes.contains("fixed viewport"), "{boxes}");
+    assert!(boxes.contains("sticky top 0 range"), "{boxes}");
+}
+
+#[test]
+fn dump_text_includes_fixed_and_sticky_static_content() {
+    let body = br#"<style>
+        .fixed { position: fixed; top: 0 }
+        .sticky { position: sticky; top: 0 }
+        p { margin: 0 }
+    </style><div class=fixed>fixed</div><div class=sticky>sticky</div><p>flow</p>"#;
+    let addr = serve_once(response_with_body("200 OK", body));
+    let out = yata(&["--dump-text", &format!("http://{addr}/")]);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("fixed"), "{text}");
+    assert!(text.contains("sticky"), "{text}");
+    assert!(text.contains("flow"), "{text}");
 }
 
 #[test]

@@ -1,0 +1,31 @@
+<html>  x=0 y=0 w=40 h=9
+  <body>  x=0 y=0 w=40 h=9
+    <input.tools …> field value "find"  x=33 y=0 w=6 h=1 fixed viewport
+    <div.row> flex row  x=0 y=0 w=40 h=1
+      <div.sticky>  x=0 y=0 w=12 h=1 sticky top 0 range 0
+        anonymous  x=0 y=0 w=12 h=1 sticky top 0 range 0
+          line  x=0 y=0 w=12 h=1 sticky top 0 range 0
+            #text "flex heading"  x=0 y=0 w=12 h=1 sticky top 0 range 0
+      <div>  x=12 y=0 w=9 h=1
+        anonymous  x=12 y=0 w=9 h=1
+          line  x=12 y=0 w=9 h=1
+            #text "flex body"  x=12 y=0 w=9 h=1
+    table <table>  x=1 y=2 w=22 h=6
+      table-row <tr>  x=1 y=2 w=22 h=3
+        table-cell <td.sticky>  x=2 y=3 w=13 h=1 sticky top 0 range 0
+          anonymous  x=2 y=3 w=13 h=1 sticky top 0 range 0
+            line  x=2 y=3 w=13 h=1 sticky top 0 range 0
+              #text "table heading"  x=2 y=3 w=13 h=1 sticky top 0 range 0
+        table-cell <td>  x=17 y=3 w=5 h=1
+          anonymous  x=17 y=3 w=5 h=1
+            line  x=17 y=3 w=5 h=1
+              #text "value"  x=17 y=3 w=5 h=1
+      table-row <tr>  x=1 y=5 w=22 h=3
+        table-cell <td>  x=2 y=6 w=13 h=1
+          anonymous  x=2 y=6 w=13 h=1
+            line  x=2 y=6 w=13 h=1
+              #text "later"  x=2 y=6 w=5 h=1
+        table-cell <td>  x=17 y=6 w=5 h=1
+          anonymous  x=17 y=6 w=5 h=1
+            line  x=17 y=6 w=5 h=1
+              #text "row"  x=17 y=6 w=3 h=1

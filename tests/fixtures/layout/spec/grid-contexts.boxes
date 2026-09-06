@@ -1,0 +1,62 @@
+# Nested-context derivation at 24 cells: the grid in flex receives all 24,
+# so its 8px fixed track is 1 and its fractional track is 23. The auto table
+# shrink-wraps to six cells before its nested grid resolves to 1 + 5. The
+# positioned grid stays 24 cells wide and its absolute child reserves no cell.
+# The clipped grid still emits its two resolved rows (1 and 4); its one-line
+# used height is clipping state consumed later by paint, not a layout rewrite.
+<html>  x=0 y=0 w=24 h=4
+  <body>  x=0 y=0 w=24 h=4
+    <div.flex> flex row  x=0 y=0 w=24 h=1
+      <div.grid.flexgrid> grid cols=[1, 23] rows=[1]  x=0 y=0 w=24 h=1
+        <p>  x=0 y=0 w=1 h=1
+          anonymous  x=0 y=0 w=1 h=1
+            line  x=0 y=0 w=1 h=1
+              #text "f"  x=0 y=0 w=1 h=1
+        <p>  x=1 y=0 w=23 h=1
+          anonymous  x=1 y=0 w=23 h=1
+            line  x=1 y=0 w=23 h=1
+              #text "flex"  x=1 y=0 w=4 h=1
+    table <table>  x=0 y=1 w=6 h=1
+      table-row <tr>  x=0 y=1 w=6 h=1
+        table-cell <td>  x=0 y=1 w=6 h=1
+          <div.grid> grid cols=[1, 5] rows=[1]  x=0 y=1 w=6 h=1
+            <p>  x=0 y=1 w=1 h=1
+              anonymous  x=0 y=1 w=1 h=1
+                line  x=0 y=1 w=1 h=1
+                  #text "t"  x=0 y=1 w=1 h=1
+            <p>  x=1 y=1 w=5 h=1
+              anonymous  x=1 y=1 w=5 h=1
+                line  x=1 y=1 w=5 h=1
+                  #text "table"  x=1 y=1 w=5 h=1
+    <div.grid.positioned> grid cols=[1, 23] rows=[1]  x=0 y=2 w=24 h=1
+      <p>  x=0 y=2 w=1 h=1
+        anonymous  x=0 y=2 w=1 h=1
+          line  x=0 y=2 w=1 h=1
+            #text "p"  x=0 y=2 w=1 h=1
+      <p>  x=1 y=2 w=23 h=1
+        anonymous  x=1 y=2 w=23 h=1
+          line  x=1 y=2 w=23 h=1
+            #text "positioned"  x=1 y=2 w=10 h=1
+      <p.absolute>  x=0 y=2 w=24 h=1
+        anonymous  x=0 y=2 w=24 h=1
+          line  x=0 y=2 w=24 h=1
+            #text "absolute"  x=0 y=2 w=8 h=1
+    <div.grid.clip> grid cols=[1, 23] rows=[1, 4]  x=0 y=3 w=24 h=1 overflow=hidden
+      <p>  x=0 y=3 w=1 h=1
+        anonymous  x=0 y=3 w=1 h=1
+          line  x=0 y=3 w=1 h=1
+            #text "c"  x=0 y=3 w=1 h=1
+      <p>  x=1 y=3 w=23 h=1
+        anonymous  x=1 y=3 w=23 h=1
+          line  x=1 y=3 w=23 h=1
+            #text "shown"  x=1 y=3 w=5 h=1
+      <p>  x=0 y=4 w=1 h=4
+        anonymous  x=0 y=4 w=1 h=4
+          line  x=0 y=4 w=1 h=1
+            #text "n"  x=0 y=4 w=1 h=1
+          line  x=0 y=5 w=1 h=1
+            #text "e"  x=0 y=5 w=1 h=1
+          line  x=0 y=6 w=1 h=1
+            #text "x"  x=0 y=6 w=1 h=1
+          line  x=0 y=7 w=1 h=1
+            #text "t"  x=0 y=7 w=1 h=1
