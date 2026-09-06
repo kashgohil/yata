@@ -8257,6 +8257,55 @@ mod tests {
         assert!(navigation_elapsed < Duration::from_millis(10));
     }
 
+    fn m11_memory_shape(integrated: bool) {
+        let wikipedia = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/en.wikipedia.org.html"
+        ));
+        let mut browser = Browser::with_persistence(80, 24, false, true, true);
+        browser.update(Msg::BookmarksLoaded(Ok(Bookmarks::new())));
+        load_active_browser_page(&mut browser, "https://en.wikipedia.org/wiki/Cat", wikipedia);
+        if integrated {
+            let mut library = Bookmarks::new();
+            for n in 0..MAX_BOOKMARKS {
+                assert_eq!(
+                    library.add(
+                        Arc::from(format!("https://saved.test/{n}#cat")),
+                        Arc::from(format!("保存した猫 {n}"))
+                    ),
+                    AddResult::Added
+                );
+            }
+            browser.bookmarks = library;
+            while browser.tabs.len() < MAX_TABS {
+                browser.update(ch('t'));
+                browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            browser.active = 0;
+            browser.update(ch('R'));
+            assert!(browser.tabs[0].page.reader.is_some());
+            assert_eq!(browser.session_snapshot().tabs.len(), MAX_TABS);
+        }
+        let mut frame = Frame::new(80, 24);
+        browser.draw(&mut frame);
+        std::hint::black_box((&browser, &frame));
+    }
+
+    /// RSS is recorded externally with `/usr/bin/time -l`; keeping one test
+    /// per shape makes the 16-tab/product-state increment explicit instead of
+    /// mislabelling the integrated total as the one-page budget.
+    #[test]
+    #[ignore = "external RSS measurement"]
+    fn measure_m11_one_normal_tab_memory_shape() {
+        m11_memory_shape(false);
+    }
+
+    #[test]
+    #[ignore = "external RSS measurement"]
+    fn measure_m11_integrated_memory_shape() {
+        m11_memory_shape(true);
+    }
+
     #[test]
     fn a_background_parse_after_resize_uses_the_new_geometry_once() {
         let mut browser = Browser::new(30, 8);
