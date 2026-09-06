@@ -5833,8 +5833,10 @@ mod tests {
 
         browser.update(key(KeyCode::Esc, KeyModifiers::NONE));
         browser.update(ch('g'));
-        browser.update(ch('t'));
+        let switched = browser.update(ch('t'));
         assert_eq!(browser.active, 0);
+        assert!(switched.fetch.is_none() && switched.cached.is_none());
+        assert!(switched.documents.is_empty());
         assert_eq!(browser.tabs[0].page.surface, Surface::Dom);
         assert!(browser.tabs[0].page.timing_visible);
         assert_eq!(
